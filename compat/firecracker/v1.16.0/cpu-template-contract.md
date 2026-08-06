@@ -213,8 +213,11 @@ leaves the ordinary no-template snapshot profile unchanged.
 
 The terminal [Wave 6 snapshot contract](snapshot-wave6-contract.md) records
 the broader multi-vCPU/device profiles and this deliberate no-custom-template
-snapshot gate. Wave 7 owns cross-host portability and the five public
-`cpu-template-helper` commands and arguments.
+snapshot gate. The
+[CPU-template helper foundation contract](cpu-template-helper-contract.md)
+owns Wave 7's portable format, config projection, provider, input, publication,
+and exit-class boundary. Its public command and signed effective-provider gate
+remain separately owned by #1862.
 
 ## Security and signed evidence
 
@@ -248,4 +251,6 @@ The strict platform-exclusion evidence and alternatives for the seven narrow
 KVM/static inventory leaves, plus the implementation and validation evidence
 for the six completed ARM records, are recorded in `capabilities.json`.
 Mechanical write/readback establishes routing, not a portable or coherent CPU
-feature model; helper capture and comparison remain Wave 7 work.
+feature model. The portable helper foundation cannot create effective platform
+evidence without the real all-vCPU provider and signed process integration
+owned by #1862.

@@ -1,6 +1,8 @@
 //! Firecracker-compatible API surface.
 
+pub mod config;
 pub mod http;
+mod json;
 pub mod route;
 
 /// Firecracker's default maximum accepted HTTP request body size.

@@ -24,6 +24,7 @@ signal-hook = "0.3"
 signal-hook-registry = "1"
 
 [dev-dependencies]
+bangbang-cpu-template-helper = { path = "../../tools/cpu-template-helper" }
 bangbang-session = { path = "../session", features = ["test-support"] }
 crc64 = "2.0.0"
 plist = "1"

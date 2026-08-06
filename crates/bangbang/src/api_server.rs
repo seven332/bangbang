@@ -13477,6 +13477,57 @@ mod tests {
     }
 
     #[test]
+    fn helper_cpu_inspection_projection_matches_production_actions() {
+        let cpu = bangbang_api::config::parse_cpu_config_document(
+            r#"{
+                "kvm_capabilities": ["1", "!2"],
+                "reg_modifiers": [
+                    {"addr":"0x60200000001000d5","bitmap":"0b1"},
+                    {"addr":"0x6030000000100000","bitmap":"0b1x"},
+                    {"addr":"0x6040000000100054","bitmap":"0b0x1"}
+                ],
+                "vcpu_features": [{"index":0,"bitmap":"0b1x"}]
+            }"#,
+        )
+        .expect("CPU request fixture should parse");
+        let cpu_request = ApiRequest::PutCpuConfig(Box::new(cpu));
+        assert_eq!(
+            config_vmm_action_from_api_request(cpu_request.clone()),
+            bangbang_cpu_template_helper::projection::inspection_action_from_api_request(
+                &cpu_request
+            )
+        );
+
+        let requests = bangbang_api::config::parse_config_document(
+            r#"{
+                "machine-config": {
+                    "vcpu_count": 4,
+                    "mem_size_mib": 512,
+                    "smt": true,
+                    "cpu_template": "V1N1",
+                    "track_dirty_pages": true,
+                    "huge_pages": "2M"
+                },
+                "boot-source": {"kernel_image_path":"private-kernel"}
+            }"#,
+        )
+        .expect("machine request fixture should parse");
+        let machine_request = requests
+            .into_iter()
+            .find_map(|request| match request.into_parts().1 {
+                request @ ApiRequest::PutMachineConfig(_) => Some(request),
+                _ => None,
+            })
+            .expect("machine request should be present");
+        assert_eq!(
+            config_vmm_action_from_api_request(machine_request.clone()),
+            bangbang_cpu_template_helper::projection::inspection_action_from_api_request(
+                &machine_request
+            )
+        );
+    }
+
+    #[test]
     fn fails_when_socket_path_is_broken_symlink_without_deleting_it() {
         let path = unique_socket_path("symlink");
         let target = unique_socket_path("missing-target");

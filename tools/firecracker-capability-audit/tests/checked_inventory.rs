@@ -2104,6 +2104,71 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
 }
 
 #[test]
+fn cpu_template_helper_foundation_policy_is_stable() {
+    const HELPER_CAPABILITIES: [&str; 7] = [
+        "tool-argument:cpu-template-helper/template/dump/config",
+        "tool-argument:cpu-template-helper/template/dump/output",
+        "tool-argument:cpu-template-helper/template/dump/template",
+        "tool-argument:cpu-template-helper/template/verify/config",
+        "tool-argument:cpu-template-helper/template/verify/template",
+        "tool-operation:cpu-template-helper/template/dump",
+        "tool-operation:cpu-template-helper/template/verify",
+    ];
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    let contract_path = "compat/firecracker/v1.16.0/cpu-template-helper-contract.md";
+    let contract = std::fs::read_to_string(repository_root.join(contract_path))
+        .expect("CPU-template helper contract must be readable");
+
+    assert_eq!(
+        HELPER_CAPABILITIES
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        7,
+        "CPU-template helper capability set must remain exact"
+    );
+    for id in HELPER_CAPABILITIES {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("CPU-template helper capability must exist: {id}"));
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "library-only foundation must not promote public helper behavior: {id}"
+        );
+        assert_eq!(
+            contract
+                .matches(&format!("| `{id}` | `audit-required` |"))
+                .count(),
+            1,
+            "helper contract must contain one exact nonterminal row: {id}"
+        );
+    }
+    assert!(contract.contains("#1862"));
+
+    let package_root = repository_root.join("tools/cpu-template-helper");
+    let package_manifest = std::fs::read_to_string(package_root.join("Cargo.toml"))
+        .expect("CPU-template helper package manifest must be readable");
+    assert!(package_root.join("src/lib.rs").is_file());
+    assert!(!package_root.join("src/main.rs").exists());
+    assert!(!package_root.join("src/bin").exists());
+    assert!(!package_manifest.contains("[[bin]]"));
+    assert!(!package_manifest.contains("bangbang-hvf"));
+}
+
+#[test]
 fn snapshot_paging_terminal_policy_is_stable() {
     const CAPABILITY_ID: &str = "corpus:snapshot-page-faults";
 

@@ -344,41 +344,53 @@ impl CpuConfigArmRegisterModifier {
     }
 
     fn into_executable(self) -> Result<ArmRegisterModifier, CpuConfigError> {
-        match self.width {
-            CpuConfigArmRegisterWidth::U32 => {
-                let register = match core_class_index(self.id) {
-                    Some(212) => ArmRegister32::Fpsr,
-                    Some(213) => ArmRegister32::Fpcr,
-                    Some(index) if expected_core_width(index).is_some() => {
-                        return Err(CpuConfigError::InvalidRegisterWidth);
-                    }
-                    Some(_) => return Err(CpuConfigError::InvalidRegisterIdentity),
-                    None => return Err(classify_unaccepted_register(self.id)),
-                };
-                Ok(ArmRegisterModifier::U32 {
+        if let Some(descriptor) = arm64_cpu_template_register_descriptor(self.id) {
+            if descriptor.width() != self.width {
+                return Err(CpuConfigError::InvalidRegisterWidth);
+            }
+            if self.filter & !descriptor.allowed_filter() != 0 {
+                debug_assert_eq!(
+                    descriptor.register(),
+                    ArmCpuTemplateRegister::U64(ArmRegister64::Actlr)
+                );
+                return Err(CpuConfigError::ActlrFilterUnsupported);
+            }
+
+            return match descriptor.register() {
+                ArmCpuTemplateRegister::U32(register) => Ok(ArmRegisterModifier::U32 {
                     register,
                     filter: u32::try_from(self.filter)
                         .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?,
                     value: u32::try_from(self.value)
                         .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?,
-                })
-            }
-            CpuConfigArmRegisterWidth::U64 => {
-                let register = classify_u64_register(self.id)?;
-                let filter = u64::try_from(self.filter)
-                    .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?;
-                if accepted_system_register(self.id)
-                    .is_some_and(|entry| filter & !entry.allowed_filter != 0)
-                {
-                    return Err(CpuConfigError::ActlrFilterUnsupported);
-                }
-                Ok(ArmRegisterModifier::U64 {
+                }),
+                ArmCpuTemplateRegister::U64(register) => Ok(ArmRegisterModifier::U64 {
                     register,
-                    filter,
+                    filter: u64::try_from(self.filter)
+                        .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?,
                     value: u64::try_from(self.value)
                         .map_err(|_| CpuConfigError::ValueOutsideRegisterWidth)?,
-                })
-            }
+                }),
+                ArmCpuTemplateRegister::U128(register) => Ok(ArmRegisterModifier::U128 {
+                    register,
+                    filter: self.filter,
+                    value: self.value,
+                }),
+            };
+        }
+
+        match self.width {
+            CpuConfigArmRegisterWidth::U32 => match core_class_index(self.id) {
+                Some(index) if expected_core_width(index).is_some() => {
+                    Err(CpuConfigError::InvalidRegisterWidth)
+                }
+                Some(_) => Err(CpuConfigError::InvalidRegisterIdentity),
+                None => Err(classify_unaccepted_register(self.id)),
+            },
+            CpuConfigArmRegisterWidth::U64 => match classify_u64_register(self.id) {
+                Ok(_) => Err(CpuConfigError::InvalidRegisterIdentity),
+                Err(error) => Err(error),
+            },
             CpuConfigArmRegisterWidth::U128 => {
                 let Some(index) = core_class_index(self.id) else {
                     return Err(classify_unaccepted_register(self.id));
@@ -390,11 +402,7 @@ impl CpuConfigArmRegisterModifier {
                         Err(CpuConfigError::InvalidRegisterIdentity)
                     };
                 }
-                Ok(ArmRegisterModifier::U128 {
-                    register: ArmRegister128::Q(ArmQRegister(((index - 84) / 4) as u8)),
-                    filter: self.filter,
-                    value: self.value,
-                })
+                Err(CpuConfigError::InvalidRegisterIdentity)
             }
         }
     }
@@ -633,6 +641,292 @@ pub enum ArmRegisterAvailability {
     MacOs15_2,
 }
 
+/// One typed register in the closed arm64 CPU-template profile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArmCpuTemplateRegister {
+    U32(ArmRegister32),
+    U64(ArmRegister64),
+    U128(ArmRegister128),
+}
+
+impl ArmCpuTemplateRegister {
+    /// Return the exact architectural width.
+    pub const fn width(self) -> CpuConfigArmRegisterWidth {
+        match self {
+            Self::U32(_) => CpuConfigArmRegisterWidth::U32,
+            Self::U64(_) => CpuConfigArmRegisterWidth::U64,
+            Self::U128(_) => CpuConfigArmRegisterWidth::U128,
+        }
+    }
+
+    /// Return whether initial boot setup retains or supersedes this target.
+    pub const fn boot_disposition(self) -> ArmRegisterBootDisposition {
+        match self {
+            Self::U64(register) => register.boot_disposition(),
+            Self::U32(_) | Self::U128(_) => ArmRegisterBootDisposition::Retained,
+        }
+    }
+
+    /// Return the public Hypervisor.framework availability tier.
+    pub const fn availability(self) -> ArmRegisterAvailability {
+        match self {
+            Self::U64(register) => register.availability(),
+            Self::U32(_) | Self::U128(_) => ArmRegisterAvailability::Baseline,
+        }
+    }
+}
+
+impl fmt::Debug for ArmCpuTemplateRegister {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(CPU_CONFIG_VALUE_REDACTED)
+    }
+}
+
+/// One read-only descriptor in the exact arm64 CPU-template register census.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ArmCpuTemplateRegisterDescriptor {
+    identity: u64,
+    register: ArmCpuTemplateRegister,
+    allowed_filter: u128,
+}
+
+impl ArmCpuTemplateRegisterDescriptor {
+    const fn new(identity: u64, register: ArmCpuTemplateRegister, allowed_filter: u128) -> Self {
+        Self {
+            identity,
+            register,
+            allowed_filter,
+        }
+    }
+
+    const fn full_width(identity: u64, register: ArmCpuTemplateRegister) -> Self {
+        let allowed_filter = match register.width() {
+            CpuConfigArmRegisterWidth::U32 => u32::MAX as u128,
+            CpuConfigArmRegisterWidth::U64 => u64::MAX as u128,
+            CpuConfigArmRegisterWidth::U128 => u128::MAX,
+        };
+        Self::new(identity, register, allowed_filter)
+    }
+
+    /// Return the Firecracker/KVM-shaped compatibility identity.
+    pub const fn identity(self) -> u64 {
+        self.identity
+    }
+
+    /// Return the typed backend-neutral target.
+    pub const fn register(self) -> ArmCpuTemplateRegister {
+        self.register
+    }
+
+    /// Return the exact architectural width.
+    pub const fn width(self) -> CpuConfigArmRegisterWidth {
+        self.register.width()
+    }
+
+    /// Return the complete mask admitted for this target.
+    pub const fn allowed_filter(self) -> u128 {
+        self.allowed_filter
+    }
+
+    /// Return whether initial boot setup retains or supersedes this target.
+    pub const fn boot_disposition(self) -> ArmRegisterBootDisposition {
+        self.register.boot_disposition()
+    }
+
+    /// Return the minimum public Hypervisor.framework availability tier.
+    pub const fn availability(self) -> ArmRegisterAvailability {
+        self.register.availability()
+    }
+}
+
+impl fmt::Debug for ArmCpuTemplateRegisterDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArmCpuTemplateRegisterDescriptor")
+            .field("width", &self.width())
+            .field("boot_disposition", &self.boot_disposition())
+            .field("availability", &self.availability())
+            .field("identity", &CPU_CONFIG_VALUE_REDACTED)
+            .field("register", &CPU_CONFIG_VALUE_REDACTED)
+            .field("allowed_filter", &CPU_CONFIG_VALUE_REDACTED)
+            .finish()
+    }
+}
+
+/// Exact number of accepted arm64 CPU-template targets.
+pub const ARM64_CPU_TEMPLATE_REGISTER_COUNT: usize = 80;
+
+const ARM64_SYSTEM_REGISTERS: [(u64, ArmRegister64, u128); 12] = [
+    (
+        KVM_REG_ARM64_ID_AA64PFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Pfr0),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64PFR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Pfr1),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64ZFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Zfr0),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64SMFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Smfr0),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64DFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Dfr0),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64DFR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Dfr1),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64ISAR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Isar0),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64ISAR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Isar1),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64MMFR0_EL1,
+        ArmRegister64::Id(ArmIdRegister::Mmfr0),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64MMFR1_EL1,
+        ArmRegister64::Id(ArmIdRegister::Mmfr1),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ID_AA64MMFR2_EL1,
+        ArmRegister64::Id(ArmIdRegister::Mmfr2),
+        u64::MAX as u128,
+    ),
+    (
+        KVM_REG_ARM64_ACTLR_EL1,
+        ArmRegister64::Actlr,
+        ARM64_ACTLR_ENTSO_MASK as u128,
+    ),
+];
+
+/// Iterator over the exact arm64 CPU-template register census.
+#[derive(Debug, Clone)]
+pub struct ArmCpuTemplateRegisterDescriptors {
+    position: usize,
+}
+
+impl Iterator for ArmCpuTemplateRegisterDescriptors {
+    type Item = ArmCpuTemplateRegisterDescriptor;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let descriptor = descriptor_at(self.position)?;
+        self.position += 1;
+        Some(descriptor)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = ARM64_CPU_TEMPLATE_REGISTER_COUNT.saturating_sub(self.position);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ArmCpuTemplateRegisterDescriptors {
+    fn len(&self) -> usize {
+        ARM64_CPU_TEMPLATE_REGISTER_COUNT.saturating_sub(self.position)
+    }
+}
+
+impl std::iter::FusedIterator for ArmCpuTemplateRegisterDescriptors {}
+
+/// Iterate over every accepted arm64 CPU-template register in ascending
+/// compatibility-identity order.
+pub const fn arm64_cpu_template_register_descriptors() -> ArmCpuTemplateRegisterDescriptors {
+    ArmCpuTemplateRegisterDescriptors { position: 0 }
+}
+
+/// Resolve one compatibility identity through the exact descriptor authority.
+pub fn arm64_cpu_template_register_descriptor(
+    identity: u64,
+) -> Option<ArmCpuTemplateRegisterDescriptor> {
+    arm64_cpu_template_register_descriptors().find(|descriptor| descriptor.identity == identity)
+}
+
+fn descriptor_at(position: usize) -> Option<ArmCpuTemplateRegisterDescriptor> {
+    let descriptor = match position {
+        0 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_FPSR,
+            ArmCpuTemplateRegister::U32(ArmRegister32::Fpsr),
+        ),
+        1 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_FPCR,
+            ArmCpuTemplateRegister::U32(ArmRegister32::Fpcr),
+        ),
+        2 => ArmCpuTemplateRegisterDescriptor::full_width(
+            kvm_reg_arm64_core_x(0)?,
+            ArmCpuTemplateRegister::U64(ArmRegister64::X(ArmGeneralRegister(0))),
+        ),
+        3..=29 => {
+            let index = u8::try_from(position + 1).ok()?;
+            ArmCpuTemplateRegisterDescriptor::full_width(
+                kvm_reg_arm64_core_x(index)?,
+                ArmCpuTemplateRegister::U64(ArmRegister64::X(ArmGeneralRegister(index))),
+            )
+        }
+        30 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_SP_EL0,
+            ArmCpuTemplateRegister::U64(ArmRegister64::SpEl0),
+        ),
+        31 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_PC,
+            ArmCpuTemplateRegister::U64(ArmRegister64::Pc),
+        ),
+        32 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_PSTATE,
+            ArmCpuTemplateRegister::U64(ArmRegister64::Pstate),
+        ),
+        33 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_SP_EL1,
+            ArmCpuTemplateRegister::U64(ArmRegister64::SpEl1),
+        ),
+        34 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_ELR_EL1,
+            ArmCpuTemplateRegister::U64(ArmRegister64::ElrEl1),
+        ),
+        35 => ArmCpuTemplateRegisterDescriptor::full_width(
+            KVM_REG_ARM64_CORE_SPSR_EL1,
+            ArmCpuTemplateRegister::U64(ArmRegister64::SpsrEl1),
+        ),
+        36..=47 => {
+            let (identity, register, allowed_filter) =
+                ARM64_SYSTEM_REGISTERS.get(position - 36).copied()?;
+            ArmCpuTemplateRegisterDescriptor::new(
+                identity,
+                ArmCpuTemplateRegister::U64(register),
+                allowed_filter,
+            )
+        }
+        48..=79 => {
+            let index = u8::try_from(position - 48).ok()?;
+            ArmCpuTemplateRegisterDescriptor::full_width(
+                kvm_reg_arm64_core_q(index)?,
+                ArmCpuTemplateRegister::U128(ArmRegister128::Q(ArmQRegister(index))),
+            )
+        }
+        _ => return None,
+    };
+    Some(descriptor)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ArmRegisterModifier {
     U32 {
@@ -653,11 +947,38 @@ pub enum ArmRegisterModifier {
 }
 
 impl ArmRegisterModifier {
+    /// Return the typed target.
+    pub const fn register(self) -> ArmCpuTemplateRegister {
+        match self {
+            Self::U32 { register, .. } => ArmCpuTemplateRegister::U32(register),
+            Self::U64 { register, .. } => ArmCpuTemplateRegister::U64(register),
+            Self::U128 { register, .. } => ArmCpuTemplateRegister::U128(register),
+        }
+    }
+
     pub const fn width(self) -> CpuConfigArmRegisterWidth {
         match self {
             Self::U32 { .. } => CpuConfigArmRegisterWidth::U32,
             Self::U64 { .. } => CpuConfigArmRegisterWidth::U64,
             Self::U128 { .. } => CpuConfigArmRegisterWidth::U128,
+        }
+    }
+
+    /// Return the modifier filter in a zero-extended transport slot.
+    pub const fn filter(self) -> u128 {
+        match self {
+            Self::U32 { filter, .. } => filter as u128,
+            Self::U64 { filter, .. } => filter as u128,
+            Self::U128 { filter, .. } => filter,
+        }
+    }
+
+    /// Return the modifier value in a zero-extended transport slot.
+    pub const fn value(self) -> u128 {
+        match self {
+            Self::U32 { value, .. } => value as u128,
+            Self::U64 { value, .. } => value as u128,
+            Self::U128 { value, .. } => value,
         }
     }
 
@@ -824,105 +1145,14 @@ impl fmt::Display for CpuConfigError {
 
 impl std::error::Error for CpuConfigError {}
 
-#[derive(Clone, Copy)]
-struct Arm64SystemRegisterProfile {
-    identity: u64,
-    register: ArmRegister64,
-    width: CpuConfigArmRegisterWidth,
-    boot_disposition: ArmRegisterBootDisposition,
-    availability: ArmRegisterAvailability,
-    allowed_filter: u64,
-}
-
-impl Arm64SystemRegisterProfile {
-    const fn accepted(identity: u64, register: ArmRegister64, allowed_filter: u64) -> Self {
-        Self {
-            identity,
-            register,
-            width: CpuConfigArmRegisterWidth::U64,
-            boot_disposition: register.boot_disposition(),
-            availability: register.availability(),
-            allowed_filter,
-        }
-    }
-}
-
-const ARM64_SYSTEM_REGISTER_PROFILE: [Arm64SystemRegisterProfile; 12] = [
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64PFR0_EL1,
-        ArmRegister64::Id(ArmIdRegister::Pfr0),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64PFR1_EL1,
-        ArmRegister64::Id(ArmIdRegister::Pfr1),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64DFR0_EL1,
-        ArmRegister64::Id(ArmIdRegister::Dfr0),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64DFR1_EL1,
-        ArmRegister64::Id(ArmIdRegister::Dfr1),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64ISAR0_EL1,
-        ArmRegister64::Id(ArmIdRegister::Isar0),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64ISAR1_EL1,
-        ArmRegister64::Id(ArmIdRegister::Isar1),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64MMFR0_EL1,
-        ArmRegister64::Id(ArmIdRegister::Mmfr0),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64MMFR1_EL1,
-        ArmRegister64::Id(ArmIdRegister::Mmfr1),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64MMFR2_EL1,
-        ArmRegister64::Id(ArmIdRegister::Mmfr2),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64ZFR0_EL1,
-        ArmRegister64::Id(ArmIdRegister::Zfr0),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ID_AA64SMFR0_EL1,
-        ArmRegister64::Id(ArmIdRegister::Smfr0),
-        u64::MAX,
-    ),
-    Arm64SystemRegisterProfile::accepted(
-        KVM_REG_ARM64_ACTLR_EL1,
-        ArmRegister64::Actlr,
-        ARM64_ACTLR_ENTSO_MASK,
-    ),
-];
-
-fn accepted_system_register(id: u64) -> Option<Arm64SystemRegisterProfile> {
-    ARM64_SYSTEM_REGISTER_PROFILE
-        .iter()
-        .copied()
-        .find(|entry| entry.identity == id)
-}
-
 fn classify_u64_register(id: u64) -> Result<ArmRegister64, CpuConfigError> {
-    if let Some(entry) = accepted_system_register(id) {
-        debug_assert_eq!(entry.width, CpuConfigArmRegisterWidth::U64);
-        debug_assert_eq!(entry.boot_disposition, entry.register.boot_disposition());
-        debug_assert_eq!(entry.availability, entry.register.availability());
-        return Ok(entry.register);
+    if let Some(descriptor) = arm64_cpu_template_register_descriptor(id) {
+        return match descriptor.register() {
+            ArmCpuTemplateRegister::U64(register) => Ok(register),
+            ArmCpuTemplateRegister::U32(_) | ArmCpuTemplateRegister::U128(_) => {
+                Err(CpuConfigError::InvalidRegisterWidth)
+            }
+        };
     }
     if matches!(
         id,
@@ -1005,9 +1235,9 @@ fn classify_unaccepted_register(id: u64) -> CpuConfigError {
 }
 
 fn classify_unaccepted_system_register(register: u16) -> CpuConfigError {
-    if ARM64_SYSTEM_REGISTER_PROFILE
+    if ARM64_SYSTEM_REGISTERS
         .iter()
-        .any(|entry| entry.identity as u16 == register)
+        .any(|(identity, _, _)| *identity as u16 == register)
     {
         return CpuConfigError::InvalidRegisterWidth;
     }
@@ -1188,13 +1418,13 @@ mod tests {
     fn prepares_the_complete_system_register_profile_in_order() {
         let input = CpuConfigInput::new(
             Vec::new(),
-            ARM64_SYSTEM_REGISTER_PROFILE
+            ARM64_SYSTEM_REGISTERS
                 .iter()
-                .map(|entry| {
+                .map(|(identity, _, allowed_filter)| {
                     modifier(
-                        entry.identity,
+                        *identity,
                         CpuConfigArmRegisterWidth::U64,
-                        entry.allowed_filter.into(),
+                        *allowed_filter,
                         0,
                     )
                 })
@@ -1211,16 +1441,22 @@ mod tests {
             .modifiers()
             .iter()
             .copied()
-            .zip(ARM64_SYSTEM_REGISTER_PROFILE)
+            .zip(ARM64_SYSTEM_REGISTERS)
         {
+            let (identity, expected_register, allowed_filter) = entry;
             let (register, filter, value) = u64_modifier_parts(modifier);
-            assert_eq!(register, entry.register);
-            assert_eq!(filter, entry.allowed_filter);
+            assert_eq!(register, expected_register);
+            assert_eq!(filter as u128, allowed_filter);
             assert_eq!(value, 0);
-            assert_eq!(entry.width, CpuConfigArmRegisterWidth::U64);
-            assert_eq!(entry.boot_disposition, ArmRegisterBootDisposition::Retained);
-            assert_eq!(register.boot_disposition(), entry.boot_disposition);
-            assert_eq!(register.availability(), entry.availability);
+            let descriptor = arm64_cpu_template_register_descriptor(identity)
+                .expect("system identity should have one descriptor");
+            assert_eq!(descriptor.width(), CpuConfigArmRegisterWidth::U64);
+            assert_eq!(
+                descriptor.boot_disposition(),
+                ArmRegisterBootDisposition::Retained
+            );
+            assert_eq!(descriptor.register(), ArmCpuTemplateRegister::U64(register));
+            assert_eq!(descriptor.allowed_filter(), allowed_filter);
         }
 
         assert_eq!(
@@ -1252,10 +1488,89 @@ mod tests {
             );
         }
 
-        for (index, left) in ARM64_SYSTEM_REGISTER_PROFILE.iter().enumerate() {
-            for right in &ARM64_SYSTEM_REGISTER_PROFILE[index + 1..] {
-                assert_ne!(left.identity, right.identity);
-                assert_ne!(left.register, right.register);
+        for (index, left) in ARM64_SYSTEM_REGISTERS.iter().enumerate() {
+            for right in &ARM64_SYSTEM_REGISTERS[index + 1..] {
+                assert_ne!(left.0, right.0);
+                assert_ne!(left.1, right.1);
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_inventory_is_exact_unique_and_ordered() {
+        let descriptors = arm64_cpu_template_register_descriptors().collect::<Vec<_>>();
+        assert_eq!(descriptors.len(), ARM64_CPU_TEMPLATE_REGISTER_COUNT);
+
+        for pair in descriptors.windows(2) {
+            assert!(pair[0].identity() < pair[1].identity());
+            assert_ne!(pair[0].register(), pair[1].register());
+        }
+
+        let width_count = |width| {
+            descriptors
+                .iter()
+                .filter(|descriptor| descriptor.width() == width)
+                .count()
+        };
+        assert_eq!(width_count(CpuConfigArmRegisterWidth::U32), 2);
+        assert_eq!(width_count(CpuConfigArmRegisterWidth::U64), 46);
+        assert_eq!(width_count(CpuConfigArmRegisterWidth::U128), 32);
+
+        let disposition_count = |disposition| {
+            descriptors
+                .iter()
+                .filter(|descriptor| descriptor.boot_disposition() == disposition)
+                .count()
+        };
+        assert_eq!(disposition_count(ArmRegisterBootDisposition::Retained), 77);
+        assert_eq!(
+            disposition_count(ArmRegisterBootDisposition::AppliedThenBootOverridden),
+            3
+        );
+
+        let availability_count = |availability| {
+            descriptors
+                .iter()
+                .filter(|descriptor| descriptor.availability() == availability)
+                .count()
+        };
+        assert_eq!(availability_count(ArmRegisterAvailability::Baseline), 77);
+        assert_eq!(availability_count(ArmRegisterAvailability::MacOs15_0), 1);
+        assert_eq!(availability_count(ArmRegisterAvailability::MacOs15_2), 2);
+
+        for descriptor in descriptors {
+            assert_eq!(
+                arm64_cpu_template_register_descriptor(descriptor.identity()),
+                Some(descriptor)
+            );
+            let expected_full_filter = match descriptor.width() {
+                CpuConfigArmRegisterWidth::U32 => u32::MAX as u128,
+                CpuConfigArmRegisterWidth::U64 => u64::MAX as u128,
+                CpuConfigArmRegisterWidth::U128 => u128::MAX,
+            };
+            if descriptor.register() == ArmCpuTemplateRegister::U64(ArmRegister64::Actlr) {
+                assert_eq!(descriptor.allowed_filter(), ARM64_ACTLR_ENTSO_MASK as u128);
+            } else {
+                assert_eq!(descriptor.allowed_filter(), expected_full_filter);
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_decoder_rejects_every_mismatched_declared_width() {
+        for descriptor in arm64_cpu_template_register_descriptors() {
+            for width in [
+                CpuConfigArmRegisterWidth::U32,
+                CpuConfigArmRegisterWidth::U64,
+                CpuConfigArmRegisterWidth::U128,
+            ] {
+                if width == descriptor.width() {
+                    continue;
+                }
+                assert_eq!(
+                    executable_modifier(descriptor.identity(), width, 0, 0),
+                    Err(CpuConfigError::InvalidRegisterWidth)
+                );
             }
         }
     }
@@ -1705,34 +2020,9 @@ mod tests {
             );
         }
 
-        let mut accepted = vec![
-            (KVM_REG_ARM64_CORE_FPCR, CpuConfigArmRegisterWidth::U32),
-            (KVM_REG_ARM64_CORE_FPSR, CpuConfigArmRegisterWidth::U32),
-            (KVM_REG_ARM64_CORE_SP_EL0, CpuConfigArmRegisterWidth::U64),
-            (KVM_REG_ARM64_CORE_PC, CpuConfigArmRegisterWidth::U64),
-            (KVM_REG_ARM64_CORE_PSTATE, CpuConfigArmRegisterWidth::U64),
-            (KVM_REG_ARM64_CORE_SP_EL1, CpuConfigArmRegisterWidth::U64),
-            (KVM_REG_ARM64_CORE_ELR_EL1, CpuConfigArmRegisterWidth::U64),
-            (KVM_REG_ARM64_CORE_SPSR_EL1, CpuConfigArmRegisterWidth::U64),
-        ];
-        accepted.extend([0_u8].into_iter().chain(4..=30).map(|index| {
-            (
-                kvm_reg_arm64_core_x(index).expect("reviewed X index should map"),
-                CpuConfigArmRegisterWidth::U64,
-            )
-        }));
-        accepted.extend((0..=31).map(|index| {
-            (
-                kvm_reg_arm64_core_q(index).expect("reviewed Q index should map"),
-                CpuConfigArmRegisterWidth::U128,
-            )
-        }));
-        accepted.extend(
-            ARM64_SYSTEM_REGISTER_PROFILE
-                .iter()
-                .map(|entry| (entry.identity, CpuConfigArmRegisterWidth::U64)),
-        );
-        for (id, correct_width) in accepted {
+        for descriptor in arm64_cpu_template_register_descriptors() {
+            let id = descriptor.identity();
+            let correct_width = descriptor.width();
             for wrong_width in [
                 CpuConfigArmRegisterWidth::U32,
                 CpuConfigArmRegisterWidth::U64,

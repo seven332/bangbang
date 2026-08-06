@@ -1,0 +1,16 @@
+[package]
+name = "bangbang-cpu-template-helper"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+bangbang-api = { path = "../../crates/api" }
+bangbang-runtime = { path = "../../crates/runtime" }
+rustix = { version = "=1.1.4", features = ["fs"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.140"
+
+[lints]
+workspace = true

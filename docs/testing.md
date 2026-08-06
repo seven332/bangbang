@@ -1172,6 +1172,26 @@ fixed success/failure markers, never report values. Run both through
 `scripts/run-integration-tests.sh` without `--allow-unsupported`; the direct
 rootfs builder requires the installed stable `aarch64-unknown-linux-musl`
 target and embeds the deterministic static helper.
+
+The library-only CPU-template helper foundation has a separate portable gate:
+
+```sh
+cargo test -p bangbang-api --locked
+cargo test -p bangbang-runtime --all-features --locked --lib cpu
+cargo test -p bangbang-cpu-template-helper --locked
+cargo test -p bangbang --all-features --locked helper_cpu_inspection_projection_matches_production_actions
+cargo test -p bangbang-firecracker-capability-audit --test checked_inventory cpu_template_helper_foundation_policy_is_stable --locked
+```
+
+These tests prove shared duplicate-safe config parsing, exact production action
+projection, the runtime-owned descriptor census and accepted decoder, canonical
+format round trips, identity-bound provider profiles, optional availability,
+filter comparison, bounded regular-file input, value/path redaction, and the
+exclusive publication fault matrix. They do not prove a public command or real
+effective capture. #1862 must add the executable and production provider, run
+its direct and App Sandbox process matrix through
+`scripts/run-integration-tests.sh` without `--allow-unsupported`, and only then
+promote the seven dump/verify capability rows.
 SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
 and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,

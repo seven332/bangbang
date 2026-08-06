@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv4Addr;
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use crate::json::JsonValueWithoutDuplicateObjectKeys;
 use crate::route::Endpoint;
 use crate::{HTTP_MAX_PAYLOAD_SIZE, HTTP_MAX_REQUEST_HEAD_SIZE};
 
@@ -942,116 +942,6 @@ struct SerialConfigRequestBody {
 struct EntropyDeviceConfigRequestBody {
     #[serde(default)]
     rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
-}
-
-#[derive(Debug)]
-struct JsonValueWithoutDuplicateObjectKeys(serde_json::Value);
-
-impl JsonValueWithoutDuplicateObjectKeys {
-    const fn as_value(&self) -> &serde_json::Value {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for JsonValueWithoutDuplicateObjectKeys {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_any(JsonValueWithoutDuplicateObjectKeysVisitor)
-            .map(Self)
-    }
-}
-
-#[derive(Debug)]
-struct JsonValueWithoutDuplicateObjectKeysVisitor;
-
-impl<'de> Visitor<'de> for JsonValueWithoutDuplicateObjectKeysVisitor {
-    type Value = serde_json::Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value without duplicate object keys")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Number(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| E::custom("invalid JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(serde_json::Value::String(value.to_string()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::String(value))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Null)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Deserialize::deserialize(deserializer)
-            .map(|JsonValueWithoutDuplicateObjectKeys(value)| value)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
-
-        while let Some(JsonValueWithoutDuplicateObjectKeys(value)) = sequence.next_element()? {
-            values.push(value);
-        }
-
-        Ok(serde_json::Value::Array(values))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut object = serde_json::Map::new();
-
-        while let Some(key) = map.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(de::Error::custom("duplicate object key"));
-            }
-
-            let JsonValueWithoutDuplicateObjectKeys(value) = map.next_value()?;
-            object.insert(key, value);
-        }
-
-        Ok(serde_json::Value::Object(object))
-    }
 }
 
 const fn default_memory_hotplug_block_size_mib() -> u64 {

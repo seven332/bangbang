@@ -42,7 +42,10 @@ mod vsock_restore;
 use anchored_socket::bind as bind_anchored_socket;
 use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
-use bangbang_api::http::{RequestError, parse_request_with_limit};
+use bangbang_api::config::{
+    ConfigDocumentError, parse_config_document, parse_json_document_without_duplicate_keys,
+};
+use bangbang_api::http::RequestError;
 use bangbang_hvf::HvfBackend;
 #[cfg(target_os = "macos")]
 use contained_session::PagerGrantAuthority;
@@ -50,7 +53,6 @@ use contained_session::{ContainedSession, GrantAuthority};
 use periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use signal_hook::consts::signal::SIGTERM;
 use signal_hook::consts::signal::{SIGBUS, SIGHUP, SIGILL, SIGINT, SIGPIPE, SIGSEGV, SIGSYS};
 use signal_hook::consts::signal::{SIGXCPU, SIGXFSZ};
@@ -820,326 +822,33 @@ fn config_file_actions_with_authority(
 }
 
 fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
-    let value = parse_json_value_without_duplicate_object_keys(contents)
-        .map_err(|_| ConfigFileError::Malformed)?;
-    let object = value.as_object().ok_or(ConfigFileError::Malformed)?;
-
-    validate_config_file_sections(object)?;
-
-    let mut requests = Vec::new();
-    if let Some(machine_config) = object.get("machine-config") {
-        requests.push(config_section_request(
-            "machine-config",
-            "PUT",
-            "/machine-config".to_string(),
-            machine_config,
-        )?);
-    }
-
-    let boot_source = object
-        .get("boot-source")
-        .ok_or(ConfigFileError::MissingSection("boot-source"))?;
-    requests.push(config_section_request(
-        "boot-source",
-        "PUT",
-        "/boot-source".to_string(),
-        boot_source,
-    )?);
-
-    if let Some(drives) = object.get("drives") {
-        for drive in config_section_array("drives", drives)? {
-            let drive_id = config_section_string_field("drives", drive, "drive_id")?;
-            requests.push(config_section_request(
-                "drives",
-                "PUT",
-                format!("/drives/{drive_id}"),
-                drive,
-            )?);
-        }
-    }
-
-    if let Some(pmem_devices) = object.get("pmem") {
-        for pmem in config_section_array("pmem", pmem_devices)? {
-            let pmem_id = config_section_string_field("pmem", pmem, "id")?;
-            requests.push(config_section_request(
-                "pmem",
-                "PUT",
-                format!("/pmem/{pmem_id}"),
-                pmem,
-            )?);
-        }
-    }
-
-    if let Some(network_interfaces) = object.get("network-interfaces") {
-        for network_interface in config_section_array("network-interfaces", network_interfaces)? {
-            let iface_id =
-                config_section_string_field("network-interfaces", network_interface, "iface_id")?;
-            requests.push(config_section_request(
-                "network-interfaces",
-                "PUT",
-                format!("/network-interfaces/{iface_id}"),
-                network_interface,
-            )?);
-        }
-    }
-
-    if let Some(mmds_config) = object.get("mmds-config") {
-        requests.push(config_section_request(
-            "mmds-config",
-            "PUT",
-            "/mmds/config".to_string(),
-            mmds_config,
-        )?);
-    }
-
-    if let Some(vsock) = object.get("vsock") {
-        requests.push(config_section_request(
-            "vsock",
-            "PUT",
-            "/vsock".to_string(),
-            vsock,
-        )?);
-    }
-
-    if let Some(entropy) = object.get("entropy") {
-        requests.push(config_section_request(
-            "entropy",
-            "PUT",
-            "/entropy".to_string(),
-            entropy,
-        )?);
-    }
-
-    if let Some(memory_hotplug) = object.get("memory-hotplug") {
-        requests.push(config_section_request(
-            "memory-hotplug",
-            "PUT",
-            "/hotplug/memory".to_string(),
-            memory_hotplug,
-        )?);
-    }
-
-    if let Some(balloon) = object.get("balloon") {
-        requests.push(config_section_request(
-            "balloon",
-            "PUT",
-            "/balloon".to_string(),
-            balloon,
-        )?);
-    }
-
-    if let Some(cpu_config) = object.get("cpu-config") {
-        requests.push(config_section_request(
-            "cpu-config",
-            "PUT",
-            "/cpu-config".to_string(),
-            cpu_config,
-        )?);
-    }
-
-    if let Some(metrics) = object.get("metrics") {
-        requests.push(config_section_request(
-            "metrics",
-            "PUT",
-            "/metrics".to_string(),
-            metrics,
-        )?);
-    }
-
-    if let Some(logger) = object.get("logger") {
-        requests.push(config_section_request(
-            "logger",
-            "PUT",
-            "/logger".to_string(),
-            logger,
-        )?);
-    }
-
-    if let Some(serial) = object.get("serial") {
-        requests.push(config_section_request(
-            "serial",
-            "PUT",
-            "/serial".to_string(),
-            serial,
-        )?);
-    }
-
-    requests
+    parse_config_document(contents)
+        .map_err(config_file_error_from_document)?
         .into_iter()
-        .map(|(section, request)| {
-            config_vmm_action_from_api_request(request)
-                .ok_or(ConfigFileError::UnsupportedRequest { section })
+        .map(|config_request| {
+            let (section, request) = config_request.into_parts();
+            config_vmm_action_from_api_request(request).ok_or(ConfigFileError::UnsupportedRequest {
+                section: section.as_str(),
+            })
         })
         .collect()
 }
 
-fn parse_json_value_without_duplicate_object_keys(
-    contents: &str,
-) -> Result<serde_json::Value, serde_json::Error> {
-    let JsonValueWithoutDuplicateObjectKeys(value) =
-        serde_json::from_str::<JsonValueWithoutDuplicateObjectKeys>(contents)?;
-    Ok(value)
-}
-
-#[derive(Debug)]
-struct JsonValueWithoutDuplicateObjectKeys(serde_json::Value);
-
-impl<'de> serde::Deserialize<'de> for JsonValueWithoutDuplicateObjectKeys {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer
-            .deserialize_any(JsonValueWithoutDuplicateObjectKeysVisitor)
-            .map(Self)
-    }
-}
-
-#[derive(Debug)]
-struct JsonValueWithoutDuplicateObjectKeysVisitor;
-
-impl<'de> Visitor<'de> for JsonValueWithoutDuplicateObjectKeysVisitor {
-    type Value = serde_json::Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value without duplicate object keys")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Number(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| E::custom("invalid JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(serde_json::Value::String(value.to_string()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::String(value))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(serde_json::Value::Null)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        serde::Deserialize::deserialize(deserializer)
-            .map(|JsonValueWithoutDuplicateObjectKeys(value)| value)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
-
-        while let Some(JsonValueWithoutDuplicateObjectKeys(value)) = sequence.next_element()? {
-            values.push(value);
+fn config_file_error_from_document(error: ConfigDocumentError) -> ConfigFileError {
+    match error {
+        ConfigDocumentError::Malformed => ConfigFileError::Malformed,
+        ConfigDocumentError::MissingSection(section) => {
+            ConfigFileError::MissingSection(section.as_str())
         }
-
-        Ok(serde_json::Value::Array(values))
+        ConfigDocumentError::UnknownSection(section) => ConfigFileError::UnknownSection(section),
+        ConfigDocumentError::MalformedSection(section) => ConfigFileError::MalformedSection {
+            section: section.as_str(),
+        },
+        ConfigDocumentError::Request { section, source } => ConfigFileError::Request {
+            section: section.as_str(),
+            source,
+        },
     }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut object = serde_json::Map::new();
-
-        while let Some(key) = map.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(de::Error::custom("duplicate object key"));
-            }
-
-            let JsonValueWithoutDuplicateObjectKeys(value) = map.next_value()?;
-            object.insert(key, value);
-        }
-
-        Ok(serde_json::Value::Object(object))
-    }
-}
-
-fn validate_config_file_sections(
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), ConfigFileError> {
-    for section in object.keys() {
-        match section.as_str() {
-            "balloon" | "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config"
-            | "memory-hotplug" | "metrics" | "mmds-config" | "network-interfaces" | "pmem"
-            | "serial" | "vsock" | "entropy" => {}
-            _ => return Err(ConfigFileError::UnknownSection(section.clone())),
-        }
-    }
-
-    Ok(())
-}
-
-fn config_section_array<'value>(
-    section: &'static str,
-    value: &'value serde_json::Value,
-) -> Result<&'value [serde_json::Value], ConfigFileError> {
-    value
-        .as_array()
-        .map(Vec::as_slice)
-        .ok_or(ConfigFileError::MalformedSection { section })
-}
-
-fn config_section_string_field<'value>(
-    section: &'static str,
-    value: &'value serde_json::Value,
-    field: &'static str,
-) -> Result<&'value str, ConfigFileError> {
-    value
-        .as_object()
-        .and_then(|object| object.get(field))
-        .and_then(serde_json::Value::as_str)
-        .ok_or(ConfigFileError::MalformedSection { section })
-}
-
-fn config_section_request(
-    section: &'static str,
-    method: &str,
-    path: String,
-    body: &serde_json::Value,
-) -> Result<(&'static str, bangbang_api::http::ApiRequest), ConfigFileError> {
-    let body =
-        serde_json::to_vec(body).map_err(|_| ConfigFileError::MalformedSection { section })?;
-    let header = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    let mut request = header.into_bytes();
-    request.extend_from_slice(&body);
-
-    parse_request_with_limit(&request, usize::MAX)
-        .map(|request| (section, request))
-        .map_err(|source| ConfigFileError::Request { section, source })
 }
 
 fn apply_startup_metrics_config<S>(
@@ -1226,7 +935,7 @@ fn metadata_content_input_with_authority(
         StartupFileReadError::TooLarge => MetadataFileError::TooLarge,
         StartupFileReadError::Grant => MetadataFileError::Grant,
     })?;
-    let value = parse_json_value_without_duplicate_object_keys(&contents)
+    let value = parse_json_document_without_duplicate_keys(&contents)
         .map_err(|_| MetadataFileError::Malformed)?;
 
     Ok(MmdsContentInput::new(value))
