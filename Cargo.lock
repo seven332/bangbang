@@ -99,6 +99,7 @@ name = "bangbang"
 version = "0.1.0"
 dependencies = [
  "bangbang-api",
+ "bangbang-cpu-template-helper",
  "bangbang-hvf",
  "bangbang-pager",
  "bangbang-runtime",
@@ -119,6 +120,17 @@ name = "bangbang-api"
 version = "0.1.0"
 dependencies = [
  "httparse",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bangbang-cpu-template-helper"
+version = "0.1.0"
+dependencies = [
+ "bangbang-api",
+ "bangbang-runtime",
+ "rustix",
  "serde",
  "serde_json",
 ]

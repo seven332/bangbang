@@ -58,6 +58,8 @@ crates/session    Private launcher/worker lifecycle and grant protocols
 crates/vhost-user Portable vhost-user frontend protocol foundations
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
+tools/cpu-template-helper
+                  Library-only portable CPU-template helper foundation
 tools/seccompiler Firecracker-compatible offline seccompiler artifact tool
 tools/snapshot-tools
                   Firecracker-shaped native memory rebase, inspection, and reviewed editing

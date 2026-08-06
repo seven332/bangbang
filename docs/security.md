@@ -1848,6 +1848,23 @@ is resource-specific:
   executor/backend construction because live writes cannot establish its
   documented Neoverse V1 source model on Apple Silicon. The complete boundary
   is checked in `compat/firecracker/v1.16.0/cpu-template-contract.md`.
+  The library-only CPU-template helper foundation adds no ambient resource or
+  hypervisor authority. It parses complete config documents but projects only
+  machine and CPU actions, never opening paths from unrelated sections. Config
+  and template files are capped at 1 MiB and opened close-on-exec, no-follow,
+  and nonblocking; only descriptor-confirmed regular UTF-8 files are read.
+  Diagnostics omit paths, register identities, masks, values, and provider
+  internals.
+  Helper output is absent-only: an owner-only same-directory stage is written,
+  synchronized, identity-checked, and committed by exclusive `NOREPLACE`
+  rename. Precommit cleanup removes only the captured stage identity. A changed
+  identity or failed cleanup is explicitly uncertain and leaves the unknown
+  object untouched. After rename, final-state or directory-durability failure
+  is postcommit uncertainty and is never presented as rollback. This is
+  no-clobber integrity, not content authentication or authority over hostile
+  ancestor directories. The complete helper-specific boundary is checked in
+  `compat/firecracker/v1.16.0/cpu-template-helper-contract.md`; real all-vCPU
+  HVF capture and signed public-process evidence remain #1862 work.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled
