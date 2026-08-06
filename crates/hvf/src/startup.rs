@@ -34387,18 +34387,28 @@ fn signal_pmem_queue_interrupts(
     Ok(HvfArm64BootPmemNotificationDispatches::new(devices))
 }
 
+#[cfg(test)]
 fn collect_network_notification_dispatches(
     dispatches: Arm64BootNetworkNotificationDispatches,
+) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
+{
+    collect_network_notification_dispatches_with_metrics(dispatches, None)
+}
+
+fn collect_network_notification_dispatches_with_metrics(
+    dispatches: Arm64BootNetworkNotificationDispatches,
+    metrics: Option<&SharedNetworkInterfaceMetricsRegistry>,
 ) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
 {
     let retry_after = dispatches.rate_limiter_retry_after();
     let runtime_dispatches = dispatches.into_vec();
     let mut devices = Vec::new();
-    devices
-        .try_reserve_exact(runtime_dispatches.len())
-        .map_err(
-            |source| HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { source },
-        )?;
+    if let Err(source) = devices.try_reserve_exact(runtime_dispatches.len()) {
+        if let Some(metrics) = metrics {
+            record_network_runtime_event_failures(metrics, &runtime_dispatches, true);
+        }
+        return Err(HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { source });
+    }
 
     for dispatch in runtime_dispatches {
         devices.push(HvfArm64BootNetworkNotificationDispatch::new(dispatch, None));
@@ -35382,58 +35392,18 @@ fn collect_or_signal_network_queue_interrupts(
     metrics: &SharedNetworkInterfaceMetricsRegistry,
 ) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
 {
-    let targets = match capture_network_event_failure_targets(dispatches.as_slice()) {
-        Ok(targets) => targets,
+    if !dispatches.needs_queue_interrupt() {
+        return collect_network_notification_dispatches_with_metrics(dispatches, Some(metrics));
+    }
+
+    let signaler = match HvfGicSpiSignaler::from_metadata(gic) {
+        Ok(signaler) => signaler,
         Err(source) => {
-            record_network_runtime_event_failures(metrics, dispatches.as_slice(), true);
-            return Err(HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { source });
+            record_network_runtime_event_failures(metrics, dispatches.as_slice(), false);
+            return Err(HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { source });
         }
     };
-    let needs_queue_interrupt = dispatches.needs_queue_interrupt();
-    let result = if !needs_queue_interrupt {
-        collect_network_notification_dispatches(dispatches)
-    } else {
-        match HvfGicSpiSignaler::from_metadata(gic) {
-            Ok(signaler) => signal_network_queue_interrupts(dispatches, &signaler),
-            Err(source) => {
-                Err(HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { source })
-            }
-        }
-    };
-
-    if let Err(source) = &result {
-        let all_targets = matches!(
-            source,
-            HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { .. }
-        );
-        for target in &targets {
-            if all_targets || target.needs_queue_interrupt {
-                metrics.record_event_failure_for_interface(&target.iface_id);
-            }
-        }
-    }
-
-    result
-}
-
-#[derive(Debug)]
-struct NetworkEventFailureTarget {
-    iface_id: String,
-    needs_queue_interrupt: bool,
-}
-
-fn capture_network_event_failure_targets(
-    dispatches: &[Arm64BootNetworkNotificationDispatch],
-) -> Result<Vec<NetworkEventFailureTarget>, TryReserveError> {
-    let mut targets = Vec::new();
-    targets.try_reserve_exact(dispatches.len())?;
-    for dispatch in dispatches {
-        targets.push(NetworkEventFailureTarget {
-            iface_id: dispatch.device().registration.iface_id().to_string(),
-            needs_queue_interrupt: dispatch.needs_queue_interrupt(),
-        });
-    }
-    Ok(targets)
+    signal_network_queue_interrupts_with_metrics(dispatches, &signaler, Some(metrics))
 }
 
 fn record_network_runtime_event_failures(
@@ -35518,19 +35488,30 @@ fn collect_or_signal_entropy_queue_interrupts(
     signal_entropy_queue_interrupts(dispatches, &signaler)
 }
 
+#[cfg(test)]
 fn signal_network_queue_interrupts(
     dispatches: Arm64BootNetworkNotificationDispatches,
     signaler: &dyn InterruptSink,
 ) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
 {
+    signal_network_queue_interrupts_with_metrics(dispatches, signaler, None)
+}
+
+fn signal_network_queue_interrupts_with_metrics(
+    dispatches: Arm64BootNetworkNotificationDispatches,
+    signaler: &dyn InterruptSink,
+    metrics: Option<&SharedNetworkInterfaceMetricsRegistry>,
+) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
+{
     let retry_after = dispatches.rate_limiter_retry_after();
     let runtime_dispatches = dispatches.into_vec();
     let mut devices = Vec::new();
-    devices
-        .try_reserve_exact(runtime_dispatches.len())
-        .map_err(
-            |source| HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { source },
-        )?;
+    if let Err(source) = devices.try_reserve_exact(runtime_dispatches.len()) {
+        if let Some(metrics) = metrics {
+            record_network_runtime_event_failures(metrics, &runtime_dispatches, true);
+        }
+        return Err(HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { source });
+    }
 
     for dispatch in runtime_dispatches {
         let signal_error = if dispatch.needs_queue_interrupt() {
