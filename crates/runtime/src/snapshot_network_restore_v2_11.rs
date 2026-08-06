@@ -119,7 +119,6 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
         destination_memory: &GuestMemory,
         realized_profile: NetworkDeviceProfile,
         interface_metrics: SharedNetworkInterfaceMetrics,
-        aggregate_metrics: SharedNetworkInterfaceMetrics,
         now: Instant,
     ) -> Result<PreparedSnapshotV2NetworkMmioHandler, SnapshotV2NetworkMmioHandlerError> {
         let Self {
@@ -145,7 +144,6 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
             destination_memory,
             realized_profile,
             interface_metrics,
-            aggregate_metrics,
             now,
         )
         .map_err(SnapshotV2NetworkMmioHandlerError::from_device)?;
@@ -288,7 +286,6 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
         destination_memory: &GuestMemory,
         realized_profile: NetworkDeviceProfile,
         interface_metrics: SharedNetworkInterfaceMetrics,
-        aggregate_metrics: SharedNetworkInterfaceMetrics,
         region_id: MmioRegionId,
         messages: GuestMessageInterruptRegistry,
         now: Instant,
@@ -299,7 +296,6 @@ impl PreparedSnapshotV2NetworkRestoreInterface {
             destination_memory,
             realized_profile,
             interface_metrics,
-            aggregate_metrics,
             now,
         )
         .map_err(SnapshotV2NetworkPciEndpointError::from_device)?;
@@ -1305,7 +1301,6 @@ fn restore_snapshot_v2_network_device(
     destination_memory: &GuestMemory,
     realized_profile: NetworkDeviceProfile,
     interface_metrics: SharedNetworkInterfaceMetrics,
-    aggregate_metrics: SharedNetworkInterfaceMetrics,
     now: Instant,
 ) -> Result<RestoredSnapshotV2NetworkDevice, RestoreSnapshotV2NetworkDeviceError> {
     validate_snapshot_v2_network_destination_profile(controller, portable, realized_profile)?;
@@ -1419,9 +1414,8 @@ fn restore_snapshot_v2_network_device(
     if config_space.available_features() != virtio.available_features() {
         return Err(RestoreSnapshotV2NetworkDeviceError::Profile);
     }
-    config_space
-        .attach_metrics_with_aggregate(interface_metrics.clone(), aggregate_metrics.clone());
-    device.attach_metrics_with_aggregate(interface_metrics, aggregate_metrics);
+    config_space.attach_metrics(interface_metrics.clone());
+    device.attach_metrics(interface_metrics);
 
     Ok(RestoredSnapshotV2NetworkDevice {
         queue_ranges,
@@ -2135,7 +2129,6 @@ mod tests {
                 &memory,
                 realized_profile,
                 SharedNetworkInterfaceMetrics::default(),
-                SharedNetworkInterfaceMetrics::default(),
                 Instant::now(),
             )
             .expect("inactive MMIO handler should materialize");
@@ -2178,7 +2171,6 @@ mod tests {
             .into_mmio_handler(
                 &memory,
                 realized_profile,
-                SharedNetworkInterfaceMetrics::default(),
                 SharedNetworkInterfaceMetrics::default(),
                 now,
             )
@@ -2234,7 +2226,6 @@ mod tests {
                 &restore_memory_with_pending_tx(),
                 profile,
                 SharedNetworkInterfaceMetrics::default(),
-                SharedNetworkInterfaceMetrics::default(),
                 MmioRegionId::new(44),
                 messages,
                 now,
@@ -2285,7 +2276,6 @@ mod tests {
                 &restore_memory_with_pending_tx(),
                 profile,
                 SharedNetworkInterfaceMetrics::default(),
-                SharedNetworkInterfaceMetrics::default(),
                 MmioRegionId::new(44),
                 dummy_messages,
                 Instant::now(),
@@ -2317,7 +2307,6 @@ mod tests {
                 &tiny_memory,
                 profile,
                 SharedNetworkInterfaceMetrics::default(),
-                SharedNetworkInterfaceMetrics::default(),
                 MmioRegionId::new(44),
                 messages,
                 Instant::now(),
@@ -2343,8 +2332,6 @@ mod tests {
         .expect("sixteen-interface topology should prepare");
         let (interfaces, _, _) = topology.into_parts();
         let memory = restore_memory_with_pending_tx();
-        let aggregate = SharedNetworkInterfaceMetrics::default();
-
         let prepared = interfaces
             .into_iter()
             .enumerate()
@@ -2355,7 +2342,6 @@ mod tests {
                         &memory,
                         profile,
                         SharedNetworkInterfaceMetrics::default(),
-                        aggregate.clone(),
                         Instant::now(),
                     )
                     .expect("saved-order interface should materialize");
@@ -2391,7 +2377,6 @@ mod tests {
                 &restore_memory_with_pending_tx(),
                 NetworkDeviceProfile::new(None, None),
                 SharedNetworkInterfaceMetrics::default(),
-                SharedNetworkInterfaceMetrics::default(),
                 Instant::now(),
             )
             .expect_err("mismatched profile should fail");
@@ -2416,7 +2401,6 @@ mod tests {
             .into_mmio_handler(
                 &tiny_memory,
                 profile,
-                SharedNetworkInterfaceMetrics::default(),
                 SharedNetworkInterfaceMetrics::default(),
                 Instant::now(),
             )

@@ -236,14 +236,13 @@ impl MmdsOnlyVirtioNetworkPacketIo {
 
     pub fn with_guest_mac(
         mmds_detour: MmdsPacketDetour,
-        guest_mac: Option<GuestMacAddress>,
+        _guest_mac: Option<GuestMacAddress>,
     ) -> Result<Self, MmdsOnlyVirtioNetworkPacketIoBuildError> {
         let stack = mmds_detour.stack();
         Ok(Self {
             tx_sink: MmdsOnlyVirtioNetworkTxPacketSink {
                 mmds_detour,
                 staged_frame: None,
-                guest_mac,
                 backend_metrics: VirtioNetworkBackendMetrics::default(),
             },
             rx_source: MmdsOnlyVirtioNetworkRxPacketSource::new(
@@ -290,7 +289,6 @@ impl MmdsOnlyVirtioNetworkPacketIo {
 pub struct MmdsOnlyVirtioNetworkTxPacketSink {
     mmds_detour: MmdsPacketDetour,
     staged_frame: Option<StagedMmdsOnlyTxFrame>,
-    guest_mac: Option<GuestMacAddress>,
     backend_metrics: VirtioNetworkBackendMetrics,
 }
 
@@ -300,7 +298,6 @@ impl fmt::Debug for MmdsOnlyVirtioNetworkTxPacketSink {
             .debug_struct("MmdsOnlyVirtioNetworkTxPacketSink")
             .field("mmds_detour", &"<configured>")
             .field("staged_frame", &self.staged_frame.is_some())
-            .field("guest_mac", &self.guest_mac.map(|_| "<configured>"))
             .finish()
     }
 }
@@ -342,7 +339,7 @@ impl MmdsOnlyVirtioNetworkTxPacketSink {
                 let current = if self.mmds_detour.would_detour_packet(packet) {
                     VirtioNetworkTxPacketDisposition::Detoured
                 } else {
-                    VirtioNetworkTxPacketDisposition::Forwarded
+                    VirtioNetworkTxPacketDisposition::Dropped
                 };
                 if disposition.is_some_and(|previous| previous != current) {
                     return ControlFlow::Break(VirtioNetworkTxPacketSinkError::new(
@@ -366,7 +363,6 @@ impl MmdsOnlyVirtioNetworkTxPacketSink {
         packet: VirtioNetworkPacketPlan,
     ) -> Result<StagedMmdsOnlyTxFrame, VirtioNetworkTxPacketSinkError> {
         let disposition = self.classify_packet_plan(&packet)?;
-        self.observe_source_mac(&packet);
         Ok(StagedMmdsOnlyTxFrame {
             packet,
             disposition,
@@ -381,19 +377,10 @@ impl MmdsOnlyVirtioNetworkTxPacketSink {
         let packet = packet
             .try_clone_owned()
             .map_err(|source| VirtioNetworkTxPacketSinkError::new(source.to_string()))?;
-        self.observe_source_mac(&packet);
         Ok(StagedMmdsOnlyTxFrame {
             packet,
             disposition,
         })
-    }
-
-    fn observe_source_mac(&mut self, packet: &VirtioNetworkPacketPlan) {
-        if let (Some(expected), Some(observed)) = (self.guest_mac, packet.source_mac())
-            && expected.octets() != observed
-        {
-            self.backend_metrics.record_spoofed_mac();
-        }
     }
 
     fn commit_frame(
@@ -632,7 +619,7 @@ mod tests {
         let staged = StagedMmdsOnlyTxFrame {
             packet: VirtioNetworkPacketPlan::prepare(VirtioNetworkTxHeader::new(), 0, packet)
                 .expect("test Ethernet packet should validate"),
-            disposition: VirtioNetworkTxPacketDisposition::Forwarded,
+            disposition: VirtioNetworkTxPacketDisposition::Dropped,
         };
         let debug_output = format!("{staged:?}");
         assert!(!debug_output.contains(token_value));
@@ -640,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn mmds_only_tx_observes_configured_source_mac_without_filtering() {
+    fn mmds_only_tx_does_not_report_tap_path_spoof_metrics() {
         let expected = GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 1]);
         let mut packet_io =
             MmdsOnlyVirtioNetworkPacketIo::with_guest_mac(test_detour(), Some(expected))
@@ -652,17 +639,17 @@ mod tests {
         let staged = packet_io
             .tx_sink
             .prepare_borrowed_packet_plan(&plan)
-            .expect("spoof observation must not filter the packet");
+            .expect("MMDS-only classification should not filter the packet");
         assert_eq!(
             staged.disposition,
-            VirtioNetworkTxPacketDisposition::Forwarded
+            VirtioNetworkTxPacketDisposition::Dropped
         );
         assert_eq!(
             packet_io
                 .tx_sink
                 .take_backend_metrics()
                 .tx_spoofed_mac_count(),
-            1
+            0
         );
     }
 

@@ -733,7 +733,7 @@ pub(super) fn build_metrics_line(
             .network_interface_metrics_by_interface
             .as_ref()
             .and_then(|metrics| metrics.metrics.get(iface_id))
-            .copied()
+            .map(|entry| entry.metrics)
             .unwrap_or_default();
         let values = map_network_metrics(metrics);
         add_network_metrics(&mut net, &values);

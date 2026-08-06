@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::metrics::SharedMmdsMetrics;
 use crate::mmds::{
     DEFAULT_MMDS_MAC_ADDRESS, EthernetMacAddress, MMDS_GUEST_TCP_PORT, MmdsGuestRequest,
-    MmdsGuestToken, MmdsState, MmdsStateHandle, MmdsStateLockError, MmdsVersion,
+    MmdsGuestToken, MmdsState, MmdsStateHandle, MmdsStateLockError,
 };
 use crate::mmds_tcp::{
     EndpointReceiveError, HandlerBuildError, HandlerOutput, HandlerReceiveError,
@@ -240,6 +240,9 @@ impl MmdsNetworkStackHandle {
             .state
             .lock()
             .map_err(|_| MmdsNetworkStackError::Poisoned)?;
+        // Admission and parsing observe the same immutable owned packet. The
+        // pinned zero-copy mutation window behind Firecracker's rx_bad_eth
+        // counter is therefore structurally absent on this path.
         if !is_mmds_frame(frame, state.mmds_ipv4_address) {
             return Ok(false);
         }
@@ -622,6 +625,7 @@ impl MmdsNetworkStackState {
         match result {
             Ok(Some(len)) => {
                 self.pending_arp_reply_destination = None;
+                self.metrics.record_tx_attempt();
                 Ok(Some(len))
             }
             Ok(None) => Ok(None),
@@ -959,10 +963,7 @@ fn record_mmds_guest_http_request_metrics(
     state: &MmdsState,
     request_payload: &[u8],
 ) {
-    let Some(config) = state.config() else {
-        return;
-    };
-    if config.version() != MmdsVersion::V2 {
+    if state.config().is_none() {
         return;
     }
     let Ok(MmdsGuestRequest::Get(request)) = MmdsGuestRequest::parse_http(request_payload) else {
@@ -1106,8 +1107,13 @@ impl std::error::Error for MmdsNetworkStackError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mmds::{DEFAULT_MMDS_IPV4_ADDRESS, MmdsContentInput};
-    use crate::mmds_tcp::MMDS_TCP_RETRANSMISSION_PERIOD_TICKS;
+    use crate::metrics::MmdsMetrics;
+    use crate::mmds::{DEFAULT_MMDS_IPV4_ADDRESS, MmdsConfigInput, MmdsContentInput, MmdsVersion};
+    use crate::mmds_tcp::{
+        MMDS_TCP_EVICTION_THRESHOLD_TICKS, MMDS_TCP_MAX_CONNECTIONS,
+        MMDS_TCP_RETRANSMISSION_PERIOD_TICKS,
+    };
+    use crate::network::NetworkInterfaceConfigInput;
 
     const REMOTE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
     const REMOTE_IPV4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -1239,6 +1245,59 @@ mod tests {
         frame
     }
 
+    fn configured_mmds_state(version: MmdsVersion) -> MmdsState {
+        let network = NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
+            .validate()
+            .expect("test network config should validate");
+        let mut state = MmdsState::default();
+        state
+            .put_config(
+                MmdsConfigInput::new(vec!["eth0".to_string()]).with_version(version),
+                &[network],
+            )
+            .expect("test MMDS config should validate");
+        state
+    }
+
+    #[test]
+    fn guest_http_token_metrics_cover_v1_and_v2_requests() {
+        const MISSING_TOKEN: &[u8] =
+            b"GET /latest/meta-data HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n";
+        const INVALID_TOKEN: &[u8] = b"GET /latest/meta-data HTTP/1.1\r\nHost: 169.254.169.254\r\nX-metadata-token: invalid\r\n\r\n";
+
+        for version in [MmdsVersion::V1, MmdsVersion::V2] {
+            let state = configured_mmds_state(version);
+            let metrics = SharedMmdsMetrics::default();
+
+            record_mmds_guest_http_request_metrics(&metrics, &state, MISSING_TOKEN);
+            record_mmds_guest_http_request_metrics(&metrics, &state, INVALID_TOKEN);
+
+            assert_eq!(
+                metrics.snapshot(),
+                MmdsMetrics::default()
+                    .with_rx_invalid_token(1)
+                    .with_rx_no_token(1),
+                "token failure metrics should be version-independent"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_mmds_admission_keeps_rx_bad_eth_source_neutral() {
+        let metrics = SharedMmdsMetrics::default();
+        let stack = stack(metrics.clone());
+        let request = arp_request();
+
+        assert!(stack.is_mmds_frame(&request));
+        assert!(
+            stack
+                .detour_frame_at(&request, 10)
+                .expect("immutable target frame should detour")
+        );
+        assert_eq!(metrics.snapshot().rx_accepted(), 1);
+        assert_eq!(metrics.snapshot().rx_bad_eth(), 0);
+    }
+
     #[test]
     fn capture_descriptor_excludes_live_tcp_output_timers_and_validates_owners() {
         let mmds_state = MmdsStateHandle::default();
@@ -1354,7 +1413,7 @@ mod tests {
                 .expect("retained frame state should remain readable"),
             Some(ARP_FRAME_LEN)
         );
-        assert_eq!(metrics.snapshot().tx_count(), 0);
+        assert_eq!(metrics.snapshot().tx_count(), 1);
         assert_eq!(metrics.snapshot().tx_frames(), 0);
 
         let reply = next_frame(&stack, 11);
@@ -1475,6 +1534,58 @@ mod tests {
         assert_eq!(snapshot.rx_accepted_err(), 1);
         assert_eq!(snapshot.rx_count(), 1);
         assert_eq!(snapshot.connections_created(), 1);
+    }
+
+    #[test]
+    fn connection_replacement_counts_create_and_destroy() {
+        let metrics = SharedMmdsMetrics::default();
+        let stack = stack(metrics.clone());
+
+        for index in 0..MMDS_TCP_MAX_CONNECTIONS {
+            let mut syn = tcp_frame(
+                u32::try_from(index).expect("test sequence should fit"),
+                0,
+                SYN,
+                b"",
+            );
+            write_u16(
+                &mut syn[ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN..],
+                TCP_SOURCE_PORT_OFFSET,
+                REMOTE_PORT
+                    .checked_add(u16::try_from(index).expect("test port offset should fit"))
+                    .expect("test source port should fit"),
+            )
+            .expect("test source port should write");
+            assert!(
+                stack
+                    .detour_frame_at(&syn, 10)
+                    .expect("connection-table SYN should detour")
+            );
+        }
+        assert_eq!(
+            metrics.snapshot().connections_created(),
+            MMDS_TCP_MAX_CONNECTIONS as u64
+        );
+
+        let mut replacement = tcp_frame(200, 0, SYN, b"");
+        write_u16(
+            &mut replacement[ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN..],
+            TCP_SOURCE_PORT_OFFSET,
+            REMOTE_PORT
+                .checked_add(u16::try_from(MMDS_TCP_MAX_CONNECTIONS).expect("limit should fit"))
+                .expect("replacement source port should fit"),
+        )
+        .expect("replacement source port should write");
+        assert!(
+            stack
+                .detour_frame_at(&replacement, 10 + MMDS_TCP_EVICTION_THRESHOLD_TICKS + 1,)
+                .expect("replacement SYN should detour")
+        );
+        assert_eq!(
+            metrics.snapshot().connections_created(),
+            MMDS_TCP_MAX_CONNECTIONS as u64 + 1
+        );
+        assert_eq!(metrics.snapshot().connections_destroyed(), 1);
     }
 
     #[test]

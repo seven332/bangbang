@@ -36299,9 +36299,10 @@ where
                 .with_pmem_device_metrics_by_device(metrics.per_device_snapshot());
         }
         if let Some(metrics) = &self.network_interface_metrics {
+            let (aggregate, per_interface) = metrics.capture().into_parts();
             diagnostics = diagnostics
-                .with_network_interface_metrics(metrics.aggregate_snapshot())
-                .with_network_interface_metrics_by_interface(metrics.per_interface_snapshot());
+                .with_network_interface_metrics(aggregate)
+                .with_network_interface_metrics_by_interface(per_interface);
         }
         if let Some(metrics) = &self.mmds_metrics {
             diagnostics = diagnostics.with_mmds_metrics(metrics.snapshot());
@@ -53923,6 +53924,7 @@ mod tests {
             5
         );
         metrics.record_rx_accepted();
+        metrics.record_tx_attempt();
         metrics.record_tx_frame(4);
         let diagnostics = supervisor.metrics_diagnostics();
 

@@ -1113,29 +1113,155 @@
     {
       "field_id": "dynamic:net_{iface_id}.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.activate_fails` is assigned to #1843 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.activate_fails` is completed by #1843 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn record_activation_failure(&self) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "metrics.record_activation_failure();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_transport_records_config_and_activation_failures_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.cfg_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.cfg_fails` is assigned to #1843 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.cfg_fails` is completed by #1843 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn record_config_failure(&self) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "metrics.record_config_failure();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_transport_records_config_and_activation_failures_at_source()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.event_fails` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.event_fails` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn record_network_runtime_event_failures("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn record_event_failure(&self) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn network_signal_sink_creation_failure_is_attributed_only_to_interrupt_targets()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.mac_address_updates",
@@ -1149,83 +1275,466 @@
     {
       "field_id": "dynamic:net_{iface_id}.no_rx_avail_buffer",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.no_rx_avail_buffer` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.no_rx_avail_buffer` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_malformed_rx_buffer_completes_without_consuming_packet()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.no_tx_avail_buffer",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.no_tx_avail_buffer` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.no_tx_avail_buffer` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_tx_rate_limit_throttles_without_side_effects_and_retries()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_bytes_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_bytes_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_bytes_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_rx_packet_to_single_buffer()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_rx_packet_to_single_buffer()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_event_rate_limiter_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_event_rate_limiter_count` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_event_rate_limiter_count` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_rx_rate_limit_throttles_without_side_effects_and_retries()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_fails` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_fails` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_malformed_rx_buffer_completes_without_consuming_packet()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_rx_buffer_too_small_for_packet_retains_packet()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_packets_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_packets_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_packets_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_rx_packet_to_single_buffer()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_queue_event_count` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_queue_event_count` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_rx_packet_to_single_buffer()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_rate_limiter_throttled",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_rate_limiter_throttled` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.rx_rate_limiter_throttled` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_rx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_rx_rate_limit_throttles_without_side_effects_and_retries()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_tap_event_count",
@@ -1284,92 +1793,517 @@
     {
       "field_id": "dynamic:net_{iface_id}.tx_bytes_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_bytes_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_bytes_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_tx_frame_to_sink()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_tx_frame_to_sink()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_fails` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_fails` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_map_descriptor_load_failure_to_tx_fails()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_malformed_frames",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_malformed_frames` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_malformed_frames` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_record_tx_parse_failure_and_complete_used_ring()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_packets_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_packets_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_packets_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_tx_frame_to_sink()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_queue_event_count` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_queue_event_count` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_notifications_deliver_tx_frame_to_sink()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_rate_limiter_event_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_rate_limiter_event_count` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_rate_limiter_event_count` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_tx_rate_limit_throttles_without_side_effects_and_retries()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_rate_limiter_throttled",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_rate_limiter_throttled` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_rate_limiter_throttled` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_tx_rate_limit_throttles_without_side_effects_and_retries()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_remaining_reqs_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_remaining_reqs_count` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_remaining_reqs_count` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_tx_dispatch_observation("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkTxQueueDispatch {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_tx_rate_limit_throttles_without_side_effects_and_retries()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_spoofed_mac_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_spoofed_mac_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net_{iface_id}.tx_spoofed_mac_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "self.backend_metrics.record_spoofed_mac();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_backend_observation(metrics: VirtioNetworkBackendMetrics) -> NetworkInterfaceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_network_metrics(metrics: super::NetworkInterfaceMetrics) -> NetworkMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_excludes_mmds_detours_from_tap_path_spoof_metrics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/virtio_vmnet.rs",
+          "anchor": "fn tx_sink_observes_spoofed_source_mac_without_filtering()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.activate_fails",
@@ -4900,146 +5834,818 @@
     {
       "field_id": "static:mmds.connections_created",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.connections_created` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.connections_created` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "HandlerReceiveEvent::NewConnection => self.metrics.record_connection_created(),"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn connection_replacement_counts_create_and_destroy()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.connections_destroyed",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.connections_destroyed` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.connections_destroyed` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "self.metrics.record_connection_destroyed();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn connection_replacement_counts_create_and_destroy()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.rx_accepted",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.rx_accepted` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.rx_accepted` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "state.metrics.record_rx_accepted();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn targeted_malformed_and_fragmented_ipv4_frames_are_consumed_independently()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.rx_accepted_err",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.rx_accepted_err` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.rx_accepted_err` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "self.metrics.record_rx_accepted_error();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn targeted_malformed_and_fragmented_ipv4_frames_are_consumed_independently()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.rx_accepted_unusual",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.rx_accepted_unusual` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.rx_accepted_unusual` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "self.metrics.record_rx_accepted_unusual();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn targeted_malformed_and_fragmented_ipv4_frames_are_consumed_independently()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.rx_bad_eth",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "source-neutral",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.rx_bad_eth` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.rx_bad_eth` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "pinned zero-copy mutation window behind Firecracker's rx_bad_eth"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn immutable_mmds_admission_keeps_rx_bad_eth_source_neutral()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.rx_count",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.rx_count` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.rx_count` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "self.metrics.record_rx_count();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn targeted_malformed_and_fragmented_ipv4_frames_are_consumed_independently()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.rx_invalid_token",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.rx_invalid_token` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.rx_invalid_token` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "metrics.record_rx_invalid_token();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn guest_http_token_metrics_cover_v1_and_v2_requests()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.rx_no_token",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.rx_no_token` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.rx_no_token` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "MmdsGuestToken::Missing => metrics.record_rx_no_token(),"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn guest_http_token_metrics_cover_v1_and_v2_requests()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.tx_bytes",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.tx_bytes` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.tx_bytes` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "state.metrics.record_tx_frame(actual);"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn retained_frame_survives_a_short_destination_without_double_counting()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.tx_count",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.tx_count` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.tx_count` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "self.metrics.record_tx_attempt();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn retained_frame_survives_a_short_destination_without_double_counting()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.tx_errors",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.tx_errors` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.tx_errors` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "state.metrics.record_tx_error();"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn retained_frame_survives_a_short_destination_without_double_counting()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:mmds.tx_frames",
       "boundary": "mmds-data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `mmds.tx_frames` is assigned to #1843 at the `mmds-data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `mmds.tx_frames` is completed by #1843 at the `mmds-data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedMmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "mmds: MmdsMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "state.metrics.record_tx_frame(actual);"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn concurrent_mmds_metrics_are_isolated("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn failed_network_and_mmds_publication_replays_then_emits_zero_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/mmds_stack.rs",
+          "anchor": "fn retained_frame_survives_a_short_destination_without_double_counting()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.activate_fails` is assigned to #1843 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.activate_fails` is completed by #1843 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.cfg_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.cfg_fails` is assigned to #1843 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.cfg_fails` is completed by #1843 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.event_fails` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.event_fails` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.mac_address_updates",
@@ -5053,83 +6659,461 @@
     {
       "field_id": "static:net.no_rx_avail_buffer",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.no_rx_avail_buffer` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.no_rx_avail_buffer` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.no_tx_avail_buffer",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.no_tx_avail_buffer` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.no_tx_avail_buffer` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_bytes_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.rx_bytes_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_bytes_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.rx_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_event_rate_limiter_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.rx_event_rate_limiter_count` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_event_rate_limiter_count` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.rx_fails` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_fails` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_packets_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.rx_packets_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_packets_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.rx_queue_event_count` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_queue_event_count` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_rate_limiter_throttled",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.rx_rate_limiter_throttled` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.rx_rate_limiter_throttled` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.rx_tap_event_count",
@@ -5188,92 +7172,512 @@
     {
       "field_id": "static:net.tx_bytes_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_bytes_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_bytes_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_fails` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_fails` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_malformed_frames",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_malformed_frames` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_malformed_frames` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_packets_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_packets_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_packets_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_queue_event_count` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_queue_event_count` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_rate_limiter_event_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_rate_limiter_event_count` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_rate_limiter_event_count` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_rate_limiter_throttled",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_rate_limiter_throttled` is assigned to #1843 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_rate_limiter_throttled` is completed by #1843 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_remaining_reqs_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_remaining_reqs_count` is assigned to #1843 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_remaining_reqs_count` is completed by #1843 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:net.tx_spoofed_mac_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1843",
-      "rationale": "Pinned Firecracker field `net.tx_spoofed_mac_count` is assigned to #1843 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `net.tx_spoofed_mac_count` is completed by #1843 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub fn capture(&self) -> NetworkInterfaceMetricsCapture {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "add_network_metrics(&mut net, &values);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "for iface_id in configured.network_ids() {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_multi_interface_network_metrics(path: &Path, iface_ids: &[&str])"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_production_network_metrics(path: &Path, iface_id: &str, context: &str)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_metrics_same_id_replacement_starts_a_fresh_output_interval()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn network_output_aggregates_only_configured_dynamic_roots()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1843"
+        }
+      ]
     },
     {
       "field_id": "static:pmem.activate_fails",

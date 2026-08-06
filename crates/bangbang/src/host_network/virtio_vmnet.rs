@@ -1145,7 +1145,8 @@ where
                 ))
             })?;
         }
-        if let (Some(expected), Some(observed)) = (self.guest_mac, packet.source_mac())
+        if kind == StagedVmnetTxPacketKind::External
+            && let (Some(expected), Some(observed)) = (self.guest_mac, packet.source_mac())
             && expected.octets() != observed
         {
             self.backend_metrics.record_spoofed_mac();
@@ -3034,6 +3035,48 @@ mod tests {
             .expect("host packet peek should succeed")
             .expect("host packet should follow consumed MMDS reply");
         assert_eq!(host_packet.bytes(), &[0x33]);
+    }
+
+    #[test]
+    fn tx_sink_excludes_mmds_detours_from_tap_path_spoof_metrics() {
+        let detour = MmdsPacketDetour::try_new_for_test(
+            MmdsStateHandle::default(),
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            SharedMmdsMetrics::default(),
+            7,
+        )
+        .expect("MMDS session should build");
+        let prepared = super::PreparedVmnetVirtioNetworkRxBuffer::supported_maximum()
+            .expect("test packet buffers should prepare");
+        let mut packet_io =
+            VmnetVirtioNetworkPacketIo::with_prepared_batch_envelope_and_mmds_detour(
+                FakeVmnetPacketIoBackend::default(),
+                fake_interface(),
+                prepared,
+                super::VmnetVirtioNetworkPacketProfile::new(
+                    super::VmnetVirtioNetworkBatchLimits::new(2_048, 1, 1),
+                    super::VirtioNetworkPacketEnvelope::RawEthernet,
+                    Some(GuestMacAddress::from_bytes([0x02, 0, 0, 0, 0, 1])),
+                ),
+                Some(detour),
+                None,
+            )
+            .expect("profiled MMDS packet I/O should build");
+        let request = mmds_arp_request();
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&request, PAYLOAD_ADDRESS)]);
+
+        assert_eq!(
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS ARP should detour"),
+            VirtioNetworkTxPacketDisposition::Detoured
+        );
+        let metrics = packet_io.tx_sink().take_backend_metrics();
+        assert_eq!(metrics.tx_spoofed_mac_count(), 0);
+        assert_eq!(metrics.vmnet_write_count(), 0);
+        assert_eq!(metrics.vmnet_write_packets_count(), 0);
     }
 
     #[test]

@@ -262,39 +262,19 @@ impl Default for VirtioNetworkFeatureCapabilities {
 #[derive(Debug, Clone)]
 struct VirtioNetworkTransportMetrics {
     interface: SharedNetworkInterfaceMetrics,
-    aggregate: Option<SharedNetworkInterfaceMetrics>,
 }
 
 impl VirtioNetworkTransportMetrics {
     fn for_interface(interface: SharedNetworkInterfaceMetrics) -> Self {
-        Self {
-            interface,
-            aggregate: None,
-        }
-    }
-
-    fn with_aggregate(
-        interface: SharedNetworkInterfaceMetrics,
-        aggregate: SharedNetworkInterfaceMetrics,
-    ) -> Self {
-        Self {
-            interface,
-            aggregate: Some(aggregate),
-        }
+        Self { interface }
     }
 
     fn record_activation_failure(&self) {
         self.interface.record_activation_failure();
-        if let Some(aggregate) = &self.aggregate {
-            aggregate.record_activation_failure();
-        }
     }
 
     fn record_config_failure(&self) {
         self.interface.record_config_failure();
-        if let Some(aggregate) = &self.aggregate {
-            aggregate.record_config_failure();
-        }
     }
 }
 
@@ -1042,16 +1022,6 @@ impl VirtioNetworkConfigSpace {
     pub fn attach_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
         self.metrics = Some(VirtioNetworkTransportMetrics::for_interface(metrics));
     }
-
-    pub(crate) fn attach_metrics_with_aggregate(
-        &mut self,
-        interface: SharedNetworkInterfaceMetrics,
-        aggregate: SharedNetworkInterfaceMetrics,
-    ) {
-        self.metrics = Some(VirtioNetworkTransportMetrics::with_aggregate(
-            interface, aggregate,
-        ));
-    }
 }
 
 impl VirtioMmioDeviceConfigHandler for VirtioNetworkConfigSpace {
@@ -1361,6 +1331,17 @@ pub enum VirtioNetworkTxPacketPrepareError {
         source: GuestMemoryAccessError,
     },
     Semantic(VirtioNetworkPacketPlanError),
+}
+
+impl VirtioNetworkTxPacketPrepareError {
+    /// Returns whether Firecracker accounts the failure while loading guest
+    /// descriptor-backed bytes rather than while validating packet contents.
+    pub const fn is_descriptor_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::PacketAllocation { .. } | Self::SegmentRead { .. }
+        )
+    }
 }
 
 impl fmt::Display for VirtioNetworkTxPacketPrepareError {
@@ -1726,6 +1707,7 @@ pub enum VirtioNetworkTxPacketCommit {
 pub enum VirtioNetworkTxPacketDisposition {
     Forwarded,
     Detoured,
+    Dropped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2046,6 +2028,22 @@ pub enum VirtioNetworkTxFrameParseError {
         descriptor_count: usize,
         source: TryReserveError,
     },
+}
+
+impl VirtioNetworkTxFrameParseError {
+    /// Returns whether Firecracker accounts the failure in
+    /// `IoVecBuffer::load_descriptor_chain` as `tx_fails`.
+    pub const fn is_descriptor_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::HeaderDescriptorWriteOnly { .. }
+                | Self::ReadHeader { .. }
+                | Self::PayloadDescriptorWriteOnly { .. }
+                | Self::PayloadDescriptorRangeOverflow { .. }
+                | Self::PayloadDescriptorAccess { .. }
+                | Self::PayloadSegmentsAllocationFailed { .. }
+        )
+    }
 }
 
 impl fmt::Display for VirtioNetworkTxFrameParseError {
@@ -3215,16 +3213,6 @@ impl VirtioNetworkDevice {
 
     pub fn attach_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
         self.metrics = Some(VirtioNetworkTransportMetrics::for_interface(metrics));
-    }
-
-    pub(crate) fn attach_metrics_with_aggregate(
-        &mut self,
-        interface: SharedNetworkInterfaceMetrics,
-        aggregate: SharedNetworkInterfaceMetrics,
-    ) {
-        self.metrics = Some(VirtioNetworkTransportMetrics::with_aggregate(
-            interface, aggregate,
-        ));
     }
 
     pub fn is_activated(&self) -> bool {
@@ -5950,10 +5938,15 @@ pub struct VirtioNetworkTxQueueDispatch {
     successful_frames: usize,
     parse_failures: usize,
     packet_prepare_failures: usize,
+    descriptor_failures: usize,
+    malformed_frames: usize,
     sink_successful_frames: usize,
     detoured_frames: usize,
+    dropped_frames: usize,
     sink_failures: usize,
     sink_successful_bytes: u64,
+    detoured_bytes: u64,
+    dropped_bytes: u64,
     rate_limiter_throttled_frames: usize,
     rate_limiter_retry_after: Option<Duration>,
     remaining_requests: u64,
@@ -5979,10 +5972,15 @@ impl VirtioNetworkTxQueueDispatch {
             successful_frames: 0,
             parse_failures: 0,
             packet_prepare_failures: 0,
+            descriptor_failures: 0,
+            malformed_frames: 0,
             sink_successful_frames: 0,
             detoured_frames: 0,
+            dropped_frames: 0,
             sink_failures: 0,
             sink_successful_bytes: 0,
+            detoured_bytes: 0,
+            dropped_bytes: 0,
             rate_limiter_throttled_frames: 0,
             rate_limiter_retry_after: None,
             remaining_requests: 0,
@@ -6011,9 +6009,12 @@ impl VirtioNetworkTxQueueDispatch {
         self.packet_prepare_failures
     }
 
+    pub const fn descriptor_failures(&self) -> usize {
+        self.descriptor_failures
+    }
+
     pub const fn malformed_frames(&self) -> usize {
-        self.parse_failures
-            .saturating_add(self.packet_prepare_failures)
+        self.malformed_frames
     }
 
     pub const fn sink_successful_frames(&self) -> usize {
@@ -6024,12 +6025,36 @@ impl VirtioNetworkTxQueueDispatch {
         self.detoured_frames
     }
 
+    pub const fn dropped_frames(&self) -> usize {
+        self.dropped_frames
+    }
+
+    pub const fn externally_forwarded_frames(&self) -> usize {
+        self.sink_successful_frames
+            .saturating_sub(self.detoured_frames)
+            .saturating_sub(self.dropped_frames)
+    }
+
     pub const fn sink_failures(&self) -> usize {
         self.sink_failures
     }
 
     pub const fn sink_successful_bytes(&self) -> u64 {
         self.sink_successful_bytes
+    }
+
+    pub const fn detoured_bytes(&self) -> u64 {
+        self.detoured_bytes
+    }
+
+    pub const fn dropped_bytes(&self) -> u64 {
+        self.dropped_bytes
+    }
+
+    pub const fn externally_forwarded_bytes(&self) -> u64 {
+        self.sink_successful_bytes
+            .saturating_sub(self.detoured_bytes)
+            .saturating_sub(self.dropped_bytes)
     }
 
     pub const fn rate_limiter_throttled_frames(&self) -> usize {
@@ -6087,6 +6112,12 @@ impl VirtioNetworkTxQueueDispatch {
                         self.sink_successful_frames += 1;
                         if disposition == VirtioNetworkTxPacketDisposition::Detoured {
                             self.detoured_frames += 1;
+                            self.detoured_bytes =
+                                self.detoured_bytes.saturating_add(frame.frame_len());
+                        } else if disposition == VirtioNetworkTxPacketDisposition::Dropped {
+                            self.dropped_frames += 1;
+                            self.dropped_bytes =
+                                self.dropped_bytes.saturating_add(frame.frame_len());
                         }
                         self.sink_successful_bytes =
                             self.sink_successful_bytes.saturating_add(frame.frame_len());
@@ -6102,12 +6133,22 @@ impl VirtioNetworkTxQueueDispatch {
             }
             VirtioNetworkTxQueueDispatchOutcome::ParseError(source) => {
                 self.parse_failures += 1;
+                if source.is_descriptor_failure() {
+                    self.descriptor_failures += 1;
+                } else {
+                    self.malformed_frames += 1;
+                }
                 if self.first_parse_failure.is_none() {
                     self.first_parse_failure = Some(source);
                 }
             }
             VirtioNetworkTxQueueDispatchOutcome::PacketPrepareError(source) => {
                 self.packet_prepare_failures += 1;
+                if source.is_descriptor_failure() {
+                    self.descriptor_failures += 1;
+                } else {
+                    self.malformed_frames += 1;
+                }
                 if self.first_packet_prepare_failure.is_none() {
                     self.first_packet_prepare_failure = Some(source);
                 }
@@ -6136,10 +6177,14 @@ impl VirtioNetworkTxQueueDispatch {
         match result {
             Ok(disposition) => {
                 self.sink_successful_frames += 1;
-                if disposition == VirtioNetworkTxPacketDisposition::Detoured {
-                    self.detoured_frames += 1;
-                }
                 if let Some(frame) = self.frames.get(frame_index) {
+                    if disposition == VirtioNetworkTxPacketDisposition::Detoured {
+                        self.detoured_frames += 1;
+                        self.detoured_bytes = self.detoured_bytes.saturating_add(frame.frame_len());
+                    } else if disposition == VirtioNetworkTxPacketDisposition::Dropped {
+                        self.dropped_frames += 1;
+                        self.dropped_bytes = self.dropped_bytes.saturating_add(frame.frame_len());
+                    }
                     self.sink_successful_bytes =
                         self.sink_successful_bytes.saturating_add(frame.frame_len());
                 }
@@ -6444,28 +6489,16 @@ impl VirtioNetworkMmioHandler {
             .attach_metrics(metrics.clone());
         self.activation_handler_mut().attach_metrics(metrics);
     }
-
-    pub fn attach_network_metrics_with_aggregate(
-        &mut self,
-        interface: SharedNetworkInterfaceMetrics,
-        aggregate: SharedNetworkInterfaceMetrics,
-    ) {
-        self.device_config_handler_mut()
-            .attach_metrics_with_aggregate(interface.clone(), aggregate.clone());
-        self.activation_handler_mut()
-            .attach_metrics_with_aggregate(interface, aggregate);
-    }
 }
 
 pub fn attach_network_metrics_to_mmio_handler(
     dispatcher: &mut MmioDispatcher,
     region_id: MmioRegionId,
-    interface: SharedNetworkInterfaceMetrics,
-    aggregate: SharedNetworkInterfaceMetrics,
+    metrics: SharedNetworkInterfaceMetrics,
 ) -> Result<(), MmioHandlerLookupError> {
     dispatcher
         .handler_mut::<VirtioNetworkMmioHandler>(region_id)?
-        .attach_network_metrics_with_aggregate(interface, aggregate);
+        .attach_network_metrics(metrics);
     Ok(())
 }
 
@@ -6812,17 +6845,6 @@ impl PreparedNetworkDevice {
     pub fn attach_metrics(&mut self, metrics: SharedNetworkInterfaceMetrics) {
         self.config_space.attach_metrics(metrics.clone());
         self.device.attach_metrics(metrics);
-    }
-
-    pub fn attach_metrics_with_aggregate(
-        &mut self,
-        interface: SharedNetworkInterfaceMetrics,
-        aggregate: SharedNetworkInterfaceMetrics,
-    ) {
-        self.config_space
-            .attach_metrics_with_aggregate(interface.clone(), aggregate.clone());
-        self.device
-            .attach_metrics_with_aggregate(interface, aggregate);
     }
 
     pub fn into_parts(
@@ -9042,6 +9064,7 @@ mod tests {
         calls: usize,
         fail_on_call: Option<usize>,
         detour_successes: bool,
+        drop_successes: bool,
         frame_heads: Vec<u16>,
         packets: Vec<Vec<u8>>,
         backend_metrics: VirtioNetworkBackendMetrics,
@@ -9053,6 +9076,7 @@ mod tests {
                 calls: 0,
                 fail_on_call: Some(fail_on_call),
                 detour_successes: false,
+                drop_successes: false,
                 frame_heads: Vec::new(),
                 packets: Vec::new(),
                 backend_metrics: VirtioNetworkBackendMetrics::default(),
@@ -9064,9 +9088,17 @@ mod tests {
                 calls: 0,
                 fail_on_call: None,
                 detour_successes: true,
+                drop_successes: false,
                 frame_heads: Vec::new(),
                 packets: Vec::new(),
                 backend_metrics: VirtioNetworkBackendMetrics::default(),
+            }
+        }
+
+        fn dropping() -> Self {
+            Self {
+                drop_successes: true,
+                ..Self::default()
             }
         }
     }
@@ -9109,6 +9141,8 @@ mod tests {
 
             if self.detour_successes {
                 Ok(VirtioNetworkTxPacketDisposition::Detoured)
+            } else if self.drop_successes {
+                Ok(VirtioNetworkTxPacketDisposition::Dropped)
             } else {
                 Ok(VirtioNetworkTxPacketDisposition::Forwarded)
             }
@@ -9134,6 +9168,8 @@ mod tests {
             self.packets.push(emitted.bytes().to_vec());
             if self.detour_successes {
                 Ok(VirtioNetworkTxPacketDisposition::Detoured)
+            } else if self.drop_successes {
+                Ok(VirtioNetworkTxPacketDisposition::Dropped)
             } else {
                 Ok(VirtioNetworkTxPacketDisposition::Forwarded)
             }
@@ -14536,10 +14572,7 @@ mod tests {
         );
         let metrics = SharedNetworkInterfaceMetrics::default();
         metrics.record_rx_queue_dispatch(completed);
-        assert_eq!(
-            metrics.snapshot(),
-            NetworkInterfaceMetrics::default().with_rx_fails(1)
-        );
+        assert_eq!(metrics.snapshot(), NetworkInterfaceMetrics::default());
         assert_eq!(source.consume_calls, 0);
         assert_eq!(read_interrupt_status(&handler), 0);
     }
@@ -15062,6 +15095,9 @@ mod tests {
         assert_eq!(dispatch.processed_frames(), 2);
         assert_eq!(dispatch.sink_successful_frames(), 2);
         assert_eq!(dispatch.detoured_frames(), 2);
+        assert_eq!(dispatch.externally_forwarded_frames(), 0);
+        assert_eq!(dispatch.detoured_bytes(), 32);
+        assert_eq!(dispatch.externally_forwarded_bytes(), 0);
         assert_eq!(dispatch.rate_limiter_throttled_frames(), 0);
         assert_eq!(sink.calls, 2);
         assert_eq!(read_tx_used_index(&memory), 2);
@@ -15073,6 +15109,14 @@ mod tests {
             &initial_limiter
         );
         assert!(!handler.has_pending_network_queue_work());
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_tx_remaining_reqs_count(1)
+        );
         assert!(logger.wait_for_delivery_for_test());
         assert_eq!(
             capture.output(),
@@ -15244,6 +15288,55 @@ mod tests {
             read_interrupt_status(&handler),
             DeviceInterruptKind::Queue.status().bits()
         );
+    }
+
+    #[test]
+    fn virtio_network_notifications_exclude_dropped_tx_from_public_metrics() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::dropping();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0xde, 0xad, 0xbe, 0xef]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 4, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect("dropped TX should complete through the sink");
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.sink_successful_frames(), 1);
+        assert_eq!(dispatch.dropped_frames(), 1);
+        assert_eq!(dispatch.externally_forwarded_frames(), 0);
+        assert_eq!(dispatch.sink_successful_bytes(), 16);
+        assert_eq!(dispatch.dropped_bytes(), 16);
+        assert_eq!(dispatch.externally_forwarded_bytes(), 0);
+
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default().with_tx_queue_event_count(1)
+        );
+        assert_eq!(read_tx_used_index(&memory), 1);
     }
 
     #[test]
@@ -15857,6 +15950,8 @@ mod tests {
         assert_eq!(dispatch.processed_frames(), 1);
         assert_eq!(dispatch.successful_frames(), 0);
         assert_eq!(dispatch.parse_failures(), 1);
+        assert_eq!(dispatch.descriptor_failures(), 0);
+        assert_eq!(dispatch.malformed_frames(), 1);
         assert_eq!(dispatch.sink_successful_frames(), 0);
         assert_eq!(dispatch.sink_failures(), 0);
         assert_eq!(dispatch.sink_successful_bytes(), 0);
@@ -15886,6 +15981,57 @@ mod tests {
         );
         assert_eq!(read_tx_used_index(&memory), 1);
         assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_network_notifications_map_descriptor_load_failure_to_tx_fails() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(
+                TEST_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE,
+                None,
+            )],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect("descriptor failure should still complete descriptor head");
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.parse_failures(), 1);
+        assert_eq!(dispatch.descriptor_failures(), 1);
+        assert_eq!(dispatch.malformed_frames(), 0);
+        assert!(matches!(
+            dispatch.first_parse_failure(),
+            Some(VirtioNetworkTxFrameParseError::HeaderDescriptorWriteOnly { index: 0 })
+        ));
+
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_tx_fails(1)
+        );
+        assert_eq!(sink.calls, 0);
     }
 
     #[test]
@@ -15963,7 +16109,6 @@ mod tests {
             NetworkInterfaceMetrics::default()
                 .with_tx_queue_event_count(1)
                 .with_tx_bytes_count(30)
-                .with_tx_fails(1)
                 .with_tx_packets_count(2)
                 .with_tx_count(2)
                 .with_tx_remaining_reqs_count(3)

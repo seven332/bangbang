@@ -132,10 +132,10 @@ cargo check --workspace --all-targets --all-features --locked
 ```
 
 The ordinary audit also validates the exact 231-field device producer
-authority for #1789. The completed #1838–#1842 slices contribute 133
-implemented entropy/pmem/RTC/UART/balloon/memory-hotplug/vsock/block/vhost-user
-block records and one source-neutral UART record; 82 planned and 15 provisional
-platform-zero records remain across the later children.
+authority for #1789. The completed #1838–#1843 slices contribute 189
+implemented device records and two source-neutral records: `uart.flush_count`
+and the immutable-packet-path `mmds.rx_bad_eth`. Twenty-five planned and 15
+provisional platform-zero records remain across the later children.
 
 The terminal 69-field API/process metrics producer scope has a separate
 fail-closed certification gate:

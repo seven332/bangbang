@@ -11,7 +11,7 @@ use crate::{
 };
 
 const EXPECTED_DEVICE_FIELDS: usize = 231;
-const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1838", "#1839", "#1840", "#1841", "#1842"];
+const COMPLETED_DELIVERY_ISSUES: &[&str] = &["#1838", "#1839", "#1840", "#1841", "#1842", "#1843"];
 
 /// Validate exact device-producer authority against the resolved metrics schema.
 pub fn validate_metrics_device_producers(
@@ -478,7 +478,7 @@ fn expected_boundary(path: &str) -> Option<MetricsDeviceProducerBoundary> {
 }
 
 fn expected_terminal_disposition(path: &str) -> Option<MetricsDeviceProducerDisposition> {
-    if path == "uart.flush_count" {
+    if matches!(path, "uart.flush_count" | "mmds.rx_bad_eth") {
         return Some(MetricsDeviceProducerDisposition::SourceNeutral);
     }
     expected_delivery_issue(path)

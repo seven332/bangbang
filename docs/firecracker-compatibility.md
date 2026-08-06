@@ -695,11 +695,11 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-The checked device-producer audit now terminally certifies all 134 #1838–#1842
-fields: 133 entropy, pmem, RTC, UART, balloon, memory-hotplug, vsock,
-ordinary-block, and vhost-user-block fields are implemented, while
-`uart.flush_count` is
-source-neutral zero because pinned Firecracker has no producer for it. Each
+The checked device-producer audit now terminally certifies all 191 #1838–#1843
+fields: 189 device fields are implemented, while `uart.flush_count` and
+`mmds.rx_bad_eth` are source-neutral zeros. The former has no pinned
+Firecracker producer; the latter's pinned zero-copy mutation window is absent
+because Bangbang admits and parses one immutable owned packet. Each
 device owner publishes an immutable compound counter snapshot. Entropy counts
 popped requests before parse or throttling; pmem binds configuration and
 activation failures to both the exact current generation and aggregate; RTC
@@ -732,7 +732,27 @@ configured nonempty vhost owners, replays the whole observation after failed
 publication, and starts fresh after same-ID reuse. Snapshot rejection prevents
 vhost-user owners or stores from migrating.
 
-Later #1843–#1846 records remain nonterminal and repository-final certification
+Network interfaces likewise publish through one coherent, generation-bearing
+owner. A single registry cut supplies both `net_{iface_id}` and static `net`,
+so static fields are exactly the saturating sum of configured roots, zero roots
+remain visible, deletion removes an owner, and same-ID replacement starts a
+fresh interval. Only successful external forwarding increments public network
+TX count/packet/bytes; MMDS detours remain MMDS traffic and cannot increment
+the TAP-path spoof field. Guest descriptor/buffer failures remain separate from
+malformed packets and backend failures, and interrupt creation failures are
+charged only to affected interface generations.
+
+MMDS metrics share one coherent process-local owner across that VM's selected
+interfaces. Missing and invalid tokens are observed for both V1 and V2.
+`tx_count` records a successful stack write attempt; retained-frame delivery
+records `tx_frames` and `tx_bytes` once, including after a short destination is
+retried. Failed publication replays the complete network/MMDS interval, while
+a later unchanged successful interval is zero. Signed MMDS-only MMIO/PCI
+evidence asserts positive network RX, zero public network TX/spoof/failure
+fields, and static/configured equality without treating it as credentialed
+external vmnet evidence.
+
+Later #1844–#1846 records remain nonterminal and repository-final certification
 remains gated on their delivery.
 
 One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through
@@ -2663,8 +2683,10 @@ profile before artifact mutation.
 A signed two-interface MMDS-only case configures distinct API IDs and guest
 MACs, selects both IDs in MMDS config, finds the Linux devices by MAC, and binds
 one bounded request to each device through a replaced `/32` MMDS route. The two
-results occupy separate fixed data-drive sectors, and both `net_<iface_id>`
-metric objects report RX and TX activity. Focused tests prove the matching
+results occupy separate fixed data-drive sectors. Both `net_<iface_id>` metric
+objects report positive RX, zero public network TX/spoof/failure fields, and a
+static `net` root equal to their saturating sum; the shared `mmds` root records
+the detoured request/response activity. Focused tests prove the matching
 stacks retain independent ARP, TCP, reset, retransmission, and retained-output state while the
 shared data store and top-level `mmds` metrics remain process-local aggregates;
 second-interface packet I/O also retains its own interrupt line and network

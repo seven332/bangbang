@@ -43,7 +43,7 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 134 records delivered by #1838–#1842; later child
+terminally certifies the 191 records delivered by #1838–#1843; later child
 records remain nonterminal. `corpus:metrics` and the cross-producer aggregate
 semantic remain #1790-owned. A required zero therefore proves wire-shape
 completeness only, never producer completion unless its field audit is
@@ -219,18 +219,32 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1842, the audit contains 82 `planned`, 15
-`provisional-platform-zero`, 133 `implemented`, and one `source-neutral`
-record. The 134 terminal records cover the complete pinned entropy, pmem, RTC,
-UART, balloon, memory-hotplug, vsock, static block, configured ordinary block,
-and configured vhost-user block roots. `uart.flush_count` is the
-source-neutral record because pinned Firecracker declares the field but has no
-producer; receive-FIFO clearing and other Bangbang-only serial diagnostics do
-not feed it. The remaining planned and provisional records are nonterminal,
-carry empty implementation and validation arrays, and have no platform
-exclusion. The provisional records are the six retained i8042 fields plus nine
-vCPU PIO/KVM-clock fields; this label does not claim that the terminal platform
-evidence required by #1846 already exists.
+After #1843, the audit contains 25 `planned`, 15
+`provisional-platform-zero`, 189 `implemented`, and two `source-neutral`
+records. The 191 terminal records additionally cover all 44 mapped configured
+and static network fields plus all 13 MMDS fields. `uart.flush_count` remains
+source-neutral because pinned Firecracker declares it without a producer.
+`mmds.rx_bad_eth` is also source-neutral: Bangbang classifies and parses the
+same immutable owned packet, so Firecracker's zero-copy mutation window cannot
+occur and no broader malformed-frame event is aliased into the field. The
+remaining planned and provisional records are nonterminal, carry empty
+implementation and validation arrays, and have no platform exclusion. The 14
+#1844 network records remain the Linux-TAP-oriented gap. The provisional
+records are the six retained i8042 fields plus nine vCPU PIO/KVM-clock fields;
+this label does not claim that the terminal platform evidence required by
+#1846 already exists.
+
+Network metrics use one generation-bearing per-interface owner. A single
+registry capture produces both configured `net_{iface_id}` values and the
+static `net` saturating sum; deleted owners disappear, zero configured roots
+remain present, and same-ID reuse starts a fresh interval. Guest-to-MMDS
+detours do not count as public network TX or spoof observations. RX/TX
+descriptor failures, malformed packets, limiter events, remaining requests,
+and exact affected-interface interrupt failures retain their pinned producer
+boundaries. MMDS uses one coherent process-local owner: `tx_count` records a
+successful stack write attempt, while `tx_frames` and `tx_bytes` commit only
+when the retained frame reaches guest RX. Failed publication replays the whole
+network/MMDS interval and advances the baseline only after success.
 
 Vsock uses one coherent saturating owner from configuration and activation
 through MMIO/PCI dispatch, HVF readiness, snapshot normalization, restore, and

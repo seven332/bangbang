@@ -2229,7 +2229,10 @@ fn assert_signed_guest_network_semantics(
         evidence.retransmission_observed(),
         "{transport} MMDS session did not retransmit after the withheld ACK: {evidence:?}"
     );
-    assert!(metrics.tx_bytes_count() > 3000);
+    assert_eq!(metrics.tx_count(), 0);
+    assert_eq!(metrics.tx_packets_count(), 0);
+    assert_eq!(metrics.tx_bytes_count(), 0);
+    assert_eq!(metrics.tx_spoofed_mac_count(), 0);
     assert!(metrics.rx_bytes_count() > 48 * 1024);
     assert!(metrics.rx_rate_limiter_throttled() > 0);
     assert!(metrics.rx_rate_limiter_event_count() > 0);

@@ -1553,14 +1553,13 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. After #1842 it contains 133 implemented
-entropy/pmem/RTC/UART/balloon/memory-hotplug/vsock/ordinary-block/vhost-user-block
-fields, one source-neutral `uart.flush_count`, 82 planned fields, and 15
+children. After #1843 it contains 189 implemented fields, two source-neutral
+fields (`uart.flush_count` and `mmds.rx_bad_eth`), 25 planned fields, and 15
 provisional-platform-zero fields. Only the latter two groups are nonterminal
 and evidence-free. The same focused test checks canonical bytes, exact
 membership and partition, completed-child regression, future-child premature
 promotion, the UART-flush disposition, suffix routing, provisional state,
-anchored-evidence rules, and final-mode rejection of the remaining 97 records.
+anchored-evidence rules, and final-mode rejection of the remaining 40 records.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1629,6 +1628,23 @@ backends, successful live refresh, snapshot rejection and backend-death
 isolation, exact five-field output, descriptor/path redaction, App Sandbox
 containment, and fresh metrics after same-ID reuse.
 
+Focused #1843 coverage pins 44 configured/static network leaves and all 13 MMDS
+leaves. Runtime tests distinguish externally forwarded TX from MMDS detours,
+descriptor failures from malformed frames and backend failures, both RX guest
+buffer failure classes, limiter admission/throttling, remaining work, spoof
+classification, and exact per-interface interrupt-failure attribution. One
+generation-aware registry capture derives dynamic roots and the static sum,
+keeps zero configured roots, excludes deleted/unconfigured owners, starts a
+fresh interval after same-ID reuse, and replays whole network/MMDS observations
+after a failed publication. MMDS tests cover V1/V2 missing/invalid tokens,
+connection create/destroy replacement, receive classifications, retransmission,
+short-output retry, and attempt-versus-delivery TX accounting. Concurrent cuts
+cannot split packet/byte observations. `mmds.rx_bad_eth` remains exact zero
+because admission and parsing see the same immutable packet. Signed direct and
+contained MMIO/PCI helpers assert positive MMDS response RX, zero public network
+TX/spoof/failure values for MMDS-only traffic, and equality between the static
+network root and its configured roots without claiming credentialed vmnet.
+
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
 
@@ -1690,7 +1706,7 @@ logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
 and four platform-zero device profiles remain #1789-owned; within the 231-field
-device audit, #1838–#1842 contribute 134 terminal records and the other 97
+device audit, #1838–#1843 contribute 191 terminal records and the other 40
 remain nonterminal. The two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
@@ -2935,9 +2951,11 @@ interfaces by their configured MAC addresses, gives them distinct link-local
 `/32` source addresses, replaces the MMDS host route before each device-bound
 request, and writes the `eth0` and `eth1` results to separate fixed sectors of
 the scratch drive. The host requires both static success markers under one
-deadline and checks that both API interface metric objects report RX and TX
-activity. This MMDS-only scenario does not open direct vmnet resources or need
-the restricted networking entitlement. The process-specific MMDS boot modes
+deadline and checks that both API interface metric objects report positive RX
+while public network TX/spoof/failure fields stay zero; the shared MMDS root
+records the detoured request/response activity instead. This MMDS-only scenario
+does not open direct vmnet resources or need the restricted networking
+entitlement. The process-specific MMDS boot modes
 extend that protocol to two concurrently running signed executables with
 unique instance IDs, API sockets, interface IDs, metadata, metrics, and scratch
 drives. Each guest obtains a 48-character standard-Base64 v2 token, verifies
