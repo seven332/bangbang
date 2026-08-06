@@ -8,17 +8,18 @@ use bangbang_firecracker_capability_audit::{
     AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, LOGGER_PRODUCER_AUDIT_PATH,
     LOGGER_PRODUCER_MANIFEST_PATH, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
     METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
-    METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH, derive_logger_producer_manifest,
-    derive_metrics_schema_source, derive_source_manifest, logger_producer_manifest_json,
-    metrics_schema_source_candidate_json, read_capability_inventory, read_logger_producer_audit,
-    read_logger_producer_manifest, read_metrics_device_producer_audit,
+    METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH, TRACING_AUDIT_PATH,
+    derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
+    logger_producer_manifest_json, metrics_schema_source_candidate_json, read_capability_inventory,
+    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
     read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
-    read_metrics_schema_authority, read_source_manifest, source_manifest_json, validate,
-    validate_logger_compatibility, validate_logger_producers, validate_metrics_compatibility,
-    validate_metrics_device_compatibility, validate_metrics_device_producers,
-    validate_metrics_lifecycle, validate_metrics_process_compatibility,
-    validate_metrics_process_producers, validate_metrics_schema,
-    validate_metrics_schema_compatibility,
+    read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
+    validate, validate_logger_compatibility, validate_logger_producers,
+    validate_metrics_compatibility, validate_metrics_device_compatibility,
+    validate_metrics_device_producers, validate_metrics_lifecycle,
+    validate_metrics_process_compatibility, validate_metrics_process_producers,
+    validate_metrics_schema, validate_metrics_schema_compatibility, validate_tracing_audit,
+    validate_tracing_compatibility,
 };
 
 fn main() -> ExitCode {
@@ -58,6 +59,7 @@ enum ValidateMode {
     Delivery,
     Final,
     LoggerFinal,
+    TracingFinal,
     MetricsSchemaFinal,
     MetricsProcessFinal,
     MetricsDeviceFinal,
@@ -69,12 +71,13 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
         [] => Ok(ValidateMode::Delivery),
         [flag] if flag == "--final" => Ok(ValidateMode::Final),
         [flag] if flag == "--logger-final" => Ok(ValidateMode::LoggerFinal),
+        [flag] if flag == "--tracing-final" => Ok(ValidateMode::TracingFinal),
         [flag] if flag == "--metrics-schema-final" => Ok(ValidateMode::MetricsSchemaFinal),
         [flag] if flag == "--metrics-process-final" => Ok(ValidateMode::MetricsProcessFinal),
         [flag] if flag == "--metrics-device-final" => Ok(ValidateMode::MetricsDeviceFinal),
         [flag] if flag == "--metrics-final" => Ok(ValidateMode::MetricsFinal),
         _ => Err(AuditError::new(
-            "validate accepts only one optional --final, --logger-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, or --metrics-final flag",
+            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, or --metrics-final flag",
         )),
     }
 }
@@ -94,6 +97,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         read_metrics_device_producer_audit(&root.join(METRICS_DEVICE_PRODUCER_AUDIT_PATH))?;
     let metrics_lifecycle_audit =
         read_metrics_lifecycle_audit(&root.join(METRICS_LIFECYCLE_AUDIT_PATH))?;
+    let tracing_audit = read_tracing_audit(&root.join(TRACING_AUDIT_PATH))?;
     let audit_mode = match mode {
         ValidateMode::Delivery => AuditMode::Delivery,
         ValidateMode::Final => AuditMode::Final,
@@ -143,8 +147,65 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             .map_err(|errors| {
                 AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
             })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
             return Ok(
-                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, and metrics lifecycle audit are valid for the terminal logger compatibility scope"
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal logger compatibility scope"
+                    .to_string(),
+            );
+        }
+        ValidateMode::TracingFinal => {
+            validate_tracing_compatibility(
+                &manifest,
+                &inventory,
+                &logger_manifest,
+                &logger_audit,
+                &tracing_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "tracing compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_schema(&metrics_authority, &manifest, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("metrics schema validation errors:\n{errors}"))
+                })?;
+            validate_metrics_process_producers(
+                &metrics_process_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics process producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_device_producers(
+                &metrics_device_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics device producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_lifecycle(
+                &metrics_lifecycle_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
+            })?;
+            return Ok(
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal tracing compatibility scope"
                     .to_string(),
             );
         }
@@ -190,8 +251,11 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             .map_err(|errors| {
                 AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
             })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
             return Ok(
-                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, and metrics lifecycle audit are valid for the terminal metrics API/schema compatibility scope"
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal metrics API/schema compatibility scope"
                     .to_string(),
             );
         }
@@ -232,8 +296,11 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             .map_err(|errors| {
                 AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
             })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
             return Ok(
-                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, and metrics lifecycle audit are valid for the terminal process metrics compatibility scope"
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal process metrics compatibility scope"
                     .to_string(),
             );
         }
@@ -264,8 +331,11 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             .map_err(|errors| {
                 AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
             })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
             return Ok(
-                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, and metrics lifecycle audit are valid for the terminal device metrics compatibility scope"
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal device metrics compatibility scope"
                     .to_string(),
             );
         }
@@ -288,8 +358,11 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
                 .map_err(|errors| {
                     AuditError::new(format!("logger producer validation errors:\n{errors}"))
                 })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
             return Ok(
-                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, and metrics lifecycle audit are valid for the terminal aggregate metrics compatibility scope"
+                "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal aggregate metrics compatibility scope"
                     .to_string(),
             );
         }
@@ -334,6 +407,9 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     ) {
         failures.push(format!("metrics lifecycle validation errors:\n{errors}"));
     }
+    if let Err(errors) = validate_tracing_audit(&tracing_audit, &root, audit_mode) {
+        failures.push(format!("tracing audit validation errors:\n{errors}"));
+    }
     if !failures.is_empty() {
         return Err(AuditError::new(failures.join("\n")));
     }
@@ -342,7 +418,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         AuditMode::Final => "final",
     };
     Ok(format!(
-        "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, and metrics lifecycle audit are valid in {mode_name} mode"
+        "Firecracker capability inventory, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
     ))
 }
 
@@ -511,6 +587,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
     let metrics_process_audit_path = root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH);
     let metrics_device_audit_path = root.join(METRICS_DEVICE_PRODUCER_AUDIT_PATH);
     let metrics_lifecycle_audit_path = root.join(METRICS_LIFECYCLE_AUDIT_PATH);
+    let tracing_audit_path = root.join(TRACING_AUDIT_PATH);
     let normalized_output = normalize_lexically(&output_path);
     let checked_paths = [
         &source_path,
@@ -521,6 +598,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
         &metrics_process_audit_path,
         &metrics_device_audit_path,
         &metrics_lifecycle_audit_path,
+        &tracing_audit_path,
     ];
     if checked_paths
         .iter()
@@ -642,7 +720,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -670,6 +748,10 @@ mod tests {
             ValidateMode::LoggerFinal
         );
         assert_eq!(
+            parse_validate_mode(&["--tracing-final".to_string()]).unwrap(),
+            ValidateMode::TracingFinal
+        );
+        assert_eq!(
             parse_validate_mode(&["--metrics-schema-final".to_string()]).unwrap(),
             ValidateMode::MetricsSchemaFinal
         );
@@ -689,6 +771,7 @@ mod tests {
         for invalid in [
             vec!["--unknown".to_string()],
             vec!["--final".to_string(), "--logger-final".to_string()],
+            vec!["--logger-final".to_string(), "--tracing-final".to_string()],
             vec![
                 "--logger-final".to_string(),
                 "--metrics-schema-final".to_string(),
@@ -715,6 +798,7 @@ mod tests {
     fn completed_scoped_modes_consume_device_audit_in_delivery_mode() {
         for flag in [
             "--logger-final",
+            "--tracing-final",
             "--metrics-schema-final",
             "--metrics-process-final",
         ] {
@@ -729,6 +813,13 @@ mod tests {
         let message = run_validate(&["--metrics-device-final".to_string()])
             .expect("terminal device validation must pass");
         assert!(message.contains("terminal device metrics compatibility scope"));
+    }
+
+    #[test]
+    fn tracing_final_mode_certifies_the_terminal_tracing_scope() {
+        let message = run_validate(&["--tracing-final".to_string()])
+            .expect("terminal tracing validation must pass");
+        assert!(message.contains("terminal tracing compatibility scope"));
     }
 
     #[test]
@@ -779,6 +870,7 @@ mod tests {
             METRICS_PROCESS_PRODUCER_AUDIT_PATH,
             METRICS_DEVICE_PRODUCER_AUDIT_PATH,
             METRICS_LIFECYCLE_AUDIT_PATH,
+            TRACING_AUDIT_PATH,
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory path should be refused");
@@ -798,6 +890,7 @@ mod tests {
             "compat/firecracker/v1.16.0/./metrics-process-producer-audit.json",
             "compat/firecracker/v1.16.0/./metrics-device-producer-audit.json",
             "compat/firecracker/v1.16.0/./metrics-lifecycle-audit.json",
+            "compat/firecracker/v1.16.0/./tracing-audit.json",
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory alias should be refused");

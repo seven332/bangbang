@@ -2,6 +2,8 @@ mod delivery;
 mod event;
 mod process_stdout;
 mod rate_limiter;
+#[cfg(feature = "tracing")]
+mod tracing;
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -33,6 +35,8 @@ pub use event::{
     ProcessStartupOutcome, ProcessTerminalCategory,
 };
 pub use process_stdout::{ProcessStdoutLogger, ProcessStdoutLoggerError};
+#[cfg(feature = "tracing")]
+pub use tracing::{MAX_TRACE_DEPTH, ToolTraceSession, TraceLogger, TraceScope};
 
 const BOOT_TIMER_LOG_MODULE: &str = "bangbang_runtime::boot_timer";
 const BACKEND_LOG_MODULE: &str = "bangbang_hvf::backend";
@@ -1701,7 +1705,7 @@ impl LoggerState {
     }
 
     #[cfg(test)]
-    fn disconnect_delivery_for_test(&self) -> bool {
+    pub(crate) fn disconnect_delivery_for_test(&self) -> bool {
         self.delivery
             .as_ref()
             .is_some_and(LoggerDelivery::disconnect_for_test)

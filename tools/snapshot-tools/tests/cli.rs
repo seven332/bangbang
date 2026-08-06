@@ -274,6 +274,64 @@ fn invalid_invocations_are_deterministic_and_do_not_echo_values() {
     }
 }
 
+#[cfg(all(feature = "tracing", unix))]
+#[test]
+fn tool_tracing_requires_a_matching_runtime_filter_and_preserves_diagnostics() {
+    const SENSITIVE_PATH: &str = "/private/tool-tracing-secret-7d91.vmstate";
+    const ARGUMENTS: [&str; 4] = ["info-vmstate", "version", "--vmstate-path", SENSITIVE_PATH];
+
+    let baseline = snapshot_editor()
+        .env_remove("BANGBANG_TRACE")
+        .args(ARGUMENTS)
+        .output()
+        .expect("untraced inspection should run");
+    assert_eq!(baseline.status.code(), Some(1));
+    assert!(baseline.stdout.is_empty());
+    let baseline_stderr =
+        String::from_utf8(baseline.stderr.clone()).expect("baseline diagnostic should be UTF-8");
+
+    let nonmatching = snapshot_editor()
+        .env("BANGBANG_TRACE", "other::module")
+        .args(ARGUMENTS)
+        .output()
+        .expect("filtered inspection should run");
+    assert_eq!(nonmatching.status, baseline.status);
+    assert_eq!(nonmatching.stdout, baseline.stdout);
+    assert_eq!(nonmatching.stderr, baseline.stderr);
+
+    let matching = snapshot_editor()
+        .env("BANGBANG_TRACE", "bangbang_snapshot_tools::command")
+        .args(ARGUMENTS)
+        .output()
+        .expect("traced inspection should run");
+    assert_eq!(matching.status, baseline.status);
+    assert_eq!(matching.stdout, baseline.stdout);
+    let stderr = String::from_utf8(matching.stderr).expect("trace diagnostics should be UTF-8");
+    let lines = stderr.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), baseline_stderr.lines().count() + 2);
+    assert!(
+        lines.first().is_some_and(|line| {
+            line.contains("level=Trace trace module=bangbang_snapshot_tools::command")
+                && line.contains("scope=execute_snapshot_info phase=enter")
+        }),
+        "trace entry should be first: {stderr}"
+    );
+    assert!(
+        lines.last().is_some_and(|line| {
+            line.contains("level=Trace trace module=bangbang_snapshot_tools::command")
+                && line.contains("scope=execute_snapshot_info phase=exit")
+        }),
+        "trace exit should be last: {stderr}"
+    );
+    let ordinary = lines
+        .iter()
+        .filter(|line| !line.contains(" trace module="))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    assert_eq!(ordinary, baseline_stderr);
+    assert!(!stderr.contains(SENSITIVE_PATH));
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn unsupported_target_rejects_before_accessing_or_echoing_paths() {

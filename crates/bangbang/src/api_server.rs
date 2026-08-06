@@ -715,6 +715,11 @@ fn handle_request_bytes_with_limit(
     vmm: &mut impl VmmRequestHandler,
     http_api_max_payload_size: usize,
 ) -> HttpResponse {
+    bangbang_runtime::bangbang_trace_scope!(
+        vmm.trace_logger(),
+        "bangbang::api_server",
+        "handle_request_bytes_with_limit",
+    );
     let request_started = vmm.process_latency_timestamp();
     let (request, metric_effect) =
         parse_request_outcome_with_limit(bytes, http_api_max_payload_size).into_parts();

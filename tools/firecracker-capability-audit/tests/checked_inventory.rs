@@ -10,14 +10,16 @@ use bangbang_firecracker_capability_audit::{
     METRICS_SCHEMA_AUTHORITY_PATH, METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS,
     MetricsDeviceProducerDisposition, MetricsProcessProducerDisposition,
     MetricsProducerDisposition, MetricsProducerOwner, Reference, SOURCE_MANIFEST_PATH,
-    TERMINAL_DEVICE_POLICY_PROFILE_IDS, logger_producer_audit_json, logger_producer_manifest_json,
-    read_capability_inventory, read_logger_producer_audit, read_logger_producer_manifest,
-    read_metrics_device_producer_audit, read_metrics_lifecycle_audit,
-    read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
-    source_manifest_json, validate, validate_logger_compatibility, validate_logger_producers,
+    TERMINAL_DEVICE_POLICY_PROFILE_IDS, TRACING_AUDIT_PATH, TRACING_CALL_SITE_IDS,
+    TRACING_COMPATIBILITY_CAPABILITY_IDS, logger_producer_audit_json,
+    logger_producer_manifest_json, read_capability_inventory, read_logger_producer_audit,
+    read_logger_producer_manifest, read_metrics_device_producer_audit,
+    read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
+    read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
+    tracing_audit_json, validate, validate_logger_compatibility, validate_logger_producers,
     validate_metrics_compatibility, validate_metrics_device_compatibility,
     validate_metrics_device_producers, validate_metrics_process_compatibility,
-    validate_metrics_schema_compatibility,
+    validate_metrics_schema_compatibility, validate_tracing_audit, validate_tracing_compatibility,
 };
 
 #[test]
@@ -608,6 +610,109 @@ fn checked_logger_compatibility_is_terminal_and_fail_closed() {
 }
 
 #[test]
+fn checked_tracing_compatibility_is_terminal_and_fail_closed() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let logger_manifest =
+        read_logger_producer_manifest(&repository_root.join(LOGGER_PRODUCER_MANIFEST_PATH))
+            .expect("checked logger producer manifest must parse");
+    let logger_audit =
+        read_logger_producer_audit(&repository_root.join(LOGGER_PRODUCER_AUDIT_PATH))
+            .expect("checked logger producer audit must parse");
+    let tracing_path = repository_root.join(TRACING_AUDIT_PATH);
+    let tracing_audit =
+        read_tracing_audit(&tracing_path).expect("checked tracing audit must parse");
+
+    assert_eq!(
+        tracing_audit_json(&tracing_audit).expect("tracing audit must serialize canonically"),
+        std::fs::read(tracing_path).expect("checked tracing audit must be readable")
+    );
+    assert_eq!(
+        tracing_audit
+            .call_sites
+            .iter()
+            .map(|call_site| call_site.id.as_str())
+            .collect::<Vec<_>>(),
+        TRACING_CALL_SITE_IDS
+    );
+    assert_eq!(TRACING_COMPATIBILITY_CAPABILITY_IDS, ["corpus:tracing"]);
+    validate_tracing_audit(&tracing_audit, &repository_root, AuditMode::Final)
+        .expect("checked tracing audit must be terminal");
+    validate_tracing_compatibility(
+        &manifest,
+        &inventory,
+        &logger_manifest,
+        &logger_audit,
+        &tracing_audit,
+        &repository_root,
+    )
+    .expect("checked tracing compatibility scope must be terminal");
+
+    let mut missing_call = tracing_audit.clone();
+    missing_call.call_sites.pop();
+    let error = validate_tracing_audit(&missing_call, &repository_root, AuditMode::Final)
+        .expect_err("a missing tracing call site must fail closed")
+        .to_string();
+    assert!(error.contains("must contain 8 call sites"));
+    assert!(error.contains("exact call-site id set"));
+
+    let mut changed_policy = tracing_audit.clone();
+    changed_policy.call_sites[0].module = "bangbang::changed".to_string();
+    let error = validate_tracing_audit(&changed_policy, &repository_root, AuditMode::Final)
+        .expect_err("changed tracing policy must fail closed")
+        .to_string();
+    assert!(error.contains("call-site policy has drifted"));
+
+    let mut nonterminal = inventory.clone();
+    let capability = nonterminal
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "corpus:tracing")
+        .expect("tracing corpus capability must exist");
+    capability.disposition = Disposition::AuditRequired;
+    capability.implementation.clear();
+    capability.validation.clear();
+    let error = validate_tracing_compatibility(
+        &manifest,
+        &nonterminal,
+        &logger_manifest,
+        &logger_audit,
+        &tracing_audit,
+        &repository_root,
+    )
+    .expect_err("nonterminal tracing capability must fail")
+    .to_string();
+    assert!(error.contains("tracing certification requires implemented-and-verified"));
+
+    let mut stale_evidence = inventory.clone();
+    stale_evidence
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "corpus:tracing")
+        .expect("tracing corpus capability must exist")
+        .validation
+        .pop();
+    let error = validate_tracing_compatibility(
+        &manifest,
+        &stale_evidence,
+        &logger_manifest,
+        &logger_audit,
+        &tracing_audit,
+        &repository_root,
+    )
+    .expect_err("stale tracing evidence must fail")
+    .to_string();
+    assert!(error.contains("tracing certification requires exact capability evidence"));
+}
+
+#[test]
 fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -645,7 +750,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        343
+        344
     );
     assert_eq!(
         inventory
@@ -653,7 +758,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        42
+        41
     );
     assert_eq!(
         inventory
@@ -1760,6 +1865,9 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let metrics_aggregate_implemented = METRICS_AGGREGATE_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let tracing_implemented = TRACING_COMPATIBILITY_CAPABILITY_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let impossible = X86_IMPOSSIBLE.into_iter().collect::<BTreeSet<_>>();
 
     assert_eq!(owned.len(), 93, "Wave 7 owner identities must be unique");
@@ -1769,6 +1877,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert_eq!(logger_implemented.len(), 11);
     assert_eq!(metrics_implemented.len(), 12);
     assert_eq!(metrics_aggregate_implemented.len(), 2);
+    assert_eq!(tracing_implemented.len(), 1);
     assert_eq!(impossible.len(), 13);
     assert!(implemented.is_disjoint(&impossible));
     assert!(logger_implemented.is_disjoint(&implemented));
@@ -1780,6 +1889,11 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert!(metrics_aggregate_implemented.is_disjoint(&logger_implemented));
     assert!(metrics_aggregate_implemented.is_disjoint(&metrics_implemented));
     assert!(metrics_aggregate_implemented.is_disjoint(&impossible));
+    assert!(tracing_implemented.is_disjoint(&implemented));
+    assert!(tracing_implemented.is_disjoint(&logger_implemented));
+    assert!(tracing_implemented.is_disjoint(&metrics_implemented));
+    assert!(tracing_implemented.is_disjoint(&metrics_aggregate_implemented));
+    assert!(tracing_implemented.is_disjoint(&impossible));
     assert!(implemented.union(&impossible).all(|id| owned.contains(id)));
     assert!(logger_implemented.iter().all(|id| owned.contains(id)));
     assert!(metrics_implemented.iter().all(|id| owned.contains(id)));
@@ -1788,6 +1902,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .iter()
             .all(|id| owned.contains(id))
     );
+    assert!(tracing_implemented.iter().all(|id| owned.contains(id)));
 
     for (id, owner) in WAVE_7_OWNED.into_iter().chain(RETAINED_HANDOFFS) {
         assert!(
@@ -1868,6 +1983,22 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         );
     }
 
+    for id in &tracing_implemented {
+        let capability = by_id.get(id).expect("tracing identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "tracing identity must be terminal: {id}"
+        );
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+        assert!(capability.exclusion.is_none());
+        assert!(
+            contract.contains(&format!("| `{id}` | #1791 | `implemented-and-verified` |")),
+            "contract must record implemented tracing result: {id}"
+        );
+    }
+
     for id in &impossible {
         let capability = by_id.get(id).expect("x86 identity must exist");
         assert_eq!(capability.source_refs, [*id]);
@@ -1937,6 +2068,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .chain(logger_implemented.iter())
         .chain(metrics_implemented.iter())
         .chain(metrics_aggregate_implemented.iter())
+        .chain(tracing_implemented.iter())
         .chain(impossible.iter())
         .copied()
         .collect::<BTreeSet<_>>();
@@ -1967,7 +2099,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
     );
     assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
-    assert!(normalized_contract.contains("343 implemented, 42 audit-required"));
+    assert!(normalized_contract.contains("344 implemented, 41 audit-required"));
     assert!(normalized_contract.contains("376/9/3/30"));
 }
 
@@ -2432,8 +2564,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
-    assert_eq!(count(Disposition::AuditRequired), 42);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
+    assert_eq!(count(Disposition::AuditRequired), 41);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3162,8 +3294,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
-    assert_eq!(count(Disposition::AuditRequired), 42);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
+    assert_eq!(count(Disposition::AuditRequired), 41);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3459,8 +3591,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
-    assert_eq!(count(Disposition::AuditRequired), 42);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
+    assert_eq!(count(Disposition::AuditRequired), 41);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3608,8 +3740,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
-    assert_eq!(count(Disposition::AuditRequired), 42);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
+    assert_eq!(count(Disposition::AuditRequired), 41);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3878,8 +4010,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 343);
-    assert_eq!(count(Disposition::AuditRequired), 42);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 344);
+    assert_eq!(count(Disposition::AuditRequired), 41);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 

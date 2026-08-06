@@ -397,8 +397,9 @@ Run
 `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`
 when the PR changes Firecracker-facing behavior or inventory data. A checked
 scope may define a narrower terminal command such as logger
-`validate --logger-final`; it must still run general delivery validation and
-must name every record in that scope exactly. Repository-wide parent
+`validate --logger-final` or tracing `validate --tracing-final`; it must still
+run general delivery validation and name every record or production call in
+that scope exactly. Repository-wide parent
 certification runs `validate --final`. Ordinary feature or scoped-certification
 PRs must not weaken that global gate to make unrelated unresolved records pass.
 

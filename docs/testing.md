@@ -1395,9 +1395,9 @@ cargo test -p bangbang-firecracker-capability-audit --all-targets --locked
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 ```
 
-The workspace suite also validates all five checked JSON files: the general
-source manifest and capability overlay, the logger producer manifest and human
-audit, and the combined metrics source/policy authority. Ordinary validation
+The workspace suite validates every checked authority: the general source
+manifest and capability overlay, logger manifest/audit, metrics schema and
+producer/lifecycle audits, and the developer-tracing audit. Ordinary validation
 uses only the pinned checked-in inventory and does not discover or require a
 sibling Firecracker checkout.
 
@@ -1907,6 +1907,29 @@ unchanged and fails while any capability record is `audit-required` or
 change cannot promote a capability without implementation and validation
 evidence.
 
+### Opt-in Developer Tracing
+
+Tracing validation covers both sides of the compile-time feature, real
+process/tool boundaries, and the checked AST authority:
+
+```sh
+cargo test -p bangbang-runtime --test tracing_feature --no-default-features --locked
+cargo test -p bangbang-runtime --test tracing_feature --no-default-features --features tracing --locked
+cargo test -p bangbang-runtime --lib --features tracing --locked logger::tracing::tests
+cargo test -p bangbang --test process_e2e --features tracing --locked executable_tracing_is_nested_filtered_and_value_free
+cargo test -p bangbang-snapshot-tools --test cli --features tracing --locked tool_tracing_requires_a_matching_runtime_filter_and_preserves_diagnostics
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
+scripts/report-tracing-overhead.sh
+```
+
+The feature-off case proves the logger expression is not evaluated. Feature-on
+tests cover nested order, filtering before stack work, unwind and forgotten
+guards, per-thread isolation, depth/record bounds, loss/result preservation,
+redaction, nested API/VMM output, nonblocking device scopes, and runtime-gated
+tool diagnostics. The report builds separate default and tracing release
+binaries, checks fixed-marker absence/presence, and prints descriptive size and
+timing data; it has no machine-independent threshold.
+
 ## Running Tests
 
 Run the standard workspace checks before opening or updating a PR:
@@ -1915,6 +1938,7 @@ Run the standard workspace checks before opening or updating a PR:
 cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

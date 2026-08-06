@@ -57,6 +57,10 @@ and #1799 certification boundaries respectively.
 - **METRICS-LIFECYCLE**: exact ten-scenario aggregate authority and certifier in
   `compat/firecracker/v1.16.0/metrics-lifecycle-audit.json` and the audit
   tool's lifecycle validator/certifier modules.
+- **TRACING-AUTHORITY**: exact opt-in feature, record, limit, privacy, delivery,
+  and eight-call production scope authority in
+  `compat/firecracker/v1.16.0/tracing-audit.json`, with its AST validator and
+  terminal certifier in the capability-audit tool.
 
 ## Core API certification
 
@@ -117,6 +121,24 @@ previous-success retry, concurrent-cut ownership, lost-output accounting, and
 one-shot final behavior. Both #1790 capability rows and owner rows are now
 `implemented-and-verified`; partial promotion, claim/evidence drift, or a
 regressed producer census fails closed.
+
+## Developer-tracing certification
+
+The single #1791 row is terminal under `validate --tracing-final`. The gate
+composes the terminal logger foundation with an exact AST scan of eight
+literal API, VMM, controller, virtio-MMIO, and snapshot-tool scopes. Tracing is
+absent from default and default-release builds; enabled VMM scopes still obey
+the configured Trace level and module prefix, while standalone tools also
+require `BANGBANG_TRACE` runtime admission. Each thread has a 32-entry fixed
+stack and each scope emits at most two 512-byte records through bounded host,
+bounded tool, or nonblocking guest delivery.
+
+Only literal module/scope, opaque Rust thread identity, and enter/exit phase
+are admitted. Result-preservation, loss accounting, unwind and forgotten-scope
+recovery, thread isolation, redaction, default expression removal, and marker
+absence are directly tested. The contract does not claim Firecracker's source
+rewrite mechanism, durable delivery, tracing enabled by default, sensitive
+dynamic fields, or portable timing thresholds.
 
 ## X86 CPUID/MSR platform boundary
 
@@ -205,7 +227,7 @@ remain in the CPU-template contract.
 | `api-schema:TokenBucket` | #1787 | `implemented-and-verified` |
 | `corpus:metrics` | #1790 | `implemented-and-verified` |
 | `semantic.observability:metrics-schema-producers-flush-and-lifecycle` | #1790 | `implemented-and-verified` |
-| `corpus:tracing` | #1791 | `audit-required` |
+| `corpus:tracing` | #1791 | `implemented-and-verified` |
 | `tool-argument:cpu-template-helper/template/dump/config` | #1792 | `audit-required` |
 | `tool-argument:cpu-template-helper/template/dump/output` | #1792 | `audit-required` |
 | `tool-argument:cpu-template-helper/template/dump/template` | #1792 | `audit-required` |
@@ -262,8 +284,10 @@ logger operation/path/schema/property rows to `implemented-and-verified`, and
 producer, focused, process, signed, contained, and isolation gates pass. The
 #1787 metrics schema/API certification moves its exact twelve rows to
 `implemented-and-verified`; #1790 now promotes its exact two aggregate rows
-after the schema, process, device, lifecycle, and signed gates pass. The current
-inventory is therefore exactly 343 implemented, 42 audit-required, three
+after the schema, process, device, lifecycle, and signed gates pass. #1791
+promotes the single tracing corpus row after its feature, AST, privacy,
+delivery, process, device, tool, and release-marker gates pass. The current
+inventory is therefore exactly 344 implemented, 41 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

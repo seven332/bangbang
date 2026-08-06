@@ -3071,8 +3071,20 @@ signed direct, and ordinary-production/App Sandbox evidence. The signed output
 oracle admits only 41 fixed API method/route pairs and the closed non-API
 vocabulary; selector values, arbitrary paths, extra fields, and invented
 method/route ownership are rejected. This certification does not make logger
-output durable, grant a guest or worker sink authority, or implement the
-separately owned tracing surface.
+output durable, grant a guest or worker sink authority, or fold the separately
+feature-gated tracing surface into ordinary logger producer classes.
+
+The terminal tracing gate adds no sink or resource authority. Default builds
+remove the logger expression and guard; standalone tools require an explicit
+`BANGBANG_TRACE` module admission in addition to the compiled feature. The
+only dynamic record value is Rust's opaque thread identity; module and nested
+scope are source literals, and phase is closed. API/VMM scopes reuse bounded
+host delivery, device scopes are nonblocking, and tool scopes reuse an
+eight-batch worker with 100 ms receipt bounds. Host paths, environment values,
+payloads, guest values, identities, credentials, addresses, selectors,
+descriptors, registers, timestamps, and errors are forbidden. Loss is
+accounted without replacing functional results, so operators must not treat
+trace presence or absence as an audit, authorization, or durability signal.
 
 The terminal metrics API/schema certification binds the corresponding
 confidentiality boundary to exactly twelve #1787 records. Its scoped validator
@@ -3317,9 +3329,10 @@ The current scaffold does not implement:
   unconstrained cross-host portability remain non-goals. The exact snapshot
   boundary is in
   [Snapshot Feasibility](snapshot-feasibility.md#native-v2-212-vsock-activation-and-certification).
-- log rotation, syslog, journald, tracing, remote telemetry, or durable
-  catch-all worker/double-panic/abort/fatal observability beyond the fixed
-  catchable-main boundary above
+- log rotation, syslog, journald, remote telemetry, default-enabled or durable
+  tracing, sensitive dynamic trace fields, or durable catch-all
+  worker/double-panic/abort/fatal observability beyond the fixed catchable-main
+  boundary above
 - a public serial streaming API or serial behavior beyond the implemented
   exact native-v2 2.7–2.13 destination-authorized endpoint reconstruction
 

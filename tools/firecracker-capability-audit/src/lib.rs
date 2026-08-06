@@ -18,6 +18,9 @@ mod metrics_process_validate;
 mod metrics_upstream;
 mod metrics_validate;
 mod model;
+mod tracing_certify;
+mod tracing_model;
+mod tracing_validate;
 mod upstream;
 mod validate;
 
@@ -72,6 +75,12 @@ pub use model::{
     AuditMode, Baseline, Capability, CapabilityInventory, Counts, Disposition, Input,
     PlatformExclusion, Reference, SourceItem, SourceManifest,
 };
+pub use tracing_certify::{TRACING_COMPATIBILITY_CAPABILITY_IDS, validate_tracing_compatibility};
+pub use tracing_model::{
+    TracingAudit, TracingCallSite, TracingCallSiteCategory, TracingDelivery,
+    TracingFeatureContract, TracingField, TracingLimits, TracingPhase,
+};
+pub use tracing_validate::{TRACING_CALL_SITE_IDS, validate_tracing_audit};
 pub use upstream::{derive_source_manifest, ensure_pinned_checkout};
 pub use validate::{ValidationErrors, validate};
 
@@ -102,6 +111,8 @@ pub const METRICS_PROCESS_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
 pub const METRICS_DEVICE_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Current checked aggregate metrics lifecycle audit format.
 pub const METRICS_LIFECYCLE_AUDIT_SCHEMA_VERSION: u32 = 1;
+/// Current checked developer-tracing audit format.
+pub const TRACING_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Repository-relative generated source manifest path.
 pub const SOURCE_MANIFEST_PATH: &str = "compat/firecracker/v1.16.0/source-manifest.json";
 /// Repository-relative human capability overlay path.
@@ -123,6 +134,8 @@ pub const METRICS_DEVICE_PRODUCER_AUDIT_PATH: &str =
 /// Repository-relative aggregate metrics lifecycle audit path.
 pub const METRICS_LIFECYCLE_AUDIT_PATH: &str =
     "compat/firecracker/v1.16.0/metrics-lifecycle-audit.json";
+/// Repository-relative developer-tracing audit path.
+pub const TRACING_AUDIT_PATH: &str = "compat/firecracker/v1.16.0/tracing-audit.json";
 
 /// Error produced while reading, parsing, or deriving an inventory.
 #[derive(Debug)]
@@ -231,6 +244,14 @@ pub fn read_metrics_lifecycle_audit(path: &Path) -> Result<MetricsLifecycleAudit
     })
 }
 
+/// Read and parse the checked developer-tracing audit.
+pub fn read_tracing_audit(path: &Path) -> Result<TracingAudit, AuditError> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| AuditError::new(format!("failed to read tracing audit: {error}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AuditError::new(format!("failed to parse tracing audit: {error}")))
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -295,6 +316,11 @@ pub fn metrics_device_producer_audit_json(
 /// Serialize the aggregate metrics lifecycle audit using canonical pretty JSON.
 pub fn metrics_lifecycle_audit_json(audit: &MetricsLifecycleAudit) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "metrics lifecycle audit")
+}
+
+/// Serialize the checked developer-tracing audit using canonical pretty JSON.
+pub fn tracing_audit_json(audit: &TracingAudit) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "tracing audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {

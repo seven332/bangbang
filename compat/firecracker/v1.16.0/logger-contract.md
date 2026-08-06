@@ -365,5 +365,5 @@ promotes `corpus:logger` and
 `semantic.observability:logger-delivery-filtering-loss-and-redaction`; all
 eleven #1786 rows are `implemented-and-verified`. The terminal claim remains
 best effort and process local: it does not promise durable sink delivery,
-implement developer tracing owned by #1791, or complete the unrelated metrics
-and tooling rows.
+fold the separately terminal #1791 developer-tracing feature into ordinary
+logger producer classes, or complete unrelated tooling rows.

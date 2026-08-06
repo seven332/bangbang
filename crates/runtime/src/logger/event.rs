@@ -1,5 +1,7 @@
 use std::fmt::{self, Write as _};
 use std::panic::Location;
+#[cfg(feature = "tracing")]
+use std::thread::ThreadId;
 
 use super::LoggerLevel;
 
@@ -1588,6 +1590,23 @@ pub(super) enum LoggerEvent {
     Vsock(LoggerVsockOutcome),
 }
 
+#[cfg(feature = "tracing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TracePhase {
+    Enter,
+    Exit,
+}
+
+#[cfg(feature = "tracing")]
+impl TracePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enter => "enter",
+            Self::Exit => "exit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LogOrigin<'a> {
     file: &'a str,
@@ -1822,6 +1841,45 @@ impl LogRecord {
                 );
             }
         }
+
+        encoder.finish()
+    }
+
+    #[cfg(feature = "tracing")]
+    pub(super) fn encode_trace(
+        show_level: bool,
+        show_log_origin: bool,
+        origin: LogOrigin<'_>,
+        module: &str,
+        thread_id: ThreadId,
+        scopes: &[&str],
+        phase: TracePhase,
+    ) -> Self {
+        let mut encoder = RecordEncoder::default();
+
+        if show_level {
+            encoder.push_str("level=");
+            encoder.push_str(LoggerLevel::Trace.as_str());
+            encoder.push_byte(b' ');
+        }
+        if show_log_origin {
+            encoder.push_str("origin=");
+            encoder.push_origin(origin.file);
+            encoder.push_byte(b':');
+            encoder.push_u64(u64::from(origin.line));
+            encoder.push_byte(b' ');
+        }
+
+        encoder.push_str("trace module=");
+        encoder.push_str(module);
+        encoder.push_str(" thread=");
+        let _ = write!(encoder, "{thread_id:?}");
+        encoder.push_str(" scope=");
+        let phase = phase.as_str();
+        let phase_suffix_bytes = " phase=".len().saturating_add(phase.len());
+        encoder.push_trace_scope_path(scopes, phase_suffix_bytes);
+        encoder.push_str(" phase=");
+        encoder.push_str(phase);
 
         encoder.finish()
     }
@@ -2064,6 +2122,66 @@ impl RecordEncoder {
         target.copy_from_slice(value);
         self.len = end;
         true
+    }
+
+    #[cfg(feature = "tracing")]
+    fn push_trace_scope_path(&mut self, scopes: &[&str], reserved_tail_bytes: usize) {
+        let path_len = if scopes.is_empty() {
+            "<root>".len()
+        } else {
+            scopes
+                .iter()
+                .fold(0_usize, |total, scope| total.saturating_add(scope.len()))
+                .saturating_add(scopes.len().saturating_sub(1).saturating_mul(2))
+        };
+        let capacity = (MAX_LOG_RECORD_BYTES - 1)
+            .saturating_sub(self.len)
+            .saturating_sub(reserved_tail_bytes);
+        if path_len <= capacity {
+            if scopes.is_empty() {
+                self.push_str("<root>");
+            } else {
+                for (index, scope) in scopes.iter().enumerate() {
+                    if index != 0 {
+                        self.push_str("::");
+                    }
+                    self.push_str(scope);
+                }
+            }
+            return;
+        }
+
+        let start = self.len;
+        let mut content_budget = capacity.saturating_sub(TRUNCATION_MARKER.len());
+        if scopes.is_empty() {
+            let _complete = self.push_utf8_prefix_with_budget("<root>", &mut content_budget);
+        } else {
+            for (index, scope) in scopes.iter().enumerate() {
+                if index != 0 && !self.push_utf8_prefix_with_budget("::", &mut content_budget) {
+                    break;
+                }
+                if !self.push_utf8_prefix_with_budget(scope, &mut content_budget) {
+                    break;
+                }
+            }
+        }
+        let written = self.len.saturating_sub(start);
+        let marker_len = TRUNCATION_MARKER
+            .len()
+            .min(capacity.saturating_sub(written));
+        if let Some(marker) = TRUNCATION_MARKER.as_bytes().get(..marker_len) {
+            let _ = self.push_bytes(marker);
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    fn push_utf8_prefix_with_budget(&mut self, value: &str, budget: &mut usize) -> bool {
+        let prefix_len = utf8_prefix_len(value, *budget);
+        if let Some(prefix) = value.as_bytes().get(..prefix_len) {
+            let _ = self.push_bytes(prefix);
+        }
+        *budget = budget.saturating_sub(prefix_len);
+        prefix_len == value.len()
     }
 
     fn push_origin(&mut self, file: &str) {

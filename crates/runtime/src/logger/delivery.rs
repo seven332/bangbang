@@ -207,6 +207,22 @@ impl Default for LoggerDeliveryConfig {
 }
 
 impl LoggerDeliveryConfig {
+    #[cfg(feature = "tracing")]
+    pub(super) const fn for_tool_tracing() -> Self {
+        const TOOL_TRACE_TIMEOUT: Duration = Duration::from_millis(100);
+
+        Self {
+            queue_capacity: 8,
+            receipt_timeout: TOOL_TRACE_TIMEOUT,
+            replacement_timeout: TOOL_TRACE_TIMEOUT,
+            emergency_poll_interval: TOOL_TRACE_TIMEOUT,
+            #[cfg(test)]
+            fail_spawn: false,
+            #[cfg(test)]
+            worker_observer: None,
+        }
+    }
+
     #[cfg(test)]
     pub(super) const fn for_test(queue_capacity: usize, timeout: Duration) -> Self {
         Self {
