@@ -17241,10 +17241,164 @@ mod macos_arm64 {
         }
     }
 
+    const SNAPSHOT_BLOCK_METRIC_FIELDS: [&str; 20] = [
+        "activate_fails",
+        "cfg_fails",
+        "no_avail_buffer",
+        "event_fails",
+        "execute_fails",
+        "invalid_reqs_count",
+        "flush_count",
+        "queue_event_count",
+        "rate_limiter_event_count",
+        "update_count",
+        "update_fails",
+        "read_bytes",
+        "write_bytes",
+        "read_count",
+        "write_count",
+        "read_agg",
+        "write_agg",
+        "rate_limiter_throttled_events",
+        "io_engine_throttled_events",
+        "remaining_reqs_count",
+    ];
+    const SNAPSHOT_BLOCK_COUNTER_FIELDS: [&str; 18] = [
+        "activate_fails",
+        "cfg_fails",
+        "no_avail_buffer",
+        "event_fails",
+        "execute_fails",
+        "invalid_reqs_count",
+        "flush_count",
+        "queue_event_count",
+        "rate_limiter_event_count",
+        "update_count",
+        "update_fails",
+        "read_bytes",
+        "write_bytes",
+        "read_count",
+        "write_count",
+        "rate_limiter_throttled_events",
+        "io_engine_throttled_events",
+        "remaining_reqs_count",
+    ];
+
+    fn assert_snapshot_block_metric_shape(metric: &serde_json::Value, context: &str) {
+        let object = metric
+            .as_object()
+            .unwrap_or_else(|| panic!("{context} block metric should be an object"));
+        assert_eq!(
+            object.len(),
+            SNAPSHOT_BLOCK_METRIC_FIELDS.len(),
+            "{context} should contain exactly the 24 Firecracker block leaves"
+        );
+        for field in SNAPSHOT_BLOCK_METRIC_FIELDS {
+            assert!(
+                object.contains_key(field),
+                "{context} should contain block field {field}"
+            );
+        }
+        for field in SNAPSHOT_BLOCK_COUNTER_FIELDS {
+            assert!(
+                object.get(field).is_some_and(serde_json::Value::is_u64),
+                "{context}.{field} should be an unsigned counter"
+            );
+        }
+        for aggregate in ["read_agg", "write_agg"] {
+            let aggregate = object
+                .get(aggregate)
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{context}.{aggregate} should be an object"));
+            assert_eq!(
+                aggregate.len(),
+                3,
+                "{context} latency shape should be exact"
+            );
+            for field in ["min_us", "max_us", "sum_us"] {
+                assert!(
+                    aggregate.get(field).is_some_and(serde_json::Value::is_u64),
+                    "{context} latency field {field} should be unsigned"
+                );
+            }
+        }
+    }
+
     fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {
         let output = fs::read_to_string(path).unwrap_or_else(|error| {
             panic!("{context} metrics {} should read: {error}", path.display())
         });
+        let values = output
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|error| panic!("{context} metrics line should parse: {error}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(!values.is_empty(), "{context} should emit metrics lines");
+        for (line_index, value) in values.iter().enumerate() {
+            let root = value.as_object().unwrap_or_else(|| {
+                panic!("{context} metrics line {line_index} should be an object")
+            });
+            let static_metric = root
+                .get("block")
+                .unwrap_or_else(|| panic!("{context} line {line_index} should contain block"));
+            assert_snapshot_block_metric_shape(
+                static_metric,
+                &format!("{context} line {line_index} block"),
+            );
+            for drive_id in ["primary", "data", "audit"] {
+                let key = format!("block_{drive_id}");
+                let metric = root
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("{context} line {line_index} should contain {key}"));
+                assert_snapshot_block_metric_shape(
+                    metric,
+                    &format!("{context} line {line_index} {key}"),
+                );
+            }
+            for field in SNAPSHOT_BLOCK_COUNTER_FIELDS {
+                let expected = ["primary", "data", "audit"]
+                    .into_iter()
+                    .map(|drive_id| {
+                        root[&format!("block_{drive_id}")][field]
+                            .as_u64()
+                            .expect("validated block counter should remain unsigned")
+                    })
+                    .fold(0_u64, u64::saturating_add);
+                assert_eq!(
+                    static_metric[field].as_u64(),
+                    Some(expected),
+                    "{context} line {line_index} static {field} should derive from configured drives"
+                );
+            }
+            for aggregate in ["read_agg", "write_agg"] {
+                let expected_sum = ["primary", "data", "audit"]
+                    .into_iter()
+                    .map(|drive_id| {
+                        root[&format!("block_{drive_id}")][aggregate]["sum_us"]
+                            .as_u64()
+                            .expect("validated block latency should remain unsigned")
+                    })
+                    .fold(0_u64, u64::saturating_add);
+                assert_eq!(static_metric[aggregate]["min_us"], 0);
+                assert_eq!(static_metric[aggregate]["max_us"], 0);
+                assert_eq!(static_metric[aggregate]["sum_us"], expected_sum);
+            }
+            for field in [
+                "activate_fails",
+                "cfg_fails",
+                "event_fails",
+                "execute_fails",
+                "invalid_reqs_count",
+                "update_fails",
+            ] {
+                assert_eq!(
+                    static_metric[field], 0,
+                    "{context} successful signed workload should not report {field}"
+                );
+            }
+        }
         for (drive_id, expect_write) in [("primary", true), ("data", true), ("audit", false)] {
             assert!(
                 snapshot_block_metric_total(path, drive_id, "queue_event_count") > 0,

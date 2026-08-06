@@ -9,218 +9,1106 @@
     {
       "field_id": "dynamic:block_{drive_id}.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.activate_fails` is assigned to #1841 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.activate_fails` is completed by #1841 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_activation_failure();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_activation_trait_error_is_generic_handler_error()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.cfg_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.cfg_fails` is assigned to #1841 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.cfg_fails` is completed by #1841 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_config_failure();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn ordinary_config_space_records_only_failed_accesses()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.event_fails` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.event_fails` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "metrics.record_event_failure_for_drive(config.drive_id());"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn block_metrics_record_signal_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.execute_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.execute_fails` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.execute_fails` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.flush_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.flush_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.flush_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.invalid_reqs_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.invalid_reqs_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.invalid_reqs_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.io_engine_throttled_events",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.io_engine_throttled_events` is assigned to #1841 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.io_engine_throttled_events` is completed by #1841 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_io_engine_throttled_event(&mut self) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.no_avail_buffer",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.no_avail_buffer` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.no_avail_buffer` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn finish_queue_pass(&mut self) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.queue_event_count` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.queue_event_count` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_queue_events(1);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.rate_limiter_event_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.rate_limiter_event_count` is assigned to #1841 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.rate_limiter_event_count` is completed by #1841 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_rate_limiter_event();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.rate_limiter_throttled_events",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.rate_limiter_throttled_events` is assigned to #1841 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.rate_limiter_throttled_events` is completed by #1841 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_rate_limited_request(&mut self, retry_after: Duration) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.read_agg.max_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.read_agg.max_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.read_agg.min_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.read_agg.min_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.read_agg.sum_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.read_agg.sum_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_bytes",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.read_bytes` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.read_bytes` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.read_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.read_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.remaining_reqs_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.remaining_reqs_count` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.remaining_reqs_count` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_remaining_requests(&mut self, remaining: u16) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.update_count",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.update_count` is assigned to #1841 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.update_count` is completed by #1841 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn record_block_device_update(&self, drive_id: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_block_update_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.update_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.update_fails` is assigned to #1841 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.update_fails` is completed by #1841 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn record_block_device_update_failure(&self, drive_id: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_block_update_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.write_agg.max_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.write_agg.max_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.write_agg.min_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.write_agg.min_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.write_agg.sum_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.write_agg.sum_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_bytes",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.write_bytes` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.write_bytes` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block_{drive_id}.write_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block_{drive_id}.write_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "dynamic:net_{iface_id}.activate_fails",
@@ -1143,218 +2031,1106 @@
     {
       "field_id": "static:block.activate_fails",
       "boundary": "activation",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.activate_fails` is assigned to #1841 at the `activation` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.activate_fails` is completed by #1841 at the `activation` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_activation_failure();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_activation_trait_error_is_generic_handler_error()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.cfg_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.cfg_fails` is assigned to #1841 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.cfg_fails` is completed by #1841 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_config_failure();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn ordinary_config_space_records_only_failed_accesses()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.event_fails",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.event_fails` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.event_fails` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "metrics.record_event_failure_for_drive(config.drive_id());"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/startup.rs",
+          "anchor": "fn block_metrics_record_signal_failure()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.execute_fails",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.execute_fails` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.execute_fails` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.flush_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.flush_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.flush_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.invalid_reqs_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.invalid_reqs_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.invalid_reqs_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.io_engine_throttled_events",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.io_engine_throttled_events` is assigned to #1841 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.io_engine_throttled_events` is completed by #1841 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_io_engine_throttled_event(&mut self) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.no_avail_buffer",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.no_avail_buffer` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.no_avail_buffer` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn finish_queue_pass(&mut self) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.queue_event_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.queue_event_count` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.queue_event_count` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_queue_events(1);"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.rate_limiter_event_count",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.rate_limiter_event_count` is assigned to #1841 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.rate_limiter_event_count` is completed by #1841 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "metrics.record_rate_limiter_event();"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.rate_limiter_throttled_events",
       "boundary": "rate-limiter",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.rate_limiter_throttled_events` is assigned to #1841 at the `rate-limiter` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.rate_limiter_throttled_events` is completed by #1841 at the `rate-limiter` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_rate_limited_request(&mut self, retry_after: Duration) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.read_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.read_agg.max_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.read_agg.max_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.read_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.read_agg.min_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.read_agg.min_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.read_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.read_agg.sum_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.read_agg.sum_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.read_bytes",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.read_bytes` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.read_bytes` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.read_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.read_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.read_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.remaining_reqs_count",
       "boundary": "queue-event",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.remaining_reqs_count` is assigned to #1841 at the `queue-event` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.remaining_reqs_count` is completed by #1841 at the `queue-event` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_remaining_requests(&mut self, remaining: u16) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.update_count",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.update_count` is assigned to #1841 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.update_count` is completed by #1841 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn record_block_device_update(&self, drive_id: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_block_update_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.update_fails",
       "boundary": "configuration",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.update_fails` is assigned to #1841 at the `configuration` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.update_fails` is completed by #1841 at the `configuration` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/vmm.rs",
+          "anchor": "fn record_block_device_update_failure(&self, drive_id: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_block_update_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.write_agg.max_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.write_agg.max_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.write_agg.max_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.write_agg.min_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.write_agg.min_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.write_agg.min_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.write_agg.sum_us",
       "boundary": "latency",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.write_agg.sum_us` is assigned to #1841 at the `latency` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.write_agg.sum_us` is completed by #1841 at the `latency` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_executes_read_and_publishes_used_element()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.write_bytes",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.write_bytes` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.write_bytes` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:block.write_count",
       "boundary": "data-path",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1841",
-      "rationale": "Pinned Firecracker field `block.write_count` is assigned to #1841 at the `data-path` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `block.write_count` is completed by #1841 at the `data-path` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn record_outcome(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct BlockDeviceMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn add_block_metrics(aggregate: &mut BlockMetrics, metrics: &BlockMetrics) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_snapshot_block_metrics(path: &Path, expect_limiter: bool, context: &str) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_queue_dispatch_execution_failure_still_publishes_completion()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_block_device_metrics_when_provided()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1841"
+        }
+      ]
     },
     {
       "field_id": "static:entropy.activate_fails",

@@ -26,8 +26,8 @@ use bangbang_runtime::block::{
     DriveIoEngine, DriveLiveUpdateMode, DriveRateLimiterConfig, DriveRuntimeMutationError,
     DriveUpdateError, PreparedBlockDevice, RuntimeBlockDeviceResource, VIRTIO_BLOCK_DEVICE_ID,
     VIRTIO_BLOCK_QUEUE_SIZES, VhostUserBlockConfigSignalError, VirtioBlockBackendKind,
-    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceNotificationError,
-    VirtioBlockLiveUpdateError, VirtioBlockSnapshotPersistenceBinding,
+    VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockLiveUpdateError,
+    VirtioBlockSnapshotPersistenceBinding, attach_block_metrics_to_mmio_handler,
 };
 use bangbang_runtime::boot::{
     BootSourceFiles, canonical_process_block_command_line,
@@ -1059,6 +1059,13 @@ impl HvfArm64BootPciDataDevices {
                 message: source.to_string(),
             }
         })?;
+        if prepared.device().backend_kind() == VirtioBlockBackendKind::File
+            && !prepared.attach_metrics(prepared_metrics.metrics())
+        {
+            return Err(DriveRuntimeMutationError::PrepareDevice {
+                message: "ordinary block metrics owner was rejected".to_string(),
+            });
+        }
         let interrupts = self.shared_msi_registry().map_err(|source| {
             DriveRuntimeMutationError::TerminalInsertion {
                 message: source.to_string(),
@@ -1353,7 +1360,7 @@ impl HvfArm64BootPciDataDevices {
         memory: &mut GuestMemory,
         update: HvfLiveBlockUpdate<'_>,
         async_runtime: &SharedBlockAsyncRuntime,
-        metrics: &SharedBlockDeviceMetricsRegistry,
+        _metrics: &SharedBlockDeviceMetricsRegistry,
     ) -> Result<(), DriveUpdateError> {
         let HvfLiveBlockUpdate {
             config,
@@ -1380,14 +1387,8 @@ impl HvfArm64BootPciDataDevices {
                 async_runtime,
             );
         match result {
-            Ok(dispatch) => {
-                metrics.record_queue_dispatch_for_drive(config.drive_id(), &dispatch);
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(source) => {
-                if let Some(dispatch) = source.completed_device_operation() {
-                    metrics.record_queue_dispatch_for_drive(config.drive_id(), dispatch);
-                }
                 let terminal = source.endpoint_error().is_some()
                     || source
                         .device_error()
@@ -1406,7 +1407,7 @@ impl HvfArm64BootPciDataDevices {
         &mut self,
         drive_id: &str,
         memory: &mut GuestMemory,
-        metrics: &SharedBlockDeviceMetricsRegistry,
+        _metrics: &SharedBlockDeviceMetricsRegistry,
     ) -> Result<(), DriveRuntimeMutationError> {
         if !self.runtime_hotplug {
             return Err(DriveRuntimeMutationError::PciNotEnabled);
@@ -1455,14 +1456,6 @@ impl HvfArm64BootPciDataDevices {
                 );
             }
             let retire = device.published.endpoint().retire_quiesced_async(memory);
-            match &retire {
-                Ok(dispatch) => metrics.record_queue_dispatch_for_drive(drive_id, dispatch),
-                Err(source) => {
-                    if let Some(dispatch) = source.completed_device_operation() {
-                        metrics.record_queue_dispatch_for_drive(drive_id, dispatch);
-                    }
-                }
-            }
             device
                 .published
                 .commit_prepared_teardown(&mut dispatcher, self.validation.bar_allocator_mut())
@@ -2058,7 +2051,7 @@ impl HvfArm64BootPciDataDevices {
     fn dispatch_block(
         &mut self,
         memory: &mut GuestMemory,
-        metrics: &SharedBlockDeviceMetricsRegistry,
+        _metrics: &SharedBlockDeviceMetricsRegistry,
     ) -> Option<Duration> {
         for device in &mut self.block {
             let mut retry_after = None;
@@ -2068,7 +2061,6 @@ impl HvfArm64BootPciDataDevices {
                 .dispatch_block_queue_notifications(memory);
             match &result {
                 Ok(dispatch) => {
-                    metrics.record_notification_dispatch_for_drive(&device.drive_id, dispatch);
                     retain_earliest_retry(
                         &mut retry_after,
                         dispatch
@@ -2080,7 +2072,6 @@ impl HvfArm64BootPciDataDevices {
                     }
                 }
                 Err(error) => {
-                    record_pci_block_operation_error(metrics, &device.drive_id, error);
                     if let Some(completed) = error.completed_device_operation() {
                         retain_earliest_retry(
                             &mut retry_after,
@@ -2916,7 +2907,6 @@ fn update_mmio_live_block_device(
             ),
         )?
     };
-    metrics.record_queue_dispatch_for_drive(config.drive_id(), &dispatch);
     let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
         DriveUpdateError::TerminalActiveSessionCommand {
             message: source.to_string(),
@@ -3106,32 +3096,6 @@ fn pci_memory_hotplug_configuration_updated(
 fn retain_earliest_retry(retained: &mut Option<Duration>, candidate: Option<Duration>) {
     if let Some(candidate) = candidate {
         *retained = Some(retained.map_or(candidate, |retained| retained.min(candidate)));
-    }
-}
-
-fn record_pci_block_operation_error(
-    metrics: &SharedBlockDeviceMetricsRegistry,
-    drive_id: &str,
-    error: &VirtioPciDeviceOperationError<
-        VirtioBlockDeviceNotificationError,
-        bangbang_runtime::block::VirtioBlockDeviceNotificationDispatch,
-    >,
-) {
-    if let Some(completed) = error.completed_device_operation() {
-        metrics.record_notification_dispatch_for_drive(drive_id, completed);
-    }
-    if let Some(source) = error.device_error() {
-        metrics.record_queue_events_for_drive(
-            drive_id,
-            usize_to_u64_saturating(source.drained_notifications().len()),
-        );
-        metrics.record_event_failure_for_drive(drive_id);
-        if let Some(completed) = source.completed_dispatch() {
-            metrics.record_queue_dispatch_for_drive(drive_id, completed);
-        }
-    }
-    if error.endpoint_error().is_some() {
-        metrics.record_event_failure_for_drive(drive_id);
     }
 }
 
@@ -13113,17 +13077,6 @@ fn capture_ready_storage_transaction_at_with_cancel(
                         .completed_block_dispatch()
                         .is_some_and(|dispatch| dispatch.needs_queue_interrupt()),
                 };
-                match &publication {
-                    Ok(dispatch) => block_device_metrics
-                        .record_queue_dispatch_for_drive(config.drive_id(), dispatch),
-                    Err(error) => {
-                        if let Some(dispatch) = error.completed_block_dispatch() {
-                            block_device_metrics
-                                .record_queue_dispatch_for_drive(config.drive_id(), dispatch);
-                        }
-                        block_device_metrics.record_event_failure_for_drive(config.drive_id());
-                    }
-                }
                 if needs_queue_interrupt {
                     mmio_block_interrupts.push(CaptureReadyMmioBlockInterrupt {
                         config_index: async_owner.config_index,
@@ -13161,22 +13114,16 @@ fn capture_ready_storage_transaction_at_with_cancel(
                 let mut delivered = false;
                 match &publication {
                     Ok(dispatch) => {
-                        block_device_metrics
-                            .record_queue_dispatch_for_drive(config.drive_id(), dispatch);
                         delivered = dispatch.needs_queue_interrupt();
                     }
                     Err(error) => {
-                        if let Some(dispatch) = error.completed_device_operation() {
-                            block_device_metrics
-                                .record_queue_dispatch_for_drive(config.drive_id(), dispatch);
-                        } else if let Some(source) = error.device_error() {
+                        if error.completed_device_operation().is_none()
+                            && let Some(source) = error.device_error()
+                        {
                             let dispatch = source.completed_dispatch();
-                            block_device_metrics
-                                .record_queue_dispatch_for_drive(config.drive_id(), dispatch);
                             delivered = error.endpoint_error().is_none()
                                 && dispatch.needs_queue_interrupt();
                         }
-                        block_device_metrics.record_event_failure_for_drive(config.drive_id());
                     }
                 }
                 if delivered {
@@ -16527,13 +16474,16 @@ impl HvfArm64BootSession<'_> {
             match HvfGicSpiSignaler::from_metadata(&self.gic) {
                 Ok(signaler) => signal_block_queue_interrupts(dispatches, &signaler),
                 Err(source) => {
+                    record_block_unavailable_signal_metrics(
+                        &self.block_device_metrics,
+                        dispatches.as_slice(),
+                    );
                     Err(HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source })
                 }
             }
         };
-        match &result {
-            Ok(dispatches) => record_block_signal_metrics(&self.block_device_metrics, dispatches),
-            Err(_) => self.block_device_metrics.record_event_failure(),
+        if let Ok(dispatches) = &result {
+            record_block_signal_metrics(&self.block_device_metrics, dispatches);
         }
         observe_block_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
@@ -16995,8 +16945,15 @@ fn snapshot_v2_root_identity_and_retry_deadline(
 fn install_snapshot_v2_mmio_root(
     platform: &RestoredHvfSnapshotV2Platform,
     root: bangbang_runtime::snapshot_device_v2::PreparedSnapshotV2MmioRoot,
+    metrics: &SharedBlockDeviceMetricsRegistry,
 ) -> Result<Arm64BootBlockDevice, HvfSnapshotV2RootRestoreFailure> {
-    let (drive_id, _partuuid, _retry, region, interrupt_line, handler) = root.into_parts();
+    let (drive_id, _partuuid, _retry, region, interrupt_line, mut handler) = root.into_parts();
+    let device_metrics = metrics
+        .per_drive(&drive_id)
+        .ok_or(HvfSnapshotV2RootRestoreFailure::ResourcePlan)?;
+    if !handler.attach_block_metrics(device_metrics) {
+        return Err(HvfSnapshotV2RootRestoreFailure::ResourcePlan);
+    }
     let mut dispatcher = platform
         .mmio_dispatcher()
         .lock()
@@ -17021,7 +16978,7 @@ fn install_snapshot_v2_mmio_root(
 
 fn prepare_snapshot_v2_pci_root_owner(
     platform: &RestoredHvfSnapshotV2Platform,
-    root: PreparedSnapshotV2PciRoot,
+    mut root: PreparedSnapshotV2PciRoot,
     resources: HvfSnapshotV2RootResourcePlan,
     layout: &GuestMemoryLayout,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
@@ -17140,6 +17097,12 @@ fn prepare_snapshot_v2_pci_root_owner(
         return Err(HvfSnapshotV2RootRestoreFailure::ResourcePlan);
     };
 
+    let root_metrics = block_device_metrics
+        .per_drive(root.drive_id())
+        .ok_or(HvfSnapshotV2RootRestoreFailure::ResourcePlan)?;
+    if !root.attach_metrics(root_metrics) {
+        return Err(HvfSnapshotV2RootRestoreFailure::ResourcePlan);
+    }
     let interrupts = manager
         .shared_msi_registry()
         .map_err(HvfSnapshotV2RootRestoreFailure::PciData)?;
@@ -17147,9 +17110,6 @@ fn prepare_snapshot_v2_pci_root_owner(
         .prepare_endpoint(bar_region_id, interrupts.registry())
         .map_err(HvfSnapshotV2RootRestoreFailure::PciEndpoint)?;
     let (drive_id, _partuuid, _retry, origin, endpoint) = endpoint.into_parts();
-    let metrics_lease = block_device_metrics
-        .claim_drive_lease(&drive_id)
-        .map_err(HvfSnapshotV2RootRestoreFailure::Metrics)?;
     let segment = manager.validation.segment().clone();
     let published = {
         let mut dispatcher = manager
@@ -17165,6 +17125,9 @@ fn prepare_snapshot_v2_pci_root_owner(
             )
             .map_err(HvfSnapshotV2RootRestoreFailure::PciPublication)?
     };
+    let metrics_lease = block_device_metrics
+        .claim_drive_lease(&drive_id)
+        .map_err(HvfSnapshotV2RootRestoreFailure::Metrics)?;
     manager.block.push(HvfArm64BootPciBlockDevice {
         drive_id,
         is_root_device: true,
@@ -24503,23 +24466,24 @@ impl OwnedHvfArm64BootSession {
         match transport {
             PreparedSnapshotV2RootTransport::Mmio(root) => {
                 let interrupt_line = root.interrupt_line();
-                let device = match install_snapshot_v2_mmio_root(&platform, root) {
-                    Ok(device) => device,
-                    Err(failure) => {
-                        let stage = match &failure {
-                            HvfSnapshotV2RootRestoreFailure::MmioRegion(_) => {
-                                HvfSnapshotV2RootRestoreStage::MmioRegion
-                            }
-                            _ => HvfSnapshotV2RootRestoreStage::MmioHandler,
-                        };
-                        return Err(failed_snapshot_v2_root_after_platform(
-                            platform,
-                            stage,
-                            failure,
-                            &mut pci_data_devices,
-                        ));
-                    }
-                };
+                let device =
+                    match install_snapshot_v2_mmio_root(&platform, root, &block_device_metrics) {
+                        Ok(device) => device,
+                        Err(failure) => {
+                            let stage = match &failure {
+                                HvfSnapshotV2RootRestoreFailure::MmioRegion(_) => {
+                                    HvfSnapshotV2RootRestoreStage::MmioRegion
+                                }
+                                _ => HvfSnapshotV2RootRestoreStage::MmioHandler,
+                            };
+                            return Err(failed_snapshot_v2_root_after_platform(
+                                platform,
+                                stage,
+                                failure,
+                                &mut pci_data_devices,
+                            ));
+                        }
+                    };
                 block_devices.push(device);
                 block_interrupt_lines.push(interrupt_line);
             }
@@ -24853,8 +24817,18 @@ impl OwnedHvfArm64BootSession {
                     region,
                     interrupt_line,
                     _async_generation,
-                    handler,
+                    mut handler,
                 ) = record.into_parts();
+                let device_metrics = block_device_metrics.per_drive(&drive_id).ok_or((
+                    HvfSnapshotV2MultiBlockMmioRestoreStage::Registration { index },
+                    HvfSnapshotV2MultiBlockMmioRestoreFailure::ResourcePlan,
+                ))?;
+                if !handler.attach_block_metrics(device_metrics) {
+                    return Err((
+                        HvfSnapshotV2MultiBlockMmioRestoreStage::Registration { index },
+                        HvfSnapshotV2MultiBlockMmioRestoreFailure::ResourcePlan,
+                    ));
+                }
                 let request = [MmioRegionRequest::new(
                     region.range().start(),
                     region.range().size(),
@@ -25561,8 +25535,22 @@ impl OwnedHvfArm64BootSession {
                     region,
                     interrupt_line,
                     _async_generation,
-                    handler,
+                    mut handler,
                 ) = record.into_parts();
+                let device_metrics = block_device_metrics.per_drive(&drive_id).ok_or((
+                    HvfSnapshotV2StorageMmioRestoreStage::Registration {
+                        index: registration_index,
+                    },
+                    HvfSnapshotV2StorageMmioRestoreFailure::ResourcePlan,
+                ))?;
+                if !handler.attach_block_metrics(device_metrics) {
+                    return Err((
+                        HvfSnapshotV2StorageMmioRestoreStage::Registration {
+                            index: registration_index,
+                        },
+                        HvfSnapshotV2StorageMmioRestoreFailure::ResourcePlan,
+                    ));
+                }
                 let request = [MmioRegionRequest::new(
                     region.range().start(),
                     region.range().size(),
@@ -26502,11 +26490,24 @@ impl OwnedHvfArm64BootSession {
             });
         }
 
-        for (index, (record, planned)) in block_records
+        for (index, (mut record, planned)) in block_records
             .into_iter()
             .zip(pci_plan.block_records())
             .enumerate()
         {
+            let device_metrics = match block_device_metrics.per_drive(record.drive_id()) {
+                Some(metrics) => metrics,
+                None => fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                ),
+            };
+            if !record.attach_metrics(device_metrics) {
+                fail_after_platform!(
+                    HvfSnapshotV2StoragePciRestoreStage::EndpointPreparation { index },
+                    HvfSnapshotV2StoragePciRestoreFailure::ResourcePlan
+                );
+            }
             let manager = match pci_data_devices.as_mut() {
                 Some(manager) => manager,
                 None => fail_after_platform!(
@@ -27769,9 +27770,19 @@ impl OwnedHvfArm64BootSession {
                 HvfSnapshotV2MultiBlockPciRestoreStage::PciRoutes,
                 HvfSnapshotV2MultiBlockPciRestoreFailure::ResourcePlan,
             ))?;
-            for (index, (record, planned)) in
+            for (index, (mut record, planned)) in
                 records.into_iter().zip(pci_plan.records()).enumerate()
             {
+                let device_metrics = block_device_metrics.per_drive(record.drive_id()).ok_or((
+                    HvfSnapshotV2MultiBlockPciRestoreStage::EndpointPreparation { index },
+                    HvfSnapshotV2MultiBlockPciRestoreFailure::ResourcePlan,
+                ))?;
+                if !record.attach_metrics(device_metrics) {
+                    return Err((
+                        HvfSnapshotV2MultiBlockPciRestoreStage::EndpointPreparation { index },
+                        HvfSnapshotV2MultiBlockPciRestoreFailure::ResourcePlan,
+                    ));
+                }
                 let mut interrupts = manager.shared_msi_registry().map_err(|source| {
                     (
                         HvfSnapshotV2MultiBlockPciRestoreStage::EndpointPreparation { index },
@@ -28092,7 +28103,7 @@ impl OwnedHvfArm64BootSession {
         );
 
         let InstalledSnapshotV1RuntimeParts {
-            mmio_dispatcher,
+            mut mmio_dispatcher,
             mut runtime_resources,
             drive_config,
             block_retry,
@@ -28309,6 +28320,35 @@ impl OwnedHvfArm64BootSession {
                     &mut backend,
                 ));
             }
+        }
+
+        let mut block_metrics_binding_failed = false;
+        for device in &runtime_resources.block_devices {
+            let drive_id = device.registration.drive_id();
+            let Some(device_metrics) = block_device_metrics.per_drive(drive_id) else {
+                block_metrics_binding_failed = true;
+                break;
+            };
+            match attach_block_metrics_to_mmio_handler(
+                &mut mmio_dispatcher,
+                device.registration.region_id(),
+                device_metrics,
+            ) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    block_metrics_binding_failed = true;
+                    break;
+                }
+            }
+        }
+        if block_metrics_binding_failed {
+            return Err(failed_snapshot_v1_restore_after_destination_commit(
+                HvfSnapshotV1RestoreStage::AssembleSession,
+                HvfSnapshotV1RestoreFailure::InvalidRuntime,
+                &mut block_retry_wakeup_scheduler,
+                &mut runner,
+                &mut backend,
+            ));
         }
 
         let runner = match runner.take() {
@@ -30552,13 +30592,16 @@ impl OwnedHvfArm64BootSession {
             match HvfGicSpiSignaler::from_metadata(&self.gic) {
                 Ok(signaler) => signal_block_queue_interrupts(dispatches, &signaler),
                 Err(source) => {
+                    record_block_unavailable_signal_metrics(
+                        &self.block_device_metrics,
+                        dispatches.as_slice(),
+                    );
                     Err(HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source })
                 }
             }
         };
-        match &result {
-            Ok(dispatches) => record_block_signal_metrics(&self.block_device_metrics, dispatches),
-            Err(_) => self.block_device_metrics.record_event_failure(),
+        if let Ok(dispatches) = &result {
+            record_block_signal_metrics(&self.block_device_metrics, dispatches);
         }
         observe_block_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
@@ -34819,10 +34862,6 @@ fn balloon_update_error_from_display(source: impl fmt::Display) -> BalloonUpdate
     }
 }
 
-fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 fn record_block_dispatch_metrics(
     metrics: &SharedBlockDeviceMetricsRegistry,
@@ -34842,21 +34881,19 @@ fn record_block_runtime_dispatch_metrics<'a>(
 ) {
     for dispatch in dispatches {
         let drive_id = dispatch.device().registration.drive_id();
-        if let Some(dispatched) = dispatch.outcome().dispatched() {
-            metrics.record_notification_dispatch_for_drive(drive_id, dispatched);
-        }
-        if let Some(source) = dispatch.outcome().dispatch_error() {
-            metrics.record_queue_events_for_drive(
-                drive_id,
-                usize_to_u64_saturating(source.drained_notifications().len()),
-            );
-            metrics.record_event_failure_for_drive(drive_id);
-            if let Some(completed) = source.completed_dispatch() {
-                metrics.record_queue_dispatch_for_drive(drive_id, completed);
-            }
-        }
         if dispatch.outcome().handler_lookup_error().is_some() {
             metrics.record_event_failure_for_drive(drive_id);
+        }
+    }
+}
+
+fn record_block_unavailable_signal_metrics(
+    metrics: &SharedBlockDeviceMetricsRegistry,
+    dispatches: &[Arm64BootBlockNotificationDispatch],
+) {
+    for dispatch in dispatches {
+        if dispatch.needs_queue_interrupt() {
+            metrics.record_event_failure_for_drive(dispatch.device().registration.drive_id());
         }
     }
 }
@@ -36976,6 +37013,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
     let vsock_device_metrics = SharedVsockDeviceMetrics::default();
     let entropy_device_metrics = SharedEntropyDeviceMetrics::default();
     bind_mmio_balloon_transport_metrics(&runtime, &mmio_dispatcher, &balloon_device_metrics)?;
+    bind_mmio_block_transport_metrics(&runtime, &mmio_dispatcher, &block_device_metrics)?;
     bind_mmio_vsock_transport_metrics(&runtime, &mmio_dispatcher, &vsock_device_metrics)?;
     bind_mmio_entropy_transport_metrics(&runtime, &mmio_dispatcher, &entropy_device_metrics)?;
     bind_mmio_pmem_transport_metrics(&runtime, &mmio_dispatcher, &pmem_device_metrics)?;
@@ -37584,6 +37622,39 @@ fn bind_mmio_pmem_transport_metrics(
     Ok(())
 }
 
+fn bind_mmio_block_transport_metrics(
+    runtime: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    metrics: &SharedBlockDeviceMetricsRegistry,
+) -> Result<(), HvfArm64BootSessionError> {
+    let mut dispatcher =
+        dispatcher
+            .lock()
+            .map_err(|_| HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "block",
+                message: "MMIO dispatcher is unavailable".to_string(),
+            })?;
+    for device in &runtime.block_devices {
+        let drive_id = device.registration.drive_id();
+        let device_metrics = metrics.per_drive(drive_id).ok_or_else(|| {
+            HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "block",
+                message: format!("missing metrics generation for MMIO block device {drive_id}"),
+            }
+        })?;
+        attach_block_metrics_to_mmio_handler(
+            &mut dispatcher,
+            device.registration.region_id(),
+            device_metrics,
+        )
+        .map_err(|source| HvfArm64BootSessionError::DeviceMetricsBinding {
+            kind: "block",
+            message: format!("failed to resolve MMIO block device {drive_id}: {source}"),
+        })?;
+    }
+    Ok(())
+}
+
 fn bind_mmio_network_transport_metrics(
     runtime: &Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
@@ -37882,21 +37953,23 @@ fn prepare_pci_data_devices(
             endpoint_index += 1;
         }
 
-        for prepared in blocks {
-            let (drive_id, is_root_device, config_space, device) = prepared.into_parts();
-            let metrics_lease = if all_virtio {
-                Some(
-                    block_device_metrics
-                        .claim_drive_lease(&drive_id)
-                        .map_err(|source| {
-                            HvfArm64BootPciDataError::new(format!(
-                                "failed to claim PCI block metrics ownership: {source}"
-                            ))
-                        })?,
-                )
-            } else {
-                None
-            };
+        for mut prepared in blocks {
+            let drive_id = prepared.drive_id().to_string();
+            if prepared.device().backend_kind() == VirtioBlockBackendKind::File {
+                let device_metrics =
+                    block_device_metrics.per_drive(&drive_id).ok_or_else(|| {
+                        HvfArm64BootPciDataError::new(format!(
+                            "missing PCI block metrics generation for {drive_id}"
+                        ))
+                    })?;
+                if !prepared.attach_metrics(device_metrics) {
+                    return Err(HvfArm64BootPciDataError::new(format!(
+                        "ordinary PCI block metrics owner was rejected for {drive_id}"
+                    )));
+                }
+            }
+            let (published_drive_id, is_root_device, config_space, device) = prepared.into_parts();
+            debug_assert_eq!(published_drive_id, drive_id);
             let interrupts = manager.shared_msi_registry()?;
             let region_id = pci_data_region_id(endpoint_index)?;
             let published = {
@@ -37922,6 +37995,19 @@ fn prepare_pci_data_devices(
                         "failed to publish PCI block endpoint {drive_id}: {source}"
                     ))
                 })?
+            };
+            let metrics_lease = if all_virtio {
+                Some(
+                    block_device_metrics
+                        .claim_drive_lease(&drive_id)
+                        .map_err(|source| {
+                            HvfArm64BootPciDataError::new(format!(
+                                "failed to claim PCI block metrics ownership: {source}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
             };
             manager.block.push(HvfArm64BootPciBlockDevice {
                 drive_id,
@@ -42892,6 +42978,27 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn bind_test_block_metrics(
+        runtime: &Arm64BootRuntimeResources,
+        dispatcher: &mut MmioDispatcher,
+        metrics: &SharedBlockDeviceMetricsRegistry,
+    ) {
+        for device in &runtime.block_devices {
+            let drive_id = device.registration.drive_id();
+            let owner = metrics
+                .per_drive(drive_id)
+                .expect("test block metrics owner should exist");
+            assert!(
+                super::attach_block_metrics_to_mmio_handler(
+                    dispatcher,
+                    device.registration.region_id(),
+                    owner,
+                )
+                .expect("test block handler should resolve")
+            );
+        }
+    }
+
     fn boot_runtime_with_pmem(
         devices: &[&str],
     ) -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
@@ -45338,6 +45445,8 @@ mod tests {
             ("rootfs", payload.as_slice(), true),
             ("data", payload.as_slice(), false),
         ]);
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
+        bind_test_block_metrics(&runtime, &mut mmio_dispatcher, &metrics);
         configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 1, TEST_USED_RING);
         write_queued_read_request(&mut memory);
         notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 1);
@@ -45346,8 +45455,6 @@ mod tests {
         let (_, sink) = RecordingSink::successful();
         let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
             .expect("queued dispatch should collect");
-        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
-
         super::record_block_dispatch_metrics(&metrics, &result);
 
         let aggregate = metrics.aggregate_snapshot();
@@ -45363,14 +45470,16 @@ mod tests {
         );
         assert_eq!(
             metrics.per_drive_snapshot(),
-            BlockDeviceMetricsByDrive::new().with_drive_metrics(
-                "data",
-                BlockDeviceMetrics::default()
-                    .with_queue_event_count(1)
-                    .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
-                    .with_read_count(1)
-                    .with_read_agg(read_agg),
-            )
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics("rootfs", BlockDeviceMetrics::default())
+                .with_drive_metrics(
+                    "data",
+                    BlockDeviceMetrics::default()
+                        .with_queue_event_count(1)
+                        .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
+                        .with_read_count(1)
+                        .with_read_agg(read_agg),
+                )
         );
     }
 
@@ -45378,6 +45487,8 @@ mod tests {
     fn block_metrics_preserve_partial_dispatch_before_signal() {
         let (mut memory, mut runtime, mut mmio_dispatcher) =
             boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs"]);
+        bind_test_block_metrics(&runtime, &mut mmio_dispatcher, &metrics);
         configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
         write_partially_invalid_queued_flush_request(&mut memory);
         notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
@@ -45386,25 +45497,23 @@ mod tests {
         let (_, sink) = RecordingSink::successful();
         let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
             .expect("partial dispatch result should collect");
-        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs"]);
-
         super::record_block_dispatch_metrics(&metrics, &result);
 
         assert_eq!(
             metrics.aggregate_snapshot(),
             BlockDeviceMetrics::default()
-                .with_event_fails(1)
                 .with_flush_count(1)
                 .with_queue_event_count(1)
+                .with_remaining_reqs_count(1)
         );
         assert_eq!(
             metrics.per_drive_snapshot(),
             BlockDeviceMetricsByDrive::new().with_drive_metrics(
                 "rootfs",
                 BlockDeviceMetrics::default()
-                    .with_event_fails(1)
                     .with_flush_count(1)
-                    .with_queue_event_count(1),
+                    .with_queue_event_count(1)
+                    .with_remaining_reqs_count(1),
             )
         );
     }
@@ -45414,6 +45523,8 @@ mod tests {
         let payload = vec![0x74; VIRTIO_BLOCK_SECTOR_SIZE as usize];
         let (mut memory, mut runtime, mut mmio_dispatcher) =
             boot_runtime_with_drives(&[("rootfs", payload.as_slice(), true)]);
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs"]);
+        bind_test_block_metrics(&runtime, &mut mmio_dispatcher, &metrics);
         configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
         write_queued_read_request(&mut memory);
         notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
@@ -45422,8 +45533,6 @@ mod tests {
         let (_, sink) = RecordingSink::failing("injected signal failure");
         let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
             .expect("signal failure should stay per-device");
-        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs"]);
-
         super::record_block_dispatch_metrics(&metrics, &result);
 
         let aggregate = metrics.aggregate_snapshot();

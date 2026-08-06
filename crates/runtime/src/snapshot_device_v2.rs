@@ -17,6 +17,7 @@ use crate::block::{
 use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatus, GuestInterruptLine};
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
 use crate::message_interrupt::GuestMessageInterruptRegistry;
+use crate::metrics::SharedBlockDeviceMetrics;
 use crate::mmio::{MmioRegion, MmioRegionId};
 use crate::pci::{
     PCI_BAR64_SIZE, PCI_BAR64_START, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
@@ -1333,8 +1334,8 @@ pub struct PreparedSnapshotV2RootBlock {
 
 impl PreparedSnapshotV2RootBlock {
     /// Returns the canonical block configuration space.
-    pub const fn config_space(&self) -> VirtioBlockConfigSpace {
-        self.config_space
+    pub fn config_space(&self) -> VirtioBlockConfigSpace {
+        self.config_space.clone()
     }
 
     /// Returns the prepared pathless block device.
@@ -1545,6 +1546,15 @@ pub struct PreparedSnapshotV2PciRoot {
 }
 
 impl PreparedSnapshotV2PciRoot {
+    /// Attaches a fresh destination-local ordinary block metrics owner.
+    pub fn attach_metrics(&mut self, metrics: SharedBlockDeviceMetrics) -> bool {
+        if !self.device.attach_metrics(metrics.clone()) {
+            return false;
+        }
+        self.config_space.attach_metrics(metrics);
+        true
+    }
+
     /// Returns the stable drive identifier.
     pub fn drive_id(&self) -> &str {
         &self.drive_id

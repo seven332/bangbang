@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::balloon::{VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDiscardOutcome};
@@ -1275,6 +1275,9 @@ impl PutApiRequestMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockDeviceMetrics {
     config_change_time_us: Option<u64>,
+    activate_fails: u64,
+    cfg_fails: u64,
+    no_avail_buffer: u64,
     event_fails: u64,
     execute_fails: u64,
     invalid_reqs_count: u64,
@@ -1291,6 +1294,7 @@ pub struct BlockDeviceMetrics {
     write_count: u64,
     read_agg: VirtioBlockLatencyAggregate,
     write_agg: VirtioBlockLatencyAggregate,
+    remaining_reqs_count: u64,
 }
 
 impl BlockDeviceMetrics {
@@ -1301,6 +1305,9 @@ impl BlockDeviceMetrics {
             } else {
                 self.config_change_time_us
             },
+            activate_fails: incremental_delta(self.activate_fails, previous.activate_fails),
+            cfg_fails: incremental_delta(self.cfg_fails, previous.cfg_fails),
+            no_avail_buffer: incremental_delta(self.no_avail_buffer, previous.no_avail_buffer),
             event_fails: incremental_delta(self.event_fails, previous.event_fails),
             execute_fails: incremental_delta(self.execute_fails, previous.execute_fails),
             invalid_reqs_count: incremental_delta(
@@ -1332,11 +1339,18 @@ impl BlockDeviceMetrics {
             write_count: incremental_delta(self.write_count, previous.write_count),
             read_agg: block_latency_delta(self.read_agg, previous.read_agg),
             write_agg: block_latency_delta(self.write_agg, previous.write_agg),
+            remaining_reqs_count: incremental_delta(
+                self.remaining_reqs_count,
+                previous.remaining_reqs_count,
+            ),
         }
     }
 
     pub const fn is_empty(self) -> bool {
         self.config_change_time_us.is_none()
+            && self.activate_fails == 0
+            && self.cfg_fails == 0
+            && self.no_avail_buffer == 0
             && self.event_fails == 0
             && self.execute_fails == 0
             && self.invalid_reqs_count == 0
@@ -1353,10 +1367,23 @@ impl BlockDeviceMetrics {
             && self.write_count == 0
             && self.read_agg.is_empty()
             && self.write_agg.is_empty()
+            && self.remaining_reqs_count == 0
     }
 
     pub const fn config_change_time_us(self) -> Option<u64> {
         self.config_change_time_us
+    }
+
+    pub const fn activate_fails(self) -> u64 {
+        self.activate_fails
+    }
+
+    pub const fn cfg_fails(self) -> u64 {
+        self.cfg_fails
+    }
+
+    pub const fn no_avail_buffer(self) -> u64 {
+        self.no_avail_buffer
     }
 
     pub const fn event_fails(self) -> u64 {
@@ -1421,6 +1448,25 @@ impl BlockDeviceMetrics {
 
     pub const fn write_agg(self) -> VirtioBlockLatencyAggregate {
         self.write_agg
+    }
+
+    pub const fn remaining_reqs_count(self) -> u64 {
+        self.remaining_reqs_count
+    }
+
+    pub const fn with_activate_fails(mut self, activate_fails: u64) -> Self {
+        self.activate_fails = activate_fails;
+        self
+    }
+
+    pub const fn with_cfg_fails(mut self, cfg_fails: u64) -> Self {
+        self.cfg_fails = cfg_fails;
+        self
+    }
+
+    pub const fn with_no_avail_buffer(mut self, no_avail_buffer: u64) -> Self {
+        self.no_avail_buffer = no_avail_buffer;
+        self
     }
 
     pub const fn with_event_fails(mut self, event_fails: u64) -> Self {
@@ -1514,12 +1560,20 @@ impl BlockDeviceMetrics {
         self
     }
 
+    pub const fn with_remaining_reqs_count(mut self, remaining_reqs_count: u64) -> Self {
+        self.remaining_reqs_count = remaining_reqs_count;
+        self
+    }
+
     const fn merged_with(self, other: Self) -> Self {
         Self {
             config_change_time_us: match other.config_change_time_us {
                 Some(value) => Some(value),
                 None => self.config_change_time_us,
             },
+            activate_fails: self.activate_fails.saturating_add(other.activate_fails),
+            cfg_fails: self.cfg_fails.saturating_add(other.cfg_fails),
+            no_avail_buffer: self.no_avail_buffer.saturating_add(other.no_avail_buffer),
             event_fails: self.event_fails.saturating_add(other.event_fails),
             execute_fails: self.execute_fails.saturating_add(other.execute_fails),
             invalid_reqs_count: self
@@ -1546,13 +1600,45 @@ impl BlockDeviceMetrics {
             write_count: self.write_count.saturating_add(other.write_count),
             read_agg: self.read_agg.merged_with(other.read_agg),
             write_agg: self.write_agg.merged_with(other.write_agg),
+            remaining_reqs_count: self
+                .remaining_reqs_count
+                .saturating_add(other.remaining_reqs_count),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct BlockDeviceMetricsByDrive {
-    metrics: BTreeMap<String, BlockDeviceMetrics>,
+    metrics: BTreeMap<String, BlockDeviceMetricsByDriveEntry>,
+}
+
+impl PartialEq for BlockDeviceMetricsByDrive {
+    fn eq(&self, other: &Self) -> bool {
+        self.metrics.len() == other.metrics.len()
+            && self.metrics.iter().all(|(drive_id, entry)| {
+                other
+                    .metrics
+                    .get(drive_id)
+                    .is_some_and(|other| entry.metrics == other.metrics)
+            })
+    }
+}
+
+impl Eq for BlockDeviceMetricsByDrive {}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct BlockDeviceMetricsByDriveEntry {
+    generation: u64,
+    metrics: BlockDeviceMetrics,
+}
+
+impl fmt::Debug for BlockDeviceMetricsByDriveEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockDeviceMetricsByDriveEntry")
+            .field("metrics", &self.metrics)
+            .finish()
+    }
 }
 
 impl BlockDeviceMetricsByDrive {
@@ -1576,22 +1662,41 @@ impl BlockDeviceMetricsByDrive {
         drive_id: impl Into<String>,
         metrics: BlockDeviceMetrics,
     ) {
+        self.insert_drive_metrics_at_generation(drive_id, 0, metrics);
+    }
+
+    fn insert_drive_metrics_at_generation(
+        &mut self,
+        drive_id: impl Into<String>,
+        generation: u64,
+        metrics: BlockDeviceMetrics,
+    ) {
         self.metrics
             .entry(drive_id.into())
-            .and_modify(|existing| *existing = existing.merged_with(metrics))
-            .or_insert(metrics);
+            .and_modify(|existing| {
+                if existing.generation == generation {
+                    existing.metrics = existing.metrics.merged_with(metrics);
+                } else {
+                    *existing = BlockDeviceMetricsByDriveEntry {
+                        generation,
+                        metrics,
+                    };
+                }
+            })
+            .or_insert(BlockDeviceMetricsByDriveEntry {
+                generation,
+                metrics,
+            });
     }
 
     pub fn is_empty(&self) -> bool {
-        self.metrics
-            .values()
-            .all(|metrics| BlockDeviceMetrics::is_empty(*metrics))
+        self.metrics.values().all(|entry| entry.metrics.is_empty())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, BlockDeviceMetrics)> {
         self.metrics
             .iter()
-            .map(|(drive_id, metrics)| (drive_id.as_str(), *metrics))
+            .map(|(drive_id, entry)| (drive_id.as_str(), entry.metrics))
     }
 
     fn delta_since(&self, previous: Option<&Self>) -> Self {
@@ -1601,17 +1706,24 @@ impl BlockDeviceMetricsByDrive {
             .map(|(drive_id, current)| {
                 let previous = previous
                     .and_then(|metrics| metrics.metrics.get(drive_id))
-                    .copied()
+                    .filter(|previous| previous.generation == current.generation)
+                    .map(|previous| previous.metrics)
                     .unwrap_or_default();
-                (drive_id.clone(), current.delta_since(previous))
+                (
+                    drive_id.clone(),
+                    BlockDeviceMetricsByDriveEntry {
+                        generation: current.generation,
+                        metrics: current.metrics.delta_since(previous),
+                    },
+                )
             })
             .collect();
         Self { metrics }
     }
 
     fn merged_with(mut self, other: Self) -> Self {
-        for (drive_id, metrics) in other.metrics {
-            self.insert_drive_metrics(drive_id, metrics);
+        for (drive_id, entry) in other.metrics {
+            self.insert_drive_metrics_at_generation(drive_id, entry.generation, entry.metrics);
         }
         self
     }
@@ -1619,262 +1731,130 @@ impl BlockDeviceMetricsByDrive {
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedBlockDeviceMetrics {
-    inner: Arc<SharedBlockDeviceMetricsInner>,
+    inner: Arc<Mutex<BlockDeviceMetrics>>,
 }
 
 impl SharedBlockDeviceMetrics {
+    pub fn record_observation(&self, observation: BlockDeviceMetrics) {
+        if observation.is_empty() {
+            return;
+        }
+        let mut metrics = lock_block_device_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
+    }
+
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn record_notification_dispatch(&self, dispatch: &VirtioBlockDeviceNotificationDispatch) {
-        self.record_queue_events(usize_to_u64_saturating(
-            dispatch.drained_notifications().len(),
-        ));
+        self.record_queue_events(u64::from(!dispatch.drained_notifications().is_empty()));
         if let Some(queue_dispatch) = dispatch.queue_dispatch() {
             self.record_queue_dispatch(queue_dispatch);
         }
     }
 
     pub fn record_queue_dispatch(&self, dispatch: &VirtioBlockQueueDispatch) {
-        self.record_reads(
-            usize_to_u64_saturating(dispatch.read_count()),
-            dispatch.read_bytes(),
-        );
-        self.record_writes(
-            usize_to_u64_saturating(dispatch.write_count()),
-            dispatch.write_bytes(),
-        );
+        let mut observation = BlockDeviceMetrics::default()
+            .with_read_count(usize_to_u64_saturating(dispatch.read_count()))
+            .with_read_bytes(dispatch.read_bytes())
+            .with_write_count(usize_to_u64_saturating(dispatch.write_count()))
+            .with_write_bytes(dispatch.write_bytes())
+            .with_flush_count(usize_to_u64_saturating(dispatch.flush_count()))
+            .with_rate_limiter_throttled_events(usize_to_u64_saturating(
+                dispatch.rate_limiter_throttled_requests(),
+            ))
+            .with_io_engine_throttled_events(usize_to_u64_saturating(
+                dispatch.io_engine_throttled_events(),
+            ))
+            .with_no_avail_buffer(dispatch.no_avail_buffer())
+            .with_remaining_reqs_count(dispatch.remaining_reqs_count())
+            .with_execute_fails(usize_to_u64_saturating(dispatch.parse_failures()))
+            .with_invalid_reqs_count(usize_to_u64_saturating(
+                dispatch
+                    .io_errors()
+                    .saturating_add(dispatch.unsupported_requests()),
+            ));
         if let Some(read_agg) = dispatch.read_latency_aggregate() {
-            self.record_read_latency_aggregate(read_agg);
+            observation = observation.with_read_agg(read_agg);
         }
         if let Some(write_agg) = dispatch.write_latency_aggregate() {
-            self.record_write_latency_aggregate(write_agg);
+            observation = observation.with_write_agg(write_agg);
         }
-        self.record_flushes(usize_to_u64_saturating(dispatch.flush_count()));
-        self.record_rate_limiter_throttled_events(usize_to_u64_saturating(
-            dispatch.rate_limiter_throttled_requests(),
-        ));
-        self.record_io_engine_throttled_events(usize_to_u64_saturating(
-            dispatch.io_engine_throttled_events(),
-        ));
-        self.record_execute_failures(usize_to_u64_saturating(
-            dispatch
-                .parse_failures()
-                .saturating_add(dispatch.status_write_failures()),
-        ));
-        self.record_invalid_requests(usize_to_u64_saturating(
-            dispatch
-                .io_errors()
-                .saturating_add(dispatch.unsupported_requests()),
-        ));
+        self.record_observation(observation);
+    }
+
+    pub fn record_activation_failure(&self) {
+        self.record_observation(BlockDeviceMetrics::default().with_activate_fails(1));
+    }
+
+    pub fn record_config_failure(&self) {
+        self.record_observation(BlockDeviceMetrics::default().with_cfg_fails(1));
+    }
+
+    pub fn record_rate_limiter_event(&self) {
+        self.record_observation(BlockDeviceMetrics::default().with_rate_limiter_event_count(1));
     }
 
     pub fn record_queue_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.queue_event_count, count);
-        }
+        self.record_observation(BlockDeviceMetrics::default().with_queue_event_count(count));
     }
 
     pub fn record_event_failure(&self) {
-        record_atomic_metric(&self.inner.event_fails, 1);
+        self.record_observation(BlockDeviceMetrics::default().with_event_fails(1));
     }
 
     pub fn record_update(&self) {
-        record_atomic_metric(&self.inner.update_count, 1);
+        self.record_observation(BlockDeviceMetrics::default().with_update_count(1));
     }
 
     pub fn record_update_failure(&self) {
-        record_atomic_metric(&self.inner.update_fails, 1);
+        self.record_observation(BlockDeviceMetrics::default().with_update_fails(1));
     }
 
     pub fn record_config_change_time_us(&self, duration_us: u64) {
-        self.inner
-            .config_change_time_us
-            .store(duration_us, Ordering::Relaxed);
-        self.inner
-            .config_change_time_recorded
-            .store(true, Ordering::Release);
+        self.record_observation(
+            BlockDeviceMetrics::default().with_config_change_time_us(duration_us),
+        );
     }
 
     pub fn snapshot(&self) -> BlockDeviceMetrics {
-        BlockDeviceMetrics {
-            config_change_time_us: self
-                .inner
-                .config_change_time_recorded
-                .load(Ordering::Acquire)
-                .then(|| self.inner.config_change_time_us.load(Ordering::Relaxed)),
-            event_fails: self.inner.event_fails.load(Ordering::Relaxed),
-            execute_fails: self.inner.execute_fails.load(Ordering::Relaxed),
-            invalid_reqs_count: self.inner.invalid_reqs_count.load(Ordering::Relaxed),
-            flush_count: self.inner.flush_count.load(Ordering::Relaxed),
-            queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
-            rate_limiter_event_count: self.inner.rate_limiter_event_count.load(Ordering::Relaxed),
-            rate_limiter_throttled_events: self
-                .inner
-                .rate_limiter_throttled_events
-                .load(Ordering::Relaxed),
-            io_engine_throttled_events: self
-                .inner
-                .io_engine_throttled_events
-                .load(Ordering::Relaxed),
-            update_count: self.inner.update_count.load(Ordering::Relaxed),
-            update_fails: self.inner.update_fails.load(Ordering::Relaxed),
-            read_bytes: self.inner.read_bytes.load(Ordering::Relaxed),
-            write_bytes: self.inner.write_bytes.load(Ordering::Relaxed),
-            read_count: self.inner.read_count.load(Ordering::Relaxed),
-            write_count: self.inner.write_count.load(Ordering::Relaxed),
-            read_agg: self.read_latency_aggregate_snapshot(),
-            write_agg: self.write_latency_aggregate_snapshot(),
-        }
-    }
-
-    fn record_reads(&self, count: u64, bytes: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.read_count, count);
-        }
-        if bytes != 0 {
-            record_atomic_metric(&self.inner.read_bytes, bytes);
-        }
-    }
-
-    fn record_writes(&self, count: u64, bytes: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.write_count, count);
-        }
-        if bytes != 0 {
-            record_atomic_metric(&self.inner.write_bytes, bytes);
-        }
-    }
-
-    fn record_read_latency_aggregate(&self, latency_aggregate: VirtioBlockLatencyAggregate) {
-        record_latency_aggregate(
-            latency_aggregate,
-            &self.inner.read_agg_min_us,
-            &self.inner.read_agg_max_us,
-            &self.inner.read_agg_sum_us,
-            &self.inner.read_agg_sample_count,
-        );
-    }
-
-    fn record_write_latency_aggregate(&self, latency_aggregate: VirtioBlockLatencyAggregate) {
-        record_latency_aggregate(
-            latency_aggregate,
-            &self.inner.write_agg_min_us,
-            &self.inner.write_agg_max_us,
-            &self.inner.write_agg_sum_us,
-            &self.inner.write_agg_sample_count,
-        );
-    }
-
-    fn read_latency_aggregate_snapshot(&self) -> VirtioBlockLatencyAggregate {
-        latency_aggregate_snapshot(
-            &self.inner.read_agg_min_us,
-            &self.inner.read_agg_max_us,
-            &self.inner.read_agg_sum_us,
-            &self.inner.read_agg_sample_count,
-        )
-    }
-
-    fn write_latency_aggregate_snapshot(&self) -> VirtioBlockLatencyAggregate {
-        latency_aggregate_snapshot(
-            &self.inner.write_agg_min_us,
-            &self.inner.write_agg_max_us,
-            &self.inner.write_agg_sum_us,
-            &self.inner.write_agg_sample_count,
-        )
-    }
-
-    fn record_flushes(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.flush_count, count);
-        }
-    }
-
-    fn record_rate_limiter_throttled_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.rate_limiter_throttled_events, count);
-        }
-    }
-
-    fn record_io_engine_throttled_events(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.io_engine_throttled_events, count);
-        }
-    }
-
-    fn record_execute_failures(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.execute_fails, count);
-        }
-    }
-
-    fn record_invalid_requests(&self, count: u64) {
-        if count != 0 {
-            record_atomic_metric(&self.inner.invalid_reqs_count, count);
-        }
+        *lock_block_device_metrics(&self.inner)
     }
 }
 
-#[derive(Debug)]
-struct SharedBlockDeviceMetricsInner {
-    config_change_time_recorded: AtomicBool,
-    config_change_time_us: AtomicU64,
-    event_fails: AtomicU64,
-    execute_fails: AtomicU64,
-    invalid_reqs_count: AtomicU64,
-    flush_count: AtomicU64,
-    queue_event_count: AtomicU64,
-    rate_limiter_event_count: AtomicU64,
-    rate_limiter_throttled_events: AtomicU64,
-    io_engine_throttled_events: AtomicU64,
-    update_count: AtomicU64,
-    update_fails: AtomicU64,
-    read_bytes: AtomicU64,
-    write_bytes: AtomicU64,
-    read_count: AtomicU64,
-    write_count: AtomicU64,
-    read_agg_min_us: AtomicU64,
-    read_agg_max_us: AtomicU64,
-    read_agg_sum_us: AtomicU64,
-    read_agg_sample_count: AtomicU64,
-    write_agg_min_us: AtomicU64,
-    write_agg_max_us: AtomicU64,
-    write_agg_sum_us: AtomicU64,
-    write_agg_sample_count: AtomicU64,
-}
-
-impl Default for SharedBlockDeviceMetricsInner {
-    fn default() -> Self {
-        Self {
-            config_change_time_recorded: AtomicBool::new(false),
-            config_change_time_us: AtomicU64::new(0),
-            event_fails: AtomicU64::new(0),
-            execute_fails: AtomicU64::new(0),
-            invalid_reqs_count: AtomicU64::new(0),
-            flush_count: AtomicU64::new(0),
-            queue_event_count: AtomicU64::new(0),
-            rate_limiter_event_count: AtomicU64::new(0),
-            rate_limiter_throttled_events: AtomicU64::new(0),
-            io_engine_throttled_events: AtomicU64::new(0),
-            update_count: AtomicU64::new(0),
-            update_fails: AtomicU64::new(0),
-            read_bytes: AtomicU64::new(0),
-            write_bytes: AtomicU64::new(0),
-            read_count: AtomicU64::new(0),
-            write_count: AtomicU64::new(0),
-            read_agg_min_us: AtomicU64::new(u64::MAX),
-            read_agg_max_us: AtomicU64::new(0),
-            read_agg_sum_us: AtomicU64::new(0),
-            read_agg_sample_count: AtomicU64::new(0),
-            write_agg_min_us: AtomicU64::new(u64::MAX),
-            write_agg_max_us: AtomicU64::new(0),
-            write_agg_sum_us: AtomicU64::new(0),
-            write_agg_sample_count: AtomicU64::new(0),
-        }
+fn lock_block_device_metrics(
+    metrics: &Mutex<BlockDeviceMetrics>,
+) -> MutexGuard<'_, BlockDeviceMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct SharedBlockDeviceMetricsRegistry {
-    aggregate: SharedBlockDeviceMetrics,
     per_drive: Arc<Mutex<BlockDeviceMetricsRegistryState>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockDeviceMetricsCapture {
+    aggregate: BlockDeviceMetrics,
+    per_drive: BlockDeviceMetricsByDrive,
+}
+
+impl BlockDeviceMetricsCapture {
+    pub const fn aggregate(&self) -> BlockDeviceMetrics {
+        self.aggregate
+    }
+
+    pub const fn per_drive(&self) -> &BlockDeviceMetricsByDrive {
+        &self.per_drive
+    }
+
+    pub fn into_parts(self) -> (BlockDeviceMetrics, BlockDeviceMetricsByDrive) {
+        (self.aggregate, self.per_drive)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1937,6 +1917,10 @@ impl fmt::Debug for PreparedBlockDeviceMetrics {
 }
 
 impl PreparedBlockDeviceMetrics {
+    pub fn metrics(&self) -> SharedBlockDeviceMetrics {
+        self.metrics.clone()
+    }
+
     pub fn publish(mut self) -> BlockDeviceMetricsLease {
         let mut state = lock_block_metrics_registry(&self.registry.per_drive);
         let reservation_count = state.reservations.len();
@@ -2033,7 +2017,6 @@ impl std::error::Error for BlockDeviceMetricsRegistryError {}
 impl Default for SharedBlockDeviceMetricsRegistry {
     fn default() -> Self {
         Self {
-            aggregate: SharedBlockDeviceMetrics::default(),
             per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState::default())),
         }
     }
@@ -2060,7 +2043,6 @@ impl SharedBlockDeviceMetricsRegistry {
         let next_generation = u64::try_from(entries.len()).unwrap_or(u64::MAX);
 
         Self {
-            aggregate: SharedBlockDeviceMetrics::default(),
             per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState {
                 capacity: entries.len(),
                 entries,
@@ -2104,7 +2086,6 @@ impl SharedBlockDeviceMetricsRegistry {
         let next_generation = u64::try_from(entries.len())
             .map_err(|_| BlockDeviceMetricsRegistryError::GenerationExhausted)?;
         Ok(Self {
-            aggregate: SharedBlockDeviceMetrics::default(),
             per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState {
                 entries,
                 reservations,
@@ -2153,7 +2134,6 @@ impl SharedBlockDeviceMetricsRegistry {
         let next_generation = u64::try_from(entries.len())
             .map_err(|_| BlockDeviceMetricsRegistryError::GenerationExhausted)?;
         Ok(Self {
-            aggregate: SharedBlockDeviceMetrics::default(),
             per_drive: Arc::new(Mutex::new(BlockDeviceMetricsRegistryState {
                 entries,
                 reservations,
@@ -2269,10 +2249,6 @@ impl SharedBlockDeviceMetricsRegistry {
         })
     }
 
-    pub fn aggregate(&self) -> SharedBlockDeviceMetrics {
-        self.aggregate.clone()
-    }
-
     pub fn per_drive(&self, drive_id: &str) -> Option<SharedBlockDeviceMetrics> {
         lock_block_metrics_registry(&self.per_drive)
             .entries
@@ -2285,7 +2261,6 @@ impl SharedBlockDeviceMetricsRegistry {
         drive_id: &str,
         dispatch: &VirtioBlockDeviceNotificationDispatch,
     ) {
-        self.aggregate.record_notification_dispatch(dispatch);
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_notification_dispatch(dispatch);
         }
@@ -2296,64 +2271,87 @@ impl SharedBlockDeviceMetricsRegistry {
         drive_id: &str,
         dispatch: &VirtioBlockQueueDispatch,
     ) {
-        self.aggregate.record_queue_dispatch(dispatch);
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_queue_dispatch(dispatch);
         }
     }
 
     pub fn record_queue_events_for_drive(&self, drive_id: &str, count: u64) {
-        self.aggregate.record_queue_events(count);
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_queue_events(count);
         }
     }
 
+    /// Records an unattributed transport failure against every live drive.
+    ///
+    /// Callers that retain exact dispatch identity should use
+    /// [`Self::record_event_failure_for_drive`] instead.
     pub fn record_event_failure(&self) {
-        self.aggregate.record_event_failure();
+        let metrics = lock_block_metrics_registry(&self.per_drive)
+            .entries
+            .iter()
+            .map(|entry| entry.metrics.clone())
+            .collect::<Vec<_>>();
+        for metrics in metrics {
+            metrics.record_event_failure();
+        }
     }
 
     pub fn record_event_failure_for_drive(&self, drive_id: &str) {
-        self.aggregate.record_event_failure();
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_event_failure();
         }
     }
 
     pub fn record_update_for_drive(&self, drive_id: &str) {
-        self.aggregate.record_update();
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_update();
         }
     }
 
     pub fn record_update_failure_for_drive(&self, drive_id: &str) {
-        self.aggregate.record_update_failure();
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_update_failure();
         }
     }
 
     pub fn record_config_change_time_for_drive(&self, drive_id: &str, duration_us: u64) {
-        self.aggregate.record_config_change_time_us(duration_us);
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_config_change_time_us(duration_us);
         }
     }
 
+    pub fn record_observation_for_drive(&self, drive_id: &str, observation: BlockDeviceMetrics) {
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_observation(observation);
+        }
+    }
+
+    pub fn capture(&self) -> BlockDeviceMetricsCapture {
+        let state = lock_block_metrics_registry(&self.per_drive);
+        let mut aggregate = BlockDeviceMetrics::default();
+        let mut per_drive = BlockDeviceMetricsByDrive::new();
+        for entry in &state.entries {
+            let metrics = entry.metrics.snapshot();
+            aggregate = aggregate.merged_with(metrics);
+            per_drive.insert_drive_metrics_at_generation(
+                entry.drive_id.clone(),
+                entry.generation,
+                metrics,
+            );
+        }
+        BlockDeviceMetricsCapture {
+            aggregate,
+            per_drive,
+        }
+    }
+
     pub fn aggregate_snapshot(&self) -> BlockDeviceMetrics {
-        self.aggregate.snapshot()
+        self.capture().aggregate
     }
 
     pub fn per_drive_snapshot(&self) -> BlockDeviceMetricsByDrive {
-        let mut snapshot = BlockDeviceMetricsByDrive::new();
-        for entry in &lock_block_metrics_registry(&self.per_drive).entries {
-            let metrics = entry.metrics.snapshot();
-            if !metrics.is_empty() {
-                snapshot.insert_drive_metrics(entry.drive_id.clone(), metrics);
-            }
-        }
-        snapshot
+        self.capture().per_drive
     }
 }
 
@@ -6522,42 +6520,6 @@ fn snapshot_network_latency(
     }
 }
 
-fn record_latency_aggregate(
-    latency_aggregate: VirtioBlockLatencyAggregate,
-    min_us: &AtomicU64,
-    max_us: &AtomicU64,
-    sum_us: &AtomicU64,
-    sample_count: &AtomicU64,
-) {
-    if latency_aggregate.is_empty() {
-        return;
-    }
-
-    record_atomic_min_metric(min_us, latency_aggregate.min_us());
-    record_atomic_max_metric(max_us, latency_aggregate.max_us());
-    record_atomic_metric(sum_us, latency_aggregate.sum_us());
-    record_atomic_metric_release(sample_count, latency_aggregate.sample_count());
-}
-
-fn latency_aggregate_snapshot(
-    min_us: &AtomicU64,
-    max_us: &AtomicU64,
-    sum_us: &AtomicU64,
-    sample_count: &AtomicU64,
-) -> VirtioBlockLatencyAggregate {
-    let sample_count = sample_count.load(Ordering::Acquire);
-    if sample_count == 0 {
-        return VirtioBlockLatencyAggregate::default();
-    }
-
-    VirtioBlockLatencyAggregate::new(
-        min_us.load(Ordering::Relaxed),
-        max_us.load(Ordering::Relaxed),
-        sum_us.load(Ordering::Relaxed),
-        sample_count,
-    )
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricsDiagnostics {
     block_device_metrics: Option<BlockDeviceMetrics>,
@@ -7384,6 +7346,9 @@ mod tests {
 
     fn block_metrics_with_all_fields() -> BlockDeviceMetrics {
         BlockDeviceMetrics::default()
+            .with_activate_fails(15)
+            .with_cfg_fails(16)
+            .with_no_avail_buffer(17)
             .with_event_fails(1)
             .with_execute_fails(2)
             .with_invalid_reqs_count(3)
@@ -7400,6 +7365,7 @@ mod tests {
             .with_write_count(9)
             .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, 42, 2))
             .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, 44, 3))
+            .with_remaining_reqs_count(18)
     }
 
     fn pmem_metrics_with_all_fields() -> PmemDeviceMetrics {
@@ -8757,12 +8723,56 @@ mod tests {
         );
 
         let value = only_metrics_value(&output);
-        assert_eq!(value["block"]["event_fails"], 1);
-        assert_eq!(value["block"]["read_agg"]["min_us"], 0);
-        assert_eq!(value["block"]["read_agg"]["max_us"], 0);
-        assert_eq!(value["block"]["read_agg"]["sum_us"], 42);
-        assert_eq!(value["block_rootfs"]["read_agg"]["min_us"], 12);
-        assert_eq!(value["block_rootfs"]["read_agg"]["max_us"], 30);
+        assert_eq!(
+            value["block"],
+            serde_json::json!({
+                "activate_fails": 15,
+                "cfg_fails": 16,
+                "no_avail_buffer": 17,
+                "event_fails": 1,
+                "execute_fails": 2,
+                "invalid_reqs_count": 3,
+                "flush_count": 4,
+                "queue_event_count": 5,
+                "rate_limiter_event_count": 12,
+                "update_count": 10,
+                "update_fails": 11,
+                "read_bytes": 6,
+                "write_bytes": 7,
+                "read_count": 8,
+                "write_count": 9,
+                "read_agg": {"min_us": 0, "max_us": 0, "sum_us": 42},
+                "write_agg": {"min_us": 0, "max_us": 0, "sum_us": 44},
+                "rate_limiter_throttled_events": 13,
+                "io_engine_throttled_events": 14,
+                "remaining_reqs_count": 18,
+            })
+        );
+        assert_eq!(
+            value["block_rootfs"],
+            serde_json::json!({
+                "activate_fails": 15,
+                "cfg_fails": 16,
+                "no_avail_buffer": 17,
+                "event_fails": 1,
+                "execute_fails": 2,
+                "invalid_reqs_count": 3,
+                "flush_count": 4,
+                "queue_event_count": 5,
+                "rate_limiter_event_count": 12,
+                "update_count": 10,
+                "update_fails": 11,
+                "read_bytes": 6,
+                "write_bytes": 7,
+                "read_count": 8,
+                "write_count": 9,
+                "read_agg": {"min_us": 12, "max_us": 30, "sum_us": 42},
+                "write_agg": {"min_us": 13, "max_us": 31, "sum_us": 44},
+                "rate_limiter_throttled_events": 13,
+                "io_engine_throttled_events": 14,
+                "remaining_reqs_count": 18,
+            })
+        );
     }
 
     #[test]
@@ -8882,8 +8892,8 @@ mod tests {
         );
         assert_eq!(
             registry.aggregate_snapshot().config_change_time_us(),
-            Some(37),
-            "aggregate latest-value store should retain the VM-wide last success"
+            None,
+            "the aggregate is derived from the currently published generation"
         );
         drop(replacement_generation);
     }
@@ -8906,6 +8916,34 @@ mod tests {
     }
 
     #[test]
+    fn block_compound_observation_is_never_torn_by_a_racing_snapshot() {
+        let metrics = SharedBlockDeviceMetrics::default();
+        let observation = BlockDeviceMetrics::default()
+            .with_queue_event_count(1)
+            .with_read_bytes(512)
+            .with_read_count(1)
+            .with_read_agg(VirtioBlockLatencyAggregate::new(7, 7, 7, 1))
+            .with_remaining_reqs_count(2);
+        let start = Arc::new(Barrier::new(2));
+        let writer_metrics = metrics.clone();
+        let writer_start = Arc::clone(&start);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            writer_metrics.record_observation(observation);
+        });
+
+        start.wait();
+        let racing_cut = metrics.snapshot();
+        writer.join().expect("block metrics writer should finish");
+
+        assert!(
+            racing_cut == BlockDeviceMetrics::default() || racing_cut == observation,
+            "one coherent observation must be entirely before or after a snapshot cut"
+        );
+        assert_eq!(metrics.snapshot(), observation);
+    }
+
+    #[test]
     fn shared_block_device_metrics_registry_snapshot_is_per_instance() {
         let first = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
         let second = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs"]);
@@ -8915,12 +8953,12 @@ mod tests {
         first.record_update_for_drive("rootfs");
         first.record_update_failure_for_drive("data");
         first
-            .aggregate()
-            .record_read_latency_aggregate(VirtioBlockLatencyAggregate::new(0, 10, 10, 2));
-        first
             .per_drive("rootfs")
             .expect("rootfs metrics should exist")
-            .record_read_latency_aggregate(VirtioBlockLatencyAggregate::new(0, 10, 10, 2));
+            .record_observation(
+                BlockDeviceMetrics::default()
+                    .with_read_agg(VirtioBlockLatencyAggregate::new(0, 10, 10, 2)),
+            );
 
         assert_eq!(
             first.aggregate_snapshot(),
@@ -8946,6 +8984,69 @@ mod tests {
         );
         assert_eq!(second.aggregate_snapshot(), BlockDeviceMetrics::default());
         assert!(second.per_drive_snapshot().is_empty());
+    }
+
+    #[test]
+    fn block_metrics_capture_is_coherent_and_same_id_delta_is_generation_aware() {
+        let registry =
+            SharedBlockDeviceMetricsRegistry::from_drive_ids_with_capacity(["rootfs", "data"], 2)
+                .expect("bounded block metrics registry should allocate");
+        registry.record_observation_for_drive(
+            "rootfs",
+            BlockDeviceMetrics::default()
+                .with_queue_event_count(5)
+                .with_read_bytes(512),
+        );
+        registry.record_observation_for_drive(
+            "data",
+            BlockDeviceMetrics::default()
+                .with_queue_event_count(2)
+                .with_write_bytes(256),
+        );
+
+        let original = registry.capture();
+        let merged_per_drive = original
+            .per_drive()
+            .iter()
+            .fold(BlockDeviceMetrics::default(), |aggregate, (_, metrics)| {
+                aggregate.merged_with(metrics)
+            });
+        assert_eq!(original.aggregate(), merged_per_drive);
+
+        let old_data = registry
+            .claim_drive_lease("data")
+            .expect("old data generation should be claimable");
+        drop(old_data);
+        let replacement = registry
+            .prepare_drive("data")
+            .expect("same ID should receive a fresh generation");
+        replacement
+            .metrics()
+            .record_observation(BlockDeviceMetrics::default().with_queue_event_count(1));
+        let replacement = replacement.publish();
+
+        let current = registry.capture();
+        assert!(
+            !format!("{current:?}").contains("generation"),
+            "private block metrics generations must stay out of Debug output"
+        );
+        let delta = current.per_drive().delta_since(Some(original.per_drive()));
+        assert_eq!(
+            delta,
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics("rootfs", BlockDeviceMetrics::default())
+                .with_drive_metrics(
+                    "data",
+                    BlockDeviceMetrics::default().with_queue_event_count(1),
+                )
+        );
+        assert_eq!(
+            current.aggregate(),
+            BlockDeviceMetrics::default()
+                .with_queue_event_count(6)
+                .with_read_bytes(512)
+        );
+        drop(replacement);
     }
 
     #[test]
@@ -9044,9 +9145,7 @@ mod tests {
     fn block_metric_increment_saturates() {
         let metrics = SharedBlockDeviceMetrics::default();
         metrics
-            .inner
-            .queue_event_count
-            .store(u64::MAX - 1, Ordering::Relaxed);
+            .record_observation(BlockDeviceMetrics::default().with_queue_event_count(u64::MAX - 1));
 
         metrics.record_queue_events(3);
 
@@ -9057,11 +9156,8 @@ mod tests {
     fn block_latency_metric_preserves_saturated_minimum() {
         let metrics = SharedBlockDeviceMetrics::default();
 
-        metrics.record_read_latency_aggregate(VirtioBlockLatencyAggregate::new(
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-            1,
+        metrics.record_observation(BlockDeviceMetrics::default().with_read_agg(
+            VirtioBlockLatencyAggregate::new(u64::MAX, u64::MAX, u64::MAX, 1),
         ));
 
         assert_eq!(
@@ -9082,6 +9178,9 @@ mod tests {
     fn block_diagnostics_merge_saturates() {
         let base = MetricsDiagnostics::new().with_block_device_metrics(
             BlockDeviceMetrics::default()
+                .with_activate_fails(u64::MAX - 15)
+                .with_cfg_fails(u64::MAX - 16)
+                .with_no_avail_buffer(u64::MAX - 17)
                 .with_event_fails(u64::MAX - 1)
                 .with_execute_fails(u64::MAX - 2)
                 .with_invalid_reqs_count(u64::MAX - 3)
@@ -9097,7 +9196,8 @@ mod tests {
                 .with_read_count(u64::MAX - 8)
                 .with_write_count(u64::MAX - 9)
                 .with_read_agg(VirtioBlockLatencyAggregate::new(20, 24, u64::MAX - 1, 2))
-                .with_write_agg(VirtioBlockLatencyAggregate::new(14, 20, u64::MAX - 2, 1)),
+                .with_write_agg(VirtioBlockLatencyAggregate::new(14, 20, u64::MAX - 2, 1))
+                .with_remaining_reqs_count(u64::MAX - 18),
         );
         let additional =
             MetricsDiagnostics::new().with_block_device_metrics(block_metrics_with_all_fields());
@@ -9106,6 +9206,9 @@ mod tests {
             base.merged_with(additional).block_device_metrics(),
             Some(
                 BlockDeviceMetrics::default()
+                    .with_activate_fails(u64::MAX)
+                    .with_cfg_fails(u64::MAX)
+                    .with_no_avail_buffer(u64::MAX)
                     .with_event_fails(u64::MAX)
                     .with_execute_fails(u64::MAX)
                     .with_invalid_reqs_count(u64::MAX)
@@ -9122,6 +9225,7 @@ mod tests {
                     .with_write_count(u64::MAX)
                     .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, u64::MAX, 4))
                     .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, u64::MAX, 4))
+                    .with_remaining_reqs_count(u64::MAX)
             )
         );
     }
@@ -9146,6 +9250,9 @@ mod tests {
             .with_drive_metrics(
                 "rootfs",
                 BlockDeviceMetrics::default()
+                    .with_activate_fails(15)
+                    .with_cfg_fails(16)
+                    .with_no_avail_buffer(17)
                     .with_event_fails(u64::MAX)
                     .with_execute_fails(2)
                     .with_invalid_reqs_count(3)
@@ -9161,7 +9268,8 @@ mod tests {
                     .with_read_count(u64::MAX)
                     .with_write_count(9)
                     .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, u64::MAX, 3))
-                    .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, 44, 3)),
+                    .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, 44, 3))
+                    .with_remaining_reqs_count(18),
             )
             .with_drive_metrics("data", BlockDeviceMetrics::default().with_write_count(3));
         let merged = base.merged_with(additional);

@@ -712,7 +712,7 @@ pub(super) fn build_metrics_line(
             .block_device_metrics_by_drive
             .as_ref()
             .and_then(|metrics| metrics.metrics.get(drive_id))
-            .copied()
+            .map(|entry| entry.metrics)
             .unwrap_or_default();
         let values = map_block_metrics(metrics);
         add_block_metrics(&mut block, &values);
@@ -753,7 +753,7 @@ pub(super) fn build_metrics_line(
             .block_device_metrics_by_drive
             .as_ref()
             .and_then(|metrics| metrics.metrics.get(drive_id))
-            .copied()
+            .map(|entry| entry.metrics)
             .unwrap_or_default();
         vhost_user_block_devices.push(DynamicMetrics {
             root: try_dynamic_root("vhost_user_block_", drive_id)?,
@@ -1030,6 +1030,9 @@ fn try_dynamic_root(prefix: &str, id: &str) -> Result<String, MetricsLineBuildEr
 
 fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {
     BlockMetrics {
+        activate_fails: metrics.activate_fails,
+        cfg_fails: metrics.cfg_fails,
+        no_avail_buffer: metrics.no_avail_buffer,
         event_fails: metrics.event_fails,
         execute_fails: metrics.execute_fails,
         invalid_reqs_count: metrics.invalid_reqs_count,
@@ -1054,7 +1057,7 @@ fn map_block_metrics(metrics: super::BlockDeviceMetrics) -> BlockMetrics {
         },
         rate_limiter_throttled_events: metrics.rate_limiter_throttled_events,
         io_engine_throttled_events: metrics.io_engine_throttled_events,
-        ..BlockMetrics::default()
+        remaining_reqs_count: metrics.remaining_reqs_count,
     }
 }
 

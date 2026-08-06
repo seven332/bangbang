@@ -43,7 +43,7 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 81 records delivered by #1838–#1840; later child
+terminally certifies the 129 records delivered by #1838–#1841; later child
 records remain nonterminal. `corpus:metrics` and the cross-producer aggregate
 semantic remain #1790-owned. A required zero therefore proves wire-shape
 completeness only, never producer completion unless its field audit is
@@ -219,10 +219,11 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1840, the audit contains 135 `planned`, 15
-`provisional-platform-zero`, 80 `implemented`, and one `source-neutral`
-record. The 81 terminal records cover the complete pinned entropy, pmem, RTC,
-UART, balloon, memory-hotplug, and vsock roots. `uart.flush_count` is the
+After #1841, the audit contains 87 `planned`, 15
+`provisional-platform-zero`, 128 `implemented`, and one `source-neutral`
+record. The 129 terminal records cover the complete pinned entropy, pmem, RTC,
+UART, balloon, memory-hotplug, vsock, static block, and configured ordinary
+block roots. `uart.flush_count` is the
 source-neutral record because pinned Firecracker declares the field but has no
 producer; receive-FIFO clearing and other Bangbang-only serial diagnostics do
 not feed it. The remaining planned and provisional records are nonterminal,
@@ -242,6 +243,36 @@ Every metrics flush snapshots all 20 fields atomically and advances its
 success baseline only after the full JSON line is accepted, so first-zero,
 later-delta, failed-middle, and ambiguously accepted writes retain the same
 at-least-once contract as the other device roots.
+
+Ordinary block uses one coherent saturating owner per live drive generation.
+The same owner is attached to its configuration space and MMIO or PCI device;
+vhost-user devices reject that binding and remain exclusive to
+`vhost_user_block_{drive_id}`. Invalid ordinary configuration reads and every
+configuration write count in `cfg_fails`, while only failed ordinary
+activation attempts count in `activate_fails`. One nonempty notification call
+counts one `queue_event_count` regardless of kick multiplicity. An empty call
+that starts with retained limiter work counts one `rate_limiter_event_count`.
+Interrupt-delivery failures are attributed only to affected drives.
+
+Each successfully popped descriptor contributes the then-current available
+length to `remaining_reqs_count`. A completed queue pass that publishes no used
+element increments `no_avail_buffer`; an available- or used-ring failure that
+returns before that tail does not. Parse failures feed `execute_fails`; I/O,
+partial-transfer, and unsupported outcomes feed `invalid_reqs_count`. Partial
+read/write byte totals retain the actual prefix, but operation counts require
+full I/O success. A successful backing flush is counted before guest status
+publication, and read/write latency covers attempted host I/O even when it
+fails. Status-byte publication failure remains typed and logged without being
+misclassified as a parse failure.
+
+One registry capture freezes every current per-drive value and private
+generation, then derives static `block` from that same set. A removed and
+reinserted ID therefore starts a fresh interval rather than subtracting its
+predecessor. Snapshot state never persists metrics owners or generations, so a
+restored destination starts fresh. Dynamic latency retains min/max/sum; static
+latency sums `sum_us` and leaves min/max zero exactly as pinned Firecracker
+does. The baseline advances only after a complete accepted line, preserving
+whole-observation replay after failed or ambiguously accepted publication.
 
 Entropy, pmem, RTC, and UART counters use one narrow owner-local value lock per
 immutable snapshot. A compound producer update and a snapshot therefore cannot

@@ -695,20 +695,30 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-The checked device-producer audit now terminally certifies all 81 #1838–#1840
-fields: 80 entropy, pmem, RTC, UART, balloon, memory-hotplug, and vsock fields
-are implemented, while `uart.flush_count` is source-neutral zero because pinned
-Firecracker has no producer for it. Each device owner publishes an immutable
-compound counter snapshot. Entropy counts popped requests before parse or
-throttling; pmem binds configuration and activation failures to both the exact
-current generation and aggregate; RTC records missed counters only for
-invalid/read-only register accesses; UART limiter drops count an attempted
-write while FIFO clears and host-input/state failures stay internal. Balloon
-and memory-hotplug retain coherent operation tuples. Vsock binds configuration,
-device, MMIO/PCI, HVF readiness, and restored sessions to one fresh owner;
-records queue, packet, byte, connection, and I/O failure semantics at their
-source boundaries; and uses a stale-safe bounded deadline queue. Later
-#1841–#1846 records remain nonterminal and repository-final certification
+The checked device-producer audit now terminally certifies all 129 #1838–#1841
+fields: 128 entropy, pmem, RTC, UART, balloon, memory-hotplug, vsock, and
+ordinary-block fields are implemented, while `uart.flush_count` is
+source-neutral zero because pinned Firecracker has no producer for it. Each
+device owner publishes an immutable compound counter snapshot. Entropy counts
+popped requests before parse or throttling; pmem binds configuration and
+activation failures to both the exact current generation and aggregate; RTC
+records missed counters only for invalid/read-only register accesses; UART
+limiter drops count an attempted write while FIFO clears and host-input/state
+failures stay internal. Balloon and memory-hotplug retain coherent operation
+tuples. Vsock binds configuration, device, MMIO/PCI, HVF readiness, and
+restored sessions to one fresh owner; records queue, packet, byte, connection,
+and I/O failure semantics at their source boundaries; and uses a stale-safe
+bounded deadline queue.
+
+Every ordinary block drive likewise owns one fresh coherent generation shared
+by config and MMIO/PCI source paths. Queue admission, retained limiter retry,
+descriptor depth, empty-pass, partial I/O, successful flush, attempted I/O
+latency, runtime update, and exact interrupt-delivery facts are recorded once
+where they become final. One registry capture derives static `block` from the
+same configured values used for `block_{drive_id}`; same-ID replacement starts
+a fresh interval, restore does not inherit counters, static latency extrema
+remain zero, and vhost-user state cannot contaminate the ordinary family.
+Later #1842–#1846 records remain nonterminal and repository-final certification
 remains gated on their delivery.
 
 One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through

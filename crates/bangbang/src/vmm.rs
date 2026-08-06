@@ -36283,9 +36283,10 @@ where
         let mut diagnostics =
             MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status());
         if let Some(metrics) = &self.block_device_metrics {
+            let (aggregate, per_drive) = metrics.capture().into_parts();
             diagnostics = diagnostics
-                .with_block_device_metrics(metrics.aggregate_snapshot())
-                .with_block_device_metrics_by_drive(metrics.per_drive_snapshot());
+                .with_block_device_metrics(aggregate)
+                .with_block_device_metrics_by_drive(per_drive);
         }
         if let Some(metrics) = &self.pmem_device_metrics {
             diagnostics = diagnostics
@@ -53777,12 +53778,14 @@ mod tests {
         assert_eq!(
             diagnostics.block_device_metrics_by_drive(),
             Some(
-                &BlockDeviceMetricsByDrive::new().with_drive_metrics(
-                    "rootfs",
-                    BlockDeviceMetrics::default()
-                        .with_event_fails(1)
-                        .with_queue_event_count(1),
-                )
+                &BlockDeviceMetricsByDrive::new()
+                    .with_drive_metrics(
+                        "rootfs",
+                        BlockDeviceMetrics::default()
+                            .with_event_fails(1)
+                            .with_queue_event_count(1),
+                    )
+                    .with_drive_metrics("data", BlockDeviceMetrics::default())
             )
         );
 
