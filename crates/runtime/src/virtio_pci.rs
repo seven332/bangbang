@@ -16,6 +16,7 @@ use crate::message_interrupt::{
     GuestMessageInterruptRegistryPhase, GuestMessageInterruptResources,
     GuestMessageInterruptResourcesError,
 };
+use crate::metrics::SharedInterruptMetrics;
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioDispatcher, MmioHandler, MmioHandlerError, MmioOperationKind,
     MmioRegionId, MmioRegionRequest, MmioRegistrationError, MmioRegistrationLease,
@@ -654,6 +655,7 @@ struct VirtioPciEndpointState<C, A> {
     queue_select: u16,
     core: VirtioDeviceCore<C, A>,
     msix: VirtioPciMsixState,
+    interrupt_metrics: SharedInterruptMetrics,
     guest_logger: GuestLogger,
     queue_notification_success_logging_enabled: bool,
 }
@@ -747,6 +749,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
                 },
             });
         }
+        let interrupt_metrics = messages.shared_interrupt_metrics();
         let notifications = VirtioQueueNotificationState::new(queue_count)
             .map_err(|source| VirtioPciEndpointError::QueueNotificationInitialization { source })?;
         let device = VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
@@ -786,6 +789,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
                     queue_select: 0,
                     core,
                     msix: VirtioPciMsixState::new(vector_count, queue_count),
+                    interrupt_metrics,
                     guest_logger: GuestLogger::default(),
                     queue_notification_success_logging_enabled: false,
                 }),
@@ -1191,6 +1195,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
         );
         core.device_activated = retained.device_activated;
         core.interrupt_intents = retained.interrupt_intents.clone();
+        let interrupt_metrics = messages.shared_interrupt_metrics();
 
         let endpoint = VirtioPciEndpoint {
             inner: Arc::new(VirtioPciEndpointInner {
@@ -1207,6 +1212,7 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
                     queue_select: retained.queue_select,
                     core,
                     msix: retained.msix.clone(),
+                    interrupt_metrics,
                     guest_logger: GuestLogger::default(),
                     queue_notification_success_logging_enabled: false,
                 }),
@@ -1216,6 +1222,19 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler>
         };
         if endpoint.transport_state()? != *retained {
             return Err(retained_error(VirtioPciRetainedStateError::Recapture));
+        }
+        if retained.msix.enabled && !retained.msix.function_masked {
+            let updates = retained
+                .msix
+                .entries
+                .iter()
+                .filter(|entry| !entry.is_masked())
+                .count();
+            endpoint
+                .inner
+                .messages
+                .shared_interrupt_metrics()
+                .record_config_updates(u64::try_from(updates).unwrap_or(u64::MAX));
         }
         Ok(Self {
             endpoint,
@@ -2166,15 +2185,24 @@ impl VirtioPciMsixState {
         }
     }
 
-    fn set_message_control(&mut self, value: u16) -> Vec<GuestMessage> {
+    fn set_message_control(&mut self, value: u16) -> (Vec<GuestMessage>, u64) {
         let was_deliverable = self.enabled && !self.function_masked;
+        let was_enabled = self.enabled;
+        let was_function_masked = self.function_masked;
         self.enabled = (value & MSIX_ENABLE) != 0;
         self.function_masked = (value & MSIX_FUNCTION_MASK) != 0;
-        if !was_deliverable && self.enabled && !self.function_masked {
+        let messages = if !was_deliverable && self.enabled && !self.function_masked {
             self.take_deliverable_pending()
         } else {
             Vec::new()
-        }
+        };
+        let changed = was_enabled != self.enabled || was_function_masked != self.function_masked;
+        let config_updates = if changed && self.enabled && !self.function_masked {
+            u64::try_from(self.entries.len()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        (messages, config_updates)
     }
 
     fn trigger(
@@ -2245,15 +2273,16 @@ impl VirtioPciMsixState {
         &mut self,
         offset: u64,
         data: &[u8],
-    ) -> Result<Vec<GuestMessage>, VirtioPciEndpointError> {
+    ) -> Result<(Vec<GuestMessage>, u64), VirtioPciEndpointError> {
         let Ok(index) = usize::try_from(offset / MSIX_TABLE_ENTRY_SIZE) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         let within = offset % MSIX_TABLE_ENTRY_SIZE;
         let vector_count = self.vector_count();
         let Some(entry) = self.entries.get_mut(index) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
+        let before = *entry;
         let was_masked = entry.is_masked();
         match (within, data.len()) {
             (0, 4) => entry.message_address_low = read_u32(data),
@@ -2271,9 +2300,12 @@ impl VirtioPciMsixState {
                 entry.vector_control = (value >> 32) as u32;
             }
             _ => {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), 0));
             }
         }
+        let config_updates = u64::from(
+            *entry != before && self.enabled && !self.function_masked && !entry.is_masked(),
+        );
         let now_unmasked = was_masked && !entry.is_masked();
         let message = entry.message();
         if self.enabled
@@ -2282,9 +2314,9 @@ impl VirtioPciMsixState {
             && pending_bit(&self.pending, index, vector_count)?
         {
             self.set_pending(index, false);
-            Ok(vec![message])
+            Ok((vec![message], config_updates))
         } else {
-            Ok(Vec::new())
+            Ok((Vec::new(), config_updates))
         }
     }
 
@@ -2477,7 +2509,9 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             self.configuration
                 .read_config(msix_control, &mut control)
                 .map_err(|_| VirtioPciEndpointError::PciConfigurationAccess)?;
-            let messages = self.msix.set_message_control(u16::from_le_bytes(control));
+            let (messages, config_updates) =
+                self.msix.set_message_control(u16::from_le_bytes(control));
+            self.interrupt_metrics.record_config_updates(config_updates);
             self.log_transport(LoggerTransportOutcome::MsiConfigurationSucceeded);
             return Ok(messages);
         }
@@ -2648,9 +2682,10 @@ impl<C: VirtioDeviceConfigHandler, A: VirtioDeviceActivationHandler> VirtioPciEn
             VIRTIO_PCI_MSIX_TABLE_OFFSET,
             VIRTIO_PCI_MSIX_TABLE_SIZE,
         ) {
-            let messages = self
+            let (messages, config_updates) = self
                 .msix
                 .write_table(offset - VIRTIO_PCI_MSIX_TABLE_OFFSET, data)?;
+            self.interrupt_metrics.record_config_updates(config_updates);
             self.log_transport(LoggerTransportOutcome::MsiConfigurationSucceeded);
             Ok(messages)
         } else if access_within(
@@ -5952,6 +5987,189 @@ mod tests {
             .trigger(VirtioInterruptIntent::Configuration)
             .unwrap();
         assert_eq!(fixture.signals[0].lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn msix_metrics_count_active_route_updates_and_successful_deliveries() {
+        let fixture = fixture(&[8]);
+        let bus = bar_bus(&fixture);
+        let base = fixture.bar.range().start();
+        let mut bar = fixture.endpoint.bar_handler();
+        let mut config = fixture.endpoint.config_function();
+        let message = fixture.messages[0];
+        let (metrics, control_offset) = {
+            let state = fixture
+                .endpoint
+                .inner
+                .state
+                .lock()
+                .expect("endpoint state should remain available");
+            (state.interrupt_metrics.clone(), state.msix_cap_offset + 2)
+        };
+
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &message.address().to_le_bytes(),
+        )
+        .expect("masked address update should succeed");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 8,
+            &u64::from(message.data()).to_le_bytes(),
+        )
+        .expect("data programming and entry unmask should succeed");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 8,
+            &u64::from(message.data()).to_le_bytes(),
+        )
+        .expect("identical update should be a no-op");
+        assert_eq!(metrics.snapshot().config_updates(), 1);
+
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 12,
+            &0_u32.to_le_bytes(),
+        )
+        .expect("entry unmask should succeed");
+        assert_eq!(metrics.snapshot().config_updates(), 1);
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 8,
+            &u64::from(message.data()).to_le_bytes(),
+        )
+        .expect("identical active update should be a no-op");
+        assert_eq!(metrics.snapshot().config_updates(), 1);
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &(message.address() + 4).to_le_bytes(),
+        )
+        .expect("active address update should succeed");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &message.address().to_le_bytes(),
+        )
+        .expect("active address repair should succeed");
+        assert_eq!(metrics.snapshot().config_updates(), 3);
+
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 12,
+            &1_u32.to_le_bytes(),
+        )
+        .expect("entry masking should succeed");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &(message.address() + 4).to_le_bytes(),
+        )
+        .expect("masked address update should succeed");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &message.address().to_le_bytes(),
+        )
+        .expect("masked address repair should succeed");
+        assert_eq!(metrics.snapshot().config_updates(), 3);
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET + 12,
+            &0_u32.to_le_bytes(),
+        )
+        .expect("entry unmask should succeed");
+        assert_eq!(metrics.snapshot().config_updates(), 4);
+
+        config_write(&mut config, control_offset, &0xc001_u16.to_le_bytes());
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &(message.address() + 4).to_le_bytes(),
+        )
+        .expect("function-masked route update should succeed");
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &message.address().to_le_bytes(),
+        )
+        .expect("function-masked route repair should succeed");
+        assert_eq!(metrics.snapshot().config_updates(), 4);
+        config_write(&mut config, control_offset, &0x8001_u16.to_le_bytes());
+        assert_eq!(metrics.snapshot().config_updates(), 6);
+
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_COMMON_MSIX_CONFIG,
+            &0_u16.to_le_bytes(),
+        )
+        .expect("configuration vector should program");
+        fixture
+            .endpoint
+            .trigger(VirtioInterruptIntent::Configuration)
+            .expect("known live route should signal");
+        assert_eq!(metrics.snapshot().triggers(), 1);
+
+        bar_write(
+            &mut bar,
+            &bus,
+            base,
+            VIRTIO_PCI_MSIX_TABLE_OFFSET,
+            &0xdead_beef_u64.to_le_bytes(),
+        )
+        .expect("unknown active route should still program");
+        assert!(matches!(
+            fixture
+                .endpoint
+                .trigger(VirtioInterruptIntent::Configuration),
+            Err(VirtioPciEndpointError::MessageRegistry {
+                source: GuestMessageInterruptRegistryError::UnknownMessage
+            })
+        ));
+        assert_eq!(metrics.snapshot().config_updates(), 7);
+        assert_eq!(metrics.snapshot().triggers(), 1);
+    }
+
+    #[test]
+    fn retained_endpoint_counts_each_restored_active_msix_route() {
+        let fixture = retained_transport_fixture();
+        let (registry, _) = registry_for_messages(&fixture.messages);
+        let metrics = registry.shared_interrupt_metrics();
+
+        let _prepared = prepare_retained_endpoint(&fixture, &fixture.state, registry)
+            .expect("valid retained endpoint should prepare");
+
+        assert_eq!(metrics.snapshot().config_updates(), 2);
+        assert_eq!(metrics.snapshot().triggers(), 0);
     }
 
     #[test]

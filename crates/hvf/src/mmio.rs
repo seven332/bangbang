@@ -1,9 +1,11 @@
 //! HVF-specific MMIO operation construction and read completion.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use bangbang_runtime::{
     BackendError,
+    metrics::SharedVcpuMetrics,
     mmio::{
         MmioAccessBytes, MmioAccessBytesError, MmioDispatchError, MmioDispatchOutcome,
         MmioDispatcher, MmioOperation, MmioOperationError,
@@ -213,11 +215,36 @@ pub(crate) fn dispatch_mmio_access(
     dispatcher: &mut MmioDispatcher,
     registers: &mut impl HvfMmioRegisterAccess,
 ) -> Result<MmioDispatchOutcome, HvfMmioDispatchError> {
+    dispatch_mmio_access_inner(access, dispatcher, registers, None)
+}
+
+pub(crate) fn dispatch_mmio_access_with_metrics(
+    access: HvfResolvedMmioAccess,
+    dispatcher: &mut MmioDispatcher,
+    registers: &mut impl HvfMmioRegisterAccess,
+    metrics: &SharedVcpuMetrics,
+) -> Result<MmioDispatchOutcome, HvfMmioDispatchError> {
+    dispatch_mmio_access_inner(access, dispatcher, registers, Some(metrics))
+}
+
+fn dispatch_mmio_access_inner(
+    access: HvfResolvedMmioAccess,
+    dispatcher: &mut MmioDispatcher,
+    registers: &mut impl HvfMmioRegisterAccess,
+    metrics: Option<&SharedVcpuMetrics>,
+) -> Result<MmioDispatchOutcome, HvfMmioDispatchError> {
     let operation = build_mmio_operation(access, |register| registers.read_register(register))
         .map_err(|source| HvfMmioDispatchError::Operation { source })?;
-    let outcome = dispatcher
-        .dispatch(operation)
-        .map_err(|source| HvfMmioDispatchError::Dispatch { source })?;
+    let start = Instant::now();
+    let dispatch = dispatcher.dispatch(operation);
+    let latency_us = duration_us_saturating(start.elapsed());
+    if let Some(metrics) = metrics {
+        match access.direction() {
+            HvfMmioDirection::Read => metrics.record_mmio_read(latency_us),
+            HvfMmioDirection::Write => metrics.record_mmio_write(latency_us),
+        }
+    }
+    let outcome = dispatch.map_err(|source| HvfMmioDispatchError::Dispatch { source })?;
 
     if let MmioDispatchOutcome::Read { data } = outcome {
         complete_mmio_read(access, data, |register, value| {
@@ -227,6 +254,10 @@ pub(crate) fn dispatch_mmio_access(
     }
 
     Ok(outcome)
+}
+
+fn duration_us_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 const fn is_zero_register(register: HvfMmioRegister) -> bool {
@@ -301,6 +332,7 @@ mod tests {
     use bangbang_runtime::{
         BackendError,
         memory::GuestAddress,
+        metrics::SharedVcpuMetrics,
         mmio::{
             MmioAccess, MmioBus, MmioDispatchError, MmioDispatchOutcome, MmioDispatcher,
             MmioHandler, MmioHandlerError, MmioOperation, MmioRegionId,
@@ -309,6 +341,7 @@ mod tests {
 
     use super::{
         HvfMmioRegisterAccess, build_mmio_operation, complete_mmio_read, dispatch_mmio_access,
+        dispatch_mmio_access_with_metrics,
     };
     use crate::exit::{
         HvfExceptionExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -881,6 +914,59 @@ mod tests {
             state.writes,
             vec![(access.runtime_access(), bytes(&[0x88, 0x77]))]
         );
+    }
+
+    #[test]
+    fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher() {
+        let metrics = SharedVcpuMetrics::default();
+        let read = resolved_access(
+            HvfMmioAccessSize::Byte,
+            HvfMmioDirection::Read,
+            2,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+        let write = resolved_access(
+            HvfMmioAccessSize::Byte,
+            HvfMmioDirection::Write,
+            3,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+
+        let (mut dispatcher, _) = dispatcher_with_handler(Ok(bytes(&[7])), Ok(()));
+        let mut registers = FakeRegisters::new(Ok(9), Ok(()));
+        dispatch_mmio_access_with_metrics(read, &mut dispatcher, &mut registers, &metrics)
+            .expect("read should dispatch");
+        dispatch_mmio_access_with_metrics(write, &mut dispatcher, &mut registers, &metrics)
+            .expect("write should dispatch");
+
+        let mut missing = dispatcher_without_handler();
+        assert!(matches!(
+            dispatch_mmio_access_with_metrics(read, &mut missing, &mut registers, &metrics),
+            Err(HvfMmioDispatchError::Dispatch { .. })
+        ));
+
+        let mut register_failure = FakeRegisters::new(
+            Err(BackendError::InvalidState("injected register failure")),
+            Ok(()),
+        );
+        assert!(matches!(
+            dispatch_mmio_access_with_metrics(
+                write,
+                &mut dispatcher,
+                &mut register_failure,
+                &metrics,
+            ),
+            Err(HvfMmioDispatchError::Operation { .. })
+        ));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.exit_mmio_read(), 2);
+        assert_eq!(snapshot.exit_mmio_write(), 1);
+        assert_eq!(snapshot.exit_mmio_read_agg().sample_count(), 2);
+        assert_eq!(snapshot.exit_mmio_write_agg().sample_count(), 1);
+        assert!(snapshot.exit_mmio_read_agg().min_us() <= snapshot.exit_mmio_read_agg().max_us());
     }
 
     #[test]

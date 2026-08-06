@@ -1026,6 +1026,7 @@ fn boots_firecracker_kernel_with_modern_virtio_pci_rng_and_distinct_msix_vectors
     ] {
         assert_guest_boot_observed_marker(&observation, marker, name);
     }
+    assert_guest_vcpu_and_interrupt_metrics(&observation);
     assert!(
         !bytes_contain_marker(&observation.serial_bytes, VIRTIO_PCI_RNG_FAILURE_MARKER),
         "modern virtio-pci guest emitted failure marker\nserial output:\n{}",
@@ -1047,6 +1048,12 @@ fn boots_firecracker_kernel_with_modern_virtio_pci_rng_and_distinct_msix_vectors
     assert!(!diagnostics.transport.msix_function_masked);
     assert!(diagnostics.transport.programmed_msix_entries >= 2);
     assert!(diagnostics.transport.unmasked_msix_entries >= 2);
+    assert!(
+        observation.interrupt_metrics.config_updates()
+            >= u64::try_from(diagnostics.transport.unmasked_msix_entries)
+                .expect("MSI-X entry count should fit in u64"),
+        "signed PCI setup should account for every active unmasked MSI-X route"
+    );
     let queue_vector = diagnostics.transport.queue_vectors[0]
         .expect("Linux should assign the virtio-rng queue vector");
     let config_vector = diagnostics
@@ -1214,6 +1221,7 @@ fn boots_firecracker_kernel_and_reads_virtio_block_marker() {
         });
 
     assert_guest_boot_observed_marker(&observation, BLOCK_READ_MARKER, "block-read marker");
+    assert_guest_vcpu_and_interrupt_metrics(&observation);
     assert!(
         bytes_contain_marker(&observation.serial_bytes, BOOT_MARKER),
         "guest block read test should still observe boot marker\nserial output:\n{}",
@@ -2702,6 +2710,8 @@ where
         .shared_network_interface_metrics()
         .per_interface("eth0")
         .map(|metrics| metrics.snapshot());
+    let vcpu_metrics = session.shared_vcpu_metrics().snapshot();
+    let interrupt_metrics = session.shared_interrupt_metrics().snapshot();
     let pci_validation = session
         .pci_validation_diagnostics()
         .map(|diagnostics| diagnostics.expect("PCI validation diagnostics should be available"));
@@ -2733,6 +2743,8 @@ where
         pvtime_captures,
         mmio_network_driver_features,
         network_interface_metrics,
+        vcpu_metrics,
+        interrupt_metrics,
     }
 }
 
@@ -2774,6 +2786,34 @@ fn assert_guest_boot_observed_marker(
         String::from_utf8_lossy(marker),
         GuestBootFailureReport::new(&observation.boot_diagnostics, &observation.run_diagnostics),
         String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_guest_vcpu_and_interrupt_metrics(observation: &GuestBootObservation) {
+    let vcpu = observation.vcpu_metrics;
+    let read = vcpu.exit_mmio_read();
+    let write = vcpu.exit_mmio_write();
+    assert!(
+        read.saturating_add(write) > 0,
+        "a completed signed guest boot should dispatch at least one MMIO exit"
+    );
+    assert_eq!(vcpu.failures(), 0);
+
+    for (count, latency) in [
+        (read, vcpu.exit_mmio_read_agg()),
+        (write, vcpu.exit_mmio_write_agg()),
+    ] {
+        assert_eq!(latency.sample_count(), count);
+        if count > 0 {
+            assert!(latency.min_us() <= latency.max_us());
+            assert!(latency.sum_us() >= latency.max_us());
+        }
+    }
+
+    assert!(
+        observation.interrupt_metrics.triggers() > 0,
+        "a completed signed guest boot should deliver at least one device interrupt"
     );
 }
 
@@ -2838,6 +2878,8 @@ struct GuestBootObservation {
     )>,
     mmio_network_driver_features: Option<u64>,
     network_interface_metrics: Option<bangbang_runtime::metrics::NetworkInterfaceMetrics>,
+    vcpu_metrics: bangbang_runtime::metrics::VcpuMetrics,
+    interrupt_metrics: bangbang_runtime::metrics::InterruptMetrics,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

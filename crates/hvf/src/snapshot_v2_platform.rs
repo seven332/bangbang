@@ -16,6 +16,7 @@ use bangbang_runtime::logger::{GuestLogger, LoggerBackendOutcome, LoggerTimeIden
 use bangbang_runtime::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange, aarch64,
 };
+use bangbang_runtime::metrics::{SharedInterruptMetrics, SharedVcpuMetrics};
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegion, MmioRegionId};
 use bangbang_runtime::pci::{
     Arm64PciAddressPlan, PCI_BUS_ZERO, PCI_FIRST_ENDPOINT_DEVICE, PCI_FUNCTION_ZERO,
@@ -1197,6 +1198,14 @@ impl RestoredHvfSnapshotV2Platform {
     /// Return owner-thread-verified canonical MPIDRs.
     pub fn vcpu_mpidrs(&self) -> &[u64] {
         self.parts().runner.mpidrs()
+    }
+
+    pub fn shared_vcpu_metrics(&self) -> SharedVcpuMetrics {
+        self.parts().runner.shared_vcpu_metrics()
+    }
+
+    pub fn shared_interrupt_metrics(&self) -> SharedInterruptMetrics {
+        self.parts().runner.shared_interrupt_metrics()
     }
 
     /// Return the retained exact memory-image binding.

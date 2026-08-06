@@ -22,6 +22,7 @@ use bangbang_runtime::message_interrupt::{
     GuestMessageInterruptRegistryError, GuestMessageInterruptResources,
     GuestMessageInterruptResourcesError, GuestMessageInterruptSignalError,
 };
+use bangbang_runtime::metrics::SharedInterruptMetrics;
 
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 const GIC_REQUIRES_MACOS_15_MESSAGE: &str =
@@ -1183,11 +1184,19 @@ impl HvfGicMsiDeviceInterruptResources {
         signaler: &HvfGicMsiSignaler,
         count: usize,
     ) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
+        Self::allocate_with_interrupt_metrics(signaler, count, SharedInterruptMetrics::default())
+    }
+
+    pub fn allocate_with_interrupt_metrics(
+        signaler: &HvfGicMsiSignaler,
+        count: usize,
+        metrics: SharedInterruptMetrics,
+    ) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
         let allocator = signaler.allocator();
         let interrupts = allocator
             .allocate_many(count)
             .map_err(|source| HvfGicMsiDeviceInterruptResourceError::Allocate { source })?;
-        Self::from_interrupts(signaler, allocator, interrupts)
+        Self::from_interrupts(signaler, allocator, interrupts, metrics)
     }
 
     /// Atomically allocate and bind one caller-ordered exact GICv2m INTID
@@ -1196,17 +1205,30 @@ impl HvfGicMsiDeviceInterruptResources {
         signaler: &HvfGicMsiSignaler,
         intids: &[u32],
     ) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
+        Self::allocate_exact_with_interrupt_metrics(
+            signaler,
+            intids,
+            SharedInterruptMetrics::default(),
+        )
+    }
+
+    pub fn allocate_exact_with_interrupt_metrics(
+        signaler: &HvfGicMsiSignaler,
+        intids: &[u32],
+        metrics: SharedInterruptMetrics,
+    ) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
         let allocator = signaler.allocator();
         let interrupts = allocator
             .allocate_many_exact(intids)
             .map_err(|source| HvfGicMsiDeviceInterruptResourceError::Allocate { source })?;
-        Self::from_interrupts(signaler, allocator, interrupts)
+        Self::from_interrupts(signaler, allocator, interrupts, metrics)
     }
 
     fn from_interrupts(
         signaler: &HvfGicMsiSignaler,
         allocator: HvfGicMsiInterruptAllocator,
         interrupts: Vec<HvfGicMsiInterrupt>,
+        metrics: SharedInterruptMetrics,
     ) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
         let mut routes: Vec<Arc<dyn GuestMessageInterrupt>> = Vec::new();
         if routes.try_reserve_exact(interrupts.len()).is_err() {
@@ -1229,7 +1251,10 @@ impl HvfGicMsiDeviceInterruptResources {
             };
             routes.push(Arc::new(route));
         }
-        let registry = match GuestMessageInterruptRegistry::new(routes.clone()) {
+        let registry = match GuestMessageInterruptRegistry::new_with_interrupt_metrics(
+            routes.clone(),
+            metrics,
+        ) {
             Ok(registry) => registry,
             Err(source) => {
                 return Err(rollback_device_interrupts(
@@ -1263,8 +1288,11 @@ impl HvfGicMsiDeviceInterruptResources {
     }
 
     pub(crate) fn shared_registry(&self) -> Result<Self, HvfGicMsiDeviceInterruptResourceError> {
-        let registry = GuestMessageInterruptRegistry::new(self.owner.routes.clone())
-            .map_err(|source| HvfGicMsiDeviceInterruptResourceError::Registry { source })?;
+        let registry = GuestMessageInterruptRegistry::new_with_interrupt_metrics(
+            self.owner.routes.clone(),
+            self.registry.shared_interrupt_metrics(),
+        )
+        .map_err(|source| HvfGicMsiDeviceInterruptResourceError::Registry { source })?;
         let mut state = self
             .owner
             .state
@@ -3741,6 +3769,7 @@ mod tests {
         GuestMessage, GuestMessageInterrupt, GuestMessageInterruptRegistryError,
         GuestMessageInterruptResources,
     };
+    use bangbang_runtime::metrics::SharedInterruptMetrics;
 
     use super::{
         ARM64_GIC_EL1_ICC_REGISTERS, GIC_ICC_RPR_MISMATCH_MESSAGE,
@@ -4768,11 +4797,27 @@ mod tests {
         )
         .expect("MSI metadata should produce a signaler");
         let allocator = signaler.allocator();
-        let mut owner = HvfGicMsiDeviceInterruptResources::allocate(&signaler, 3)
-            .expect("shared interrupt pool should allocate");
+        let metrics = SharedInterruptMetrics::default();
+        let mut owner = HvfGicMsiDeviceInterruptResources::allocate_with_interrupt_metrics(
+            &signaler,
+            3,
+            metrics.clone(),
+        )
+        .expect("shared interrupt pool should allocate");
         let mut peer = owner
             .shared_registry()
             .expect("peer registry should share every live route");
+        assert!(
+            owner
+                .registry()
+                .shared_interrupt_metrics()
+                .shares_state_with(&metrics)
+        );
+        assert!(
+            peer.registry()
+                .shared_interrupt_metrics()
+                .shares_state_with(&metrics)
+        );
         let interrupt = owner
             .owner
             .state
@@ -4787,6 +4832,7 @@ mod tests {
         peer.registry()
             .signal(message)
             .expect("peer registry should resolve a route anywhere in the pool");
+        assert_eq!(metrics.snapshot().triggers(), 1);
         peer.release()
             .expect("peer registry should release independently");
         assert_eq!(allocator.remaining(), 0);

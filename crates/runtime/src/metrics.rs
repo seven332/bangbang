@@ -6848,6 +6848,254 @@ fn lock_memory_hotplug_device_metrics(
     }
 }
 
+/// Bounded latency aggregate for one vCPU MMIO direction.
+///
+/// `sample_count` distinguishes an empty aggregate from a real zero-microsecond
+/// sample. The canonical Firecracker shape emits only min/max/sum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VcpuLatencyMetrics {
+    min_us: u64,
+    max_us: u64,
+    sum_us: u64,
+    sample_count: u64,
+}
+
+impl VcpuLatencyMetrics {
+    pub const fn min_us(self) -> u64 {
+        self.min_us
+    }
+
+    pub const fn max_us(self) -> u64 {
+        self.max_us
+    }
+
+    pub const fn sum_us(self) -> u64 {
+        self.sum_us
+    }
+
+    pub const fn sample_count(self) -> u64 {
+        self.sample_count
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.sample_count == 0
+    }
+
+    const fn from_sample(latency_us: u64) -> Self {
+        Self {
+            min_us: latency_us,
+            max_us: latency_us,
+            sum_us: latency_us,
+            sample_count: 1,
+        }
+    }
+
+    const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            min_us: self.min_us,
+            max_us: self.max_us,
+            sum_us: incremental_delta(self.sum_us, previous.sum_us),
+            sample_count: incremental_delta(self.sample_count, previous.sample_count),
+        }
+    }
+
+    const fn merged_with(mut self, other: Self) -> Self {
+        if other.is_empty() {
+            return self;
+        }
+        if self.is_empty() || other.min_us < self.min_us {
+            self.min_us = other.min_us;
+        }
+        if other.max_us > self.max_us {
+            self.max_us = other.max_us;
+        }
+        self.sum_us = self.sum_us.saturating_add(other.sum_us);
+        self.sample_count = self.sample_count.saturating_add(other.sample_count);
+        self
+    }
+}
+
+/// VM-local Firecracker-compatible vCPU metrics implemented by the HVF path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VcpuMetrics {
+    exit_mmio_read: u64,
+    exit_mmio_write: u64,
+    failures: u64,
+    exit_mmio_read_agg: VcpuLatencyMetrics,
+    exit_mmio_write_agg: VcpuLatencyMetrics,
+}
+
+impl VcpuMetrics {
+    pub const fn exit_mmio_read(self) -> u64 {
+        self.exit_mmio_read
+    }
+
+    pub const fn exit_mmio_write(self) -> u64 {
+        self.exit_mmio_write
+    }
+
+    pub const fn failures(self) -> u64 {
+        self.failures
+    }
+
+    pub const fn exit_mmio_read_agg(self) -> VcpuLatencyMetrics {
+        self.exit_mmio_read_agg
+    }
+
+    pub const fn exit_mmio_write_agg(self) -> VcpuLatencyMetrics {
+        self.exit_mmio_write_agg
+    }
+
+    const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            exit_mmio_read: incremental_delta(self.exit_mmio_read, previous.exit_mmio_read),
+            exit_mmio_write: incremental_delta(self.exit_mmio_write, previous.exit_mmio_write),
+            failures: incremental_delta(self.failures, previous.failures),
+            exit_mmio_read_agg: self
+                .exit_mmio_read_agg
+                .delta_since(previous.exit_mmio_read_agg),
+            exit_mmio_write_agg: self
+                .exit_mmio_write_agg
+                .delta_since(previous.exit_mmio_write_agg),
+        }
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            exit_mmio_read: self.exit_mmio_read.saturating_add(other.exit_mmio_read),
+            exit_mmio_write: self.exit_mmio_write.saturating_add(other.exit_mmio_write),
+            failures: self.failures.saturating_add(other.failures),
+            exit_mmio_read_agg: self
+                .exit_mmio_read_agg
+                .merged_with(other.exit_mmio_read_agg),
+            exit_mmio_write_agg: self
+                .exit_mmio_write_agg
+                .merged_with(other.exit_mmio_write_agg),
+        }
+    }
+}
+
+/// Shared coherent producer for one VM's vCPU metrics.
+#[derive(Debug, Clone, Default)]
+pub struct SharedVcpuMetrics {
+    inner: Arc<Mutex<VcpuMetrics>>,
+}
+
+impl SharedVcpuMetrics {
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub fn record_mmio_read(&self, latency_us: u64) {
+        self.record_mmio(true, latency_us);
+    }
+
+    pub fn record_mmio_write(&self, latency_us: u64) {
+        self.record_mmio(false, latency_us);
+    }
+
+    pub fn record_failure(&self) {
+        let mut metrics = lock_vcpu_metrics(&self.inner);
+        metrics.failures = metrics.failures.saturating_add(1);
+    }
+
+    pub fn snapshot(&self) -> VcpuMetrics {
+        *lock_vcpu_metrics(&self.inner)
+    }
+
+    fn record_mmio(&self, read: bool, latency_us: u64) {
+        let mut metrics = lock_vcpu_metrics(&self.inner);
+        let sample = VcpuLatencyMetrics::from_sample(latency_us);
+        if read {
+            metrics.exit_mmio_read = metrics.exit_mmio_read.saturating_add(1);
+            metrics.exit_mmio_read_agg = metrics.exit_mmio_read_agg.merged_with(sample);
+        } else {
+            metrics.exit_mmio_write = metrics.exit_mmio_write.saturating_add(1);
+            metrics.exit_mmio_write_agg = metrics.exit_mmio_write_agg.merged_with(sample);
+        }
+    }
+}
+
+fn lock_vcpu_metrics(metrics: &Mutex<VcpuMetrics>) -> MutexGuard<'_, VcpuMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// VM-local Firecracker-compatible interrupt metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterruptMetrics {
+    triggers: u64,
+    config_updates: u64,
+}
+
+impl InterruptMetrics {
+    pub const fn triggers(self) -> u64 {
+        self.triggers
+    }
+
+    pub const fn config_updates(self) -> u64 {
+        self.config_updates
+    }
+
+    const fn delta_since(self, previous: Self) -> Self {
+        Self {
+            triggers: incremental_delta(self.triggers, previous.triggers),
+            config_updates: incremental_delta(self.config_updates, previous.config_updates),
+        }
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            triggers: self.triggers.saturating_add(other.triggers),
+            config_updates: self.config_updates.saturating_add(other.config_updates),
+        }
+    }
+}
+
+/// Shared producer for one VM's MMIO and PCI/MSI-X interrupt metrics.
+#[derive(Debug, Clone, Default)]
+pub struct SharedInterruptMetrics {
+    inner: Arc<Mutex<InterruptMetrics>>,
+}
+
+impl SharedInterruptMetrics {
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub fn record_trigger(&self) {
+        self.record(InterruptMetrics {
+            triggers: 1,
+            config_updates: 0,
+        });
+    }
+
+    pub fn record_config_updates(&self, updates: u64) {
+        self.record(InterruptMetrics {
+            triggers: 0,
+            config_updates: updates,
+        });
+    }
+
+    pub fn snapshot(&self) -> InterruptMetrics {
+        *lock_interrupt_metrics(&self.inner)
+    }
+
+    fn record(&self, observation: InterruptMetrics) {
+        let mut metrics = lock_interrupt_metrics(&self.inner);
+        *metrics = metrics.merged_with(observation);
+    }
+}
+
+fn lock_interrupt_metrics(metrics: &Mutex<InterruptMetrics>) -> MutexGuard<'_, InterruptMetrics> {
+    match metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -6869,6 +7117,8 @@ fn record_atomic_metric_seq_cst(metric: &AtomicU64, increment: u64) {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricsDiagnostics {
+    vcpu_metrics: Option<VcpuMetrics>,
+    interrupt_metrics: Option<InterruptMetrics>,
     block_device_metrics: Option<BlockDeviceMetrics>,
     block_device_metrics_by_drive: Option<BlockDeviceMetricsByDrive>,
     vhost_user_block_device_metrics_by_drive: Option<VhostUserBlockDeviceMetricsByDrive>,
@@ -6893,6 +7143,8 @@ pub struct MetricsDiagnostics {
 impl MetricsDiagnostics {
     pub fn new() -> Self {
         Self {
+            vcpu_metrics: None,
+            interrupt_metrics: None,
             block_device_metrics: None,
             block_device_metrics_by_drive: None,
             vhost_user_block_device_metrics_by_drive: None,
@@ -6913,6 +7165,16 @@ impl MetricsDiagnostics {
             serial_output_metrics: None,
             signal_metrics: None,
         }
+    }
+
+    pub fn with_vcpu_metrics(mut self, vcpu_metrics: VcpuMetrics) -> Self {
+        self.vcpu_metrics = Some(vcpu_metrics);
+        self
+    }
+
+    pub fn with_interrupt_metrics(mut self, interrupt_metrics: InterruptMetrics) -> Self {
+        self.interrupt_metrics = Some(interrupt_metrics);
+        self
     }
 
     pub fn with_block_device_metrics(mut self, block_device_metrics: BlockDeviceMetrics) -> Self {
@@ -7039,6 +7301,12 @@ impl MetricsDiagnostics {
 
     fn delta_since(&self, previous: &Self) -> Self {
         Self {
+            vcpu_metrics: self
+                .vcpu_metrics
+                .map(|current| current.delta_since(previous.vcpu_metrics.unwrap_or_default())),
+            interrupt_metrics: self
+                .interrupt_metrics
+                .map(|current| current.delta_since(previous.interrupt_metrics.unwrap_or_default())),
             block_device_metrics: self.block_device_metrics.map(|current| {
                 current.delta_since(previous.block_device_metrics.unwrap_or_default())
             }),
@@ -7098,6 +7366,18 @@ impl MetricsDiagnostics {
     }
 
     pub fn merged_with(mut self, other: Self) -> Self {
+        if let Some(metrics) = other.vcpu_metrics {
+            self.vcpu_metrics = Some(match self.vcpu_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
+        if let Some(metrics) = other.interrupt_metrics {
+            self.interrupt_metrics = Some(match self.interrupt_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if let Some(metrics) = other.block_device_metrics {
             self.block_device_metrics = Some(match self.block_device_metrics {
                 Some(existing) => existing.merged_with(metrics),
@@ -7201,6 +7481,14 @@ impl MetricsDiagnostics {
         }
 
         self
+    }
+
+    pub fn vcpu_metrics(&self) -> Option<VcpuMetrics> {
+        self.vcpu_metrics
+    }
+
+    pub fn interrupt_metrics(&self) -> Option<InterruptMetrics> {
+        self.interrupt_metrics
     }
 
     pub fn block_device_metrics(&self) -> Option<BlockDeviceMetrics> {
@@ -7411,11 +7699,12 @@ mod tests {
         PmemDeviceMetricsRegistryError, ProcessLatencyBoundary, ProcessLatencyOperation,
         PutApiRequestMetrics, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
         SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetrics,
-        SharedPmemDeviceMetricsRegistry, SharedProcessMetrics, SharedRtcDeviceMetrics,
-        SharedSignalMetrics, SharedVhostUserBlockDeviceMetrics, SharedVsockDeviceMetrics,
-        SignalMetrics, VhostUserBlockDeviceMetrics, VhostUserBlockDeviceMetricsByDrive,
+        SharedInterruptMetrics, SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics,
+        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedProcessMetrics,
+        SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVcpuMetrics,
+        SharedVhostUserBlockDeviceMetrics, SharedVsockDeviceMetrics, SignalMetrics,
+        VhostUserBlockDeviceMetrics, VhostUserBlockDeviceMetricsByDrive,
         VirtioNetworkLatencyAggregate, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
@@ -8924,6 +9213,99 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(only_metrics_value(&output)["signals"]["sigpipe"], 0);
+    }
+
+    #[test]
+    fn shared_vcpu_and_interrupt_metrics_are_vm_local_and_coherent() {
+        let vcpu = SharedVcpuMetrics::default();
+        let shared_vcpu = vcpu.clone();
+        let other_vcpu = SharedVcpuMetrics::default();
+        let interrupts = SharedInterruptMetrics::default();
+        let shared_interrupts = interrupts.clone();
+
+        assert!(vcpu.shares_state_with(&shared_vcpu));
+        assert!(!vcpu.shares_state_with(&other_vcpu));
+        assert!(interrupts.shares_state_with(&shared_interrupts));
+
+        vcpu.record_mmio_read(7);
+        shared_vcpu.record_mmio_read(2);
+        vcpu.record_mmio_write(0);
+        vcpu.record_failure();
+        interrupts.record_trigger();
+        shared_interrupts.record_trigger();
+        interrupts.record_config_updates(3);
+
+        let vcpu = vcpu.snapshot();
+        assert_eq!(vcpu.exit_mmio_read(), 2);
+        assert_eq!(vcpu.exit_mmio_write(), 1);
+        assert_eq!(vcpu.failures(), 1);
+        assert_eq!(vcpu.exit_mmio_read_agg().min_us(), 2);
+        assert_eq!(vcpu.exit_mmio_read_agg().max_us(), 7);
+        assert_eq!(vcpu.exit_mmio_read_agg().sum_us(), 9);
+        assert_eq!(vcpu.exit_mmio_read_agg().sample_count(), 2);
+        assert_eq!(vcpu.exit_mmio_write_agg().sample_count(), 1);
+        assert_eq!(interrupts.snapshot().triggers(), 2);
+        assert_eq!(interrupts.snapshot().config_updates(), 3);
+    }
+
+    #[test]
+    fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let vcpu = SharedVcpuMetrics::default();
+        let interrupts = SharedInterruptMetrics::default();
+
+        vcpu.record_mmio_read(7);
+        vcpu.record_mmio_read(2);
+        vcpu.record_mmio_write(0);
+        vcpu.record_failure();
+        interrupts.record_trigger();
+        interrupts.record_trigger();
+        interrupts.record_config_updates(3);
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new()
+                    .with_vcpu_metrics(vcpu.snapshot())
+                    .with_interrupt_metrics(interrupts.snapshot()),
+            ),
+            Ok(true)
+        );
+
+        vcpu.record_mmio_read(9);
+        vcpu.record_mmio_write(4);
+        interrupts.record_trigger();
+        interrupts.record_config_updates(1);
+        assert_eq!(
+            state.flush_with_diagnostics(
+                &MetricsDiagnostics::new()
+                    .with_vcpu_metrics(vcpu.snapshot())
+                    .with_interrupt_metrics(interrupts.snapshot()),
+            ),
+            Ok(true)
+        );
+
+        let values = metrics_values(&output);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["vcpu"]["exit_mmio_read"], 2);
+        assert_eq!(values[0]["vcpu"]["exit_mmio_write"], 1);
+        assert_eq!(values[0]["vcpu"]["failures"], 1);
+        assert_eq!(values[0]["vcpu"]["exit_mmio_read_agg"]["min_us"], 2);
+        assert_eq!(values[0]["vcpu"]["exit_mmio_read_agg"]["max_us"], 7);
+        assert_eq!(values[0]["vcpu"]["exit_mmio_read_agg"]["sum_us"], 9);
+        assert_eq!(values[0]["interrupts"]["triggers"], 2);
+        assert_eq!(values[0]["interrupts"]["config_updates"], 3);
+
+        assert_eq!(values[1]["vcpu"]["exit_mmio_read"], 1);
+        assert_eq!(values[1]["vcpu"]["exit_mmio_write"], 1);
+        assert_eq!(values[1]["vcpu"]["failures"], 0);
+        assert_eq!(values[1]["vcpu"]["exit_mmio_read_agg"]["min_us"], 2);
+        assert_eq!(values[1]["vcpu"]["exit_mmio_read_agg"]["max_us"], 9);
+        assert_eq!(values[1]["vcpu"]["exit_mmio_read_agg"]["sum_us"], 9);
+        assert_eq!(values[1]["vcpu"]["exit_mmio_write_agg"]["min_us"], 0);
+        assert_eq!(values[1]["vcpu"]["exit_mmio_write_agg"]["max_us"], 4);
+        assert_eq!(values[1]["vcpu"]["exit_mmio_write_agg"]["sum_us"], 4);
+        assert_eq!(values[1]["interrupts"]["triggers"], 1);
+        assert_eq!(values[1]["interrupts"]["config_updates"], 1);
     }
 
     #[test]

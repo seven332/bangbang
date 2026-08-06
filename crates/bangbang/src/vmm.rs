@@ -151,9 +151,9 @@ use bangbang_runtime::metrics::{
     NetworkInterfaceMetricsCaptureState, NetworkInterfaceMetricsLease,
     NetworkInterfaceMetricsRegistryError, NetworkInterfaceTapEventSource, ProcessLatencyBoundary,
     ProcessLatencyOperation, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-    SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
-    SharedSignalMetrics, SharedVsockDeviceMetrics,
+    SharedEntropyDeviceMetrics, SharedInterruptMetrics, SharedMemoryHotplugDeviceMetrics,
+    SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
+    SharedRtcDeviceMetrics, SharedSignalMetrics, SharedVcpuMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigError, MmdsConfigInput, MmdsContentInput, MmdsState, MmdsStateHandle,
@@ -30438,6 +30438,14 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        None
+    }
+
+    fn shared_interrupt_metrics(&self) -> Option<SharedInterruptMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -30688,6 +30696,14 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         OwnedHvfArm64BootSession::shared_rtc_device_metrics(self)
     }
 
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_vcpu_metrics(self))
+    }
+
+    fn shared_interrupt_metrics(&self) -> Option<SharedInterruptMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_interrupt_metrics(self))
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         OwnedHvfArm64BootSession::trigger_balloon_statistics_update_and_signal_interrupts(self)
     }
@@ -30931,6 +30947,14 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        None
+    }
+
+    fn shared_interrupt_metrics(&self) -> Option<SharedInterruptMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -31131,6 +31155,14 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 
     fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
         OwnedHvfArm64BootSession::shared_rtc_device_metrics(self)
+    }
+
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_vcpu_metrics(self))
+    }
+
+    fn shared_interrupt_metrics(&self) -> Option<SharedInterruptMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_interrupt_metrics(self))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -31354,6 +31386,14 @@ where
         self.session.shared_rtc_device_metrics()
     }
 
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        self.session.shared_vcpu_metrics()
+    }
+
+    fn shared_interrupt_metrics(&self) -> Option<SharedInterruptMetrics> {
+        self.session.shared_interrupt_metrics()
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         self.session.trigger_balloon_statistics_update()
     }
@@ -31413,6 +31453,14 @@ impl BootRunLoopSession for ProcessHvfSnapshotV2Session {
         Err(BackendError::InvalidState(
             "native-v2 focused process session cannot create snapshots",
         ))
+    }
+
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        Some(self.platform.shared_vcpu_metrics())
+    }
+
+    fn shared_interrupt_metrics(&self) -> Option<SharedInterruptMetrics> {
+        Some(self.platform.shared_interrupt_metrics())
     }
 
     fn run_loop(
@@ -32531,6 +32579,8 @@ where
     vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
     entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
     rtc_device_metrics: Option<SharedRtcDeviceMetrics>,
+    vcpu_metrics: Option<SharedVcpuMetrics>,
+    interrupt_metrics: Option<SharedInterruptMetrics>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
@@ -32639,6 +32689,8 @@ where
         let vsock_device_metrics = session.shared_vsock_device_metrics();
         let entropy_device_metrics = session.shared_entropy_device_metrics();
         let rtc_device_metrics = session.shared_rtc_device_metrics();
+        let vcpu_metrics = session.shared_vcpu_metrics();
+        let interrupt_metrics = session.shared_interrupt_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         if initially_paused {
@@ -32804,6 +32856,8 @@ where
             vsock_device_metrics,
             entropy_device_metrics,
             rtc_device_metrics,
+            vcpu_metrics,
+            interrupt_metrics,
             command_handle,
             status,
             pause_gate,
@@ -36431,6 +36485,12 @@ where
         if let Some(metrics) = &self.memory_hotplug_device_metrics {
             diagnostics = diagnostics.with_memory_hotplug_device_metrics(metrics.snapshot());
         }
+        if let Some(metrics) = &self.vcpu_metrics {
+            diagnostics = diagnostics.with_vcpu_metrics(metrics.snapshot());
+        }
+        if let Some(metrics) = &self.interrupt_metrics {
+            diagnostics = diagnostics.with_interrupt_metrics(metrics.snapshot());
+        }
         diagnostics
     }
 
@@ -36984,10 +37044,10 @@ mod tests {
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
         MmdsMetrics, NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface,
         PmemDeviceMetrics, PmemDeviceMetricsByDevice, RtcDeviceMetrics, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedInterruptMetrics,
         SharedMemoryHotplugDeviceMetrics, SharedMmdsMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVsockDeviceMetrics,
-        VsockDeviceMetrics,
+        SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVcpuMetrics,
+        SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{
         DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfig,
@@ -41260,6 +41320,8 @@ mod tests {
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
         entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
         rtc_device_metrics: Option<SharedRtcDeviceMetrics>,
+        vcpu_metrics: Option<SharedVcpuMetrics>,
+        interrupt_metrics: Option<SharedInterruptMetrics>,
         memory_hotplug_updates: Arc<Mutex<Vec<u64>>>,
         memory_hotplug_status_requests: Arc<Mutex<Vec<u64>>>,
         memory_hotplug_status_plugged_size_mib: u64,
@@ -41341,6 +41403,8 @@ mod tests {
                 vsock_device_metrics: None,
                 entropy_device_metrics: None,
                 rtc_device_metrics: None,
+                vcpu_metrics: None,
+                interrupt_metrics: None,
                 memory_hotplug_updates: Arc::default(),
                 memory_hotplug_status_requests: Arc::default(),
                 memory_hotplug_status_plugged_size_mib: 0,
@@ -41833,6 +41897,16 @@ mod tests {
             self
         }
 
+        fn with_vcpu_metrics(mut self, metrics: SharedVcpuMetrics) -> Self {
+            self.vcpu_metrics = Some(metrics);
+            self
+        }
+
+        fn with_interrupt_metrics(mut self, metrics: SharedInterruptMetrics) -> Self {
+            self.interrupt_metrics = Some(metrics);
+            self
+        }
+
         const fn with_wait_for_stop(mut self, wait_for_stop: bool) -> Self {
             self.wait_for_stop = wait_for_stop;
             self
@@ -42107,6 +42181,14 @@ mod tests {
 
         fn shared_rtc_device_metrics(&self) -> Option<SharedRtcDeviceMetrics> {
             self.rtc_device_metrics.clone()
+        }
+
+        fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+            self.vcpu_metrics.clone()
+        }
+
+        fn shared_interrupt_metrics(&self) -> Option<SharedInterruptMetrics> {
+            self.interrupt_metrics.clone()
         }
 
         fn update_memory_hotplug(
@@ -53893,6 +53975,51 @@ mod tests {
 
         drop(supervisor);
 
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_retains_vcpu_and_interrupt_metric_roots() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let vcpu_metrics = SharedVcpuMetrics::default();
+        let interrupt_metrics = SharedInterruptMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_vcpu_metrics(vcpu_metrics.clone())
+                .with_interrupt_metrics(interrupt_metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+
+        vcpu_metrics.record_mmio_read(3);
+        vcpu_metrics.record_failure();
+        interrupt_metrics.record_trigger();
+        interrupt_metrics.record_config_updates(2);
+        let diagnostics = supervisor.metrics_diagnostics();
+
+        let vcpu = diagnostics
+            .vcpu_metrics()
+            .expect("vCPU metrics should remain reachable after session handoff");
+        assert_eq!(vcpu.exit_mmio_read(), 1);
+        assert_eq!(vcpu.exit_mmio_read_agg().sum_us(), 3);
+        assert_eq!(vcpu.failures(), 1);
+        let interrupts = diagnostics
+            .interrupt_metrics()
+            .expect("interrupt metrics should remain reachable after session handoff");
+        assert_eq!(interrupts.triggers(), 1);
+        assert_eq!(interrupts.config_updates(), 2);
+
+        drop(supervisor);
         assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }

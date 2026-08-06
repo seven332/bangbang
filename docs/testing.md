@@ -1553,14 +1553,14 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. After #1844 it contains 201 implemented fields, two source-neutral
+children. After #1845 it contains 212 implemented fields, two source-neutral
 fields (`uart.flush_count` and `mmds.rx_bad_eth`), two terminal platform-zero
-`mac_address_updates` fields, 11 planned fields, and 15
-provisional-platform-zero fields. Only the latter two groups are nonterminal
-and evidence-free. The same focused test checks canonical bytes, exact
+`mac_address_updates` fields, no planned fields, and 15
+provisional-platform-zero fields. Only the last group is nonterminal and
+evidence-free. The same focused test checks canonical bytes, exact
 membership and partition, completed-child regression, future-child premature
 promotion, the UART-flush disposition, suffix routing, provisional state,
-anchored-evidence rules, and final-mode rejection of the remaining 26 records.
+anchored-evidence rules, and final-mode rejection of the remaining 15 records.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1669,6 +1669,26 @@ or inventing a host operation. Credentialed positive vmnet connectivity remains
 under #1378. The portable injected-vmnet tests are the deterministic positive
 producer proof for #1844.
 
+### vCPU exit and interrupt metrics validation
+
+Focused #1845 coverage pins all nine applicable vCPU leaves plus
+`interrupts.triggers` and `interrupts.config_updates`. Runtime and HVF tests
+exercise coherent saturating roots, interval counters/sums with lifetime
+latency extrema, decoded dispatcher success and failure, pre-signal MMIO
+attempts, success-only PCI message delivery, execution-failure classification,
+masked/disabled/identical MSI-X writes, active-route fanout, and fresh restore
+reconstruction. Supervisor tests retain the roots after the boot session moves
+to its worker so explicit and terminal collection observe the live VM.
+
+The signed guest-boot oracle snapshots those same roots and requires positive
+MMIO exits, one latency sample per exit, no vCPU execution failure, and
+positive interrupt delivery. Its modern PCI workload additionally requires
+every active unmasked MSI-X route to have a configuration update. The signed
+executable MMIO workload flushes the public JSON line and requires positive
+vCPU MMIO and interrupt totals with zero failures and every latency aggregate
+leaf present. These checks validate real HVF and process wiring without
+claiming the x86-only PIO/KVM-clock fields assigned to #1846.
+
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
 
@@ -1730,7 +1750,7 @@ logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
 and five platform-zero device profiles remain #1789-owned; within the 231-field
-device audit, #1838–#1844 contribute 205 terminal records and the other 26
+device audit, #1838–#1845 contribute 216 terminal records and the other 15
 remain nonterminal. The two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
