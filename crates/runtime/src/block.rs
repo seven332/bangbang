@@ -6429,7 +6429,7 @@ impl VirtioBlockDevice {
     /// Captures a regular-file device after any Async generation is drained.
     pub fn capture_state_at(
         &self,
-        config_space: VirtioBlockConfigSpace,
+        mut config_space: VirtioBlockConfigSpace,
         config: &DriveConfig,
         now: Instant,
     ) -> Result<VirtioBlockDeviceCaptureState, VirtioBlockDeviceCaptureError> {
@@ -6479,6 +6479,7 @@ impl VirtioBlockDevice {
                 return Err(VirtioBlockDeviceCaptureError::ConfigurationMismatch);
             }
         };
+        config_space.metrics = None;
         Ok(VirtioBlockDeviceCaptureState {
             config_space,
             device_id: self.device_id,
@@ -11911,6 +11912,24 @@ mod tests {
         assert!(metrics.shares_state_with(config_metrics));
         assert!(metrics.shares_state_with(device_metrics));
         assert!(config_metrics.shares_state_with(device_metrics));
+    }
+
+    #[test]
+    fn block_capture_detaches_the_live_metrics_owner() {
+        let file = temp_file("capture-metrics-owner.img", &[0; 512]);
+        let config = DriveConfigInput::new("rootfs", "rootfs", file.as_path(), true)
+            .validate()
+            .expect("file-backed drive config should validate");
+        let mut prepared = PreparedBlockDevice::from_config_with_backing(&config, None)
+            .expect("file-backed block device should prepare");
+        assert!(prepared.attach_metrics(SharedBlockDeviceMetrics::default()));
+
+        let captured = prepared
+            .device()
+            .capture_state_at(prepared.config_space(), &config, Instant::now())
+            .expect("ordinary block state should capture");
+
+        assert!(captured.config_space.metrics.is_none());
     }
 
     #[test]
