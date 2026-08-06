@@ -3092,12 +3092,24 @@ The separate #1788 process-producer audit is now terminal for all 69 fields:
 64 implemented, one source-neutral, and four platform-zero. Its two aggregate
 schema profiles are implemented, while the dedicated
 `validate --metrics-process-final` gate applies final mode to every exact field
-record without promoting #1789 device profiles or #1790 aggregates. Its
+record without treating the separate device audit as process evidence or
+promoting #1790 aggregates. Its
 signal/panic slice proves persistent SIGHUP/SIGXCPU/SIGXFSZ/panic Stores in the
 stable process cut, immediate platform-zero SIGILL/SIGBUS/SIGSEGV, and macOS
 platform-zero `seccomp.num_faults`. Explicit SIGSYS remains an exit-code path,
 not an invented seccomp producer. Profile, disposition, and fabricated
 SIGSYS/seccomp equivalence mutations fail the checked certification.
+
+The dedicated `validate --metrics-device-final` gate then requires the exact
+ten implemented device profiles, resolves their common local evidence, and
+applies final mode to all 231 device records at the exact 212 implemented, two
+source-neutral, and 17 platform-zero census. It also requires both #1790
+aggregate capabilities to remain `audit-required`. The portable composition
+test exercises exactly 231 device leaves, 25 intentional active zeros, and
+ambiguous accepted-write replay; signed direct, App Sandbox, snapshot, and
+production tests retain the actual trust-boundary evidence. Profile promotion
+adds no descriptor, grant, host path, dynamic identity source, snapshot field,
+or durable-delivery claim.
 
 Current session-initial, periodic, explicit, normal-terminal, and classified
 external-fatal terminal metrics lines

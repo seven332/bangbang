@@ -26,7 +26,7 @@ The checked contract has four layers:
   field's closed production boundary, delivery child, current disposition,
   rationale, and evidence without copying source shape, unit, reset, or
   aggregation policy.
-- `metrics-device-producer-audit.json` is the human-owned delivery audit of the
+- `metrics-device-producer-audit.json` is the human-owned terminal audit of the
   exact fields selected by device producer profiles. It records each field's
   closed operation boundary, concrete #1789 child, current disposition,
   rationale, and eventual anchored evidence without copying schema policy.
@@ -43,8 +43,9 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies all 231 records delivered by #1838–#1846; #1847 still
-owns the whole-device gate and shared-profile promotion. `corpus:metrics` and
+terminally certifies all 231 records delivered by #1838–#1846. #1847 promotes
+the ten unique shared device profiles and adds the composed device-final gate.
+`corpus:metrics` and
 the cross-producer aggregate semantic remain #1790-owned. A required zero therefore proves wire-shape
 completeness only, never producer completion unless its field audit is
 terminal.
@@ -68,9 +69,9 @@ The scoped gate requires those exact records and their #1787 contract rows to
 be `implemented-and-verified`, while both #1790 aggregate records remain
 `audit-required`. It also pins the policy partition to one implemented
 schema-runtime timestamp profile, two implemented process-lifecycle profiles,
-ten planned #1789 device profiles, and five #1789 platform-zero device
-profiles. Missing, extra, promoted, stale, or differently handed-off members
-fail closed.
+and either the exact historical ten-planned/five-platform-zero device handoff
+or the exact terminal ten-implemented device projection. Any partial or hybrid
+transition fails closed; the checked authority uses the terminal projection.
 
 Focused API evidence rejects duplicate `metrics_path`, rate-limiter, and token
 bucket fields. Every token-bucket number accepts the complete JSON `u64`
@@ -231,8 +232,8 @@ same immutable owned packet, so Firecracker's zero-copy mutation window cannot
 occur and no broader malformed-frame event is aliased into the field. The
 six retained i8042 fields plus nine vCPU PIO/KVM-clock fields are terminal
 platform-zero under the exact #1846 target/backend/machine evidence described
-below. This field-level closure does not promote the five shared device schema
-profiles; #1847 owns that whole-device gate.
+below. The field audit remains the authority for these 17 outcomes even though
+all fields share ten terminal implemented unit/aggregation/owner profiles.
 
 Network metrics use one generation-bearing per-interface owner. A single
 registry capture produces both configured `net_{iface_id}` values and the
@@ -436,10 +437,11 @@ Later producer children may replace only their exact records with terminal
 records require sorted implementation and validation reference lists; each
 list must include local evidence whose anchors resolve in tracked regular
 files. Terminal platform-zero additionally requires the complete structured
-platform-exclusion evidence. Ordinary and all existing scoped validation modes
+platform-exclusion evidence. Ordinary and earlier scoped validation modes
 consume this audit in delivery mode; repository-wide final mode rejects every
-nonterminal device record. A scoped device-final command and certification
-composer remain #1847 work.
+nonterminal device record. The scoped device-final command composes
+schema/process certification with final device-audit validation, exact shared
+profiles/evidence, and the 212/2/17 census while retaining #1790.
 
 ## Exact Arm64 Shape
 
@@ -629,22 +631,35 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 ```
 
 `validate --metrics-schema-final` runs repository delivery validation, the
 metrics authority delivery gate, the exact twelve-row #1787 certification, and
 the logger producer delivery gate needed by metrics collection. It validates
 the exact 69-field process audit and 231-field device audit in delivery mode.
-It permits only the completed process profiles, explicit nonterminal #1789
-device handoffs, and retained #1790 aggregate rows.
+It permits only the completed schema/process profiles, one exact complete
+device transition shape, and retained #1790 aggregate rows.
 
 `validate --metrics-process-final` composes that schema certification with
 final-mode process-audit validation and logger delivery validation. It requires
 all 69 records to be terminal with their exact child, boundary, rationale,
 disposition, and tracked evidence: 64 implemented, one source-neutral, and four
-platform-zero. It does not require the ten planned or five platform-zero
-device profiles or their 231 field records to complete and does not promote
-either #1790 aggregate.
+platform-zero. It observes the current ten implemented device profiles but
+does not itself apply final mode to their 231 field records or promote either
+#1790 aggregate.
+
+`validate --metrics-device-final` composes the schema/process gates with final
+validation of all 231 device records. It requires exactly ten implemented
+device profiles, exact common evidence with resolvable local anchors, and the
+212 implemented/two source-neutral/17 platform-zero census. One portable
+whole-inventory test binds the exact 231 device leaves to a configured
+block/network/vhost-user recipe, exactly 25 intentional active zeros, static
+and configured aggregation behavior, ambiguous accepted-write replay, and idle
+retention/reset behavior. Existing focused and signed tests retain the 985-root
+maximum, concurrency, saturation, hotplug/reuse, isolation/cleanup, snapshot,
+MMIO, and PCI evidence. Neither #1790 aggregate is promoted, and the canonical
+snapshot schema is unchanged.
 Repository-global `validate --final` remains the stronger all-capability gate.
 
 With an explicit clean sibling at the pinned commit, compare every source

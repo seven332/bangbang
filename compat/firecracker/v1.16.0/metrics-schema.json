@@ -7250,48 +7250,178 @@
   },
   "policy_profiles": [
     {
-      "id": "bytes-none-device-planned",
+      "id": "bytes-none-device-implemented",
       "unit": "bytes",
       "aggregation": "none",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
-      "id": "bytes-sum-across-configured-devices-device-planned",
+      "id": "bytes-sum-across-configured-devices-device-implemented",
       "unit": "bytes",
       "aggregation": "sum-across-configured-devices",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
-      "id": "count-none-device-planned",
+      "id": "count-none-device-implemented",
       "unit": "count",
       "aggregation": "none",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
-    },
-    {
-      "id": "count-none-device-platform-zero",
-      "unit": "count",
-      "aggregation": "none",
-      "producer_owner": "device",
-      "producer_disposition": "platform-zero",
-      "delivery_issue": "#1789",
-      "rationale": "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "count-none-process-lifecycle-implemented",
@@ -7372,81 +7502,236 @@
       ]
     },
     {
-      "id": "count-sum-across-configured-devices-device-planned",
+      "id": "count-sum-across-configured-devices-device-implemented",
       "unit": "count",
       "aggregation": "sum-across-configured-devices",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
-      "id": "count-sum-across-configured-devices-device-platform-zero",
-      "unit": "count",
-      "aggregation": "sum-across-configured-devices",
-      "producer_owner": "device",
-      "producer_disposition": "platform-zero",
-      "delivery_issue": "#1789",
-      "rationale": "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence.",
-      "implementation": [],
-      "validation": []
-    },
-    {
-      "id": "microseconds-maximum-device-planned",
+      "id": "microseconds-maximum-device-implemented",
       "unit": "microseconds",
       "aggregation": "maximum",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
-      "id": "microseconds-maximum-device-platform-zero",
-      "unit": "microseconds",
-      "aggregation": "maximum",
-      "producer_owner": "device",
-      "producer_disposition": "platform-zero",
-      "delivery_issue": "#1789",
-      "rationale": "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence.",
-      "implementation": [],
-      "validation": []
-    },
-    {
-      "id": "microseconds-minimum-device-planned",
+      "id": "microseconds-minimum-device-implemented",
       "unit": "microseconds",
       "aggregation": "minimum",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
-      "id": "microseconds-minimum-device-platform-zero",
-      "unit": "microseconds",
-      "aggregation": "minimum",
-      "producer_owner": "device",
-      "producer_disposition": "platform-zero",
-      "delivery_issue": "#1789",
-      "rationale": "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence.",
-      "implementation": [],
-      "validation": []
-    },
-    {
-      "id": "microseconds-none-device-planned",
+      "id": "microseconds-none-device-implemented",
       "unit": "microseconds",
       "aggregation": "none",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "microseconds-none-process-lifecycle-implemented",
@@ -7512,48 +7797,178 @@
       ]
     },
     {
-      "id": "microseconds-sum-across-configured-devices-device-planned",
+      "id": "microseconds-sum-across-configured-devices-device-implemented",
       "unit": "microseconds",
       "aggregation": "sum-across-configured-devices",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
-      "id": "microseconds-sum-device-planned",
+      "id": "microseconds-sum-device-implemented",
       "unit": "microseconds",
       "aggregation": "sum",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
-      "id": "microseconds-sum-device-platform-zero",
-      "unit": "microseconds",
-      "aggregation": "sum",
-      "producer_owner": "device",
-      "producer_disposition": "platform-zero",
-      "delivery_issue": "#1789",
-      "rationale": "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence.",
-      "implementation": [],
-      "validation": []
-    },
-    {
-      "id": "microseconds-zero-in-configured-device-aggregate-device-planned",
+      "id": "microseconds-zero-in-configured-device-aggregate-device-implemented",
       "unit": "microseconds",
       "aggregation": "zero-in-configured-device-aggregate",
       "producer_owner": "device",
-      "producer_disposition": "planned",
-      "delivery_issue": "#1789",
-      "rationale": "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary.",
-      "implementation": [],
-      "validation": []
+      "producer_disposition": "implemented",
+      "delivery_issue": null,
+      "rationale": "The producer has exact implementation and validation evidence for this checked field policy.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub(crate) fn flush_with_diagnostics_and_devices"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_validate.rs",
+          "anchor": "pub fn validate_metrics_device_producers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/metrics_device_certify.rs",
+          "anchor": "pub fn validate_metrics_device_compatibility"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "fn maximum_configured_recipe_has_exact_sorted_exclusive_dynamic_roots"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_architecture_retained_platform_zero_metrics"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn wait_for_canonical_output_metrics_lines"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_metrics_device_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "milliseconds-since-unix-epoch-none-schema-runtime-implemented",
@@ -7587,235 +8002,235 @@
   "field_policies": [
     {
       "field_id": "dynamic:block_{drive_id}.activate_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.cfg_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.execute_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.flush_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.invalid_reqs_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.io_engine_throttled_events",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.no_avail_buffer",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.queue_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.rate_limiter_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.rate_limiter_throttled_events",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_bytes",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.read_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.remaining_reqs_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.update_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.update_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_bytes",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "dynamic:block_{drive_id}.write_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.activate_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.cfg_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.mac_address_updates",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.no_rx_avail_buffer",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.no_tx_avail_buffer",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_bytes_count",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_event_rate_limiter_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_packets_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_queue_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_rate_limiter_throttled",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.rx_tap_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_read_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tap_write_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_bytes_count",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_malformed_frames",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_packets_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_queue_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_rate_limiter_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_rate_limiter_throttled",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_remaining_reqs_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:net_{iface_id}.tx_spoofed_mac_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.activate_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.activate_time_us",
-      "profile_id": "microseconds-none-device-planned"
+      "profile_id": "microseconds-none-device-implemented"
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.cfg_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.config_change_time_us",
-      "profile_id": "microseconds-none-device-planned"
+      "profile_id": "microseconds-none-device-implemented"
     },
     {
       "field_id": "dynamic:vhost_user_block_{drive_id}.init_time_us",
-      "profile_id": "microseconds-none-device-planned"
+      "profile_id": "microseconds-none-device-implemented"
     },
     {
       "field_id": "static:api_server.process_startup_time_cpu_us",
@@ -7827,147 +8242,147 @@
     },
     {
       "field_id": "static:balloon.activate_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.deflate_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.free_page_hint_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.free_page_hint_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.free_page_hint_freed",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:balloon.free_page_report_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.free_page_report_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.free_page_report_freed",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:balloon.inflate_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.stats_update_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:balloon.stats_updates_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:block.activate_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.cfg_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.event_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.execute_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.flush_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.invalid_reqs_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.io_engine_throttled_events",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.no_avail_buffer",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.queue_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.rate_limiter_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.rate_limiter_throttled_events",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.read_agg.max_us",
-      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-planned"
+      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-implemented"
     },
     {
       "field_id": "static:block.read_agg.min_us",
-      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-planned"
+      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-implemented"
     },
     {
       "field_id": "static:block.read_agg.sum_us",
-      "profile_id": "microseconds-sum-across-configured-devices-device-planned"
+      "profile_id": "microseconds-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.read_bytes",
-      "profile_id": "bytes-sum-across-configured-devices-device-planned"
+      "profile_id": "bytes-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.read_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.remaining_reqs_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.update_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.update_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.write_agg.max_us",
-      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-planned"
+      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-implemented"
     },
     {
       "field_id": "static:block.write_agg.min_us",
-      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-planned"
+      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-implemented"
     },
     {
       "field_id": "static:block.write_agg.sum_us",
-      "profile_id": "microseconds-sum-across-configured-devices-device-planned"
+      "profile_id": "microseconds-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.write_bytes",
-      "profile_id": "bytes-sum-across-configured-devices-device-planned"
+      "profile_id": "bytes-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:block.write_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:deprecated_api.deprecated_http_api_calls",
@@ -7975,31 +8390,31 @@
     },
     {
       "field_id": "static:entropy.activate_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:entropy.entropy_bytes",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:entropy.entropy_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:entropy.entropy_event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:entropy.entropy_rate_limiter_throttled",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:entropy.host_rng_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:entropy.rate_limiter_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:get_api_requests.hotplug_memory_count",
@@ -8023,35 +8438,35 @@
     },
     {
       "field_id": "static:i8042.error_count",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:i8042.missed_read_count",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:i8042.missed_write_count",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:i8042.read_count",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:i8042.reset_count",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:i8042.write_count",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:interrupts.config_updates",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:interrupts.triggers",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:latencies_us.diff_create_snapshot",
@@ -8111,275 +8526,275 @@
     },
     {
       "field_id": "static:memory_hotplug.activate_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.plug_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.plug_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.plug_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.plug_bytes",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.plug_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.plug_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.queue_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.queue_event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.state_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.state_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.state_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.state_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.state_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_all_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_bytes",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_discard_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:memory_hotplug.unplug_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.connections_created",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.connections_destroyed",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.rx_accepted",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.rx_accepted_err",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.rx_accepted_unusual",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.rx_bad_eth",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.rx_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.rx_invalid_token",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.rx_no_token",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.tx_bytes",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:mmds.tx_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.tx_errors",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:mmds.tx_frames",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:net.activate_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.cfg_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.event_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.mac_address_updates",
-      "profile_id": "count-sum-across-configured-devices-device-platform-zero"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.no_rx_avail_buffer",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.no_tx_avail_buffer",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_bytes_count",
-      "profile_id": "bytes-sum-across-configured-devices-device-planned"
+      "profile_id": "bytes-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_event_rate_limiter_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_packets_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_queue_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_rate_limiter_throttled",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.rx_tap_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tap_read_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tap_write_agg.max_us",
-      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-planned"
+      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-implemented"
     },
     {
       "field_id": "static:net.tap_write_agg.min_us",
-      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-planned"
+      "profile_id": "microseconds-zero-in-configured-device-aggregate-device-implemented"
     },
     {
       "field_id": "static:net.tap_write_agg.sum_us",
-      "profile_id": "microseconds-sum-across-configured-devices-device-planned"
+      "profile_id": "microseconds-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tap_write_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_bytes_count",
-      "profile_id": "bytes-sum-across-configured-devices-device-planned"
+      "profile_id": "bytes-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_malformed_frames",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_packets_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_queue_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_rate_limiter_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_rate_limiter_throttled",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_remaining_reqs_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:net.tx_spoofed_mac_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:patch_api_requests.drive_count",
@@ -8431,27 +8846,27 @@
     },
     {
       "field_id": "static:pmem.activate_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:pmem.cfg_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:pmem.event_fails",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:pmem.queue_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:pmem.rate_limiter_event_count",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:pmem.rate_limiter_throttled_events",
-      "profile_id": "count-sum-across-configured-devices-device-planned"
+      "profile_id": "count-sum-across-configured-devices-device-implemented"
     },
     {
       "field_id": "static:put_api_requests.actions_count",
@@ -8559,15 +8974,15 @@
     },
     {
       "field_id": "static:rtc.error_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:rtc.missed_read_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:rtc.missed_write_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:seccomp.num_faults",
@@ -8603,31 +9018,31 @@
     },
     {
       "field_id": "static:uart.error_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:uart.flush_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:uart.missed_read_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:uart.missed_write_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:uart.rate_limiter_dropped_bytes",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:uart.read_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:uart.write_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:utc_timestamp_ms",
@@ -8635,75 +9050,75 @@
     },
     {
       "field_id": "static:vcpu.exit_io_in",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_in_agg.max_us",
-      "profile_id": "microseconds-maximum-device-platform-zero"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_in_agg.min_us",
-      "profile_id": "microseconds-minimum-device-platform-zero"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_in_agg.sum_us",
-      "profile_id": "microseconds-sum-device-platform-zero"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_out",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_out_agg.max_us",
-      "profile_id": "microseconds-maximum-device-platform-zero"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_out_agg.min_us",
-      "profile_id": "microseconds-minimum-device-platform-zero"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_io_out_agg.sum_us",
-      "profile_id": "microseconds-sum-device-platform-zero"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_read",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_read_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_read_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_read_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_write",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_write_agg.max_us",
-      "profile_id": "microseconds-maximum-device-planned"
+      "profile_id": "microseconds-maximum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_write_agg.min_us",
-      "profile_id": "microseconds-minimum-device-planned"
+      "profile_id": "microseconds-minimum-device-implemented"
     },
     {
       "field_id": "static:vcpu.exit_mmio_write_agg.sum_us",
-      "profile_id": "microseconds-sum-device-planned"
+      "profile_id": "microseconds-sum-device-implemented"
     },
     {
       "field_id": "static:vcpu.failures",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vcpu.kvmclock_ctrl_fails",
-      "profile_id": "count-none-device-platform-zero"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vmm.panic_count",
@@ -8711,83 +9126,83 @@
     },
     {
       "field_id": "static:vsock.activate_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.cfg_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.conn_event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.conns_added",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.conns_killed",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.conns_removed",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.ev_queue_event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.killq_resync",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.muxer_event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.rx_bytes_count",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:vsock.rx_packets_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.rx_queue_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.rx_queue_event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.rx_read_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.tx_bytes_count",
-      "profile_id": "bytes-none-device-planned"
+      "profile_id": "bytes-none-device-implemented"
     },
     {
       "field_id": "static:vsock.tx_flush_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.tx_packets_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.tx_queue_event_count",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.tx_queue_event_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     },
     {
       "field_id": "static:vsock.tx_write_fails",
-      "profile_id": "count-none-device-planned"
+      "profile_id": "count-none-device-implemented"
     }
   ]
 }

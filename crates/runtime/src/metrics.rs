@@ -7677,7 +7677,7 @@ fn write_all_metrics(
 }
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs::{self, OpenOptions};
     use std::io::{self, ErrorKind};
     use std::path::PathBuf;
@@ -8225,6 +8225,54 @@ mod tests {
             .with_free_page_report_metrics(BalloonFreePageReportMetrics::new(15, 16, 17, 18, 19))
     }
 
+    fn vhost_user_metrics_with_all_fields() -> VhostUserBlockDeviceMetrics {
+        VhostUserBlockDeviceMetrics::default()
+            .with_activate_fails(1)
+            .with_cfg_fails(2)
+            .with_init_time_us(3)
+            .with_activate_time_us(4)
+            .with_config_change_time_us(5)
+    }
+
+    fn memory_hotplug_metrics_with_all_fields() -> super::MemoryHotplugDeviceMetrics {
+        let metrics = SharedMemoryHotplugDeviceMetrics::default();
+        metrics.record_activation_failure();
+        metrics.record_queue_events(2);
+        metrics.record_queue_event_failure();
+        metrics.record_operation(MemoryHotplugMetricOperation::Plug, true, 4096, 3);
+        metrics.record_operation(MemoryHotplugMetricOperation::Plug, false, 0, 5);
+        metrics.record_operation(MemoryHotplugMetricOperation::Unplug, true, 4096, 7);
+        metrics.record_operation(MemoryHotplugMetricOperation::Unplug, false, 0, 11);
+        metrics.record_operation(MemoryHotplugMetricOperation::UnplugAll, true, 0, 13);
+        metrics.record_operation(MemoryHotplugMetricOperation::UnplugAll, false, 0, 17);
+        metrics.record_operation(MemoryHotplugMetricOperation::State, true, 0, 19);
+        metrics.record_operation(MemoryHotplugMetricOperation::State, false, 0, 23);
+        metrics.record_unplug_discard_failures(2);
+        metrics.record_interrupt_failure();
+        metrics.record_rollbacks(2, 1);
+        metrics.record_owner_cleanup(2, 1);
+        metrics.record_teardown(true);
+        metrics.record_teardown(false);
+        metrics.snapshot()
+    }
+
+    fn vcpu_metrics_with_all_supported_fields() -> super::VcpuMetrics {
+        let metrics = SharedVcpuMetrics::default();
+        metrics.record_mmio_read(3);
+        metrics.record_mmio_read(5);
+        metrics.record_mmio_write(7);
+        metrics.record_mmio_write(11);
+        metrics.record_failure();
+        metrics.snapshot()
+    }
+
+    fn interrupt_metrics_with_all_fields() -> super::InterruptMetrics {
+        let metrics = SharedInterruptMetrics::default();
+        metrics.record_trigger();
+        metrics.record_config_updates(2);
+        metrics.snapshot()
+    }
+
     fn diagnostics_with_all_fields() -> MetricsDiagnostics {
         let block = block_metrics_with_all_fields();
         let pmem = pmem_metrics_with_all_fields();
@@ -8235,6 +8283,10 @@ mod tests {
             .with_block_device_metrics_by_drive(
                 BlockDeviceMetricsByDrive::new().with_drive_metrics("rootfs", block),
             )
+            .with_vhost_user_block_device_metrics_by_drive(
+                VhostUserBlockDeviceMetricsByDrive::new()
+                    .with_drive_metrics("vhost", vhost_user_metrics_with_all_fields()),
+            )
             .with_pmem_device_metrics(pmem)
             .with_pmem_device_metrics_by_device(
                 PmemDeviceMetricsByDevice::new().with_device_metrics("pmem0", pmem),
@@ -8243,17 +8295,132 @@ mod tests {
             .with_network_interface_metrics_by_interface(
                 NetworkInterfaceMetricsByInterface::new().with_interface_metrics("eth0", network),
             )
-            .with_mmds_metrics(mmds_metrics_with_all_fields())
+            .with_mmds_metrics(mmds_metrics_with_all_fields().with_rx_bad_eth(0))
             .with_vsock_device_metrics(vsock_metrics_with_all_fields())
             .with_entropy_device_metrics(entropy_metrics_with_all_fields())
             .with_rtc_device_metrics(RtcDeviceMetrics::new(1, 2, 3))
             .with_balloon_device_metrics(balloon_metrics_with_all_fields())
+            .with_memory_hotplug_device_metrics(memory_hotplug_metrics_with_all_fields())
+            .with_vcpu_metrics(vcpu_metrics_with_all_supported_fields())
+            .with_interrupt_metrics(interrupt_metrics_with_all_fields())
             .with_boot_run_loop_status(BootRunLoopMetricStatus::Running)
             .with_start_time_us(1_000)
             .with_start_time_cpu_us(2_000)
             .with_parent_cpu_time_us(3_000)
             .with_serial_output_metrics(serial_metrics_with_scale(1))
             .with_signal_metrics(SignalMetrics::new(8))
+    }
+
+    fn is_device_metric_path(path: &str) -> bool {
+        let root = path.split('.').next().unwrap_or_default();
+        root.starts_with("block_")
+            || root.starts_with("net_")
+            || root.starts_with("vhost_user_block_")
+            || matches!(
+                root,
+                "balloon"
+                    | "block"
+                    | "i8042"
+                    | "rtc"
+                    | "uart"
+                    | "mmds"
+                    | "net"
+                    | "vcpu"
+                    | "vsock"
+                    | "entropy"
+                    | "pmem"
+                    | "interrupts"
+                    | "memory_hotplug"
+            )
+    }
+
+    fn configured_device_metric_paths() -> BTreeSet<String> {
+        super::firecracker::compiled_metric_descriptors()
+            .into_iter()
+            .filter(|descriptor| is_device_metric_path(&descriptor.path))
+            .map(|descriptor| {
+                descriptor
+                    .path
+                    .replace("vhost_user_block_{drive_id}", "vhost_user_block_vhost")
+                    .replace("block_{drive_id}", "block_rootfs")
+                    .replace("net_{iface_id}", "net_eth0")
+            })
+            .collect()
+    }
+
+    fn collect_numeric_leaves(
+        value: &serde_json::Value,
+        prefix: &str,
+        leaves: &mut BTreeMap<String, u64>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_numeric_leaves(value, &path, leaves);
+                }
+            }
+            serde_json::Value::Number(number) => {
+                leaves.insert(
+                    prefix.to_string(),
+                    number
+                        .as_u64()
+                        .expect("canonical metrics values must be unsigned integers"),
+                );
+            }
+            _ => panic!("canonical metrics leaves must be numeric: {prefix}"),
+        }
+    }
+
+    fn device_metric_values(value: &serde_json::Value) -> BTreeMap<String, u64> {
+        let mut leaves = BTreeMap::new();
+        collect_numeric_leaves(value, "", &mut leaves);
+        leaves
+            .into_iter()
+            .filter(|(path, _)| is_device_metric_path(path))
+            .collect()
+    }
+
+    fn intentional_active_device_zero_paths() -> BTreeSet<String> {
+        let mut paths = [
+            "mmds.rx_bad_eth",
+            "net.mac_address_updates",
+            "net_eth0.mac_address_updates",
+            "uart.flush_count",
+            "vcpu.exit_io_in",
+            "vcpu.exit_io_out",
+            "vcpu.exit_io_in_agg.min_us",
+            "vcpu.exit_io_in_agg.max_us",
+            "vcpu.exit_io_in_agg.sum_us",
+            "vcpu.exit_io_out_agg.min_us",
+            "vcpu.exit_io_out_agg.max_us",
+            "vcpu.exit_io_out_agg.sum_us",
+            "vcpu.kvmclock_ctrl_fails",
+            "block.read_agg.min_us",
+            "block.read_agg.max_us",
+            "block.write_agg.min_us",
+            "block.write_agg.max_us",
+            "net.tap_write_agg.min_us",
+            "net.tap_write_agg.max_us",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+        for field in [
+            "error_count",
+            "missed_read_count",
+            "missed_write_count",
+            "read_count",
+            "reset_count",
+            "write_count",
+        ] {
+            paths.insert(format!("i8042.{field}"));
+        }
+        paths
     }
 
     fn record_all_process_metrics(state: &mut MetricsState) {
@@ -8492,6 +8659,77 @@ mod tests {
         assert_eq!(unchanged["latencies_us"]["resume_vm"], 102);
         assert!(unchanged["vmm"].get("boot_run_loop_status").is_none());
         assert_eq!(unchanged["vmm"]["panic_count"], 0);
+    }
+
+    #[test]
+    fn complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = diagnostics_with_all_fields();
+        let configured = configured_metrics_devices(&["rootfs"], &["vhost"], &["eth0"]);
+        let expected_paths = configured_device_metric_paths();
+        let intentional_zeros = intentional_active_device_zero_paths();
+
+        assert_eq!(expected_paths.len(), 231);
+        assert_eq!(intentional_zeros.len(), 25);
+        assert!(intentional_zeros.is_subset(&expected_paths));
+
+        output.accept_next_write_then_fail();
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+
+        let replayed = output.lines();
+        assert_eq!(replayed.len(), 2);
+        let accepted: serde_json::Value =
+            serde_json::from_str(&replayed[0]).expect("accepted line must be valid JSON");
+        let retry: serde_json::Value =
+            serde_json::from_str(&replayed[1]).expect("retry line must be valid JSON");
+        let accepted_device = device_metric_values(&accepted);
+        let retry_device = device_metric_values(&retry);
+        assert_eq!(
+            accepted_device.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_paths
+        );
+        assert_eq!(accepted_device, retry_device);
+        assert_eq!(
+            accepted_device
+                .iter()
+                .filter_map(|(path, value)| (*value == 0).then_some(path.clone()))
+                .collect::<BTreeSet<_>>(),
+            intentional_zeros
+        );
+
+        assert_eq!(
+            state.flush_with_diagnostics_and_devices(&diagnostics, &configured),
+            Ok(true)
+        );
+        let lines = output.lines();
+        assert_eq!(lines.len(), 3);
+        let idle: serde_json::Value =
+            serde_json::from_str(&lines[2]).expect("idle line must be valid JSON");
+        let idle_device = device_metric_values(&idle);
+        assert_eq!(
+            idle_device.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_paths
+        );
+        assert_eq!(idle_device["block_rootfs.read_count"], 0);
+        assert_eq!(idle_device["block_rootfs.read_agg.min_us"], 12);
+        assert_eq!(idle_device["block_rootfs.read_agg.sum_us"], 0);
+        assert_eq!(idle_device["vcpu.exit_mmio_read"], 0);
+        assert_eq!(idle_device["vcpu.exit_mmio_read_agg.min_us"], 3);
+        assert_eq!(idle_device["vcpu.exit_mmio_read_agg.sum_us"], 0);
+        assert_eq!(idle_device["memory_hotplug.plug_count"], 0);
+        assert_eq!(idle_device["memory_hotplug.plug_agg.min_us"], 3);
+        assert_eq!(idle_device["memory_hotplug.plug_agg.sum_us"], 0);
+        assert_eq!(idle_device["vhost_user_block_vhost.activate_fails"], 0);
+        assert_eq!(idle_device["vhost_user_block_vhost.init_time_us"], 3);
+        assert_architecture_retained_platform_zero_metrics(&idle);
     }
 
     #[test]

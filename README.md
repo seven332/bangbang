@@ -136,14 +136,16 @@ authority for #1789. The completed #1838–#1846 slices contribute 212
 implemented device records, two source-neutral records, and 17 terminal
 platform-zero records. The latter are the two immutable-MAC fields plus six
 arm64-retained i8042 and nine PIO/KVM-clock fields. All 231 records are
-terminal, while #1847 still owns the dedicated whole-device gate and shared
-profile promotion.
+terminal and map to ten implemented shared device profiles. The dedicated
+device gate verifies that exact profile set, its resolvable evidence, the
+212/2/17 field census, and the retained #1790 corpus boundary.
 
-The terminal 69-field API/process metrics producer scope has a separate
-fail-closed certification gate:
+The terminal 69-field API/process and 231-field device metrics producer scopes
+have separate fail-closed certification gates:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 ```
 
 When the pinned sibling checkout is available at `../firecracker`, verify its
