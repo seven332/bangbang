@@ -1559,7 +1559,23 @@ fields, and no planned or provisional fields. The same focused test checks
 canonical bytes, exact membership and partition, completed-child regression,
 the UART/MMDS source-neutral dispositions, suffix routing, anchored evidence,
 field-specific architecture exclusions, and final-mode acceptance of all 231
-terminal records.
+terminal records. The schema authority maps them through exactly ten
+implemented device profiles; no planned or platform-zero profile remains.
+
+Run the composed device certification and its portable whole-inventory oracle
+with:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
+cargo test -p bangbang-runtime complete_device_inventory_replays_ambiguous_write_and_preserves_idle_shape --locked
+```
+
+The runtime oracle configures one ordinary block, one network interface, and
+one vhost-user block. It requires the exact 231 device leaf paths, exactly 25
+intentional active zeros, equal replay after an ambiguous accepted write, and
+the expected idle reset/store behavior. The composed audit test rejects
+partial or platform-candidate profile promotion, evidence/anchor drift, field
+census regression, and premature #1790 promotion.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1746,8 +1762,9 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 Metrics-schema-final mode requires the exact twelve #1787 rows to be terminal,
 the schema-runtime timestamp profile to be implemented, both #1790 aggregates
 to remain nonterminal, both process-lifecycle profiles to be implemented, and
-the remaining device policy profiles to retain their exact #1789 disposition
-partition. It also validates the terminal 69-field process audit in delivery
+the device policy profiles to form either the complete historical handoff or
+the complete terminal projection, never a hybrid. It also validates the
+terminal 69-field process audit in delivery
 mode. Focused tests inject missing, extra, promoted, stale, wrongly handed-off,
 invalid-evidence, and boundary-drift records; API tests cover duplicate keys,
 the full unsigned token-bucket boundary, and the exact parser-metric table;
@@ -1767,15 +1784,27 @@ Metrics-process-final composes metrics-schema-final's authority and downstream
 partition with final-mode validation of the exact process audit, while retaining
 logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
-exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
-and five platform-zero device profiles remain #1789-owned pending #1847's
-whole-device promotion; within the 231-field device audit, #1838–#1846 are all
-terminal at 212 implemented, two source-neutral, and 17 platform-zero. The two
-aggregates remain #1790-owned.
+exactly 64 implemented, one source-neutral, and four platform-zero. The checked
+authority has ten implemented device profiles and a terminal 231-field audit,
+but this process-scoped gate still consumes that audit in delivery mode. The
+two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,
 ownership, boundary, child, rationale, disposition, evidence, path, and baseline
 failure rule.
+
+The terminal device metrics gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
+```
+
+Metrics-device-final composes schema-final and process-final, requires the
+exact ten terminal device profile IDs and common resolvable evidence, and
+applies final validation to all 231 device records at 212 implemented, two
+source-neutral, 17 platform-zero, and zero nonterminal. The gate pins both
+#1790 aggregate capabilities to `audit-required`; it does not change snapshot
+formats or claim durable/exactly-once publication.
 
 Current-main integration evidence is intentionally composed from the existing
 oracles: runtime publication tests cover stable cuts, partial/failing sinks,
@@ -1866,6 +1895,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo check --workspace --all-targets --all-features --locked
 cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 cargo check -p bangbang-snapshot-tools --all-targets --all-features --locked --target aarch64-unknown-linux-musl

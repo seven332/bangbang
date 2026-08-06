@@ -916,7 +916,7 @@ fn process_producer_audit_rejects_neutral_aliases_and_bad_evidence() {
 }
 
 #[test]
-fn checked_metrics_authority_has_exact_completed_process_and_later_owner_partition() {
+fn checked_metrics_authority_has_exact_terminal_producer_partition() {
     let authority = checked_authority();
     let count = |owner, disposition| {
         authority
@@ -944,7 +944,7 @@ fn checked_metrics_authority_has_exact_completed_process_and_later_owner_partiti
     assert_eq!(
         count(
             MetricsProducerOwner::Device,
-            MetricsProducerDisposition::Planned,
+            MetricsProducerDisposition::Implemented,
         ),
         10
     );
@@ -953,15 +953,21 @@ fn checked_metrics_authority_has_exact_completed_process_and_later_owner_partiti
             MetricsProducerOwner::Device,
             MetricsProducerDisposition::PlatformZero,
         ),
-        5
+        0
     );
-    assert_eq!(authority.policy_profiles.len(), 18);
+    assert_eq!(
+        count(
+            MetricsProducerOwner::Device,
+            MetricsProducerDisposition::Planned,
+        ),
+        0
+    );
+    assert_eq!(authority.policy_profiles.len(), 13);
     let root = repository_root();
     let manifest = read_source_manifest(&root.join(SOURCE_MANIFEST_PATH))
         .expect("checked source manifest must parse");
-    let error = validate_metrics_schema(&authority, &manifest, &root, AuditMode::Final)
-        .expect_err("unfinished device metrics producers must fail final mode");
-    assert!(error.to_string().contains("nonterminal producer policy"));
+    validate_metrics_schema(&authority, &manifest, &root, AuditMode::Final)
+        .expect("terminal metrics producer profiles must pass final schema validation");
 }
 
 #[test]
@@ -1083,8 +1089,11 @@ fn rejects_disposition_issue_and_rationale_drift() {
     let profile = disposition
         .policy_profiles
         .iter_mut()
-        .find(|profile| profile.producer_disposition == MetricsProducerDisposition::Planned)
-        .expect("planned profile must exist");
+        .find(|profile| {
+            profile.producer_owner == MetricsProducerOwner::Device
+                && profile.producer_disposition == MetricsProducerDisposition::Implemented
+        })
+        .expect("implemented device profile must exist");
     profile.producer_disposition = MetricsProducerDisposition::PlatformZero;
     assert!(validation_error(&disposition).contains("wrong platform producer disposition"));
 
@@ -1103,21 +1112,12 @@ fn rejects_unresolved_or_unsafe_implementation_evidence() {
     let profile = authority
         .policy_profiles
         .iter_mut()
-        .find(|profile| profile.producer_disposition == MetricsProducerDisposition::Planned)
-        .expect("planned profile must exist");
-    profile.producer_disposition = MetricsProducerDisposition::Implemented;
-    profile.delivery_issue = None;
-    profile.rationale =
-        "The producer has exact implementation and validation evidence for this checked field policy."
-            .to_string();
-    profile.implementation.push(Reference::Local {
+        .find(|profile| profile.producer_owner == MetricsProducerOwner::Device)
+        .expect("implemented device profile must exist");
+    profile.implementation[0] = Reference::Local {
         path: "../escape".to_string(),
         anchor: None,
-    });
-    profile.validation.push(Reference::Local {
-        path: "../escape".to_string(),
-        anchor: None,
-    });
+    };
     let error = validation_error(&authority);
     assert!(error.contains("path escapes repository"));
 }

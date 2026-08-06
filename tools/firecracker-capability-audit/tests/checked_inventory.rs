@@ -5,13 +5,16 @@ use bangbang_firecracker_capability_audit::{
     AuditMode, CAPABILITY_INVENTORY_PATH, Disposition, LOGGER_COMPATIBILITY_CAPABILITY_IDS,
     LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition,
     LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerNonApplicableReason,
-    METRICS_PROCESS_PRODUCER_AUDIT_PATH, METRICS_SCHEMA_AUTHORITY_PATH,
-    METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS, MetricsProcessProducerDisposition,
+    METRICS_DEVICE_PRODUCER_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
+    METRICS_SCHEMA_AUTHORITY_PATH, METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS,
+    MetricsDeviceProducerDisposition, MetricsProcessProducerDisposition,
     MetricsProducerDisposition, MetricsProducerOwner, RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS,
-    Reference, SOURCE_MANIFEST_PATH, logger_producer_audit_json, logger_producer_manifest_json,
-    read_capability_inventory, read_logger_producer_audit, read_logger_producer_manifest,
+    Reference, SOURCE_MANIFEST_PATH, TERMINAL_DEVICE_POLICY_PROFILE_IDS,
+    logger_producer_audit_json, logger_producer_manifest_json, read_capability_inventory,
+    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
     read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
     source_manifest_json, validate, validate_logger_compatibility, validate_logger_producers,
+    validate_metrics_device_compatibility, validate_metrics_device_producers,
     validate_metrics_process_compatibility, validate_metrics_schema_compatibility,
 };
 
@@ -764,7 +767,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
     )
     .expect_err("stale #1822 schema-runtime handoff must fail")
     .to_string();
-    assert!(error.contains("outside the exact completed-process/#1789 handoff"));
+    assert!(error.contains("outside the exact completed-process/device transition"));
     assert!(error.contains("exactly 1 implemented schema-runtime"));
 
     let mut wrong_handoff = authority.clone();
@@ -782,7 +785,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
     )
     .expect_err("wrong later-owner handoff must fail")
     .to_string();
-    assert!(error.contains("outside the exact completed-process/#1789 handoff"));
+    assert!(error.contains("outside the exact completed-process/device transition"));
 }
 
 #[test]
@@ -867,8 +870,282 @@ fn checked_metrics_process_compatibility_is_terminal_and_fail_closed() {
     )
     .expect_err("regressed process profile must fail final certification")
     .to_string();
-    assert!(error.contains("outside the exact completed-process/#1789 handoff"));
+    assert!(error.contains("outside the exact completed-process/device transition"));
     assert!(error.contains("exactly 2 implemented process-lifecycle"));
+}
+
+#[test]
+fn checked_metrics_device_compatibility_is_terminal_and_fail_closed() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let authority =
+        read_metrics_schema_authority(&repository_root.join(METRICS_SCHEMA_AUTHORITY_PATH))
+            .expect("checked metrics schema authority must parse");
+    let process_audit = read_metrics_process_producer_audit(
+        &repository_root.join(METRICS_PROCESS_PRODUCER_AUDIT_PATH),
+    )
+    .expect("checked process producer audit must parse");
+    let device_audit = read_metrics_device_producer_audit(
+        &repository_root.join(METRICS_DEVICE_PRODUCER_AUDIT_PATH),
+    )
+    .expect("checked device producer audit must parse");
+
+    validate_metrics_device_compatibility(
+        &manifest,
+        &inventory,
+        &authority,
+        &process_audit,
+        &device_audit,
+        &repository_root,
+    )
+    .expect("checked device metrics compatibility scope must be terminal");
+
+    let expected_ids = TERMINAL_DEVICE_POLICY_PROFILE_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let actual_ids = authority
+        .policy_profiles
+        .iter()
+        .filter(|profile| profile.producer_owner == MetricsProducerOwner::Device)
+        .map(|profile| profile.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual_ids, expected_ids);
+    assert_eq!(
+        device_audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsDeviceProducerDisposition::Implemented
+            })
+            .count(),
+        212
+    );
+    assert_eq!(
+        device_audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsDeviceProducerDisposition::SourceNeutral
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        device_audit
+            .records
+            .iter()
+            .filter(|record| {
+                record.disposition == MetricsDeviceProducerDisposition::PlatformZero
+            })
+            .count(),
+        17
+    );
+
+    let platform_field_ids = device_audit
+        .records
+        .iter()
+        .filter(|record| record.disposition == MetricsDeviceProducerDisposition::PlatformZero)
+        .map(|record| record.field_id.clone())
+        .collect::<BTreeSet<_>>();
+    let platform_terminal_profile_ids = authority
+        .field_policies
+        .iter()
+        .filter(|policy| platform_field_ids.contains(&policy.field_id))
+        .map(|policy| policy.profile_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(platform_terminal_profile_ids.len(), 5);
+
+    let mut historical = authority.clone();
+    for profile in historical
+        .policy_profiles
+        .iter_mut()
+        .filter(|profile| profile.producer_owner == MetricsProducerOwner::Device)
+    {
+        profile.id = profile.id.replace("-implemented", "-planned");
+        profile.producer_disposition = MetricsProducerDisposition::Planned;
+        profile.delivery_issue = Some("#1789".to_string());
+        profile.rationale =
+            "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary."
+                .to_string();
+        profile.implementation.clear();
+        profile.validation.clear();
+    }
+    for terminal_id in platform_terminal_profile_ids {
+        let planned_id = terminal_id.replace("-implemented", "-planned");
+        let mut profile = historical
+            .policy_profiles
+            .iter()
+            .find(|profile| profile.id == planned_id)
+            .expect("matching historical planned profile must exist")
+            .clone();
+        profile.id = terminal_id.replace("-implemented", "-platform-zero");
+        profile.producer_disposition = MetricsProducerDisposition::PlatformZero;
+        profile.rationale = "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence."
+            .to_string();
+        historical.policy_profiles.push(profile);
+    }
+    historical
+        .policy_profiles
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    for policy in &mut historical.field_policies {
+        if !policy.profile_id.contains("-device-implemented") {
+            continue;
+        }
+        let disposition = if platform_field_ids.contains(&policy.field_id) {
+            "platform-zero"
+        } else {
+            "planned"
+        };
+        policy.profile_id = policy
+            .profile_id
+            .replace("-device-implemented", &format!("-device-{disposition}"));
+    }
+    validate_metrics_schema_compatibility(&manifest, &inventory, &historical, &repository_root)
+        .expect("earlier scoped gates must accept the exact historical device handoff");
+    validate_metrics_device_producers(
+        &device_audit,
+        &historical,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect("terminal field truth must remain valid against the historical profile handoff");
+    let error = validate_metrics_device_compatibility(
+        &manifest,
+        &inventory,
+        &historical,
+        &process_audit,
+        &device_audit,
+        &repository_root,
+    )
+    .expect_err("device-final must reject the historical profile handoff")
+    .to_string();
+    assert!(error.contains("exact terminal device policy profile set"));
+
+    let certification_error = |authority: &_| {
+        validate_metrics_device_compatibility(
+            &manifest,
+            &inventory,
+            authority,
+            &process_audit,
+            &device_audit,
+            &repository_root,
+        )
+        .expect_err("mutated device authority must fail final certification")
+        .to_string()
+    };
+
+    let mut partial = authority.clone();
+    let profile = partial
+        .policy_profiles
+        .iter_mut()
+        .find(|profile| profile.id == "bytes-none-device-implemented")
+        .expect("terminal byte profile must exist");
+    profile.id = "bytes-none-device-planned".to_string();
+    profile.producer_disposition = MetricsProducerDisposition::Planned;
+    profile.delivery_issue = Some("#1789".to_string());
+    profile.rationale =
+        "#1789 owns the exact supported-device producer, neutral-value, and bounded-key boundary."
+            .to_string();
+    profile.implementation.clear();
+    profile.validation.clear();
+    partial
+        .field_policies
+        .iter_mut()
+        .filter(|policy| policy.profile_id == "bytes-none-device-implemented")
+        .for_each(|policy| policy.profile_id = "bytes-none-device-planned".to_string());
+    let error = certification_error(&partial);
+    assert!(error.contains("exact historical #1789 device handoff or the exact terminal"));
+    assert!(error.contains("exact terminal device policy profile set"));
+
+    let mut platform_candidate = authority.clone();
+    let mut profile = platform_candidate
+        .policy_profiles
+        .iter()
+        .find(|profile| profile.id == "count-none-device-implemented")
+        .expect("terminal count profile must exist")
+        .clone();
+    profile.id = "count-none-device-platform-zero".to_string();
+    profile.producer_disposition = MetricsProducerDisposition::PlatformZero;
+    profile.delivery_issue = Some("#1789".to_string());
+    profile.rationale = "The arm64 schema retains this Linux/x86-oriented field as a required numeric neutral value; #1789 owns terminal evidence."
+        .to_string();
+    profile.implementation.clear();
+    profile.validation.clear();
+    platform_candidate.policy_profiles.push(profile);
+    platform_candidate
+        .policy_profiles
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    platform_candidate
+        .field_policies
+        .iter_mut()
+        .find(|policy| policy.field_id == "static:i8042.error_count")
+        .expect("i8042 platform field must exist")
+        .profile_id = "count-none-device-platform-zero".to_string();
+    let error = certification_error(&platform_candidate);
+    assert!(error.contains("exact historical #1789 device handoff or the exact terminal"));
+    assert!(error.contains("exact terminal device policy profile set"));
+
+    let mut evidence_drift = authority.clone();
+    let profile = evidence_drift
+        .policy_profiles
+        .iter_mut()
+        .find(|profile| profile.producer_owner == MetricsProducerOwner::Device)
+        .expect("terminal device profile must exist");
+    profile.implementation[0] = Reference::Local {
+        path: "crates/runtime/src/metrics.rs".to_string(),
+        anchor: Some("fn missing_device_anchor".to_string()),
+    };
+    let error = certification_error(&evidence_drift);
+    assert!(error.contains("requires exact common evidence"));
+    assert!(error.contains("evidence anchor does not resolve"));
+
+    let mut unresolved = device_audit.clone();
+    let record = unresolved
+        .records
+        .iter_mut()
+        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Implemented)
+        .expect("implemented device record must exist");
+    record.disposition = MetricsDeviceProducerDisposition::Planned;
+    record.implementation.clear();
+    record.validation.clear();
+    let error = validate_metrics_device_compatibility(
+        &manifest,
+        &inventory,
+        &authority,
+        &process_audit,
+        &unresolved,
+        &repository_root,
+    )
+    .expect_err("regressed device record must fail final certification")
+    .to_string();
+    assert!(error.contains("final metrics device producer validation rejects nonterminal record"));
+    assert!(error.contains("exact terminal 231-record census"));
+
+    let mut promoted = inventory.clone();
+    promoted
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "corpus:metrics")
+        .expect("retained metrics corpus must exist")
+        .disposition = Disposition::ImplementedAndVerified;
+    let error = validate_metrics_device_compatibility(
+        &manifest,
+        &promoted,
+        &authority,
+        &process_audit,
+        &device_audit,
+        &repository_root,
+    )
+    .expect_err("premature #1790 promotion must fail device certification")
+    .to_string();
+    assert!(error.contains("requires retained audit-required capability"));
 }
 
 #[test]

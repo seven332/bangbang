@@ -5,6 +5,7 @@ mod logger_model;
 mod logger_upstream;
 mod logger_validate;
 mod metrics_certify;
+mod metrics_device_certify;
 mod metrics_device_model;
 mod metrics_device_validate;
 mod metrics_model;
@@ -30,6 +31,9 @@ pub use logger_validate::validate_logger_producers;
 pub use metrics_certify::{
     METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS, RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS,
     validate_metrics_schema_compatibility,
+};
+pub use metrics_device_certify::{
+    TERMINAL_DEVICE_POLICY_PROFILE_IDS, validate_metrics_device_compatibility,
 };
 pub use metrics_device_model::{
     MetricsDeviceProducerAudit, MetricsDeviceProducerBoundary, MetricsDeviceProducerDisposition,

@@ -96,12 +96,14 @@ one signed product guest observes canonical initial, real 60-second Paused and
 Running periodic, explicit, and terminal lines.
 
 The gate requires the exact #1787 row set, one implemented schema-runtime
-profile, two implemented process-lifecycle profiles, ten planned #1789 device
-profiles, four #1789 platform-zero profiles, and both #1790 aggregates still
-`audit-required`. It observes the independently certified #1788 handoff while
-remaining an API/schema gate; it does not claim device-population or
-cross-producer completion. The separate `validate --metrics-process-final`
-gate applies final-mode validation to all 69 exact #1788 producer records.
+profile, two implemented process-lifecycle profiles, one complete nonhybrid
+device transition shape, and both #1790 aggregates still `audit-required`.
+The checked authority now uses ten implemented #1789 device profiles. The
+separate `validate --metrics-process-final` gate applies final-mode validation
+to all 69 exact #1788 producer records, while
+`validate --metrics-device-final` additionally requires the exact 231-record
+212/2/17 device census and resolvable common evidence. Neither claims #1790's
+cross-producer completion.
 
 ## X86 CPUID/MSR platform boundary
 

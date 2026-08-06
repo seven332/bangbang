@@ -195,7 +195,15 @@ fn validate_record(
     }
 
     let provisional = is_provisional_platform_zero(path);
-    if provisional != (profile.producer_disposition == MetricsProducerDisposition::PlatformZero) {
+    let profile_matches_platform_transition = if provisional {
+        matches!(
+            profile.producer_disposition,
+            MetricsProducerDisposition::PlatformZero | MetricsProducerDisposition::Implemented
+        )
+    } else {
+        profile.producer_disposition != MetricsProducerDisposition::PlatformZero
+    };
+    if !profile_matches_platform_transition {
         errors.push(format!(
             "metrics device producer disagrees with the schema platform candidate: {}",
             record.field_id

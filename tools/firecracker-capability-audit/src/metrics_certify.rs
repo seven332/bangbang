@@ -30,6 +30,7 @@ pub const RETAINED_METRICS_AGGREGATE_CAPABILITY_IDS: [&str; 2] = [
 
 const EXPECTED_SCHEMA_RUNTIME_IMPLEMENTED_PROFILES: usize = 1;
 const EXPECTED_PROCESS_LIFECYCLE_IMPLEMENTED_PROFILES: usize = 2;
+const EXPECTED_DEVICE_IMPLEMENTED_PROFILES: usize = 10;
 const EXPECTED_DEVICE_PLANNED_PROFILES: usize = 10;
 const EXPECTED_DEVICE_PLATFORM_ZERO_PROFILES: usize = 5;
 const OBSERVABILITY_CONTRACT_PATH: &str =
@@ -95,6 +96,7 @@ pub fn validate_metrics_schema_compatibility(
 
     let mut schema_runtime_implemented = 0;
     let mut process_lifecycle_implemented = 0;
+    let mut device_implemented = 0;
     let mut device_planned = 0;
     let mut device_platform_zero = 0;
     for profile in &metrics_authority.policy_profiles {
@@ -119,8 +121,13 @@ pub fn validate_metrics_schema_compatibility(
             {
                 device_platform_zero += 1;
             }
+            (MetricsProducerOwner::Device, MetricsProducerDisposition::Implemented)
+                if profile.delivery_issue.is_none() =>
+            {
+                device_implemented += 1;
+            }
             _ => errors.push(format!(
-                "metrics schema certification rejects producer policy outside the exact completed-process/#1789 handoff: {}",
+                "metrics schema certification rejects producer policy outside the exact completed-process/device transition: {}",
                 profile.id
             )),
         }
@@ -137,22 +144,24 @@ pub fn validate_metrics_schema_compatibility(
             process_lifecycle_implemented,
             EXPECTED_PROCESS_LIFECYCLE_IMPLEMENTED_PROFILES,
         ),
-        (
-            "planned device",
-            device_planned,
-            EXPECTED_DEVICE_PLANNED_PROFILES,
-        ),
-        (
-            "platform-zero device",
-            device_platform_zero,
-            EXPECTED_DEVICE_PLATFORM_ZERO_PROFILES,
-        ),
     ] {
         if actual != expected {
             errors.push(format!(
                 "metrics schema certification requires exactly {expected} {label} policy profiles, found {actual}"
             ));
         }
+    }
+
+    let historical_device_handoff = device_implemented == 0
+        && device_planned == EXPECTED_DEVICE_PLANNED_PROFILES
+        && device_platform_zero == EXPECTED_DEVICE_PLATFORM_ZERO_PROFILES;
+    let terminal_device_handoff = device_implemented == EXPECTED_DEVICE_IMPLEMENTED_PROFILES
+        && device_planned == 0
+        && device_platform_zero == 0;
+    if !historical_device_handoff && !terminal_device_handoff {
+        errors.push(format!(
+            "metrics schema certification requires either the exact historical #1789 device handoff or the exact terminal device projection: implemented={device_implemented}; planned={device_planned}; platform-zero={device_platform_zero}"
+        ));
     }
 
     if errors.is_empty() {

@@ -655,8 +655,7 @@ or unrelated observability/tooling work.
 Every line now has the exact Firecracker v1.16.0 arm64 public shape: 24 static
 roots with 243 numeric leaves in pinned serialization order. All required
 static fields are present. A numeric zero can mean a checked source-neutral or
-platform-zero value, or a device producer that is not yet implemented; shape
-alone is not a support or certification claim.
+platform-zero value; shape alone is not a support or certification claim.
 
 The only dynamic families are configured ordinary block
 `block_{drive_id}`, configured network `net_{iface_id}`, and configured
@@ -786,8 +785,10 @@ table-update, and restore boundaries as `config_updates`. Signed guest and
 executable output checks bind those
 roots through real runner, device, supervisor, and collector ownership.
 
-All field-level device records are now terminal. The dedicated whole-device
-gate and shared device-profile promotion remain gated on #1847.
+All field-level device records are terminal. The dedicated
+`validate --metrics-device-final` gate additionally requires their exact
+212/2/17 census, ten implemented shared profiles, identical resolvable common
+evidence, and both #1790 aggregate capabilities to remain nonterminal.
 
 ### Architecture-retained arm64 metric zeros
 
@@ -846,10 +847,21 @@ implemented process-lifecycle policy profiles and an exact final-mode 69-field
 audit: 64 implemented records, the one source-neutral logger record, four
 platform-zero signal/seccomp records, and no planned record. Missing, extra,
 duplicate, stale, unowned, incorrectly bounded, wrongly dispositioned, or
-evidence-free records fail closed. The gate retains ten planned plus five
-platform-zero #1789 device profiles and both audit-required #1790 aggregates;
-it does not certify device/corpus completion or make best-effort terminal
-output durable.
+evidence-free records fail closed. The checked authority now contains ten
+implemented device profiles, but this process-scoped gate does not apply final
+mode to the device audit. It retains both audit-required #1790 aggregates and
+does not make best-effort terminal output durable.
+
+The scoped `validate --metrics-device-final` certification composes that
+process gate with final-mode validation of the exact 231 device records. It
+rejects a partial profile promotion, reintroduced platform candidate, evidence
+drift or unresolved anchor, changed 212/2/17 census, and premature #1790
+promotion. A portable whole-inventory oracle emits exactly 231 device leaves
+for one ordinary block, network, and vhost-user device, requires exactly 25
+intentional active zeros, proves static/configured agreement, replays the full
+device interval after an ambiguous accepted write, and checks idle
+reset/retention. Existing signed MMIO/PCI, snapshot, App Sandbox, and production
+oracles remain the product boundary; no snapshot schema or transport changes.
 
 ### Metrics triggers and errors
 

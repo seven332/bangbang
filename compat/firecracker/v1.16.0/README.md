@@ -36,11 +36,12 @@ For commands and test-layer selection, see the
   child, disposition, rationale, and evidence set per field without duplicating
   the schema or shared field policy.
 - [`metrics-device-producer-audit.json`](metrics-device-producer-audit.json) is
-  the human-owned delivery audit for the exact 231 fields assigned to device
+  the human-owned terminal audit for the exact 231 fields assigned to device
   producer profiles. It records a closed operation boundary and one of the nine
   #1789 delivery children per field. After #1846 it contains 212 implemented,
   two source-neutral, 17 terminal platform-zero, and no planned or provisional
-  records. #1847 retains whole-device gate and shared-profile ownership.
+  records. #1847 composes those facts into ten implemented shared profiles and
+  the dedicated device-final gate without promoting #1790.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -81,7 +82,7 @@ reviewed delta.
 | [Snapshot Wave 6](snapshot-wave6-contract.md) | Exact 70-row load, artifact, version, device, tool, time/identity, portability, and downstream-owner certification |
 | [Observability, tools, and specification](observability-tools-specification-contract.md) | Exact Wave 7 ownership, core API certification, x86 CPUID/MSR platform exclusions, and retained downstream handoffs |
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
-| [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and a 231-field #1789 device audit with #1838–#1846 terminal at field level |
+| [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and the device-final ten-profile/231-field #1789 certification with #1838–#1846 terminal |
 
 ## Dispositions
 
@@ -148,8 +149,9 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 This command validates the complete capability inventory and metrics authority
 in delivery mode, requires the exact twelve #1787 capability and contract rows
 as `implemented-and-verified`, pins the one implemented schema-runtime profile,
-two implemented process-lifecycle profiles, and exact downstream #1789 device
-partition, validates the terminal 69-field process audit in delivery mode, and
+two implemented process-lifecycle profiles, and either complete pre-promotion
+or terminal #1789 device partition (never a hybrid), validates the terminal
+69-field process audit in delivery mode, and
 requires both #1790 aggregate rows to remain `audit-required`. Focused parser,
 direct-process privacy, signed ordinary-production/App Sandbox privacy, and
 real Paused/Running 60-second lifecycle evidence support the terminal claim.
@@ -170,15 +172,27 @@ delivery validation, then applies final mode to the exact 69-field process
 audit. It requires both process-lifecycle profiles to be implemented, all four
 delivery children to be terminal, and every exact field boundary, disposition,
 and evidence reference to validate. Its closed result is 64 implemented, one
-source-neutral, and four platform-zero records. Ten planned and five
-platform-zero device profiles remain #1789-owned, while both aggregate rows
-remain `audit-required` for #1790; neither downstream scope is promoted by this
-gate.
+source-neutral, and four platform-zero records. The checked authority now has
+ten implemented device profiles, but this process-scoped gate does not certify
+their 231 field records; both aggregate rows remain `audit-required` for #1790.
 
-All existing scoped final commands also parse and validate the exact device
-audit in delivery mode. This prevents malformed membership, child routing, or
-provisional state from being ignored without treating any device producer as
-complete. The future device-final composition remains owned by #1847.
+## Scoped Device Metrics Certification
+
+The completed #1789 device producer scope has its own fail-closed gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
+```
+
+This command composes the schema and process certifications, requires exactly
+ten implemented device profiles with identical checked local evidence, resolves
+every evidence anchor, and applies final mode to the exact 231-field device
+audit. Its closed census is 212 implemented, two source-neutral, 17
+platform-zero, and no nonterminal records. Whole-line runtime coverage proves
+one configured ordinary block, network, and vhost-user root produce exactly
+231 device leaves, exactly 25 intentional active zeros, at-least-once replay
+after an ambiguous accepted write, and stable idle shape. Both #1790 aggregate
+rows remain `audit-required`.
 
 ## Contributor Update Rule
 

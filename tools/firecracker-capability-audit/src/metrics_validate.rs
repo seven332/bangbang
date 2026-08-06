@@ -702,7 +702,15 @@ fn validate_field_policy(
         ));
     }
     let platform_zero = is_platform_zero(&field.path);
-    if platform_zero != (profile.producer_disposition == MetricsProducerDisposition::PlatformZero) {
+    let disposition_matches = if platform_zero {
+        matches!(
+            profile.producer_disposition,
+            MetricsProducerDisposition::PlatformZero | MetricsProducerDisposition::Implemented
+        )
+    } else {
+        profile.producer_disposition != MetricsProducerDisposition::PlatformZero
+    };
+    if !disposition_matches {
         errors.push(format!(
             "metrics field has the wrong platform producer disposition: {}",
             field.id
