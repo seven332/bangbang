@@ -28,6 +28,7 @@ use bangbang_runtime::block::{
     VIRTIO_BLOCK_QUEUE_SIZES, VhostUserBlockConfigSignalError, VirtioBlockBackendKind,
     VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockLiveUpdateError,
     VirtioBlockSnapshotPersistenceBinding, attach_block_metrics_to_mmio_handler,
+    attach_vhost_user_block_metrics_to_mmio_handler,
 };
 use bangbang_runtime::boot::{
     BootSourceFiles, canonical_process_block_command_line,
@@ -1059,12 +1060,21 @@ impl HvfArm64BootPciDataDevices {
                 message: source.to_string(),
             }
         })?;
-        if prepared.device().backend_kind() == VirtioBlockBackendKind::File
-            && !prepared.attach_metrics(prepared_metrics.metrics())
-        {
-            return Err(DriveRuntimeMutationError::PrepareDevice {
-                message: "ordinary block metrics owner was rejected".to_string(),
-            });
+        match prepared.device().backend_kind() {
+            VirtioBlockBackendKind::File => {
+                if !prepared.attach_metrics(prepared_metrics.metrics()) {
+                    return Err(DriveRuntimeMutationError::PrepareDevice {
+                        message: "ordinary block metrics owner was rejected".to_string(),
+                    });
+                }
+            }
+            VirtioBlockBackendKind::VhostUser => {
+                if !prepared.attach_vhost_user_metrics(prepared_metrics.vhost_user_metrics()) {
+                    return Err(DriveRuntimeMutationError::PrepareDevice {
+                        message: "vhost-user block metrics owner was rejected".to_string(),
+                    });
+                }
+            }
         }
         let interrupts = self.shared_msi_registry().map_err(|source| {
             DriveRuntimeMutationError::TerminalInsertion {
@@ -37642,7 +37652,7 @@ fn bind_mmio_block_transport_metrics(
                 message: format!("missing metrics generation for MMIO block device {drive_id}"),
             }
         })?;
-        attach_block_metrics_to_mmio_handler(
+        let attached_ordinary = attach_block_metrics_to_mmio_handler(
             &mut dispatcher,
             device.registration.region_id(),
             device_metrics,
@@ -37651,6 +37661,33 @@ fn bind_mmio_block_transport_metrics(
             kind: "block",
             message: format!("failed to resolve MMIO block device {drive_id}: {source}"),
         })?;
+        if !attached_ordinary {
+            let vhost_user_metrics = metrics.vhost_user_per_drive(drive_id).ok_or_else(|| {
+                HvfArm64BootSessionError::DeviceMetricsBinding {
+                    kind: "block",
+                    message: format!(
+                        "missing vhost-user metrics generation for MMIO block device {drive_id}"
+                    ),
+                }
+            })?;
+            let attached_vhost_user = attach_vhost_user_block_metrics_to_mmio_handler(
+                &mut dispatcher,
+                device.registration.region_id(),
+                vhost_user_metrics,
+            )
+            .map_err(|source| HvfArm64BootSessionError::DeviceMetricsBinding {
+                kind: "block",
+                message: format!("failed to resolve MMIO block device {drive_id}: {source}"),
+            })?;
+            if !attached_vhost_user {
+                return Err(HvfArm64BootSessionError::DeviceMetricsBinding {
+                    kind: "block",
+                    message: format!(
+                        "MMIO block device {drive_id} rejected both metrics owner types"
+                    ),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -37955,17 +37992,33 @@ fn prepare_pci_data_devices(
 
         for mut prepared in blocks {
             let drive_id = prepared.drive_id().to_string();
-            if prepared.device().backend_kind() == VirtioBlockBackendKind::File {
-                let device_metrics =
-                    block_device_metrics.per_drive(&drive_id).ok_or_else(|| {
-                        HvfArm64BootPciDataError::new(format!(
-                            "missing PCI block metrics generation for {drive_id}"
-                        ))
-                    })?;
-                if !prepared.attach_metrics(device_metrics) {
-                    return Err(HvfArm64BootPciDataError::new(format!(
-                        "ordinary PCI block metrics owner was rejected for {drive_id}"
-                    )));
+            match prepared.device().backend_kind() {
+                VirtioBlockBackendKind::File => {
+                    let device_metrics =
+                        block_device_metrics.per_drive(&drive_id).ok_or_else(|| {
+                            HvfArm64BootPciDataError::new(format!(
+                                "missing PCI block metrics generation for {drive_id}"
+                            ))
+                        })?;
+                    if !prepared.attach_metrics(device_metrics) {
+                        return Err(HvfArm64BootPciDataError::new(format!(
+                            "ordinary PCI block metrics owner was rejected for {drive_id}"
+                        )));
+                    }
+                }
+                VirtioBlockBackendKind::VhostUser => {
+                    let device_metrics = block_device_metrics
+                        .vhost_user_per_drive(&drive_id)
+                        .ok_or_else(|| {
+                            HvfArm64BootPciDataError::new(format!(
+                                "missing PCI vhost-user block metrics generation for {drive_id}"
+                            ))
+                        })?;
+                    if !prepared.attach_vhost_user_metrics(device_metrics) {
+                        return Err(HvfArm64BootPciDataError::new(format!(
+                            "vhost-user PCI block metrics owner was rejected for {drive_id}"
+                        )));
+                    }
                 }
             }
             let (published_drive_id, is_root_device, config_space, device) = prepared.into_parts();

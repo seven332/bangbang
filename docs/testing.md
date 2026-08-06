@@ -1553,14 +1553,14 @@ cargo test -p bangbang-firecracker-capability-audit --test metrics_schema --lock
 
 The adjacent human-owned `metrics-device-producer-audit.json` maps all 231
 device-owned fields to closed operation boundaries and the nine concrete #1789
-children. After #1841 it contains 128 implemented
-entropy/pmem/RTC/UART/balloon/memory-hotplug/vsock/ordinary-block fields, one
-source-neutral `uart.flush_count`, 87 planned fields, and 15
+children. After #1842 it contains 133 implemented
+entropy/pmem/RTC/UART/balloon/memory-hotplug/vsock/ordinary-block/vhost-user-block
+fields, one source-neutral `uart.flush_count`, 82 planned fields, and 15
 provisional-platform-zero fields. Only the latter two groups are nonterminal
 and evidence-free. The same focused test checks canonical bytes, exact
 membership and partition, completed-child regression, future-child premature
 promotion, the UART-flush disposition, suffix routing, provisional state,
-anchored-evidence rules, and final-mode rejection of the remaining 102 records.
+anchored-evidence rules, and final-mode rejection of the remaining 97 records.
 
 Focused #1838 producer coverage lives with the owning runtime modules. It
 checks entropy popped-descriptor accounting and owner attachment, exact pmem
@@ -1617,6 +1617,17 @@ write, fresh destination counters, resumed destination I/O, repeated
 restore/recapture, App Sandbox containment, redaction, and cleanup. Focused
 collector tests separately prove immediate zero intervals and whole-line replay
 after failed or ambiguously accepted publication.
+
+Focused #1842 coverage pins all five configured vhost-user block leaves.
+Runtime tests cover success-only initialization and activation stores,
+protocol-stage activation failures, Firecracker-compatible partial-tail and
+invalid configuration accesses, successful config-refresh timing, typed
+ordinary/vhost isolation, saturating counters, persistent stores, whole-line
+replay, unpublished reservations, and fresh same-ID generations. The signed
+direct and production suites exercise delayed startup and runtime MMIO/PCI
+backends, successful live refresh, snapshot rejection and backend-death
+isolation, exact five-field output, descriptor/path redaction, App Sandbox
+containment, and fresh metrics after same-ID reuse.
 
 The ordinary `compare` command rederives the source projection together with
 the general and logger manifests. To create a metrics source-only candidate:
@@ -1679,7 +1690,7 @@ logger and device-audit validation in delivery mode. It requires the two
 implemented process profiles and all 69 field records to remain terminal at
 exactly 64 implemented, one source-neutral, and four platform-zero. Ten planned
 and four platform-zero device profiles remain #1789-owned; within the 231-field
-device audit, #1838–#1841 contribute 129 terminal records and the other 102
+device audit, #1838–#1842 contribute 134 terminal records and the other 97
 remain nonterminal. The two aggregates remain #1790-owned.
 The composed test mutates both a field record and an aggregate process profile;
 the lower-level suite separately exercises every membership, ordering,

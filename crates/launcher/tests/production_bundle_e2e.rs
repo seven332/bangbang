@@ -188,6 +188,7 @@ const VHOST_USER_SOCKET_REF_THREE: &str =
 const CONTAINED_VHOST_USER_HOST_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_HOST";
 const CONTAINED_VHOST_USER_SUCCESS_MARKER: &[u8] = b"BANGBANG_VHOST_USER_BLOCK_ro_OK";
 const VHOST_CONFIG_RESIZED_MARKER: &[u8] = b"BANGBANG_VHOST_CONFIG_RESIZED";
+const VHOST_USER_METRICS_DELAY: Duration = Duration::from_millis(10);
 const SNAPSHOT_KERNEL_ID: &str = "grant-snapshot-kernel-1368";
 const SNAPSHOT_INITRD_ID: &str = "grant-snapshot-initrd-1617";
 const SNAPSHOT_METRICS_ID: &str = "grant-snapshot-metrics-1368";
@@ -8593,6 +8594,7 @@ fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
 fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers() {
     let bundle = production_bundle();
     let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("vhost-user");
+    let metrics = fixture.devices.add_metrics_grant("vhost-user");
     let root_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
     let scratch_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_TWO);
     let root_backing = fixture.devices.rootfs.clone();
@@ -8608,17 +8610,19 @@ fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers(
     let root_backend = VhostUserBlockBackend::start(
         &root_socket,
         &root_backing,
-        VhostUserBlockBackendOptions::regular(true),
+        VhostUserBlockBackendOptions::regular(true).with_metrics_delays(VHOST_USER_METRICS_DELAY),
     )
     .expect("contained vhost root backend should start");
     let scratch_backend = VhostUserBlockBackend::start(
         &scratch_socket,
         &scratch_backing,
-        VhostUserBlockBackendOptions::regular(false),
+        VhostUserBlockBackendOptions::regular(false).with_metrics_delays(VHOST_USER_METRICS_DELAY),
     )
     .expect("contained vhost scratch backend should start");
 
     let mut running = spawn_ready_socket_grant_api_launcher(&bundle, &fixture, "vhost-user");
+    metrics.replace_source_pathname();
+    metrics.configure(&running.socket, "contained vhost-user");
     let worker = only_worker_pid(&running.child);
     assert!(
         child_pids(worker).is_empty(),
@@ -8794,6 +8798,12 @@ fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers(
     assert!(scratch_report.reads > 0);
     assert!(scratch_report.writes > 0);
     assert!(scratch_report.flushes > 0);
+    metrics.assert_vhost_user_metrics(
+        &running.socket,
+        &[("rootfs", false), ("scratch", true)],
+        "contained MMIO vhost-user lifecycle",
+        fixture.sensitive_strings(),
+    );
     assert_http_status(
         &http_request(
             &running.socket,
@@ -8844,6 +8854,7 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
     let bundle = production_bundle();
     let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("storage-certification");
     let logger = fixture.devices.add_logger_grant("storage-certification");
+    let metrics = fixture.devices.add_metrics_grant("storage-certification");
     let vhost_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
     let vhost_backing = fixture.vhost_user_backing("storage-certification-vhost.img");
 
@@ -8905,7 +8916,7 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
     let vhost_backend = VhostUserBlockBackend::start(
         &vhost_socket,
         &vhost_backing,
-        VhostUserBlockBackendOptions::regular(false),
+        VhostUserBlockBackendOptions::regular(false).with_metrics_delays(VHOST_USER_METRICS_DELAY),
     )
     .expect("contained aggregate vhost-user backend should start");
 
@@ -8917,6 +8928,7 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
     );
     fixture.devices.replace_source_pathnames();
     logger.replace_source_pathname();
+    metrics.replace_source_pathname();
     let worker = only_worker_pid(&running.child);
     assert!(
         child_pids(worker).is_empty(),
@@ -8932,6 +8944,7 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
         204,
         "PUT contained aggregate logger grant",
     );
+    metrics.configure(&running.socket, "contained aggregate storage");
 
     assert_http_status(
         &http_put(
@@ -9470,6 +9483,15 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
         child_pids(worker).is_empty(),
         "contained aggregate storage must not retain a helper",
     );
+    metrics.assert_vhost_user_metrics(
+        &running.socket,
+        &[("vhostdata", true)],
+        "contained PCI aggregate vhost-user lifecycle",
+        fixture
+            .sensitive_strings()
+            .into_iter()
+            .chain([path_text(&vhost_backing).to_owned()]),
+    );
 
     stop_running_launcher(&mut running, "contained aggregate storage shutdown");
     vhost_backend
@@ -9537,6 +9559,7 @@ fn normal_bundle_certifies_aggregate_storage_semantics_through_contained_grants(
 fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block() {
     let bundle = production_bundle();
     let fixture = SocketDirectoryGrantFixture::new_with_vhost_user("vhost-user-runtime");
+    let metrics = fixture.devices.add_metrics_grant("vhost-user-runtime");
     let control_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_ONE);
     let first_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_TWO);
     let second_socket = fixture.vhost_user_socket(VHOST_USER_SOCKET_CHILD_THREE);
@@ -9565,6 +9588,8 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
         "vhost-user-runtime",
         &["--enable-pci"],
     );
+    metrics.replace_source_pathname();
+    metrics.configure(&running.socket, "contained runtime vhost-user");
     let worker = only_worker_pid(&running.child);
     assert!(
         child_pids(worker).is_empty(),
@@ -9730,13 +9755,13 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
     let first_backend = VhostUserBlockBackend::start(
         &first_socket,
         &first_backing,
-        VhostUserBlockBackendOptions::regular(false),
+        VhostUserBlockBackendOptions::regular(false).with_metrics_delays(VHOST_USER_METRICS_DELAY),
     )
     .expect("first contained runtime-vhost backend should start");
     let second_backend = VhostUserBlockBackend::start(
         &second_socket,
         &second_backing,
-        VhostUserBlockBackendOptions::regular(false),
+        VhostUserBlockBackendOptions::regular(false).with_metrics_delays(VHOST_USER_METRICS_DELAY),
     )
     .expect("second contained runtime-vhost backend should start");
     let first = serde_json::json!({
@@ -9780,6 +9805,27 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
         .wait_for_activation(PROCESS_TIMEOUT)
         .expect("first contained runtime-vhost backend should activate");
     assert_vhost_user_memory_aperture(&first_backend.report(), "first contained runtime block");
+    assert_http_status(
+        &http_request(
+            &running.socket,
+            "PATCH",
+            "/drives/hotdata",
+            r#"{"drive_id":"hotdata"}"#,
+        ),
+        204,
+        "PATCH first contained runtime-vhost metrics generation",
+    );
+    assert_eq!(
+        first_backend.report().config_requests,
+        2,
+        "first contained runtime generation should receive discovery and refresh requests"
+    );
+    metrics.assert_vhost_user_metrics(
+        &running.socket,
+        &[("hotdata", true)],
+        "first contained runtime vhost-user generation",
+        fixture.sensitive_strings(),
+    );
     wait_for_file_prefix(
         &first_backing,
         BLOCK_HOTPLUG_GUEST_ONE_MARKER,
@@ -9839,6 +9885,12 @@ fn normal_bundle_retries_hotplugs_deletes_and_reuses_contained_vhost_user_block(
         PROCESS_TIMEOUT,
     )
     .expect("guest should remove reused contained runtime-vhost PCI function");
+    metrics.assert_vhost_user_metrics(
+        &running.socket,
+        &[("hotdata", false)],
+        "reused contained runtime vhost-user generation",
+        fixture.sensitive_strings(),
+    );
     assert_http_status(
         &http_request(&running.socket, "DELETE", "/drives/hotdata", ""),
         204,
@@ -16503,6 +16555,12 @@ struct DeviceLoggerGrant {
     opened: PathBuf,
 }
 
+#[derive(Debug)]
+struct DeviceMetricsGrant {
+    source: PathBuf,
+    opened: PathBuf,
+}
+
 impl DeviceLoggerGrant {
     fn add_to_manifest(manifest_path: &Path, case: &str) -> Self {
         let canonical_root = manifest_path
@@ -16593,6 +16651,137 @@ impl DeviceLoggerGrant {
             fs::read(&self.source).expect("replacement device logger should read"),
             OUTPUT_REPLACEMENT,
             "launcher-opened logger identity must not follow a pathname replacement"
+        );
+    }
+}
+
+impl DeviceMetricsGrant {
+    fn add_to_manifest(manifest_path: &Path, case: &str) -> Self {
+        let canonical_root = manifest_path
+            .parent()
+            .expect("device grant manifest should have a canonical parent");
+        let metrics = Self {
+            source: canonical_root.join(format!("external-{case}-metrics.out")),
+            opened: canonical_root.join(format!("opened-{case}-metrics.out")),
+        };
+        fs::write(&metrics.source, OUTPUT_METRICS_SEED)
+            .expect("device metrics fixture should write");
+
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(manifest_path).expect("device grant manifest should read"),
+        )
+        .expect("device grant manifest should parse");
+        manifest
+            .get_mut("grants")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("device grant manifest should contain grants")
+            .push(serde_json::json!({
+                "id": OUTPUT_METRICS_ID,
+                "role": "metrics-sink",
+                "access": "write-only",
+                "source": path_text(&metrics.source),
+            }));
+        fs::write(
+            manifest_path,
+            serde_json::to_vec(&manifest).expect("device metrics grant should serialize"),
+        )
+        .expect("device metrics grant manifest should write");
+        metrics
+    }
+
+    fn replace_source_pathname(&self) {
+        fs::rename(&self.source, &self.opened).expect("launcher-opened device metrics should move");
+        fs::write(&self.source, OUTPUT_REPLACEMENT)
+            .expect("replacement device metrics should write");
+    }
+
+    fn configure(&self, socket: &Path, context: &str) {
+        assert_http_status(
+            &http_put(
+                socket,
+                "/metrics",
+                &serde_json::json!({"metrics_path": OUTPUT_METRICS_REF}).to_string(),
+            ),
+            204,
+            &format!("configure {context} device metrics"),
+        );
+    }
+
+    fn assert_vhost_user_metrics(
+        &self,
+        socket: &Path,
+        expected_drives: &[(&str, bool)],
+        context: &str,
+        forbidden: impl IntoIterator<Item = String>,
+    ) {
+        assert_http_status(
+            &http_put(socket, "/actions", r#"{"action_type":"FlushMetrics"}"#),
+            204,
+            &format!("FlushMetrics for {context}"),
+        );
+        let output = fs::read_to_string(&self.opened)
+            .expect("launcher-opened device metrics output should read");
+        let seed =
+            std::str::from_utf8(OUTPUT_METRICS_SEED).expect("device metrics seed should be UTF-8");
+        let line = output
+            .strip_prefix(seed)
+            .expect("device metrics output should preserve its seed")
+            .lines()
+            .next_back()
+            .expect("device metrics output should contain a flushed line");
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("device metrics line should be valid JSON");
+        let exact_fields = [
+            "activate_fails",
+            "cfg_fails",
+            "init_time_us",
+            "activate_time_us",
+            "config_change_time_us",
+        ];
+        for &(drive_id, expect_config_change) in expected_drives {
+            let key = format!("vhost_user_block_{drive_id}");
+            let metrics = value
+                .get(&key)
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{context} should contain {key}; line:\n{line}"));
+            assert_eq!(metrics.len(), exact_fields.len(), "{context} {key}");
+            assert!(
+                exact_fields
+                    .iter()
+                    .all(|field| metrics.contains_key(*field)),
+                "{context} {key} should contain exactly the pinned fields: {metrics:?}"
+            );
+            let metric = |field: &str| {
+                metrics
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_else(|| panic!("{context} {key}.{field} should be unsigned"))
+            };
+            assert_eq!(metric("activate_fails"), 0, "{context} {key}");
+            assert_eq!(metric("cfg_fails"), 0, "{context} {key}");
+            assert!(metric("init_time_us") > 0, "{context} {key}");
+            assert!(metric("activate_time_us") > 0, "{context} {key}");
+            assert_eq!(
+                metric("config_change_time_us") > 0,
+                expect_config_change,
+                "{context} {key} config-change activity"
+            );
+        }
+        for sensitive in forbidden.into_iter().chain([
+            path_text(&self.source).to_owned(),
+            path_text(&self.opened).to_owned(),
+            OUTPUT_METRICS_ID.to_owned(),
+            OUTPUT_METRICS_REF.to_owned(),
+        ]) {
+            assert!(
+                !line.contains(&sensitive),
+                "{context} metrics should redact {sensitive:?}; line:\n{line}"
+            );
+        }
+        assert_eq!(
+            fs::read(&self.source).expect("replacement device metrics should read"),
+            OUTPUT_REPLACEMENT,
+            "launcher-opened metrics identity must not follow a pathname replacement"
         );
     }
 }
@@ -16761,6 +16950,10 @@ impl GuestDeviceGrantFixture {
 
     fn add_logger_grant(&self, case: &str) -> DeviceLoggerGrant {
         DeviceLoggerGrant::add_to_manifest(&self.manifest, case)
+    }
+
+    fn add_metrics_grant(&self, case: &str) -> DeviceMetricsGrant {
+        DeviceMetricsGrant::add_to_manifest(&self.manifest, case)
     }
 
     fn sensitive_strings(&self) -> Vec<String> {

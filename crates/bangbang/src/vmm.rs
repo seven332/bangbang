@@ -6417,6 +6417,7 @@ where
                     "vhost-user drive has no socket",
                 ))
             })?;
+            let init_started_at = Instant::now();
             #[cfg(target_os = "macos")]
             let stream = if self.grant_authority.is_some() {
                 let lease = self
@@ -6442,10 +6443,11 @@ where
                 .map_err(|source| {
                     VmmActionError::InstanceStart(BackendError::Hypervisor(source.to_string()))
                 })?;
-            let frontend = PreparedVhostUserBlockFrontend::discover(
+            let frontend = PreparedVhostUserBlockFrontend::discover_started_at(
                 stream,
                 config.cache_type(),
                 DIRECT_VHOST_USER_OPERATION_TIMEOUT,
+                init_started_at,
             )
             .map_err(|source| {
                 VmmActionError::InstanceStart(BackendError::Hypervisor(source.to_string()))
@@ -6809,6 +6811,7 @@ where
                     } else {
                         None
                     };
+                let init_started_at = Instant::now();
                 #[cfg(target_os = "macos")]
                 let stream = match prepared_vhost_claim.as_ref() {
                     Some(claim) => self
@@ -6842,10 +6845,11 @@ where
                                 },
                             )
                         })?;
-                let frontend = PreparedVhostUserBlockFrontend::discover(
+                let frontend = PreparedVhostUserBlockFrontend::discover_started_at(
                     stream,
                     config.cache_type(),
                     DIRECT_VHOST_USER_OPERATION_TIMEOUT,
+                    init_started_at,
                 )
                 .map_err(|source| {
                     VmmActionError::DriveRuntimeMutation(DriveRuntimeMutationError::PrepareDevice {
@@ -36283,10 +36287,11 @@ where
         let mut diagnostics =
             MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status());
         if let Some(metrics) = &self.block_device_metrics {
-            let (aggregate, per_drive) = metrics.capture().into_parts();
+            let (aggregate, per_drive, vhost_user_per_drive) = metrics.capture().into_parts();
             diagnostics = diagnostics
                 .with_block_device_metrics(aggregate)
-                .with_block_device_metrics_by_drive(per_drive);
+                .with_block_device_metrics_by_drive(per_drive)
+                .with_vhost_user_block_device_metrics_by_drive(vhost_user_per_drive);
         }
         if let Some(metrics) = &self.pmem_device_metrics {
             diagnostics = diagnostics
@@ -36392,7 +36397,7 @@ where
             if let Some(duration_us) = *config_change_time_us
                 && let Some(metrics) = &self.block_device_metrics
             {
-                metrics.record_config_change_time_for_drive(drive_id, duration_us);
+                metrics.record_vhost_user_config_change_time_for_drive(drive_id, duration_us);
             }
         } else {
             self.record_block_device_update_failure(drive_id);
@@ -56362,7 +56367,7 @@ mod tests {
             .expect("aggregate block metrics should be present");
         assert_eq!(aggregate.update_count(), 1);
         assert_eq!(aggregate.update_fails(), 0);
-        assert!(aggregate.config_change_time_us().is_some());
+        assert_eq!(aggregate.config_change_time_us(), None);
         let per_drive = diagnostics
             .block_device_metrics_by_drive()
             .expect("per-drive block metrics should be present")
@@ -56370,10 +56375,18 @@ mod tests {
             .find_map(|(drive_id, metrics)| (drive_id == "vhost").then_some(metrics))
             .expect("vhost metrics should be present");
         assert_eq!(per_drive.update_count(), 1);
-        assert_eq!(
-            per_drive.config_change_time_us(),
-            aggregate.config_change_time_us()
-        );
+        assert_eq!(per_drive.config_change_time_us(), None);
+        let vhost_user = diagnostics
+            .vhost_user_block_device_metrics_by_drive()
+            .expect("typed vhost-user metrics should be present")
+            .iter()
+            .find_map(|(drive_id, metrics)| (drive_id == "vhost").then_some(metrics))
+            .expect("typed vhost-user metrics should include the updated drive");
+        assert_eq!(vhost_user.activate_fails(), 0);
+        assert_eq!(vhost_user.cfg_fails(), 0);
+        assert_eq!(vhost_user.init_time_us(), None);
+        assert_eq!(vhost_user.activate_time_us(), None);
+        assert!(vhost_user.config_change_time_us().is_some());
 
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
@@ -56384,6 +56397,10 @@ mod tests {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
         let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["vhost"]);
+        metrics
+            .vhost_user_per_drive("vhost")
+            .expect("typed vhost-user metrics should exist")
+            .record_config_change_time_us(17);
         let (max_steps_sender, max_steps_receiver) = mpsc::channel();
         let session =
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
@@ -56437,13 +56454,22 @@ mod tests {
             BootRunLoopCommandAdmissionState::Shutdown
         );
         assert_eq!(control.request_stop_count(), 1);
-        let aggregate = supervisor
-            .metrics_diagnostics()
+        let diagnostics = supervisor.metrics_diagnostics();
+        let aggregate = diagnostics
             .block_device_metrics()
             .expect("aggregate block metrics should be present");
         assert_eq!(aggregate.update_count(), 0);
         assert_eq!(aggregate.update_fails(), 1);
         assert_eq!(aggregate.config_change_time_us(), None);
+        let vhost_user = diagnostics
+            .vhost_user_block_device_metrics_by_drive()
+            .expect("typed vhost-user metrics should be present")
+            .iter()
+            .find_map(|(drive_id, metrics)| (drive_id == "vhost").then_some(metrics))
+            .expect("the previous typed vhost-user store should remain visible");
+        assert_eq!(vhost_user.activate_fails(), 0);
+        assert_eq!(vhost_user.cfg_fails(), 0);
+        assert_eq!(vhost_user.config_change_time_us(), Some(17));
 
         drop(supervisor);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);

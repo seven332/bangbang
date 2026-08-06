@@ -70,6 +70,9 @@ pub(crate) struct VhostUserBlockBackendOptions {
     advertise_flush: bool,
     advertised_features: Option<u64>,
     advertised_protocol_features: u64,
+    initialization_delay: Duration,
+    activation_delay: Duration,
+    config_refresh_delay: Duration,
 }
 
 impl VhostUserBlockBackendOptions {
@@ -79,7 +82,17 @@ impl VhostUserBlockBackendOptions {
             advertise_flush: !read_only,
             advertised_features: None,
             advertised_protocol_features: PROTOCOL_FEATURES,
+            initialization_delay: Duration::ZERO,
+            activation_delay: Duration::ZERO,
+            config_refresh_delay: Duration::ZERO,
         }
+    }
+
+    pub(crate) const fn with_metrics_delays(mut self, delay: Duration) -> Self {
+        self.initialization_delay = delay;
+        self.activation_delay = delay;
+        self.config_refresh_delay = delay;
+        self
     }
 
     pub(crate) const fn missing_version_one(read_only: bool) -> Self {
@@ -412,10 +425,12 @@ fn run_backend(
     state.reply_ack = selected_protocols & VHOST_USER_PROTOCOL_F_REPLY_ACK != 0;
 
     let get_config = expect_request(&mut stream, VHOST_USER_GET_CONFIG, false, 0)?;
+    thread::sleep(options.initialization_delay);
     state.handle_get_config(&mut stream, &get_config)?;
 
     let set_features = expect_request(&mut stream, VHOST_USER_SET_FEATURES, state.reply_ack, 0)?;
     state.handle_set_features(&set_features)?;
+    thread::sleep(options.activation_delay);
     acknowledge(&mut stream, &set_features)?;
 
     let memory = expect_request(
@@ -1074,6 +1089,7 @@ impl BackendState {
                         acknowledge(stream, &request)?;
                     }
                     Ok(request) if request.code == VHOST_USER_GET_CONFIG => {
+                        thread::sleep(self.options.config_refresh_delay);
                         self.handle_get_config(stream, &request)?;
                     }
                     Ok(_) => return Err("active frontend sent an unexpected request".to_string()),
