@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::machine::MAX_SUPPORTED_VCPUS;
+use bangbang_runtime::metrics::SharedVcpuMetrics;
 use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::coordinator::{HvfVcpuRunCoordinator, HvfVcpuRunCoordinatorError};
@@ -293,15 +294,17 @@ impl<'vm> HvfVcpuTopology<'vm> {
         dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
         lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
     ) -> Result<Self, HvfVcpuTopologyError> {
+        let metrics = SharedVcpuMetrics::default();
         let created = create_ordered_topology_with(
             vcpu_count,
             crate::ffi::get_max_vcpu_count,
             |_, _| Ok(()),
             |index| {
-                HvfVcpuRunner::new_unconfigured_with_memory_fault_handlers(
+                HvfVcpuRunner::new_unconfigured_with_memory_fault_handlers_and_metrics(
                     index,
                     dirty_write_tracker.as_ref().map(Arc::clone),
                     lazy_guest_fault_handler.as_ref().map(Arc::clone),
+                    metrics.clone(),
                 )
             },
         )?;

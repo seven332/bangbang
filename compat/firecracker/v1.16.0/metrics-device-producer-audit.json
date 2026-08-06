@@ -4912,20 +4912,104 @@
     {
       "field_id": "static:interrupts.config_updates",
       "boundary": "interrupt-lifecycle",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `interrupts.config_updates` is assigned to #1845 at the `interrupt-lifecycle` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `interrupts.config_updates` is completed by #1845 at the `interrupt-lifecycle` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedInterruptMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "fn set_message_control(&mut self, value: u16) -> (Vec<GuestMessage>, u64) {"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_pci.rs",
+          "anchor": "fn msix_metrics_count_active_route_updates_and_successful_deliveries()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:interrupts.triggers",
       "boundary": "interrupt-lifecycle",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `interrupts.triggers` is assigned to #1845 at the `interrupt-lifecycle` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `interrupts.triggers` is completed by #1845 at the `interrupt-lifecycle` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/interrupt.rs",
+          "anchor": "pub struct MetricsInterruptSink {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/message_interrupt.rs",
+          "anchor": "pub struct GuestMessageInterruptRegistry {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedInterruptMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/interrupt.rs",
+          "anchor": "fn metrics_sink_counts_successful_and_failed_mmio_attempts_before_delegation()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/message_interrupt.rs",
+          "anchor": "fn registry_counts_only_successfully_delivered_message_interrupts()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:memory_hotplug.activate_fails",
@@ -8929,83 +9013,461 @@
     {
       "field_id": "static:vcpu.exit_mmio_read",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_mmio_read_agg.max_us",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read_agg.max_us` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read_agg.max_us` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_mmio_read_agg.min_us",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read_agg.min_us` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read_agg.min_us` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_mmio_read_agg.sum_us",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read_agg.sum_us` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_read_agg.sum_us` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_mmio_write",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_mmio_write_agg.max_us",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write_agg.max_us` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write_agg.max_us` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_mmio_write_agg.min_us",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write_agg.min_us` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write_agg.min_us` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.exit_mmio_write_agg.sum_us",
       "boundary": "vcpu-exit",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write_agg.sum_us` is assigned to #1845 at the `vcpu-exit` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.exit_mmio_write_agg.sum_us` is completed by #1845 at the `vcpu-exit` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "pub(crate) fn dispatch_mmio_access_with_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/mmio.rs",
+          "anchor": "fn metric_dispatch_counts_only_accesses_that_reach_the_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.failures",
       "boundary": "vcpu-failure",
-      "disposition": "planned",
+      "disposition": "implemented",
       "delivery_issue": "#1845",
-      "rationale": "Pinned Firecracker field `vcpu.failures` is assigned to #1845 at the `vcpu-failure` boundary; terminal implementation and validation evidence is intentionally deferred until that child is completed.",
-      "implementation": [],
-      "validation": []
+      "rationale": "Pinned Firecracker field `vcpu.failures` is completed by #1845 at the `vcpu-failure` boundary with exact implementation and validation evidence.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/runner.rs",
+          "anchor": "const fn is_vcpu_execution_failure(error: &HvfVcpuRunnerError) -> bool {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "pub struct SharedVcpuMetrics {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics/firecracker.rs",
+          "anchor": "pub(super) fn build_metrics_line("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/runner.rs",
+          "anchor": "fn vcpu_failure_metrics_include_execution_failures_and_exclude_lifecycle_or_device_errors()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn assert_guest_vcpu_and_interrupt_metrics("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "fn writes_interval_vcpu_and_interrupt_metrics_with_lifetime_latency_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/metrics_schema.rs",
+          "anchor": "exact #1838 disposition mutation tests, extended through #1845"
+        }
+      ]
     },
     {
       "field_id": "static:vcpu.kvmclock_ctrl_fails",

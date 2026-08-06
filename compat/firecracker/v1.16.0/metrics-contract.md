@@ -43,7 +43,7 @@ including the schema-runtime timestamp producer. #1788 certifies the exact
 API, process, logger, signal, boot, and lifecycle producers through two
 implemented aggregate profiles and the field-level process audit. The checked
 device audit now assigns every #1789 field to one concrete delivery child and
-terminally certifies the 205 records delivered by #1838–#1844; later child
+terminally certifies the 216 records delivered by #1838–#1845; later child
 records remain nonterminal. `corpus:metrics` and the cross-producer aggregate
 semantic remain #1790-owned. A required zero therefore proves wire-shape
 completeness only, never producer completion unless its field audit is
@@ -219,18 +219,19 @@ Static and configured identities remain distinct; exact suffix routing splits
 mapped network fields from tap-oriented gaps and applicable vCPU exits from
 retained PIO/KVM-clock fields.
 
-After #1844, the audit contains 11 `planned`, 15
-`provisional-platform-zero`, 201 `implemented`, two `source-neutral`, and two
-`platform-zero` records. The 205 terminal records additionally cover all 56
-applicable configured and static network fields plus all 13 MMDS fields.
+After #1845, the audit contains no `planned`, 15
+`provisional-platform-zero`, 212 `implemented`, two `source-neutral`, and two
+`platform-zero` records. The 216 terminal records additionally cover all 56
+applicable configured and static network fields, all 13 MMDS fields, and the
+11 applicable vCPU/interrupt fields.
 `uart.flush_count` remains
 source-neutral because pinned Firecracker declares it without a producer.
 `mmds.rx_bad_eth` is also source-neutral: Bangbang classifies and parses the
 same immutable owned packet, so Firecracker's zero-copy mutation window cannot
 occur and no broader malformed-frame event is aliased into the field. The
-remaining planned and provisional records are nonterminal, carry empty
-implementation and validation arrays, and have no platform exclusion. The
-provisional records are the six retained i8042 fields plus nine vCPU
+remaining provisional records are nonterminal, carry empty implementation and
+validation arrays, and have no platform exclusion. They are the six retained
+i8042 fields plus nine vCPU
 PIO/KVM-clock fields;
 this label does not claim that the terminal platform evidence required by
 #1846 already exists.
@@ -282,6 +283,36 @@ identity immutable for the generation. Both configured and static
 upstream, Apple, alternative, behavior, focused-test, compatibility, security,
 and Challenge evidence. Replacing a vmnet interface is a lifecycle change and
 is not counted as an in-place MAC update.
+
+### vCPU exit and interrupt producer closure
+
+#1845 closes the nine applicable vCPU fields and both interrupt fields with
+one fresh, VM-local saturating root for each family. A decoded and resolved HVF
+MMIO exit increments exactly one read or write counter and contributes one
+microsecond latency sample around only the runtime dispatcher call. Dispatcher
+errors retain that attempt; exit decode, register preparation/completion,
+non-MMIO exits, lock acquisition, and retries do not. Interval output resets
+the counters and latency sums only after a complete accepted metrics line,
+while read/write minima and maxima remain lifetime Stores for that VM.
+
+`vcpu.failures` counts terminal vCPU execution failures: HVF run failure,
+unknown or unusable exit, unsupported SYS64, and dirty/lazy guest execution
+fault handling. Expected pause, shutdown, reset, device-MMIO, PVTime,
+admission/channel, snapshot/configuration, retained-wait, supervisor, and
+lifecycle outcomes remain outside that field. The runner classifies the typed
+outcome once at each raw, ordinary, or coordinated execution boundary, so a
+device error cannot also become a vCPU failure.
+
+MMIO interrupt attempts increment `interrupts.triggers` immediately before
+the sink is signaled, including sink failure. PCI/MSI-X increments it only
+after one active live route succeeds; disabled, masked, pending, missing,
+rejected, and failed routes stay zero until delivery. `config_updates` counts
+MSI-X configuration work: enabling or function-unmasking counts every table
+entry, including masked entries; changing one active unmasked table entry counts
+once; and restore counts each validated active entry it reconstructs. Disabling, masking,
+identical, invalid, or still-masked writes do not count. Snapshot state carries
+neither metric root; every destination begins fresh and publication retains
+the same whole-line retry contract.
 
 Vsock uses one coherent saturating owner from configuration and activation
 through MMIO/PCI dispatch, HVF readiness, snapshot normalization, restore, and

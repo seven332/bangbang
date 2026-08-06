@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::memory::GuestAddress;
+use bangbang_runtime::metrics::SharedVcpuMetrics;
 use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
@@ -1290,6 +1291,7 @@ pub struct HvfVcpuRunner<'vm> {
     dirty_write_owner_registered: AtomicBool,
     lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
     lazy_guest_member_index: usize,
+    metrics: SharedVcpuMetrics,
     _vm: PhantomData<&'vm HvfBackend>,
 }
 
@@ -1964,6 +1966,16 @@ trait RunnerVcpu {
         access: HvfResolvedMmioAccess,
         dispatcher: &mut MmioDispatcher,
     ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError>;
+    fn dispatch_mmio_access_with_metrics(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+        self.dispatch_mmio_access(access, dispatcher)
+    }
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        None
+    }
     fn read_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
         Err(BackendError::InvalidState(
             "vCPU does not support general register reads",
@@ -3665,6 +3677,7 @@ fn configure_mpidr_el1_on_runner_thread(
 
 struct RealRunnerVcpu {
     owner: HvfVcpuOwner,
+    metrics: SharedVcpuMetrics,
     gic_ppi_pending_writer: Option<HvfGicPpiPendingWriter>,
     gic_state_snapshotter: Option<HvfGicStateSnapshotter>,
     gic_state_restorer: Option<HvfGicStateRestorer>,
@@ -3673,11 +3686,12 @@ struct RealRunnerVcpu {
 }
 
 impl RealRunnerVcpu {
-    fn create() -> Result<Self, BackendError> {
+    fn create(metrics: SharedVcpuMetrics) -> Result<Self, BackendError> {
         let owner = HvfVcpuOwner::new()?;
 
         Ok(Self {
             owner,
+            metrics,
             gic_ppi_pending_writer: None,
             gic_state_snapshotter: None,
             gic_state_restorer: None,
@@ -3719,6 +3733,24 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner
             .dispatch_mmio_access(access, dispatcher)
             .map_err(HvfVcpuRunnerError::MmioDispatch)
+    }
+
+    fn dispatch_mmio_access_with_metrics(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+        crate::mmio::dispatch_mmio_access_with_metrics(
+            access,
+            dispatcher,
+            &mut self.owner,
+            &self.metrics,
+        )
+        .map_err(HvfVcpuRunnerError::MmioDispatch)
+    }
+
+    fn shared_vcpu_metrics(&self) -> Option<SharedVcpuMetrics> {
+        Some(self.metrics.clone())
     }
 
     fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
@@ -4002,12 +4034,17 @@ impl RunnerVcpu for RealRunnerVcpu {
 }
 
 impl<'vm> HvfVcpuRunner<'vm> {
-    pub(crate) fn new_unconfigured() -> Result<Self, HvfVcpuRunnerError> {
-        Self::from_started_with_mpidr_state(
-            spawn_runner_thread(RealRunnerVcpu::create)?,
+    fn new_unconfigured_with_metrics(
+        metrics: SharedVcpuMetrics,
+    ) -> Result<Self, HvfVcpuRunnerError> {
+        let thread_metrics = metrics.clone();
+        let mut runner = Self::from_started_with_mpidr_state(
+            spawn_runner_thread(move || RealRunnerVcpu::create(thread_metrics))?,
             real_cancel_vcpu(),
             false,
-        )
+        )?;
+        runner.metrics = metrics;
+        Ok(runner)
     }
 
     pub(crate) fn new_with_memory_fault_handlers(
@@ -4037,6 +4074,20 @@ impl<'vm> HvfVcpuRunner<'vm> {
         dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
         lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
     ) -> Result<Self, HvfVcpuRunnerError> {
+        Self::new_unconfigured_with_memory_fault_handlers_and_metrics(
+            member_index,
+            dirty_write_tracker,
+            lazy_guest_fault_handler,
+            SharedVcpuMetrics::default(),
+        )
+    }
+
+    pub(crate) fn new_unconfigured_with_memory_fault_handlers_and_metrics(
+        member_index: usize,
+        dirty_write_tracker: Option<Arc<HvfDirtyWriteTracker>>,
+        lazy_guest_fault_handler: Option<Arc<HvfLazyGuestFaultHandler>>,
+        metrics: SharedVcpuMetrics,
+    ) -> Result<Self, HvfVcpuRunnerError> {
         if dirty_write_tracker.is_some() && lazy_guest_fault_handler.is_some() {
             return Err(HvfVcpuRunnerError::InvalidState(
                 "dirty-write tracking and lazy guest paging cannot share stage-two ownership",
@@ -4050,7 +4101,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if let Some(tracker) = dirty_write_tracker.as_ref() {
             tracker.register_owner(member_index)?;
         }
-        let mut runner = match Self::new_unconfigured() {
+        let mut runner = match Self::new_unconfigured_with_metrics(metrics) {
             Ok(runner) => runner,
             Err(source) => {
                 if let Some(tracker) = dirty_write_tracker.as_ref() {
@@ -4067,6 +4118,10 @@ impl<'vm> HvfVcpuRunner<'vm> {
         runner.lazy_guest_fault_handler = lazy_guest_fault_handler;
         runner.lazy_guest_member_index = member_index;
         Ok(runner)
+    }
+
+    pub fn shared_vcpu_metrics(&self) -> SharedVcpuMetrics {
+        self.metrics.clone()
     }
 
     pub(crate) fn configure_mpidr_el1(&self, expected: u64) -> Result<u64, HvfVcpuRunnerError> {
@@ -5633,6 +5688,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             dirty_write_owner_registered: AtomicBool::new(false),
             lazy_guest_fault_handler: None,
             lazy_guest_member_index: 0,
+            metrics: SharedVcpuMetrics::default(),
             _vm: PhantomData,
         })
     }
@@ -8697,6 +8753,7 @@ fn run_runner_thread<C, V>(
             }
             RunnerCommand::RunOnce { response_sender } => {
                 let result = run_once_with_pvtime_on_runner_thread(&mut vcpu, &mut pvtime);
+                record_raw_vcpu_metrics(vcpu.shared_vcpu_metrics().as_ref(), &result);
                 let _ = response_sender.send(result);
             }
             RunnerCommand::RunOnceAndHandleMmio {
@@ -9992,52 +10049,59 @@ fn run_once_and_handle_mmio_on_runner_thread(
     memory_fault_handlers: RunnerMemoryFaultHandlers<'_>,
     pvtime: &mut HvfArm64PvTimeAccounting,
 ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
-    let policy = pvtime.policy();
-    match run_once_with_pvtime_on_runner_thread(vcpu, pvtime)? {
-        HvfVcpuExit::Canceled => Ok(HvfVcpuRunStepOutcome::Canceled),
-        HvfVcpuExit::VtimerActivated => Ok(HvfVcpuRunStepOutcome::VtimerActivated),
-        HvfVcpuExit::Unknown { reason } => Ok(HvfVcpuRunStepOutcome::Unknown { reason }),
-        HvfVcpuExit::Exception(exit) => {
-            if let Ok(hvc) = exit.decode_hvc() {
-                return handle_hvc_on_runner_thread(vcpu, hvc, policy);
-            }
-            if let Ok(sys64) = exit.decode_sys64() {
-                return handle_sys64_on_runner_thread(vcpu, sys64);
-            }
-            if let Some(handler) = memory_fault_handlers.lazy_guest_fault_handler
-                && let Some(candidate) = handler.classify(exit)?
-            {
-                let pc = vcpu
-                    .read_register(HvfRegister::PC)
-                    .map_err(HvfVcpuRunnerError::Backend)?;
-                if let Some(fault) =
-                    handler.handle(memory_fault_handlers.lazy_guest_member_index, candidate, pc)?
-                {
-                    return Ok(HvfVcpuRunStepOutcome::LazyPage { fault });
+    let metrics = vcpu.shared_vcpu_metrics();
+    let result = (|| {
+        let policy = pvtime.policy();
+        match run_once_with_pvtime_on_runner_thread(vcpu, pvtime)? {
+            HvfVcpuExit::Canceled => Ok(HvfVcpuRunStepOutcome::Canceled),
+            HvfVcpuExit::VtimerActivated => Ok(HvfVcpuRunStepOutcome::VtimerActivated),
+            HvfVcpuExit::Unknown { reason } => Ok(HvfVcpuRunStepOutcome::Unknown { reason }),
+            HvfVcpuExit::Exception(exit) => {
+                if let Ok(hvc) = exit.decode_hvc() {
+                    return handle_hvc_on_runner_thread(vcpu, hvc, policy);
                 }
-            }
-            if let Some(tracker) = memory_fault_handlers.dirty_write_tracker
-                && let Some(handled) = tracker
-                    .handle_exception(memory_fault_handlers.dirty_write_member_index, exit)?
-            {
-                return Ok(HvfVcpuRunStepOutcome::DirtyWrite {
-                    page: handled.page(),
-                    first_write: handled.first_write(),
-                });
-            }
-            let access = exit
-                .decode_mmio_access()
-                .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
-            let mut dispatcher = lock_shared_mmio_dispatcher(dispatcher)?;
-            let access = access
-                .resolve(dispatcher.bus())
-                .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
-            let outcome = vcpu.dispatch_mmio_access(access, &mut dispatcher)?;
-            advance_arm64_pc(vcpu)?;
+                if let Ok(sys64) = exit.decode_sys64() {
+                    return handle_sys64_on_runner_thread(vcpu, sys64);
+                }
+                if let Some(handler) = memory_fault_handlers.lazy_guest_fault_handler
+                    && let Some(candidate) = handler.classify(exit)?
+                {
+                    let pc = vcpu
+                        .read_register(HvfRegister::PC)
+                        .map_err(HvfVcpuRunnerError::Backend)?;
+                    if let Some(fault) = handler.handle(
+                        memory_fault_handlers.lazy_guest_member_index,
+                        candidate,
+                        pc,
+                    )? {
+                        return Ok(HvfVcpuRunStepOutcome::LazyPage { fault });
+                    }
+                }
+                if let Some(tracker) = memory_fault_handlers.dirty_write_tracker
+                    && let Some(handled) = tracker
+                        .handle_exception(memory_fault_handlers.dirty_write_member_index, exit)?
+                {
+                    return Ok(HvfVcpuRunStepOutcome::DirtyWrite {
+                        page: handled.page(),
+                        first_write: handled.first_write(),
+                    });
+                }
+                let access = exit
+                    .decode_mmio_access()
+                    .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
+                let mut dispatcher = lock_shared_mmio_dispatcher(dispatcher)?;
+                let access = access
+                    .resolve(dispatcher.bus())
+                    .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
+                let outcome = vcpu.dispatch_mmio_access_with_metrics(access, &mut dispatcher)?;
+                advance_arm64_pc(vcpu)?;
 
-            Ok(HvfVcpuRunStepOutcome::Mmio { access, outcome })
+                Ok(HvfVcpuRunStepOutcome::Mmio { access, outcome })
+            }
         }
-    }
+    })();
+    record_vcpu_run_step_metrics(metrics.as_ref(), &result);
+    result
 }
 
 fn run_once_and_handle_mmio_coordinated_on_runner_thread(
@@ -10047,62 +10111,125 @@ fn run_once_and_handle_mmio_coordinated_on_runner_thread(
     memory_fault_handlers: RunnerMemoryFaultHandlers<'_>,
     pvtime: &mut HvfArm64PvTimeAccounting,
 ) -> Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError> {
-    let policy = pvtime.policy();
-    let outcome = match run_once_with_pvtime_on_runner_thread(vcpu, pvtime)? {
-        HvfVcpuExit::Canceled => HvfVcpuRunStepOutcome::Canceled,
-        HvfVcpuExit::VtimerActivated => HvfVcpuRunStepOutcome::VtimerActivated,
-        HvfVcpuExit::Unknown { reason } => HvfVcpuRunStepOutcome::Unknown { reason },
-        HvfVcpuExit::Exception(exit) => {
-            if let Ok(hvc) = exit.decode_hvc() {
-                return handle_coordinated_hvc_on_runner_thread(vcpu, hvc, psci_state, policy);
-            }
-            if let Ok(sys64) = exit.decode_sys64() {
-                return handle_sys64_on_runner_thread(vcpu, sys64)
-                    .map(HvfVcpuCoordinatedRunStepOutcome::Handled);
-            }
-            if let Some(handler) = memory_fault_handlers.lazy_guest_fault_handler
-                && let Some(candidate) = handler.classify(exit)?
-            {
-                let pc = vcpu
-                    .read_register(HvfRegister::PC)
-                    .map_err(HvfVcpuRunnerError::Backend)?;
-                if let Some(fault) =
-                    handler.handle(memory_fault_handlers.lazy_guest_member_index, candidate, pc)?
+    let metrics = vcpu.shared_vcpu_metrics();
+    let result = (|| {
+        let policy = pvtime.policy();
+        let outcome = match run_once_with_pvtime_on_runner_thread(vcpu, pvtime)? {
+            HvfVcpuExit::Canceled => HvfVcpuRunStepOutcome::Canceled,
+            HvfVcpuExit::VtimerActivated => HvfVcpuRunStepOutcome::VtimerActivated,
+            HvfVcpuExit::Unknown { reason } => HvfVcpuRunStepOutcome::Unknown { reason },
+            HvfVcpuExit::Exception(exit) => {
+                if let Ok(hvc) = exit.decode_hvc() {
+                    return handle_coordinated_hvc_on_runner_thread(vcpu, hvc, psci_state, policy);
+                }
+                if let Ok(sys64) = exit.decode_sys64() {
+                    return handle_sys64_on_runner_thread(vcpu, sys64)
+                        .map(HvfVcpuCoordinatedRunStepOutcome::Handled);
+                }
+                if let Some(handler) = memory_fault_handlers.lazy_guest_fault_handler
+                    && let Some(candidate) = handler.classify(exit)?
+                {
+                    let pc = vcpu
+                        .read_register(HvfRegister::PC)
+                        .map_err(HvfVcpuRunnerError::Backend)?;
+                    if let Some(fault) = handler.handle(
+                        memory_fault_handlers.lazy_guest_member_index,
+                        candidate,
+                        pc,
+                    )? {
+                        return Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                            HvfVcpuRunStepOutcome::LazyPage { fault },
+                        ));
+                    }
+                }
+                if let Some(tracker) = memory_fault_handlers.dirty_write_tracker
+                    && let Some(handled) = tracker
+                        .handle_exception(memory_fault_handlers.dirty_write_member_index, exit)?
                 {
                     return Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
-                        HvfVcpuRunStepOutcome::LazyPage { fault },
+                        HvfVcpuRunStepOutcome::DirtyWrite {
+                            page: handled.page(),
+                            first_write: handled.first_write(),
+                        },
                     ));
                 }
+                let access = exit
+                    .decode_mmio_access()
+                    .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
+                // A coordinated topology deliberately runs every online vCPU at
+                // once. Two members may therefore exit for MMIO together; serialize
+                // those short dispatch sections instead of treating ordinary
+                // cross-vCPU contention as a terminal runner error.
+                let mut dispatcher = lock_shared_mmio_dispatcher_coordinated(dispatcher)?;
+                let access = access
+                    .resolve(dispatcher.bus())
+                    .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
+                let outcome = vcpu.dispatch_mmio_access_with_metrics(access, &mut dispatcher)?;
+                advance_arm64_pc(vcpu)?;
+                HvfVcpuRunStepOutcome::Mmio { access, outcome }
             }
-            if let Some(tracker) = memory_fault_handlers.dirty_write_tracker
-                && let Some(handled) = tracker
-                    .handle_exception(memory_fault_handlers.dirty_write_member_index, exit)?
-            {
-                return Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
-                    HvfVcpuRunStepOutcome::DirtyWrite {
-                        page: handled.page(),
-                        first_write: handled.first_write(),
-                    },
-                ));
-            }
-            let access = exit
-                .decode_mmio_access()
-                .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
-            // A coordinated topology deliberately runs every online vCPU at
-            // once. Two members may therefore exit for MMIO together; serialize
-            // those short dispatch sections instead of treating ordinary
-            // cross-vCPU contention as a terminal runner error.
-            let mut dispatcher = lock_shared_mmio_dispatcher_coordinated(dispatcher)?;
-            let access = access
-                .resolve(dispatcher.bus())
-                .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
-            let outcome = vcpu.dispatch_mmio_access(access, &mut dispatcher)?;
-            advance_arm64_pc(vcpu)?;
-            HvfVcpuRunStepOutcome::Mmio { access, outcome }
-        }
-    };
+        };
 
-    Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(outcome))
+        Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(outcome))
+    })();
+    record_coordinated_vcpu_metrics(metrics.as_ref(), &result);
+    result
+}
+
+fn record_raw_vcpu_metrics(
+    metrics: Option<&SharedVcpuMetrics>,
+    result: &Result<HvfVcpuExit, HvfVcpuRunnerError>,
+) {
+    let failed = match result {
+        Ok(HvfVcpuExit::Unknown { .. }) => true,
+        Ok(_) => false,
+        Err(error) => is_vcpu_execution_failure(error),
+    };
+    if failed && let Some(metrics) = metrics {
+        metrics.record_failure();
+    }
+}
+
+fn record_vcpu_run_step_metrics(
+    metrics: Option<&SharedVcpuMetrics>,
+    result: &Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>,
+) {
+    let failed = match result {
+        Ok(HvfVcpuRunStepOutcome::Unknown { .. }) => true,
+        Ok(_) => false,
+        Err(error) => is_vcpu_execution_failure(error),
+    };
+    if failed && let Some(metrics) = metrics {
+        metrics.record_failure();
+    }
+}
+
+fn record_coordinated_vcpu_metrics(
+    metrics: Option<&SharedVcpuMetrics>,
+    result: &Result<HvfVcpuCoordinatedRunStepOutcome, HvfVcpuRunnerError>,
+) {
+    let failed = match result {
+        Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(HvfVcpuRunStepOutcome::Unknown {
+            ..
+        })) => true,
+        Ok(_) => false,
+        Err(error) => is_vcpu_execution_failure(error),
+    };
+    if failed && let Some(metrics) = metrics {
+        metrics.record_failure();
+    }
+}
+
+const fn is_vcpu_execution_failure(error: &HvfVcpuRunnerError) -> bool {
+    matches!(
+        error,
+        HvfVcpuRunnerError::Backend(_)
+            | HvfVcpuRunnerError::Gic(_)
+            | HvfVcpuRunnerError::VcpuExitResolve(_)
+            | HvfVcpuRunnerError::DirtyWriteFault(_)
+            | HvfVcpuRunnerError::LazyGuestFault(_)
+            | HvfVcpuRunnerError::UnsupportedSys64 { .. }
+    )
 }
 
 fn record_coordinated_psci_pending(
@@ -10543,7 +10670,10 @@ pub(crate) mod tests {
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
-    use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher, MmioRegionId};
+    use bangbang_runtime::metrics::SharedVcpuMetrics;
+    use bangbang_runtime::mmio::{
+        MmioDispatchError, MmioDispatchOutcome, MmioDispatcher, MmioRegionId,
+    };
 
     use super::{
         CancelVcpu, HvfArm64SnapshotV1CaptureStage, HvfArm64SnapshotV1Restore,
@@ -10655,6 +10785,54 @@ pub(crate) mod tests {
     const GIC_DEVICE_STATE_TEST_BYTES: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
     const GIC_ICC_REGISTER_STATE_TEST_VALUES: [u64; 10] =
         [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9];
+
+    #[test]
+    fn vcpu_failure_metrics_include_execution_failures_and_exclude_lifecycle_or_device_errors() {
+        let metrics = SharedVcpuMetrics::default();
+
+        super::record_raw_vcpu_metrics(Some(&metrics), &Ok(HvfVcpuExit::Unknown { reason: 7 }));
+        super::record_raw_vcpu_metrics(Some(&metrics), &Ok(HvfVcpuExit::Canceled));
+        super::record_raw_vcpu_metrics(
+            Some(&metrics),
+            &Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "injected run failure",
+            ))),
+        );
+        super::record_vcpu_run_step_metrics(
+            Some(&metrics),
+            &Err(HvfVcpuRunnerError::MmioDispatch(
+                HvfMmioDispatchError::Dispatch {
+                    source: MmioDispatchError::MissingHandler {
+                        region_id: MmioRegionId::new(9),
+                    },
+                },
+            )),
+        );
+        super::record_vcpu_run_step_metrics(
+            Some(&metrics),
+            &Ok(HvfVcpuRunStepOutcome::Unknown { reason: 8 }),
+        );
+        super::record_coordinated_vcpu_metrics(
+            Some(&metrics),
+            &Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                HvfVcpuRunStepOutcome::Canceled,
+            )),
+        );
+        super::record_coordinated_vcpu_metrics(
+            Some(&metrics),
+            &Ok(HvfVcpuCoordinatedRunStepOutcome::Handled(
+                HvfVcpuRunStepOutcome::Unknown { reason: 9 },
+            )),
+        );
+        super::record_vcpu_run_step_metrics(
+            Some(&metrics),
+            &Err(HvfVcpuRunnerError::InvalidState(
+                "injected lifecycle failure",
+            )),
+        );
+
+        assert_eq!(metrics.snapshot().failures(), 4);
+    }
 
     fn retained_vtimer_observation(
         control: u64,

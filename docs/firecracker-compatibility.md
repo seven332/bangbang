@@ -695,8 +695,8 @@ fields, newer balloon API/device fields, extra UART fields, and the ordinary
 block configuration-change value remain internal or are discarded at the
 public boundary. Adding an extension requires a separately versioned schema.
 
-The checked device-producer audit now terminally certifies all 205 #1838–#1844
-fields: 201 device fields are implemented, `uart.flush_count` and
+The checked device-producer audit now terminally certifies all 216 #1838–#1845
+fields: 212 device fields are implemented, `uart.flush_count` and
 `mmds.rx_bad_eth` are source-neutral zeros, and both configured/static
 `mac_address_updates` fields are terminal platform-zero. The former has no pinned
 Firecracker producer; the latter's pinned zero-copy mutation window is absent
@@ -776,8 +776,17 @@ evidence asserts positive network RX, zero public network TX/spoof/failure
 fields, and static/configured equality without treating it as credentialed
 external vmnet evidence.
 
-Later #1844–#1846 records remain nonterminal and repository-final certification
-remains gated on their delivery.
+The applicable HVF vCPU metrics count decoded MMIO dispatcher attempts, keep
+read/write lifetime latency extrema with interval counters and sums, and
+classify only terminal execution outcomes as `vcpu.failures`. One fresh
+VM-local interrupt root counts MMIO attempts before sink delivery, successful
+PCI/MSI-X routes after delivery, and the pinned MSI-X enable/unmask, active
+table-update, and restore boundaries as `config_updates`. Signed guest and
+executable output checks bind those
+roots through real runner, device, supervisor, and collector ownership.
+
+Only the #1846 architecture-retained records remain nonterminal, so
+repository-final device certification remains gated on that delivery.
 
 One flush first freezes missed-log, rate-limited-log, and SIGPIPE totals through
 two fixed-order `SeqCst` scans separated by a `SeqCst` fence. Equal monotonic

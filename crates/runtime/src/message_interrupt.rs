@@ -8,6 +8,8 @@
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::metrics::SharedInterruptMetrics;
+
 /// One address/data tuple programmed by a guest interrupt domain.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GuestMessage {
@@ -90,6 +92,7 @@ struct RegistryState {
 
 struct RegistryInner {
     routes: Vec<Arc<dyn GuestMessageInterrupt>>,
+    metrics: SharedInterruptMetrics,
     state: Mutex<RegistryState>,
     drained: Condvar,
 }
@@ -104,6 +107,13 @@ impl GuestMessageInterruptRegistry {
     pub fn new(
         routes: Vec<Arc<dyn GuestMessageInterrupt>>,
     ) -> Result<Self, GuestMessageInterruptRegistryError> {
+        Self::new_with_interrupt_metrics(routes, SharedInterruptMetrics::default())
+    }
+
+    pub fn new_with_interrupt_metrics(
+        routes: Vec<Arc<dyn GuestMessageInterrupt>>,
+        metrics: SharedInterruptMetrics,
+    ) -> Result<Self, GuestMessageInterruptRegistryError> {
         if routes.is_empty() {
             return Err(GuestMessageInterruptRegistryError::Empty);
         }
@@ -111,6 +121,7 @@ impl GuestMessageInterruptRegistry {
         Ok(Self {
             inner: Arc::new(RegistryInner {
                 routes,
+                metrics,
                 state: Mutex::new(RegistryState {
                     phase: GuestMessageInterruptRegistryPhase::Active,
                     in_flight: 0,
@@ -118,6 +129,10 @@ impl GuestMessageInterruptRegistry {
                 drained: Condvar::new(),
             }),
         })
+    }
+
+    pub fn shared_interrupt_metrics(&self) -> SharedInterruptMetrics {
+        self.inner.metrics.clone()
     }
 
     pub fn route_count(&self) -> usize {
@@ -181,7 +196,9 @@ impl GuestMessageInterruptRegistry {
         };
         route
             .signal(message)
-            .map_err(|source| GuestMessageInterruptRegistryError::Signal { source })
+            .map_err(|source| GuestMessageInterruptRegistryError::Signal { source })?;
+        self.inner.metrics.record_trigger();
+        Ok(())
     }
 
     fn resolve_route(
@@ -551,6 +568,50 @@ mod tests {
             registry.signal(GuestMessage::new(0x1000, 34)),
             Err(GuestMessageInterruptRegistryError::UnknownMessage)
         );
+    }
+
+    #[test]
+    fn registry_counts_only_successfully_delivered_message_interrupts() {
+        let message = GuestMessage::new(0x1000, 32);
+        let metrics = SharedInterruptMetrics::default();
+        let (_, successful_route) = route(message);
+        let registry = GuestMessageInterruptRegistry::new_with_interrupt_metrics(
+            vec![successful_route],
+            metrics.clone(),
+        )
+        .expect("registry should build");
+
+        assert!(
+            registry
+                .shared_interrupt_metrics()
+                .shares_state_with(&metrics)
+        );
+        registry
+            .signal(message)
+            .expect("successful route should signal");
+        assert_eq!(metrics.snapshot().triggers(), 1);
+
+        assert_eq!(
+            registry.signal(GuestMessage::new(0x1000, 33)),
+            Err(GuestMessageInterruptRegistryError::UnknownMessage)
+        );
+        let failed = GuestMessageInterruptRegistry::new_with_interrupt_metrics(
+            vec![Arc::new(RecordingRoute {
+                message,
+                sent: Arc::new(Mutex::new(Vec::new())),
+                failure: Some(GuestMessageInterruptSignalError::new(
+                    "backend delivery failed",
+                    true,
+                )),
+            })],
+            metrics.clone(),
+        )
+        .expect("failing registry should build");
+        assert!(matches!(
+            failed.signal(message),
+            Err(GuestMessageInterruptRegistryError::Signal { .. })
+        ));
+        assert_eq!(metrics.snapshot().triggers(), 1);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use bangbang_runtime::metrics::SharedVcpuMetrics;
 use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::paused_topology::{
@@ -2220,6 +2221,10 @@ impl<'vm> HvfVcpuRunCoordinator<'vm> {
 
     pub(crate) fn primary_runner(&self) -> &HvfVcpuRunner<'vm> {
         self.inner.primary_member()
+    }
+
+    pub fn shared_vcpu_metrics(&self) -> SharedVcpuMetrics {
+        self.primary_runner().shared_vcpu_metrics()
     }
 
     pub(crate) fn capture_stable_paused_members(

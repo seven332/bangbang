@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use bangbang_runtime::memory::GuestAddress;
+use bangbang_runtime::metrics::{SharedInterruptMetrics, SharedVcpuMetrics};
 use bangbang_runtime::mmio::MmioDispatcher;
 
 use crate::HvfVcpuRunStepOutcome;
@@ -421,6 +422,7 @@ struct InstalledStableCpuSuspend {
 /// bytes or restore memory, devices, registers, or time state.
 pub struct HvfArm64BootVcpuSession<'vm> {
     coordinator: HvfVcpuRunCoordinator<'vm>,
+    interrupt_metrics: SharedInterruptMetrics,
     power: PsciCpuPowerCoordinator,
     virtual_timer_intid: u32,
     pending_cpu_suspends: Vec<Option<PendingCpuSuspend>>,
@@ -447,6 +449,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
         let pending_cpu_suspends = vec![None; coordinator.member_count()];
         Self {
             coordinator,
+            interrupt_metrics: SharedInterruptMetrics::default(),
             power,
             virtual_timer_intid,
             pending_cpu_suspends,
@@ -489,6 +492,14 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
 
     pub(crate) fn control(&self) -> HvfVcpuRunControl {
         self.coordinator.control()
+    }
+
+    pub fn shared_vcpu_metrics(&self) -> SharedVcpuMetrics {
+        self.coordinator.shared_vcpu_metrics()
+    }
+
+    pub fn shared_interrupt_metrics(&self) -> SharedInterruptMetrics {
+        self.interrupt_metrics.clone()
     }
 
     pub(crate) fn capture_arm64_pvtime(
@@ -884,6 +895,7 @@ impl<'vm> HvfArm64BootVcpuSession<'vm> {
 
         Ok(Self {
             coordinator,
+            interrupt_metrics: SharedInterruptMetrics::default(),
             power,
             virtual_timer_intid,
             pending_cpu_suspends,

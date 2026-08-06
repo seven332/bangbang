@@ -776,6 +776,9 @@ pub(super) fn build_metrics_line(
 
     let current_diagnostics = &current.diagnostics;
     let interval_diagnostics = &interval.diagnostics;
+    let current_vcpu = current_diagnostics.vcpu_metrics.unwrap_or_default();
+    let interval_vcpu = interval_diagnostics.vcpu_metrics.unwrap_or_default();
+    let interrupts = interval_diagnostics.interrupt_metrics.unwrap_or_default();
     let balloon = interval_diagnostics
         .balloon_device_metrics
         .unwrap_or_default();
@@ -938,7 +941,22 @@ pub(super) fn build_metrics_line(
             hotplug_memory_fails: interval.put_api_requests.hotplug_memory_fails,
         },
         seccomp: SeccompMetrics::default(),
-        vcpu: VcpuMetrics::default(),
+        vcpu: VcpuMetrics {
+            exit_mmio_read: interval_vcpu.exit_mmio_read(),
+            exit_mmio_write: interval_vcpu.exit_mmio_write(),
+            failures: interval_vcpu.failures(),
+            exit_mmio_read_agg: LatencyAggregate {
+                min_us: current_vcpu.exit_mmio_read_agg().min_us(),
+                max_us: current_vcpu.exit_mmio_read_agg().max_us(),
+                sum_us: interval_vcpu.exit_mmio_read_agg().sum_us(),
+            },
+            exit_mmio_write_agg: LatencyAggregate {
+                min_us: current_vcpu.exit_mmio_write_agg().min_us(),
+                max_us: current_vcpu.exit_mmio_write_agg().max_us(),
+                sum_us: interval_vcpu.exit_mmio_write_agg().sum_us(),
+            },
+            ..VcpuMetrics::default()
+        },
         vmm: VmmMetrics {
             panic_count: current.panic_count,
         },
@@ -1001,7 +1019,10 @@ pub(super) fn build_metrics_line(
             rate_limiter_event_count: pmem.rate_limiter_event_count,
         },
         vhost_user_block_devices,
-        interrupts: InterruptMetrics::default(),
+        interrupts: InterruptMetrics {
+            triggers: interrupts.triggers(),
+            config_updates: interrupts.config_updates(),
+        },
         memory_hotplug: MemoryHotplugMetrics {
             activate_fails: memory_hotplug.activate_fails,
             queue_event_fails: memory_hotplug.queue_event_fails,

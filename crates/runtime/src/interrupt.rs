@@ -4,6 +4,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::metrics::SharedInterruptMetrics;
+
 const QUEUE_INTERRUPT_STATUS_BIT: u32 = 1 << 0;
 const CONFIG_INTERRUPT_STATUS_BIT: u32 = 1 << 1;
 const KNOWN_INTERRUPT_STATUS_BITS: u32 = QUEUE_INTERRUPT_STATUS_BIT | CONFIG_INTERRUPT_STATUS_BIT;
@@ -158,6 +160,34 @@ pub trait InterruptSink: fmt::Debug + Send + Sync {
     fn signal(&self, line: GuestInterruptLine) -> Result<(), InterruptSignalError>;
 }
 
+/// Firecracker-compatible MMIO interrupt accounting around another sink.
+///
+/// The trigger is recorded before delegation, so an admitted sink failure is
+/// still one interrupt attempt. PCI/MSI-X uses its successful-delivery registry
+/// boundary instead and must not use this decorator.
+#[derive(Debug, Clone)]
+pub struct MetricsInterruptSink {
+    sink: Arc<dyn InterruptSink>,
+    metrics: SharedInterruptMetrics,
+}
+
+impl MetricsInterruptSink {
+    pub fn new(sink: Arc<dyn InterruptSink>, metrics: SharedInterruptMetrics) -> Self {
+        Self { sink, metrics }
+    }
+
+    pub fn shared_metrics(&self) -> SharedInterruptMetrics {
+        self.metrics.clone()
+    }
+}
+
+impl InterruptSink for MetricsInterruptSink {
+    fn signal(&self, line: GuestInterruptLine) -> Result<(), InterruptSignalError> {
+        self.metrics.record_trigger();
+        self.sink.signal(line)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceInterruptTrigger {
     line: GuestInterruptLine,
@@ -242,8 +272,9 @@ mod tests {
     use super::{
         DeviceInterruptKind, DeviceInterruptStatus, DeviceInterruptStatusError,
         DeviceInterruptTrigger, DeviceInterruptTriggerError, GuestInterruptLine,
-        GuestInterruptLineError, InterruptSignalError, InterruptSink,
+        GuestInterruptLineError, InterruptSignalError, InterruptSink, MetricsInterruptSink,
     };
+    use crate::metrics::SharedInterruptMetrics;
 
     #[derive(Debug)]
     struct RecordingSink {
@@ -293,6 +324,40 @@ mod tests {
     fn trigger() -> (DeviceInterruptTrigger, Arc<Mutex<Vec<GuestInterruptLine>>>) {
         let (lines, sink) = RecordingSink::successful();
         (DeviceInterruptTrigger::new(line(32), sink), lines)
+    }
+
+    #[test]
+    fn metrics_sink_counts_successful_and_failed_mmio_attempts_before_delegation() {
+        let metrics = SharedInterruptMetrics::default();
+        let (successful_lines, successful) = RecordingSink::successful();
+        let successful = MetricsInterruptSink::new(Arc::new(successful), metrics.clone());
+        successful
+            .signal(line(32))
+            .expect("successful sink should accept the interrupt");
+
+        let (failed_lines, failed) = RecordingSink::failing("injected failure");
+        let failed = MetricsInterruptSink::new(Arc::new(failed), metrics.clone());
+        assert_eq!(
+            failed
+                .signal(line(33))
+                .expect_err("failing sink should reject the interrupt")
+                .message(),
+            "injected failure"
+        );
+
+        assert_eq!(metrics.snapshot().triggers(), 2);
+        assert_eq!(
+            *successful_lines
+                .lock()
+                .expect("successful lines should remain available"),
+            vec![line(32)]
+        );
+        assert_eq!(
+            *failed_lines
+                .lock()
+                .expect("failed lines should remain available"),
+            vec![line(33)]
+        );
     }
 
     #[test]

@@ -1340,6 +1340,7 @@ mod macos_arm64 {
             "process-failure",
         );
         assert_fatal_signal_terminal_metrics_output(&metrics_path, "sighup");
+        assert_vcpu_and_interrupt_metrics_output(&metrics_path);
         assert!(
             !uds_path.exists(),
             "bangbang shutdown should remove its owned vsock listener path"
@@ -18806,6 +18807,55 @@ mod macos_arm64 {
             found_vm_state_latencies,
             "metrics output should include numeric pause/resume VM state latencies; output:\n{output}"
         );
+    }
+
+    fn assert_vcpu_and_interrupt_metrics_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "metrics output {} should be readable for vCPU and interrupt metrics: {err}",
+                path.display()
+            )
+        });
+        let lines = output
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|err| {
+                    panic!("vCPU metrics line should be valid JSON: {err}; line:\n{line}")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let sum = |pointer: &str| {
+            lines.iter().fold(0_u64, |total, line| {
+                total.saturating_add(
+                    line.pointer(pointer)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "metrics output should contain numeric {pointer}; output:\n{output}"
+                            )
+                        }),
+                )
+            })
+        };
+        let reads = sum("/vcpu/exit_mmio_read");
+        let writes = sum("/vcpu/exit_mmio_write");
+        assert!(
+            reads.saturating_add(writes) > 0,
+            "signed executable should publish MMIO vCPU activity; output:\n{output}"
+        );
+        assert_eq!(sum("/vcpu/failures"), 0, "output:\n{output}");
+        assert!(
+            sum("/interrupts/triggers") > 0,
+            "signed executable should publish interrupt activity; output:\n{output}"
+        );
+
+        for direction in ["read", "write"] {
+            for field in ["min_us", "max_us", "sum_us"] {
+                let pointer = format!("/vcpu/exit_mmio_{direction}_agg/{field}");
+                let _ = sum(&pointer);
+            }
+        }
     }
 
     fn assert_block_update_metrics_output(path: &Path) {

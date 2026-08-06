@@ -76,8 +76,10 @@ fn make_device_record_terminal(
     let record = audit
         .records
         .iter_mut()
-        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
-        .expect("planned device record must exist");
+        .find(|record| {
+            record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+        })
+        .expect("provisional device record must exist");
     record.disposition = MetricsDeviceProducerDisposition::Implemented;
     record.implementation.push(anchored_local_reference());
     record.validation.push(anchored_local_reference());
@@ -236,7 +238,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
             .count(),
-        11
+        0
     );
     assert_eq!(
         audit
@@ -254,7 +256,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .iter()
             .filter(|record| record.disposition == MetricsDeviceProducerDisposition::Implemented)
             .count(),
-        201
+        212
     );
     assert_eq!(
         audit
@@ -279,7 +281,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
     for record in audit.records.iter().filter(|record| {
         matches!(
             record.delivery_issue.as_str(),
-            "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843" | "#1844"
+            "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843" | "#1844" | "#1845"
         )
     }) {
         let expected = if matches!(
@@ -312,7 +314,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .filter(|record| {
                 !matches!(
                     record.delivery_issue.as_str(),
-                    "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843" | "#1844"
+                    "#1838" | "#1839" | "#1840" | "#1841" | "#1842" | "#1843" | "#1844" | "#1845"
                 )
             })
             .all(|record| {
@@ -330,7 +332,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
             .lines()
             .filter(|line| line.contains("final metrics device producer validation rejects"))
             .count(),
-        26
+        15
     );
 }
 
@@ -339,6 +341,7 @@ fn checked_device_producer_audit_is_canonical_and_exact() {
 // exact #1838 disposition mutation tests, extended through #1842
 // exact #1838 disposition mutation tests, extended through #1843
 // exact #1838 disposition mutation tests, extended through #1844
+// exact #1838 disposition mutation tests, extended through #1845
 #[test]
 fn device_producer_audit_rejects_completed_child_regression_and_future_promotion() {
     let mut implemented_regression = checked_device_audit();
@@ -346,10 +349,10 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
         .records
         .iter_mut()
         .find(|record| {
-            record.delivery_issue == "#1844"
+            record.delivery_issue == "#1845"
                 && record.disposition == MetricsDeviceProducerDisposition::Implemented
         })
-        .expect("implemented #1844 record must exist")
+        .expect("implemented #1845 record must exist")
         .disposition = MetricsDeviceProducerDisposition::Planned;
     assert!(device_validation_error(&implemented_regression).contains("wrong current disposition"));
 
@@ -377,7 +380,7 @@ fn device_producer_audit_rejects_completed_child_regression_and_future_promotion
     let record = future_promotion
         .records
         .iter_mut()
-        .find(|record| record.delivery_issue == "#1845")
+        .find(|record| record.delivery_issue == "#1846")
         .expect("future child record must exist");
     record.disposition = MetricsDeviceProducerDisposition::Implemented;
     record.implementation.push(anchored_local_reference());
@@ -464,14 +467,17 @@ fn device_producer_audit_rejects_child_boundary_and_rationale_drift() {
 
 #[test]
 fn device_producer_audit_rejects_disposition_and_nonterminal_evidence_drift() {
-    let mut planned_as_provisional = checked_device_audit();
-    planned_as_provisional
+    let mut implemented_as_planned = checked_device_audit();
+    implemented_as_planned
         .records
         .iter_mut()
-        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
-        .expect("planned device record must exist")
-        .disposition = MetricsDeviceProducerDisposition::ProvisionalPlatformZero;
-    assert!(device_validation_error(&planned_as_provisional).contains("wrong current disposition"));
+        .find(|record| {
+            record.delivery_issue == "#1845"
+                && record.disposition == MetricsDeviceProducerDisposition::Implemented
+        })
+        .expect("implemented #1845 device record must exist")
+        .disposition = MetricsDeviceProducerDisposition::Planned;
+    assert!(device_validation_error(&implemented_as_planned).contains("wrong current disposition"));
 
     let mut provisional_as_planned = checked_device_audit();
     provisional_as_planned
@@ -488,8 +494,10 @@ fn device_producer_audit_rejects_disposition_and_nonterminal_evidence_drift() {
     let record = premature
         .records
         .iter_mut()
-        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
-        .expect("planned device record must exist");
+        .find(|record| {
+            record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+        })
+        .expect("provisional device record must exist");
     record.disposition = MetricsDeviceProducerDisposition::Implemented;
     record.implementation.push(anchored_local_reference());
     record.validation.push(anchored_local_reference());
@@ -499,8 +507,10 @@ fn device_producer_audit_rejects_disposition_and_nonterminal_evidence_drift() {
     evidence
         .records
         .iter_mut()
-        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
-        .expect("planned device record must exist")
+        .find(|record| {
+            record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+        })
+        .expect("provisional device record must exist")
         .implementation
         .push(anchored_local_reference());
     assert!(device_validation_error(&evidence).contains("must not claim terminal evidence"));
@@ -596,8 +606,10 @@ fn device_producer_audit_rejects_invalid_platform_exclusions() {
     let record = forbidden
         .records
         .iter_mut()
-        .find(|record| record.disposition == MetricsDeviceProducerDisposition::Planned)
-        .expect("planned device record must exist");
+        .find(|record| {
+            record.disposition == MetricsDeviceProducerDisposition::ProvisionalPlatformZero
+        })
+        .expect("provisional device record must exist");
     record.platform_exclusion = Some(empty_exclusion());
     assert!(device_validation_error(&forbidden).contains("must not claim terminal evidence"));
 

@@ -50,6 +50,7 @@ use bangbang_runtime::fdt::{
 };
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
+    MetricsInterruptSink,
 };
 use bangbang_runtime::logger::{
     GuestLogger, LoggerBackendOutcome, LoggerBalloonOutcome, LoggerBlockOutcome,
@@ -73,8 +74,9 @@ use bangbang_runtime::message_interrupt::{
 use bangbang_runtime::metrics::{
     BlockDeviceMetricsLease, BlockDeviceMetricsRegistryError, NetworkInterfaceMetricsLease,
     PmemDeviceMetricsLease, PmemDeviceMetricsRegistryError, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics,
+    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics, SharedInterruptMetrics,
+    SharedMemoryHotplugDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
+    SharedPmemDeviceMetricsRegistry, SharedRtcDeviceMetrics, SharedVcpuMetrics,
     SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::MmdsConfig;
@@ -2810,6 +2812,7 @@ fn refresh_mmio_vhost_user_block_config(
     runtime_resources: &Arm64BootRuntimeResources,
     mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
     config: &DriveConfig,
 ) -> Result<(), DriveUpdateError> {
     let device = runtime_resources
@@ -2838,6 +2841,7 @@ fn refresh_mmio_vhost_user_block_config(
         &mut dispatcher,
         config,
         || {
+            interrupt_metrics.record_trigger();
             signaler.set_level(interrupt_line, true).map_err(|source| {
                 let delivery_ambiguous = matches!(&source, HvfGicSpiSignalError::Signal { .. });
                 VhostUserBlockConfigSignalError::new(source.to_string(), delivery_ambiguous)
@@ -2876,6 +2880,7 @@ fn update_mmio_live_block_device(
     mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
     gic: &HvfGicMetadata,
     metrics: &SharedBlockDeviceMetricsRegistry,
+    interrupt_metrics: &SharedInterruptMetrics,
     update: HvfLiveBlockUpdate<'_>,
 ) -> Result<(), DriveUpdateError> {
     let HvfLiveBlockUpdate {
@@ -2917,7 +2922,7 @@ fn update_mmio_live_block_device(
             ),
         )?
     };
-    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+    let signaler = create_mmio_interrupt_sink(gic, interrupt_metrics).map_err(|source| {
         DriveUpdateError::TerminalActiveSessionCommand {
             message: source.to_string(),
         }
@@ -11222,6 +11227,7 @@ struct HvfArm64BootVsockCaptureOwner<'a> {
     pci_data_devices: &'a Option<HvfArm64BootPciDataDevices>,
     retry_wakeup_scheduler: &'a HvfArm64BootLimiterRetryWakeupScheduler,
     session_metrics: &'a SharedVsockDeviceMetrics,
+    interrupt_metrics: SharedInterruptMetrics,
     gic: &'a HvfGicMetadata,
     vsock_interrupt_line: Option<GuestInterruptLine>,
 }
@@ -11546,9 +11552,10 @@ fn capture_ready_vsock_state_with_cancel(
             );
             if reset_attempt.needs_queue_interrupt() {
                 drop(dispatcher);
-                let delivered = HvfGicSpiSignaler::from_metadata(owner.gic).is_ok_and(|signaler| {
-                    signal_queue_interrupt(interrupt_line, &signaler).is_ok()
-                });
+                let delivered = create_mmio_interrupt_sink(owner.gic, &owner.interrupt_metrics)
+                    .is_ok_and(|signaler| {
+                        signal_queue_interrupt(interrupt_line, &signaler).is_ok()
+                    });
                 if !delivered {
                     guest_logger.log_vsock(LoggerVsockOutcome::InterruptDeliveryFailed);
                     return Err(vsock_capture_error(
@@ -12290,6 +12297,7 @@ fn capture_ready_storage_state_at_with_cancel(
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
     block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     pmem_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     configs: &CaptureReadyStorageConfigs,
@@ -12304,6 +12312,7 @@ fn capture_ready_storage_state_at_with_cancel(
         pci_data_devices,
         block_device_metrics,
         gic,
+        interrupt_metrics,
         block_retry_wakeup_scheduler,
         pmem_retry_wakeup_scheduler,
         configs,
@@ -12331,6 +12340,7 @@ fn capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
     block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     pmem_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     configs: &CaptureReadyStorageConfigs,
@@ -12345,6 +12355,7 @@ fn capture_snapshot_v2_multi_block_device_graph_at_with_cancel(
         pci_data_devices,
         block_device_metrics,
         gic,
+        interrupt_metrics,
         block_retry_wakeup_scheduler,
         pmem_retry_wakeup_scheduler,
         configs,
@@ -12372,6 +12383,7 @@ fn capture_snapshot_v2_storage_device_graph_at_with_cancel(
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
     block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     pmem_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     configs: &CaptureReadyStorageConfigs,
@@ -12386,6 +12398,7 @@ fn capture_snapshot_v2_storage_device_graph_at_with_cancel(
         pci_data_devices,
         block_device_metrics,
         gic,
+        interrupt_metrics,
         block_retry_wakeup_scheduler,
         pmem_retry_wakeup_scheduler,
         configs,
@@ -12413,6 +12426,7 @@ fn capture_ready_storage_transaction_at_with_cancel(
     pci_data_devices: &mut Option<HvfArm64BootPciDataDevices>,
     block_device_metrics: &SharedBlockDeviceMetricsRegistry,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
     block_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     pmem_retry_wakeup_scheduler: &HvfArm64BootLimiterRetryWakeupScheduler,
     configs: &CaptureReadyStorageConfigs,
@@ -13168,7 +13182,7 @@ fn capture_ready_storage_transaction_at_with_cancel(
     let mut mmio_dispatcher_guard = Some(mmio_dispatcher_guard);
     if !mmio_block_interrupts.is_empty() {
         drop(mmio_dispatcher_guard.take());
-        let signaler = HvfGicSpiSignaler::from_metadata(gic).ok();
+        let signaler = create_mmio_interrupt_sink(gic, interrupt_metrics).ok();
         if signal_capture_ready_mmio_block_interrupts(
             &mmio_block_interrupts,
             configs,
@@ -14604,6 +14618,7 @@ impl HvfArm64BootSession<'_> {
                 pci_data_devices: &self.pci_data_devices,
                 retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
                 session_metrics: &self.vsock_device_metrics,
+                interrupt_metrics: self.runner.shared_interrupt_metrics(),
                 gic: &self.gic,
                 vsock_interrupt_line: self.vsock_interrupt_line,
             },
@@ -14710,6 +14725,7 @@ impl HvfArm64BootSession<'_> {
             &mut self.pci_data_devices,
             &self.block_device_metrics,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -14748,6 +14764,7 @@ impl HvfArm64BootSession<'_> {
             &mut self.pci_data_devices,
             &self.block_device_metrics,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -14783,6 +14800,7 @@ impl HvfArm64BootSession<'_> {
             &mut self.pci_data_devices,
             &self.block_device_metrics,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -15538,6 +15556,7 @@ impl HvfArm64BootSession<'_> {
             &self.mmio_dispatcher,
             &self.gic,
             &self.block_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
             update,
         )
     }
@@ -15558,6 +15577,7 @@ impl HvfArm64BootSession<'_> {
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             config,
         )
     }
@@ -15725,6 +15745,14 @@ impl HvfArm64BootSession<'_> {
 
     pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
         self.balloon_device_metrics.clone()
+    }
+
+    pub fn shared_vcpu_metrics(&self) -> SharedVcpuMetrics {
+        self.runner.shared_vcpu_metrics()
+    }
+
+    pub fn shared_interrupt_metrics(&self) -> SharedInterruptMetrics {
+        self.runner.shared_interrupt_metrics()
     }
 
     pub fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
@@ -16481,7 +16509,7 @@ impl HvfArm64BootSession<'_> {
         let result = if !dispatches.needs_queue_interrupt() {
             collect_block_notification_dispatches(dispatches)
         } else {
-            match HvfGicSpiSignaler::from_metadata(&self.gic) {
+            match create_mmio_interrupt_sink(&self.gic, &self.runner.shared_interrupt_metrics()) {
                 Ok(signaler) => signal_block_queue_interrupts(dispatches, &signaler),
                 Err(source) => {
                     record_block_unavailable_signal_metrics(
@@ -16516,6 +16544,7 @@ impl HvfArm64BootSession<'_> {
             &mut self.runtime_resources,
             &self.gic,
             &self.pmem_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
         )
     }
 
@@ -16557,6 +16586,7 @@ impl HvfArm64BootSession<'_> {
             dispatches,
             &self.gic,
             &self.network_interface_metrics,
+            &self.runner.shared_interrupt_metrics(),
         );
         if let Ok(dispatches) = &result {
             record_network_signal_metrics(&self.network_interface_metrics, dispatches);
@@ -16605,6 +16635,7 @@ impl HvfArm64BootSession<'_> {
             dispatches,
             &self.gic,
             &self.network_interface_metrics,
+            &self.runner.shared_interrupt_metrics(),
         );
         if let Ok(dispatches) = &result {
             record_network_signal_metrics(&self.network_interface_metrics, dispatches);
@@ -16651,6 +16682,7 @@ impl HvfArm64BootSession<'_> {
             dispatches,
             &self.gic,
             &self.backend.guest_logger(),
+            &self.runner.shared_interrupt_metrics(),
         );
         observe_vsock_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
@@ -16694,7 +16726,11 @@ impl HvfArm64BootSession<'_> {
             dispatches.as_slice(),
             true,
         );
-        let result = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic);
+        let result = collect_or_signal_balloon_queue_interrupts(
+            dispatches,
+            &self.gic,
+            &self.runner.shared_interrupt_metrics(),
+        );
         match &result {
             Ok(dispatches) => {
                 record_balloon_signal_metrics(&self.balloon_device_metrics, dispatches)
@@ -16750,7 +16786,11 @@ impl HvfArm64BootSession<'_> {
         };
 
         let needs_queue_interrupt = dispatches.needs_queue_interrupt();
-        let result = collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic);
+        let result = collect_or_signal_memory_hotplug_queue_interrupts(
+            dispatches,
+            &self.gic,
+            &self.runner.shared_interrupt_metrics(),
+        );
         if let Some(metrics) = &self.memory_hotplug_device_metrics {
             record_memory_hotplug_signal_metrics(metrics, needs_queue_interrupt, &result);
         }
@@ -16776,6 +16816,7 @@ impl HvfArm64BootSession<'_> {
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             update,
             &guest_logger,
         )
@@ -16835,8 +16876,12 @@ impl HvfArm64BootSession<'_> {
                 dispatches.as_slice(),
                 false,
             );
-            let dispatches = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
-                .map_err(balloon_update_error_from_display)?;
+            let dispatches = collect_or_signal_balloon_queue_interrupts(
+                dispatches,
+                &self.gic,
+                &self.runner.shared_interrupt_metrics(),
+            )
+            .map_err(balloon_update_error_from_display)?;
             record_balloon_signal_metrics(&self.balloon_device_metrics, &dispatches);
 
             balloon_update_result_from_hvf_dispatches(&dispatches)
@@ -16881,6 +16926,7 @@ impl HvfArm64BootSession<'_> {
             &mut self.runtime_resources,
             &self.gic,
             &self.entropy_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
             entropy_source,
         )
     }
@@ -17079,17 +17125,22 @@ fn prepare_snapshot_v2_pci_root_owner(
                 .ok_or(HvfSnapshotV2RootRestoreFailure::ResourcePlan)?,
         );
     }
+    let interrupt_metrics = platform.shared_interrupt_metrics();
     let signaler = platform.backend().gic_msi_signaler().ok_or_else(|| {
         HvfSnapshotV2RootRestoreFailure::PciData(HvfArm64BootPciDataError::new(
             "restored PCI root requires a GICv2m MSI signaler",
         ))
     })?;
-    let msi_interrupts = HvfGicMsiDeviceInterruptResources::allocate_exact(signaler, &exact_intids)
-        .map_err(|source| {
-            HvfSnapshotV2RootRestoreFailure::PciData(HvfArm64BootPciDataError::new(format!(
-                "failed to allocate exact restored PCI routes: {source}"
-            )))
-        })?;
+    let msi_interrupts = HvfGicMsiDeviceInterruptResources::allocate_exact_with_interrupt_metrics(
+        signaler,
+        &exact_intids,
+        interrupt_metrics,
+    )
+    .map_err(|source| {
+        HvfSnapshotV2RootRestoreFailure::PciData(HvfArm64BootPciDataError::new(format!(
+            "failed to allocate exact restored PCI routes: {source}"
+        )))
+    })?;
 
     *pci_data_devices = Some(HvfArm64BootPciDataDevices {
         validation,
@@ -19254,6 +19305,7 @@ impl OwnedHvfArm64BootSession {
             }
         };
         session.runtime_resources.pci_validation = Some(validation);
+        let interrupt_metrics = session.runner.shared_interrupt_metrics();
         let pci_data_devices = {
             let Self {
                 backend,
@@ -19278,6 +19330,7 @@ impl OwnedHvfArm64BootSession {
                     balloon: balloon_device_metrics,
                     vsock: vsock_device_metrics,
                     entropy: entropy_device_metrics,
+                    interrupts: &interrupt_metrics,
                 },
             )
         };
@@ -26372,6 +26425,7 @@ impl OwnedHvfArm64BootSession {
                 );
             }
         }
+        let interrupt_metrics = platform.shared_interrupt_metrics();
         let signaler = match platform.backend().gic_msi_signaler() {
             Some(signaler) => signaler,
             None => fail_after_platform!(
@@ -26382,7 +26436,11 @@ impl OwnedHvfArm64BootSession {
             ),
         };
         let msi_interrupts =
-            match HvfGicMsiDeviceInterruptResources::allocate_exact(signaler, &exact_intids) {
+            match HvfGicMsiDeviceInterruptResources::allocate_exact_with_interrupt_metrics(
+                signaler,
+                &exact_intids,
+                interrupt_metrics,
+            ) {
                 Ok(interrupts) => interrupts,
                 Err(source) => fail_after_platform!(
                     HvfSnapshotV2StoragePciRestoreStage::PciRoutes,
@@ -27720,6 +27778,7 @@ impl OwnedHvfArm64BootSession {
                 ));
             }
         }
+        let interrupt_metrics = platform.shared_interrupt_metrics();
         let signaler = match platform.backend().gic_msi_signaler() {
             Some(signaler) => signaler,
             None => {
@@ -27739,7 +27798,11 @@ impl OwnedHvfArm64BootSession {
             }
         };
         let msi_interrupts =
-            match HvfGicMsiDeviceInterruptResources::allocate_exact(signaler, &exact_intids) {
+            match HvfGicMsiDeviceInterruptResources::allocate_exact_with_interrupt_metrics(
+                signaler,
+                &exact_intids,
+                interrupt_metrics,
+            ) {
                 Ok(interrupts) => interrupts,
                 Err(source) => {
                     return Err(failed_snapshot_v2_multi_block_pci_after_platform(
@@ -28522,6 +28585,7 @@ impl OwnedHvfArm64BootSession {
                 pci_data_devices: &self.pci_data_devices,
                 retry_wakeup_scheduler: &self.block_retry_wakeup_scheduler,
                 session_metrics: &self.vsock_device_metrics,
+                interrupt_metrics: self.runner.shared_interrupt_metrics(),
                 gic: &self.gic,
                 vsock_interrupt_line: self.vsock_interrupt_line,
             },
@@ -28628,6 +28692,7 @@ impl OwnedHvfArm64BootSession {
             &mut self.pci_data_devices,
             &self.block_device_metrics,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -28666,6 +28731,7 @@ impl OwnedHvfArm64BootSession {
             &mut self.pci_data_devices,
             &self.block_device_metrics,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -28701,6 +28767,7 @@ impl OwnedHvfArm64BootSession {
             &mut self.pci_data_devices,
             &self.block_device_metrics,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             &self.block_retry_wakeup_scheduler,
             &self.pmem_retry_wakeup_scheduler,
             configs,
@@ -29503,6 +29570,7 @@ impl OwnedHvfArm64BootSession {
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             false,
         );
         if result
@@ -29660,6 +29728,7 @@ impl OwnedHvfArm64BootSession {
             &self.mmio_dispatcher,
             &self.gic,
             &self.block_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
             update,
         )
     }
@@ -29680,6 +29749,7 @@ impl OwnedHvfArm64BootSession {
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             config,
         )
     }
@@ -29847,6 +29917,14 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
         self.balloon_device_metrics.clone()
+    }
+
+    pub fn shared_vcpu_metrics(&self) -> SharedVcpuMetrics {
+        self.runner.shared_vcpu_metrics()
+    }
+
+    pub fn shared_interrupt_metrics(&self) -> SharedInterruptMetrics {
+        self.runner.shared_interrupt_metrics()
     }
 
     pub fn shared_memory_hotplug_device_metrics(&self) -> Option<SharedMemoryHotplugDeviceMetrics> {
@@ -30592,7 +30670,7 @@ impl OwnedHvfArm64BootSession {
         let result = if !dispatches.needs_queue_interrupt() {
             collect_block_notification_dispatches(dispatches)
         } else {
-            match HvfGicSpiSignaler::from_metadata(&self.gic) {
+            match create_mmio_interrupt_sink(&self.gic, &self.runner.shared_interrupt_metrics()) {
                 Ok(signaler) => signal_block_queue_interrupts(dispatches, &signaler),
                 Err(source) => {
                     record_block_unavailable_signal_metrics(
@@ -30627,6 +30705,7 @@ impl OwnedHvfArm64BootSession {
             &mut self.runtime_resources,
             &self.gic,
             &self.pmem_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
         )
     }
 
@@ -30668,6 +30747,7 @@ impl OwnedHvfArm64BootSession {
             dispatches,
             &self.gic,
             &self.network_interface_metrics,
+            &self.runner.shared_interrupt_metrics(),
         );
         if let Ok(dispatches) = &result {
             record_network_signal_metrics(&self.network_interface_metrics, dispatches);
@@ -30716,6 +30796,7 @@ impl OwnedHvfArm64BootSession {
             dispatches,
             &self.gic,
             &self.network_interface_metrics,
+            &self.runner.shared_interrupt_metrics(),
         );
         if let Ok(dispatches) = &result {
             record_network_signal_metrics(&self.network_interface_metrics, dispatches);
@@ -30762,6 +30843,7 @@ impl OwnedHvfArm64BootSession {
             dispatches,
             &self.gic,
             &self.backend.guest_logger(),
+            &self.runner.shared_interrupt_metrics(),
         );
         observe_vsock_interrupt_delivery(&self.backend.guest_logger(), &result);
         result
@@ -30805,7 +30887,11 @@ impl OwnedHvfArm64BootSession {
             dispatches.as_slice(),
             true,
         );
-        let result = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic);
+        let result = collect_or_signal_balloon_queue_interrupts(
+            dispatches,
+            &self.gic,
+            &self.runner.shared_interrupt_metrics(),
+        );
         match &result {
             Ok(dispatches) => {
                 record_balloon_signal_metrics(&self.balloon_device_metrics, dispatches)
@@ -30861,7 +30947,11 @@ impl OwnedHvfArm64BootSession {
         };
 
         let needs_queue_interrupt = dispatches.needs_queue_interrupt();
-        let result = collect_or_signal_memory_hotplug_queue_interrupts(dispatches, &self.gic);
+        let result = collect_or_signal_memory_hotplug_queue_interrupts(
+            dispatches,
+            &self.gic,
+            &self.runner.shared_interrupt_metrics(),
+        );
         if let Some(metrics) = &self.memory_hotplug_device_metrics {
             record_memory_hotplug_signal_metrics(metrics, needs_queue_interrupt, &result);
         }
@@ -30887,6 +30977,7 @@ impl OwnedHvfArm64BootSession {
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             update,
             &guest_logger,
         )
@@ -30946,8 +31037,12 @@ impl OwnedHvfArm64BootSession {
                 dispatches.as_slice(),
                 false,
             );
-            let dispatches = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
-                .map_err(balloon_update_error_from_display)?;
+            let dispatches = collect_or_signal_balloon_queue_interrupts(
+                dispatches,
+                &self.gic,
+                &self.runner.shared_interrupt_metrics(),
+            )
+            .map_err(balloon_update_error_from_display)?;
             record_balloon_signal_metrics(&self.balloon_device_metrics, &dispatches);
 
             balloon_update_result_from_hvf_dispatches(&dispatches)
@@ -30992,6 +31087,7 @@ impl OwnedHvfArm64BootSession {
             &mut self.runtime_resources,
             &self.gic,
             &self.entropy_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
             entropy_source,
         )
     }
@@ -31069,6 +31165,7 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             read_ready,
         )
     }
@@ -31216,6 +31313,7 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
             &mut self.runtime_resources,
             &self.gic,
             &self.entropy_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
             &mut self.entropy_source,
         )
     }
@@ -31417,6 +31515,7 @@ where
             &mut self.session.runtime_resources,
             &self.session.gic,
             &self.session.entropy_device_metrics,
+            &self.session.runner.shared_interrupt_metrics(),
             &mut self.session.entropy_source,
         )
     }
@@ -32753,6 +32852,7 @@ fn dispatch_serial_input(
     runtime_resources: &Arm64BootRuntimeResources,
     mmio_dispatcher: &Arc<Mutex<MmioDispatcher>>,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
     read_ready: bool,
 ) -> Result<HvfArm64BootSerialInputDispatch, HvfArm64BootSerialInputDispatchError> {
     dispatch_serial_input_with(
@@ -32764,6 +32864,7 @@ fn dispatch_serial_input(
             let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
                 HvfArm64BootSerialInputDispatchError::CreateSignaler { source }
             })?;
+            interrupt_metrics.record_trigger();
             signaler
                 .set_level(interrupt_line, true)
                 .map_err(|source| HvfArm64BootSerialInputDispatchError::Signal { source })
@@ -33104,6 +33205,7 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
             &self.runtime_resources,
             &self.mmio_dispatcher,
             &self.gic,
+            &self.runner.shared_interrupt_metrics(),
             read_ready,
         )
     }
@@ -33251,6 +33353,7 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
             &mut self.runtime_resources,
             &self.gic,
             &self.entropy_device_metrics,
+            &self.runner.shared_interrupt_metrics(),
             &mut self.entropy_source,
         )
     }
@@ -34674,6 +34777,7 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
     runtime_resources: &mut Arm64BootRuntimeResources,
     gic: &HvfGicMetadata,
     metrics: &SharedPmemDeviceMetricsRegistry,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
     let dispatches = {
         let (memory, executor) = backend
@@ -34696,7 +34800,7 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
     };
 
     record_pmem_runtime_dispatch_metrics(metrics, dispatches.as_slice());
-    let result = collect_or_signal_pmem_queue_interrupts(dispatches, gic);
+    let result = collect_or_signal_pmem_queue_interrupts(dispatches, gic, interrupt_metrics);
     match &result {
         Ok(dispatches) => record_pmem_signal_metrics(metrics, dispatches),
         Err(_) => metrics.record_event_failure(),
@@ -34808,6 +34912,7 @@ fn update_memory_hotplug_requested_size_and_signal_interrupt(
     runtime_resources: &Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
     update: MemoryHotplugSizeUpdate,
     guest_logger: &GuestLogger,
 ) -> Result<(), MemoryHotplugUpdateError> {
@@ -34825,14 +34930,15 @@ fn update_memory_hotplug_requested_size_and_signal_interrupt(
             update_memory_hotplug_config_for_device(device, &mut mmio_dispatcher, update)?;
         }
 
-        let interrupt_delivered = HvfGicSpiSignaler::from_metadata(gic).is_ok_and(|signaler| {
-            signal_device_interrupt(
-                device.fdt_device.interrupt_line,
-                DeviceInterruptKind::Config,
-                &signaler,
-            )
-            .is_ok()
-        });
+        let interrupt_delivered =
+            create_mmio_interrupt_sink(gic, interrupt_metrics).is_ok_and(|signaler| {
+                signal_device_interrupt(
+                    device.fdt_device.interrupt_line,
+                    DeviceInterruptKind::Config,
+                    &signaler,
+                )
+                .is_ok()
+            });
         if !interrupt_delivered {
             device.metrics.record_interrupt_failure();
             guest_logger.log_memory_hotplug(LoggerMemoryHotplugOutcome::InterruptDeliveryFailed);
@@ -35327,6 +35433,7 @@ fn dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
     runtime_resources: &mut Arm64BootRuntimeResources,
     gic: &HvfGicMetadata,
     metrics: &SharedEntropyDeviceMetrics,
+    interrupt_metrics: &SharedInterruptMetrics,
     entropy_source: &mut impl Arm64BootEntropySourceProvider,
 ) -> Result<HvfArm64BootEntropyNotificationDispatches, HvfArm64BootEntropyNotificationDispatchError>
 {
@@ -35350,7 +35457,7 @@ fn dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
     record_entropy_runtime_dispatch_metrics(metrics, dispatches.as_slice());
     let guest_logger = backend.guest_logger();
     observe_entropy_provider_errors(&guest_logger, dispatches.as_slice());
-    let result = collect_or_signal_entropy_queue_interrupts(dispatches, gic);
+    let result = collect_or_signal_entropy_queue_interrupts(dispatches, gic, interrupt_metrics);
     match &result {
         Ok(dispatches) => record_entropy_signal_metrics(metrics, dispatches),
         Err(_) => metrics.record_event_failure(),
@@ -35375,12 +35482,13 @@ fn dispatch_entropy_runtime_notifications_with_source(
 fn collect_or_signal_pmem_queue_interrupts(
     dispatches: Arm64BootPmemNotificationDispatches,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
     if !dispatches.needs_queue_interrupt() {
         return collect_pmem_notification_dispatches(dispatches);
     }
 
-    let signaler = HvfGicSpiSignaler::from_metadata(gic)
+    let signaler = create_mmio_interrupt_sink(gic, interrupt_metrics)
         .map_err(|source| HvfArm64BootPmemNotificationDispatchError::CreateSignalSink { source })?;
 
     signal_pmem_queue_interrupts(dispatches, &signaler)
@@ -35390,13 +35498,14 @@ fn collect_or_signal_network_queue_interrupts(
     dispatches: Arm64BootNetworkNotificationDispatches,
     gic: &HvfGicMetadata,
     metrics: &SharedNetworkInterfaceMetricsRegistry,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
 {
     if !dispatches.needs_queue_interrupt() {
         return collect_network_notification_dispatches_with_metrics(dispatches, Some(metrics));
     }
 
-    let signaler = match HvfGicSpiSignaler::from_metadata(gic) {
+    let signaler = match create_mmio_interrupt_sink(gic, interrupt_metrics) {
         Ok(signaler) => signaler,
         Err(source) => {
             record_network_runtime_event_failures(metrics, dispatches.as_slice(), false);
@@ -35422,12 +35531,13 @@ fn collect_or_signal_vsock_queue_interrupts(
     dispatches: Arm64BootVsockNotificationDispatches,
     gic: &HvfGicMetadata,
     logger: &GuestLogger,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError> {
     if !dispatches.needs_queue_interrupt() {
         return collect_vsock_notification_dispatches_with_logger(dispatches, Some(logger));
     }
 
-    let signaler = match HvfGicSpiSignaler::from_metadata(gic) {
+    let signaler = match create_mmio_interrupt_sink(gic, interrupt_metrics) {
         Ok(signaler) => signaler,
         Err(source) => {
             observe_runtime_vsock_notification_dispatches(Some(logger), dispatches.as_slice());
@@ -35441,13 +35551,14 @@ fn collect_or_signal_vsock_queue_interrupts(
 fn collect_or_signal_balloon_queue_interrupts(
     dispatches: Arm64BootBalloonNotificationDispatches,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<HvfArm64BootBalloonNotificationDispatches, HvfArm64BootBalloonNotificationDispatchError>
 {
     if !dispatches.needs_queue_interrupt() {
         return collect_balloon_notification_dispatches(dispatches);
     }
 
-    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+    let signaler = create_mmio_interrupt_sink(gic, interrupt_metrics).map_err(|source| {
         HvfArm64BootBalloonNotificationDispatchError::CreateSignalSink { source }
     })?;
 
@@ -35457,6 +35568,7 @@ fn collect_or_signal_balloon_queue_interrupts(
 fn collect_or_signal_memory_hotplug_queue_interrupts(
     dispatches: Arm64BootMemoryHotplugNotificationDispatches,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<
     HvfArm64BootMemoryHotplugNotificationDispatches,
     HvfArm64BootMemoryHotplugNotificationDispatchError,
@@ -35465,7 +35577,7 @@ fn collect_or_signal_memory_hotplug_queue_interrupts(
         return collect_memory_hotplug_notification_dispatches(dispatches);
     }
 
-    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+    let signaler = create_mmio_interrupt_sink(gic, interrupt_metrics).map_err(|source| {
         HvfArm64BootMemoryHotplugNotificationDispatchError::CreateSignalSink { source }
     })?;
 
@@ -35475,13 +35587,14 @@ fn collect_or_signal_memory_hotplug_queue_interrupts(
 fn collect_or_signal_entropy_queue_interrupts(
     dispatches: Arm64BootEntropyNotificationDispatches,
     gic: &HvfGicMetadata,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<HvfArm64BootEntropyNotificationDispatches, HvfArm64BootEntropyNotificationDispatchError>
 {
     if !dispatches.needs_queue_interrupt() {
         return collect_entropy_notification_dispatches(dispatches);
     }
 
-    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+    let signaler = create_mmio_interrupt_sink(gic, interrupt_metrics).map_err(|source| {
         HvfArm64BootEntropyNotificationDispatchError::CreateSignalSink { source }
     })?;
 
@@ -35955,6 +36068,17 @@ fn signal_device_interrupt(
     signaler
         .signal(line)
         .map_err(|source| DeviceInterruptTriggerError::Signal { line, kind, source })
+}
+
+fn create_mmio_interrupt_sink(
+    gic: &HvfGicMetadata,
+    metrics: &SharedInterruptMetrics,
+) -> Result<MetricsInterruptSink, HvfGicSpiSignalError> {
+    let signaler = HvfGicSpiSignaler::from_metadata(gic)?;
+    Ok(MetricsInterruptSink::new(
+        Arc::new(signaler),
+        metrics.clone(),
+    ))
 }
 
 #[derive(Debug)]
@@ -36976,6 +37100,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         power,
         gic.timer_interrupts.el1_virtual_timer_intid,
     );
+    let interrupt_metrics = runner.shared_interrupt_metrics();
     let runtime_pci_hotplug = runtime
         .pci_validation
         .as_ref()
@@ -37075,6 +37200,7 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
             balloon: &balloon_device_metrics,
             vsock: &vsock_device_metrics,
             entropy: &entropy_device_metrics,
+            interrupts: &interrupt_metrics,
         },
     )
     .map_err(|source| HvfArm64BootSessionError::PciData { source })?;
@@ -37140,8 +37266,12 @@ fn prepare_arm64_boot_session_parts_with_cache<'vm>(
         )
         .map_err(|source| HvfArm64BootSessionError::StartNetworkRetryWakeupScheduler { source })?
     };
-    let pci_validation_endpoint =
-        prepare_pci_validation_virtio_rng_endpoint(backend, &mut runtime, &mmio_dispatcher)?;
+    let pci_validation_endpoint = prepare_pci_validation_virtio_rng_endpoint(
+        backend,
+        &mut runtime,
+        &mmio_dispatcher,
+        &interrupt_metrics,
+    )?;
 
     Ok(PreparedHvfArm64BootSession {
         runner,
@@ -37189,6 +37319,7 @@ fn prepare_pci_validation_virtio_rng_endpoint(
     backend: &HvfBackend,
     runtime: &mut Arm64BootRuntimeResources,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    interrupt_metrics: &SharedInterruptMetrics,
 ) -> Result<Option<HvfArm64BootPciValidationEndpoint>, HvfArm64BootSessionError> {
     let Some(validation) = runtime.pci_validation.as_mut() else {
         return Ok(None);
@@ -37207,9 +37338,10 @@ fn prepare_pci_validation_virtio_rng_endpoint(
     let mut dispatcher = dispatcher
         .lock()
         .map_err(|_| HvfArm64BootSessionError::PciValidationMmioDispatcherPoisoned)?;
-    let interrupts = HvfGicMsiDeviceInterruptResources::allocate(
+    let interrupts = HvfGicMsiDeviceInterruptResources::allocate_with_interrupt_metrics(
         signaler,
         PCI_VALIDATION_VIRTIO_RNG_VECTOR_COUNT,
+        interrupt_metrics.clone(),
     )
     .map_err(|source| HvfArm64BootSessionError::PreparePciValidationInterrupts { source })?;
     let published = PublishedVirtioPciEndpoint::publish(
@@ -37765,6 +37897,7 @@ struct HvfArm64BootPciDataMetrics<'a> {
     balloon: &'a SharedBalloonDeviceMetrics,
     vsock: &'a SharedVsockDeviceMetrics,
     entropy: &'a SharedEntropyDeviceMetrics,
+    interrupts: &'a SharedInterruptMetrics,
 }
 
 fn prepare_pci_data_devices(
@@ -37780,6 +37913,7 @@ fn prepare_pci_data_devices(
         balloon: balloon_device_metrics,
         vsock: vsock_device_metrics,
         entropy: entropy_device_metrics,
+        interrupts: interrupt_metrics,
     } = metrics;
     let Some(validation) = runtime.pci_validation.as_ref() else {
         return Ok(None);
@@ -37915,13 +38049,16 @@ fn prepare_pci_data_devices(
     };
     if reserved_routes != 0 {
         manager.msi_interrupts = Some(
-            HvfGicMsiDeviceInterruptResources::allocate(signaler, reserved_routes).map_err(
-                |source| {
-                    HvfArm64BootPciDataError::new(format!(
-                        "failed to allocate shared PCI data MSI-X routes: {source}"
-                    ))
-                },
-            )?,
+            HvfGicMsiDeviceInterruptResources::allocate_with_interrupt_metrics(
+                signaler,
+                reserved_routes,
+                interrupt_metrics.clone(),
+            )
+            .map_err(|source| {
+                HvfArm64BootPciDataError::new(format!(
+                    "failed to allocate shared PCI data MSI-X routes: {source}"
+                ))
+            })?,
         );
     }
     manager
@@ -38554,7 +38691,7 @@ mod tests {
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive, EntropyDeviceMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
         PmemDeviceMetricsByDevice, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
-        SharedEntropyDeviceMetrics, SharedMemoryHotplugDeviceMetrics,
+        SharedEntropyDeviceMetrics, SharedInterruptMetrics, SharedMemoryHotplugDeviceMetrics,
         SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
         SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
@@ -40701,6 +40838,7 @@ mod tests {
         )
         .expect("vsock capture fixture should quiesce auxiliary schedulers");
         let metrics = SharedVsockDeviceMetrics::default();
+        let interrupt_metrics = SharedInterruptMetrics::default();
         let gic = gic_with_spi_range(32, 224);
         let mut backend = super::HvfBackend::new();
         let (_memory, runtime, dispatcher) = boot_runtime_without_drives();
@@ -40715,6 +40853,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &pmem_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: None,
             },
@@ -40741,6 +40880,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: None,
             },
@@ -40764,6 +40904,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: None,
             },
@@ -40788,6 +40929,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: None,
             },
@@ -40811,6 +40953,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: None,
             },
@@ -40853,6 +40996,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: Some(line(35)),
             },
@@ -40875,6 +41019,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: None,
             },
@@ -40902,6 +41047,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: Some(line(35)),
             },
@@ -40924,6 +41070,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: Some(line(35)),
             },
@@ -40947,6 +41094,7 @@ mod tests {
                 pci_data_devices: &no_pci,
                 retry_wakeup_scheduler: &block_scheduler,
                 session_metrics: &metrics,
+                interrupt_metrics: interrupt_metrics.clone(),
                 gic: &gic,
                 vsock_interrupt_line: Some(line(35)),
             },
@@ -46397,6 +46545,7 @@ mod tests {
             dispatches,
             &gic_with_spi_range(0, 1),
             &metrics,
+            &SharedInterruptMetrics::default(),
         );
 
         assert!(matches!(
@@ -47702,6 +47851,7 @@ mod tests {
             &runtime,
             &dispatcher,
             &invalid_gic,
+            &SharedInterruptMetrics::default(),
             update,
             capture.logger(),
         )
