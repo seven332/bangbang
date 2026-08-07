@@ -108,7 +108,7 @@ const EXPECTED_NONCLAIMS: [CpuTemplateHelperNonclaim; 7] = [
     CpuTemplateHelperNonclaim::TemplateSensibilityOrSecurity,
     CpuTemplateHelperNonclaim::DistinctHostEquivalenceOrSafety,
     CpuTemplateHelperNonclaim::X86KvmMechanismIdentity,
-    CpuTemplateHelperNonclaim::HostAuthentication,
+    CpuTemplateHelperNonclaim::ArtifactOrHostAuthentication,
     CpuTemplateHelperNonclaim::SnapshotPortability,
     CpuTemplateHelperNonclaim::MigrationSafety,
     CpuTemplateHelperNonclaim::GlobalCrashAtomicMultiPathPublication,

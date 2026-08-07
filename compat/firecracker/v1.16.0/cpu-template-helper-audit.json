@@ -1138,7 +1138,7 @@
     "template-sensibility-or-security",
     "distinct-host-equivalence-or-safety",
     "x86-kvm-mechanism-identity",
-    "host-authentication",
+    "artifact-or-host-authentication",
     "snapshot-portability",
     "migration-safety",
     "global-crash-atomic-multi-path-publication"

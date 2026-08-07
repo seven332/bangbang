@@ -123,7 +123,7 @@ pub enum CpuTemplateHelperNonclaim {
     TemplateSensibilityOrSecurity,
     DistinctHostEquivalenceOrSafety,
     X86KvmMechanismIdentity,
-    HostAuthentication,
+    ArtifactOrHostAuthentication,
     SnapshotPortability,
     MigrationSafety,
     GlobalCrashAtomicMultiPathPublication,
