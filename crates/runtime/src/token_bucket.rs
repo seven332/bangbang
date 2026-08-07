@@ -383,25 +383,25 @@ mod verification {
         let refill_time_nanos = u64::from(refill_time_nanos_input);
         let elapsed_nanos = u128::from(elapsed_nanos_input);
 
-        match token_bucket_refill(size, budget, refill_time_nanos, elapsed_nanos) {
-            TokenBucketRefill::Unchanged => {
-                let tokens = elapsed_nanos * u128::from(size) / u128::from(refill_time_nanos);
-                assert_eq!(tokens, 0);
-            }
-            TokenBucketRefill::Full => {
-                assert_eq!(elapsed_nanos, u128::from(refill_time_nanos));
-            }
-            TokenBucketRefill::Partial {
-                budget: new_budget,
-                adjusted_nanos,
-            } => {
-                assert!(new_budget >= budget);
-                assert!(new_budget <= size);
-                assert!(adjusted_nanos != 0);
-                assert!(u128::from(adjusted_nanos) <= elapsed_nanos);
-                assert!(adjusted_nanos < refill_time_nanos);
-            }
-        }
+        let invariant_holds =
+            match token_bucket_refill(size, budget, refill_time_nanos, elapsed_nanos) {
+                TokenBucketRefill::Unchanged => {
+                    let tokens = elapsed_nanos * u128::from(size) / u128::from(refill_time_nanos);
+                    tokens == 0
+                }
+                TokenBucketRefill::Full => elapsed_nanos == u128::from(refill_time_nanos),
+                TokenBucketRefill::Partial {
+                    budget: new_budget,
+                    adjusted_nanos,
+                } => {
+                    new_budget >= budget
+                        && new_budget <= size
+                        && adjusted_nanos != 0
+                        && u128::from(adjusted_nanos) <= elapsed_nanos
+                        && adjusted_nanos < refill_time_nanos
+                }
+            };
+        assert!(invariant_holds);
     }
 }
 
