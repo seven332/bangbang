@@ -63,7 +63,7 @@ class FakeInvoker:
                 else RUN_KANI.EXPECTED_VERSION_OUTPUT
             )
             return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
-        if command[:3] == ["cargo", "kani", "list"]:
+        if command[:2] == ["cargo", "kani"] and "list" in command:
             package = command[command.index("--package") + 1]
             self.list_directories.append(cwd)
             document = list_document(self.checked, package)
@@ -86,9 +86,33 @@ class RunKaniTests(unittest.TestCase):
         list_packages = [
             command[command.index("--package") + 1]
             for command, _, _ in invoke.calls
-            if command[:3] == ["cargo", "kani", "list"]
+            if command[:2] == ["cargo", "kani"] and "list" in command
         ]
         self.assertEqual(list_packages, RUN_KANI.EXPECTED_PACKAGES)
+        list_commands = [
+            command
+            for command, _, _ in invoke.calls
+            if command[:2] == ["cargo", "kani"] and "list" in command
+        ]
+        self.assertEqual(
+            list_commands,
+            [
+                [
+                    "cargo",
+                    "kani",
+                    "--manifest-path",
+                    str(ROOT / "Cargo.toml"),
+                    "--package",
+                    package,
+                    "--lib",
+                    "list",
+                    "--format",
+                    "json",
+                    "--quiet",
+                ]
+                for package in RUN_KANI.EXPECTED_PACKAGES
+            ],
+        )
         proof_commands = [
             command
             for command, _, _ in invoke.calls
@@ -109,7 +133,10 @@ class RunKaniTests(unittest.TestCase):
             RUN_KANI.run_verification(authority(), ROOT, invoke)
 
         self.assertFalse(
-            any(call[0][:3] == ["cargo", "kani", "list"] for call in invoke.calls)
+            any(
+                call[0][:2] == ["cargo", "kani"] and "list" in call[0]
+                for call in invoke.calls
+            )
         )
 
     def test_noncanonical_command_and_duplicate_identity_fail_closed(self):

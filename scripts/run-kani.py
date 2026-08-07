@@ -236,11 +236,12 @@ def run_verification(
                 [
                     "cargo",
                     "kani",
-                    "list",
                     "--manifest-path",
                     str(root / "Cargo.toml"),
                     "--package",
                     package,
+                    "--lib",
+                    "list",
                     "--format",
                     "json",
                     "--quiet",
