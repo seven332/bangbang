@@ -399,6 +399,45 @@ class MacosGuestWorkflowTests(unittest.TestCase):
             self.assertEqual(boundary.processes[0].returncode, 0)
             self.assertEqual(list(boundary.sessions.iterdir()), [])
 
+    def test_blocked_output_sink_fails_bounded_after_reap_and_cleanup(self) -> None:
+        class BlockingSink:
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def write(self, value):
+                self.entered.set()
+                self.release.wait()
+                return len(value)
+
+            def flush(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as raw_temp:
+            boundary = FakeBoundary(Path(raw_temp))
+            sink = BlockingSink()
+            dependencies = replace(boundary.dependencies(), stdout=sink)
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(workflow.WorkflowError, "output did not drain"):
+                    workflow.run_workflow(
+                        "no-api",
+                        manifest=fast_manifest(guest=1, terminate=1),
+                        dependencies=dependencies,
+                    )
+            finally:
+                sink.release.set()
+            self.assertLess(time.monotonic() - started, 6)
+            self.assertTrue(sink.entered.is_set())
+            self.assertIsNotNone(boundary.processes[0].poll())
+            self.assertEqual(list(boundary.sessions.iterdir()), [])
+            self.assertFalse(
+                any(
+                    thread.name.startswith("bangbang-workflow-") and not thread.daemon
+                    for thread in threading.enumerate()
+                )
+            )
+
     def test_http_failures_terminate_reap_and_cleanup(self) -> None:
         for behavior, expected in (
             ("wrong-response", "unexpected response"),

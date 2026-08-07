@@ -184,11 +184,13 @@ def run_bounded_command(
             target=_pump_capture,
             args=(process.stdout, stdout_capture),
             name=f"bangbang-{phase}-stdout",
+            daemon=True,
         ),
         threading.Thread(
             target=_pump_capture,
             args=(process.stderr, stderr_capture),
             name=f"bangbang-{phase}-stderr",
+            daemon=True,
         ),
     )
     for thread in threads:
@@ -726,11 +728,13 @@ class VmmSupervisor:
                 target=_pump_vmm,
                 args=(self.process.stdout, "stdout", self.observer),
                 name="bangbang-workflow-vmm-stdout",
+                daemon=True,
             ),
             threading.Thread(
                 target=_pump_vmm,
                 args=(self.process.stderr, "stderr", self.observer),
                 name="bangbang-workflow-vmm-stderr",
+                daemon=True,
             ),
         )
         self._finished = False
@@ -821,6 +825,7 @@ class SocketAbsenceWatcher:
         self._thread = threading.Thread(
             target=self._watch,
             name="bangbang-workflow-no-api-socket",
+            daemon=True,
         )
 
     def _watch(self) -> None:

@@ -140,9 +140,10 @@ remove such residue according to local operator policy.
 ## Optional rootless ext4 preparation
 
 The public smoke deliberately boots the pinned read-only squashfs. If a local
-test needs ext4, install `squashfs-tools` and `e2fsprogs`, then run:
+test needs ext4, install the Homebrew tools and run:
 
 ```sh
+brew install squashfs e2fsprogs
 scripts/fetch-firecracker-rootfs.sh --format ext4
 ```
 
