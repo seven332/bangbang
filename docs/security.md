@@ -1927,6 +1927,12 @@ is resource-specific:
   operators must quiesce input writers during strip, especially in replacement
   mode. The complete boundary is checked in
   `compat/firecracker/v1.16.0/cpu-template-strip-contract.md`.
+  The terminal aggregate producer ledger at
+  `compat/firecracker/v1.16.0/cpu-template-helper-audit.json` composes these
+  helper operations with runtime evidence while preserving the explicit
+  nonclaims: it authenticates neither artifacts nor hosts, authorizes no
+  migration, proves no snapshot portability, and grants no authority beyond
+  the invoking process and documented signed HVF boundary.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled

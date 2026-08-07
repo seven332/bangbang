@@ -26,11 +26,10 @@ checked identities:
 | `tool-operation:cpu-template-helper/template/verify` | `implemented-and-verified` |
 
 The scoped `validate --cpu-template-helper-final` gate requires that exact
-seven-row terminal transition and exact evidence. It accepts the separately
-certified #1793 strip transition without treating strip as dump/verify
-evidence, and still fails if any fingerprint, helper-corpus, template-corpus,
-or aggregate CPU-template row owned by #1794–#1795 moves from
-`audit-required`.
+seven-row terminal state and exact evidence. It remains valid through the exact
+ordered #1793, #1866, #1867, and #1795 terminal transitions without treating
+their rows as dump/verify evidence, and rejects every partial or reordered
+transition.
 
 ## Configuration and selection
 
@@ -165,6 +164,11 @@ two-vCPU canonical dump and permissions, mixed U32/U64/U128 verify and
 selection precedence, explicit optional-register outcomes, mismatch and
 collision retry, unsigned rejection, and boot-owned X0/PC/PSTATE checkpoint
 semantics. It additionally carries the separately contracted real fingerprint
-dump cases without broadening this contract's seven-row scope. The harness runs through `scripts/run-integration-tests.sh` and the
-audit guard proves the exact seven terminal rows and retained independent
-scopes.
+dump cases without broadening this contract's seven-row scope. Its aggregate
+composition case runs all five operations through the actual signed binary and
+checks canonical private artifacts, default/`None`, mixed custom verification,
+stable selected differences, and input nonmutation. The harness runs through
+`scripts/run-integration-tests.sh`; the scoped audit still proves these exact
+seven rows, while the checked
+[`cpu-template-helper-audit.json`](cpu-template-helper-audit.json) composes the
+independently certified operations into the terminal #1795 aggregate boundary.

@@ -68,6 +68,9 @@ jobs:
       - name: Certify deterministic CPU-fingerprint compare scope
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
 
+      - name: Certify aggregate CPU-template compatibility scope
+        run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 

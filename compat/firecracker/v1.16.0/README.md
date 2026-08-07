@@ -53,6 +53,11 @@ For commands and test-layer selection, see the
   literal production scopes, delivery classes, privacy rules, evidence, and
   nonclaims. Its validator scans production Rust syntax instead of trusting
   the declared call-site list.
+- [`cpu-template-helper-audit.json`](cpu-template-helper-audit.json) is the
+  human-owned terminal #1795 producer ledger. It owns the exact five operations
+  and thirteen arguments once, the implemented and platform-impossible CPU
+  foundations, fourteen closed composition/runtime/snapshot/fleet scenarios,
+  seven explicit nonclaims, and aggregate evidence.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -136,6 +141,24 @@ Platform-impossible records additionally keep the upstream requirement,
 authoritative host-platform evidence, considered alternatives and rejection
 reasons, stable public behavior, focused tests, documentation, and the trusted
 Challenge decision together.
+
+## Aggregate CPU-Template Certification
+
+The terminal #1795 helper/template corpus and CPU semantic use one fail-closed
+gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
+```
+
+This command composes the four earlier scoped CPU-template gates with the
+canonical producer ledger, exact implemented and platform-impossible
+foundations, signed five-operation artifact composition, transactional runtime
+selection, all-vCPU application/readback and boot precedence, the native-v1
+no-template snapshot boundary, and the applicable fleet workflow. It promotes
+only the exact three #1795 aggregate rows and preserves the ledger's explicit
+security, distinct-host, x86/KVM, snapshot, migration, and publication
+nonclaims.
 
 ## Scoped Logger Certification
 

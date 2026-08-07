@@ -1,0 +1,1190 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "delivery_issue": "#1795",
+  "operations": [
+    {
+      "capability_id": "tool-operation:cpu-template-helper/fingerprint/compare",
+      "argument_ids": [
+        "tool-argument:cpu-template-helper/fingerprint/compare/curr",
+        "tool-argument:cpu-template-helper/fingerprint/compare/filters",
+        "tool-argument:cpu-template-helper/fingerprint/compare/prev"
+      ],
+      "execution": "portable",
+      "selections": [],
+      "input_artifacts": [
+        "cpu-fingerprint-document"
+      ],
+      "output_artifacts": [],
+      "providers": [],
+      "outcomes": [
+        "silent-success",
+        "difference-exit-one-stderr",
+        "operational-exit-one-stderr",
+        "invalid-invocation-exit-two-stderr"
+      ],
+      "evidence": {
+        "pinned": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/fingerprint/compare/curr"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/fingerprint/compare/filters"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/fingerprint/compare/prev"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-operation:cpu-template-helper/fingerprint/compare"
+          }
+        ],
+        "implementation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/cli.rs",
+            "anchor": "Fingerprint(FingerprintOperation::Compare"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+            "anchor": "pub fn compare_cpu_fingerprints"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/input.rs",
+            "anchor": "pub fn read_regular_utf8"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/strip.rs",
+            "anchor": "pub fn strip_cpu_template_documents"
+          }
+        ],
+        "focused_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+            "anchor": "fn guest_difference_reuses_native_width_strip_and_preserves_missing_identity"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+            "anchor": "fn macos_defaults_emit_all_differences_in_public_order_and_repeat"
+          }
+        ],
+        "process_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn fingerprint_compare_emits_exact_canonical_difference_and_fixed_order"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn fingerprint_compare_equal_default_and_aliases_are_portable_silent_and_nonmutating"
+          }
+        ],
+        "signed_validation": [],
+        "failure_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn fingerprint_compare_filter_and_platform_errors_are_fixed_and_value_redacted"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn fingerprint_compare_rejects_strict_document_and_file_failures_without_mutation"
+          }
+        ],
+        "documentation": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+            "anchor": "Terminal certification"
+          }
+        ]
+      }
+    },
+    {
+      "capability_id": "tool-operation:cpu-template-helper/fingerprint/dump",
+      "argument_ids": [
+        "tool-argument:cpu-template-helper/fingerprint/dump/config",
+        "tool-argument:cpu-template-helper/fingerprint/dump/output",
+        "tool-argument:cpu-template-helper/fingerprint/dump/template"
+      ],
+      "execution": "signed-effective",
+      "selections": [
+        "omitted-default",
+        "explicit-none",
+        "pending-v1n1",
+        "explicit-custom"
+      ],
+      "input_artifacts": [
+        "configuration-document",
+        "cpu-template-document"
+      ],
+      "output_artifacts": [
+        "cpu-fingerprint-document"
+      ],
+      "providers": [
+        "effective-hvf",
+        "system-host"
+      ],
+      "outcomes": [
+        "silent-success",
+        "operational-exit-one-stderr",
+        "invalid-invocation-exit-two-stderr"
+      ],
+      "evidence": {
+        "pinned": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/fingerprint/dump/config"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/fingerprint/dump/output"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/fingerprint/dump/template"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-operation:cpu-template-helper/fingerprint/dump"
+          }
+        ],
+        "implementation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/cli.rs",
+            "anchor": "Fingerprint(FingerprintOperation::Dump"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/fingerprint.rs",
+            "anchor": "pub fn dump_with_providers"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/host.rs",
+            "anchor": "pub struct SystemHostFingerprintProvider"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/provider.rs",
+            "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/publication.rs",
+            "anchor": "pub fn publish_new_artifact"
+          }
+        ],
+        "focused_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/fingerprint.rs",
+            "anchor": "fn macos_golden_bytes_round_trip_and_accept_other_canonical_producer_versions"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/host.rs",
+            "anchor": "fn capture_queries_exact_public_facts_once_in_order"
+          }
+        ],
+        "process_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn fingerprint_failures_are_bounded_and_publish_neither_default_nor_explicit_output"
+          }
+        ],
+        "signed_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+            "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+            "anchor": "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection"
+          }
+        ],
+        "failure_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn fingerprint_inputs_fail_before_host_or_effective_capture"
+          }
+        ],
+        "documentation": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md",
+            "anchor": "Terminal certification"
+          }
+        ]
+      }
+    },
+    {
+      "capability_id": "tool-operation:cpu-template-helper/template/dump",
+      "argument_ids": [
+        "tool-argument:cpu-template-helper/template/dump/config",
+        "tool-argument:cpu-template-helper/template/dump/output",
+        "tool-argument:cpu-template-helper/template/dump/template"
+      ],
+      "execution": "signed-effective",
+      "selections": [
+        "omitted-default",
+        "explicit-none",
+        "pending-v1n1",
+        "explicit-custom"
+      ],
+      "input_artifacts": [
+        "configuration-document",
+        "cpu-template-document"
+      ],
+      "output_artifacts": [
+        "cpu-template-document"
+      ],
+      "providers": [
+        "effective-hvf"
+      ],
+      "outcomes": [
+        "silent-success",
+        "operational-exit-one-stderr",
+        "invalid-invocation-exit-two-stderr"
+      ],
+      "evidence": {
+        "pinned": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/template/dump/config"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/template/dump/output"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/template/dump/template"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-operation:cpu-template-helper/template/dump"
+          }
+        ],
+        "implementation": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/cpu_template_inspection.rs",
+            "anchor": "pub fn inspect_effective_arm64_cpu_template"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/cli.rs",
+            "anchor": "Template(TemplateOperation::Dump"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/provider.rs",
+            "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/publication.rs",
+            "anchor": "pub fn publish_new_artifact"
+          }
+        ],
+        "focused_validation": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/cpu_template_inspection.rs",
+            "anchor": "fn capture_plan_uses_the_exact_runtime_census_and_native_widths"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/profile.rs",
+            "anchor": "fn dump_uses_one_profile_and_excludes_boot_overridden_targets"
+          }
+        ],
+        "process_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn no_template_and_unavailable_hvf_never_publish_output"
+          }
+        ],
+        "signed_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+            "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+            "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+          }
+        ],
+        "failure_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn bounded_input_failures_are_path_and_value_redacted_before_inspection"
+          }
+        ],
+        "documentation": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+            "anchor": "Terminal certification"
+          }
+        ]
+      }
+    },
+    {
+      "capability_id": "tool-operation:cpu-template-helper/template/strip",
+      "argument_ids": [
+        "tool-argument:cpu-template-helper/template/strip/paths",
+        "tool-argument:cpu-template-helper/template/strip/suffix"
+      ],
+      "execution": "portable",
+      "selections": [],
+      "input_artifacts": [
+        "cpu-template-document"
+      ],
+      "output_artifacts": [
+        "cpu-template-document"
+      ],
+      "providers": [],
+      "outcomes": [
+        "silent-success",
+        "operational-exit-one-stderr",
+        "invalid-invocation-exit-two-stderr"
+      ],
+      "evidence": {
+        "pinned": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/template/strip/paths"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/template/strip/suffix"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-operation:cpu-template-helper/template/strip"
+          }
+        ],
+        "implementation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/cli.rs",
+            "anchor": "Strip {"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/input.rs",
+            "anchor": "pub(crate) fn prepare_strip_input"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/strip.rs",
+            "anchor": "pub fn strip_cpu_template_documents"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/strip_publication.rs",
+            "anchor": "pub(crate) fn publish_strip_artifacts"
+          }
+        ],
+        "focused_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/strip.rs",
+            "anchor": "fn strips_native_width_differences_and_preserves_missing_entries"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/strip_publication.rs",
+            "anchor": "fn rolls_back_every_observed_split_boundary_in_both_modes"
+          }
+        ],
+        "process_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn strip_default_and_explicit_suffixes_are_portable_and_silent"
+          }
+        ],
+        "signed_validation": [],
+        "failure_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn strip_bad_documents_and_file_types_fail_before_any_output"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn strip_precommit_failures_preserve_inputs_winners_and_aliases"
+          }
+        ],
+        "documentation": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+            "anchor": "Terminal certification"
+          }
+        ]
+      }
+    },
+    {
+      "capability_id": "tool-operation:cpu-template-helper/template/verify",
+      "argument_ids": [
+        "tool-argument:cpu-template-helper/template/verify/config",
+        "tool-argument:cpu-template-helper/template/verify/template"
+      ],
+      "execution": "signed-effective",
+      "selections": [
+        "omitted-default",
+        "explicit-none",
+        "pending-v1n1",
+        "explicit-custom"
+      ],
+      "input_artifacts": [
+        "configuration-document",
+        "cpu-template-document"
+      ],
+      "output_artifacts": [],
+      "providers": [
+        "effective-hvf"
+      ],
+      "outcomes": [
+        "silent-success",
+        "operational-exit-one-stderr",
+        "invalid-invocation-exit-two-stderr"
+      ],
+      "evidence": {
+        "pinned": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/template/verify/config"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-argument:cpu-template-helper/template/verify/template"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/source-manifest.json",
+            "anchor": "tool-operation:cpu-template-helper/template/verify"
+          }
+        ],
+        "implementation": [
+          {
+            "kind": "local",
+            "path": "crates/hvf/src/cpu_template_inspection.rs",
+            "anchor": "pub fn inspect_effective_arm64_cpu_template"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/cli.rs",
+            "anchor": "Template(TemplateOperation::Verify"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/profile.rs",
+            "anchor": "pub fn verify_with_provider"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/provider.rs",
+            "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+          }
+        ],
+        "focused_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/src/profile.rs",
+            "anchor": "fn verify_uses_filters_and_checks_boot_overridden_application_values"
+          }
+        ],
+        "process_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/cli.rs",
+            "anchor": "fn no_template_and_unavailable_hvf_never_publish_output"
+          }
+        ],
+        "signed_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+            "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+          },
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+            "anchor": "fn signed_mixed_width_verify_and_explicit_precedence_use_real_hvf_state"
+          }
+        ],
+        "failure_validation": [
+          {
+            "kind": "local",
+            "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+            "anchor": "fn signed_mismatch_collision_and_unsigned_failures_leave_resources_reusable"
+          }
+        ],
+        "documentation": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+            "anchor": "Terminal certification"
+          }
+        ]
+      }
+    }
+  ],
+  "foundations": {
+    "implemented_and_verified": [
+      "api-operation:GET /machine-config",
+      "api-operation:GET /vm/config",
+      "api-operation:PATCH /machine-config",
+      "api-operation:PUT /cpu-config",
+      "api-operation:PUT /machine-config",
+      "api-path:/cpu-config",
+      "api-path:/machine-config",
+      "api-path:/vm/config",
+      "api-property:ArmRegisterModifier.addr",
+      "api-property:ArmRegisterModifier.bitmap",
+      "api-property:CpuConfig.reg_modifiers",
+      "api-property:FullVmConfiguration.cpu-config",
+      "api-property:FullVmConfiguration.machine-config",
+      "api-schema:ArmRegisterModifier",
+      "api-schema:CpuConfig",
+      "api-schema:FullVmConfiguration",
+      "api-schema:MachineConfiguration",
+      "corpus:cpu-boot-protocol"
+    ],
+    "proven_platform_impossible": [
+      "api-property:CpuConfig.cpuid_modifiers",
+      "api-property:CpuConfig.kvm_capabilities",
+      "api-property:CpuConfig.msr_modifiers",
+      "api-property:CpuConfig.vcpu_features",
+      "api-property:CpuidLeafModifier.flags",
+      "api-property:CpuidLeafModifier.leaf",
+      "api-property:CpuidLeafModifier.modifiers",
+      "api-property:CpuidLeafModifier.subleaf",
+      "api-property:CpuidRegisterModifier.bitmap",
+      "api-property:CpuidRegisterModifier.register",
+      "api-property:MachineConfiguration.cpu_template",
+      "api-property:MsrModifier.addr",
+      "api-property:MsrModifier.bitmap",
+      "api-schema:CpuTemplate",
+      "api-schema:CpuidLeafModifier",
+      "api-schema:CpuidRegisterModifier",
+      "api-schema:MsrModifier"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "installed-cli",
+      "rationale": "The installed binary exposes exactly five operations, thirteen arguments, fixed help and version stdout, silent successful operations, operational or difference exit 1, and invalid-invocation exit 2 without echoing caller values.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/main.rs",
+          "anchor": "fn main() -> ExitCode"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn every_invalid_invocation_is_fixed_and_does_not_echo_values"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Diagnostics, exit classes, and evidence"
+        }
+      ]
+    },
+    {
+      "id": "default-none-equivalence",
+      "rationale": "Omitted default and explicit None remain distinct inputs but select the same no-template effective profile and produce separately canonical artifacts.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/projection.rs",
+          "anchor": "pub fn prepare_inspection_request"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Configuration and selection"
+        }
+      ]
+    },
+    {
+      "id": "custom-precedence",
+      "rationale": "Config-file machine then custom ordering and the explicit template argument apply transactionally, with the last valid custom selection replacing pending static state before effective capture.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmmAction::PutCpuConfig(config) => {"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/projection.rs",
+          "anchor": "pub fn prepare_inspection_request"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn config_file_custom_cpu_config_overrides_v1n1_and_starts_instance"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/projection.rs",
+          "anchor": "fn explicit_template_replaces_config_selection_after_valid_projection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_mixed_width_verify_and_explicit_precedence_use_real_hvf_state"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "Replacement and serialization"
+        }
+      ]
+    },
+    {
+      "id": "pending-static-rejection",
+      "rationale": "V1N1 remains visible pending configuration but fails before backend construction on Apple Silicon, while explicit None or a valid custom template can replace it without aliasing the upstream source model.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "pub fn preflight_instance_start"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "fn machine_v1n1_is_visible_and_start_gated_while_x86_template_faults_preserve_it"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn effective_v1n1_fails_before_executor_and_custom_replacement_can_retry_start"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "Replacement and serialization"
+        }
+      ]
+    },
+    {
+      "id": "canonical-template-pipeline",
+      "rationale": "Signed dump output is private and canonical, portable strip consumes immutable inputs and republishes canonical outputs, and signed verify consumes the resulting strict template without stream output.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/profile.rs",
+          "anchor": "pub fn dump_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Template document"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+          "anchor": "Normalized strip transformation"
+        }
+      ]
+    },
+    {
+      "id": "fingerprint-change-pipeline",
+      "rationale": "Signed default and custom fingerprint dumps are canonical and platform tagged; portable compare is silent for equality and emits only deterministic selected differences with the stable difference exit.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn dump_with_providers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "pub fn compare_cpu_fingerprints"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+          "anchor": "Deterministic difference diagnostic"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md",
+          "anchor": "Version-1 document"
+        }
+      ]
+    },
+    {
+      "id": "portable-provider-independence",
+      "rationale": "Template strip and fingerprint compare decode and transform persisted documents without constructing an HVF effective-state or host-fact provider on supported or unsupported targets.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "TemplateOperation::Strip"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "pub fn compare_cpu_fingerprints"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "fn fingerprint_compare_is_ordered_portable_and_provider_free"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "fn strip_is_silent_and_never_constructs_an_effective_provider_request"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+          "anchor": "Execution, diagnostics, and exit classes"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+          "anchor": "Diagnostics and evidence"
+        }
+      ]
+    },
+    {
+      "id": "signed-entitlement-effective-state",
+      "rationale": "Effective dump, verify, and fingerprint dump require the public HVF entitlement, inspect one disposable real topology at the production apply/readback checkpoint, and fail closed when unsigned or unsupported.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template_inspection.rs",
+          "anchor": "pub fn inspect_effective_arm64_cpu_template"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "cpu_template_helper"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_mismatch_collision_and_unsigned_failures_leave_resources_reusable"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_two_vcpu_default_dump_is_canonical_private_and_reparseable"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Descriptor and provider authority"
+        }
+      ]
+    },
+    {
+      "id": "collision-nonmutation",
+      "rationale": "Descriptor-bound reads never mutate inputs, single outputs are absent-only, strip publication preserves winners and exact inputs across collisions, and reusable HVF resources survive rejected publication.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip_publication.rs",
+          "anchor": "pub(crate) fn publish_strip_artifacts"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn strip_precommit_failures_preserve_inputs_winners_and_aliases"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_mismatch_collision_and_unsigned_failures_leave_resources_reusable"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-contract.md",
+          "anchor": "Input and publication boundary"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+          "anchor": "Multi-path publication boundary"
+        }
+      ]
+    },
+    {
+      "id": "bounded-redaction-failure",
+      "rationale": "Malformed, oversized, special-file, provider, mismatch, filter, collision, and publication failures remain bounded and value redacted, preserve inputs and committed winners, and use only fixed stderr classes.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub fn read_regular_utf8"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/profile.rs",
+          "anchor": "pub enum EffectiveCpuTemplateProfileError"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn bounded_input_failures_are_path_and_value_redacted_before_inspection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_rejects_strict_document_and_file_failures_without_mutation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn strip_bad_documents_and_file_types_fail_before_any_output"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "The public CPU-template helper"
+        }
+      ]
+    },
+    {
+      "id": "transactional-runtime-selection",
+      "rationale": "Complete candidate validation precedes every static or custom replacement; valid custom, empty, pending V1N1, and explicit None updates replace atomically while malformed or unavailable requests preserve the previous effective selection.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "VmmAction::PutCpuConfig(config) => {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/machine.rs",
+          "anchor": "pub fn validate(self) -> Result<MachineConfig, MachineConfigError>"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn failed_cpu_template_replacements_preserve_the_effective_selection"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn static_and_custom_cpu_template_updates_replace_only_when_explicit"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "Replacement and serialization"
+        }
+      ]
+    },
+    {
+      "id": "all-vcpu-apply-readback-boot-precedence",
+      "rationale": "Production startup reads one common requested baseline across every vCPU, writes and immediately rereads every target, then primary and PSCI-secondary Linux boot setup owns X0, PC, and PSTATE while retained feature targets remain guest visible.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/topology.rs",
+          "anchor": "pub(crate) fn apply_arm64_cpu_template_with_state"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn two_cpu_linux_observes_exact_custom_id_register_mask_results"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "HVF startup and failure atomicity"
+        }
+      ]
+    },
+    {
+      "id": "native-v1-no-template-snapshot",
+      "rationale": "Native-v1 creation rejects an effective custom template before capture or publication, and native-v1 load requires a pristine no-template destination; None or empty custom state retains that existing profile without serializing helper documents.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn snapshot_v1_load_profile"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn snapshot_v1_vm_profile"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn controller_native_v1_create_profile_is_fail_closed"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn successful_vm_configuration_actions_make_snapshot_load_non_fresh"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "Snapshot boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/snapshot-feasibility.md",
+          "anchor": "Native V1 State Envelope"
+        }
+      ]
+    },
+    {
+      "id": "heterogeneous-fleet-workflow",
+      "rationale": "Applicable fleet work has a complete public creation, inspection, stripping, verification, and platform-tagged comparison workflow plus expert and platform guidance, without claiming an untested distinct-host safety, equivalence, migration, or snapshot-portability result.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "enum Command"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub struct CpuFingerprintDocument"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+        }
+      ],
+      "documentation": [
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "Arm64 CPU-Template Subset"
+        },
+        {
+          "kind": "local",
+          "path": "docs/firecracker-compatibility.md",
+          "anchor": "CPU-Template Fingerprint Compare"
+        }
+      ]
+    }
+  ],
+  "nonclaims": [
+    "template-sensibility-or-security",
+    "distinct-host-equivalence-or-safety",
+    "x86-kvm-mechanism-identity",
+    "host-authentication",
+    "snapshot-portability",
+    "migration-safety",
+    "global-crash-atomic-multi-path-publication"
+  ],
+  "implementation": [
+    {
+      "kind": "local",
+      "path": "crates/hvf/src/cpu_template.rs",
+      "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+    },
+    {
+      "kind": "local",
+      "path": "tools/cpu-template-helper/src/cli.rs",
+      "anchor": "pub fn run_cli_with_provider"
+    },
+    {
+      "kind": "local",
+      "path": "tools/firecracker-capability-audit/src/cpu_template_helper_audit_validate.rs",
+      "anchor": "pub fn validate_cpu_template_helper_audit"
+    }
+  ],
+  "validation": [
+    {
+      "kind": "local",
+      "path": "crates/hvf/tests/guest_boot.rs",
+      "anchor": "fn two_cpu_linux_observes_exact_custom_id_register_mask_results"
+    },
+    {
+      "kind": "local",
+      "path": "crates/hvf/tests/hvf_lifecycle.rs",
+      "anchor": "fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus"
+    },
+    {
+      "kind": "local",
+      "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+      "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+    },
+    {
+      "kind": "local",
+      "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+      "anchor": "fn checked_cpu_template_aggregate_compatibility_is_terminal_and_fail_closed"
+    },
+    {
+      "kind": "local",
+      "path": "tools/firecracker-capability-audit/tests/cpu_template_helper_audit.rs",
+      "anchor": "fn checked_cpu_template_helper_audit_is_canonical_and_fail_closed"
+    }
+  ]
+}

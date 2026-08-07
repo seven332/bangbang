@@ -310,7 +310,7 @@ custom or `None`, but an effective selection fails before backend construction
 because Apple Silicon cannot provide its documented Neoverse V1 source model.
 KVM capability/feature namespaces are separate strict platform exclusions.
 Exact bounds, replacement/GET/snapshot behavior, expert-risk limits, signed
-evidence, and remaining Wave 7 helper/portability ownership are in the checked
+evidence, and aggregate helper/fleet ownership are in the checked
 [CPU-template contract](../compat/firecracker/v1.16.0/cpu-template-contract.md).
 
 ### CPU-Template Dump and Verify Helper
@@ -347,10 +347,11 @@ successful operations exit 0. Paths, register identities, masks, values,
 readbacks, and provider internals are never reported.
 
 This dump/verify scope does not itself certify fingerprint operations, the
-upstream helper/template corpora, a persistent inspection VM, guest execution,
+aggregate helper/template corpora, a persistent inspection VM, guest execution,
 or a distinct-host compatibility decision. Fingerprint dump and compare are
-independently certified below; aggregate identities remain #1795. The exact
-format, publication, security, evidence, and terminal audit gate are in the checked
+independently certified below, and the aggregate composition gate closes only
+the bounded applicable workflow described after them. The exact format,
+publication, security, evidence, and terminal audit gate are in the checked
 [CPU-template helper contract](../compat/firecracker/v1.16.0/cpu-template-helper-contract.md).
 
 ### CPU-Template Strip
@@ -462,6 +463,30 @@ template invalidity, host identity, migration safety, or snapshot portability.
 The exact vocabulary, JSON schema, admission/alias/security rules, tests, and
 four-row audit gate are in the checked
 [CPU-template fingerprint compare contract](../compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md).
+
+### Aggregate CPU-Template Compatibility
+
+The terminal aggregate gate composes the five helper operations and all
+thirteen arguments from one canonical checked
+[producer ledger](../compat/firecracker/v1.16.0/cpu-template-helper-audit.json).
+It requires the exact implemented machine/CPU/config-export API foundations,
+the runtime boot protocol, transactional selection, real all-vCPU
+apply/readback with X0/PC/PSTATE boot precedence, and the native-v1
+no-template snapshot boundary. Existing signed lifecycle and guest-boot tests
+retain authority for runtime and boot behavior; the signed helper composition
+case runs dump, strip, verify, fingerprint dump, and fingerprint compare
+through the actual binary while checking canonical private artifacts, streams,
+stable differences, and nonmutation.
+
+The resulting fleet workflow supports creating and inspecting effective
+artifacts, stripping common state, verifying a selected template, and making a
+platform-tagged comparison with the documented expert and platform guidance.
+It does not establish distinct-host equivalence or safety, decide whether a
+template is sensible or secure, authenticate artifacts, reproduce x86/KVM
+mechanisms, authorize migration, prove snapshot portability, or make multi-path
+publication globally crash-atomic. Complete CPUID/MSR, KVM-vCPU-feature, and
+static Firecracker template execution remain their exact terminal Apple
+Silicon platform exclusions rather than silently weakened aliases.
 
 ## X86 CPUID and MSR platform boundary
 
