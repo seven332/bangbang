@@ -13,6 +13,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  kani:
+    name: kani
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Kani
+        run: |
+          rustup toolchain install nightly-2025-11-21 --profile minimal
+          cargo +nightly-2025-11-21 install --locked --version 0.67.0 kani-verifier
+          cargo kani setup
+
+      - name: Run targeted Kani verification
+        run: python3 scripts/run-kani.py
+
   rust:
     name: rust
     runs-on: macos-26
@@ -61,6 +81,9 @@ jobs:
 
       - name: Certify macOS guest workflow scope
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --guest-workflow-final
+
+      - name: Certify targeted formal verification scope
+        run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --formal-verification-final
 
       - name: Certify CPU-template dump and verify scope
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final

@@ -1226,6 +1226,41 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(kani)]
+#[allow(dead_code)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_pager_limits_admission() {
+        let page_size: u32 = kani::any();
+        let region_count: u16 = kani::any();
+        let max_in_flight: u16 = kani::any();
+        let max_frame_bytes: u32 = kani::any();
+        let operations = PagerOperations(kani::any());
+
+        let Ok(limits) = PagerLimits::new(
+            page_size,
+            region_count,
+            max_in_flight,
+            max_frame_bytes,
+            operations,
+        ) else {
+            return;
+        };
+
+        assert!(limits.page_size().is_power_of_two());
+        assert!((MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&limits.page_size()));
+        assert!((1..=MAX_REGIONS).contains(&limits.region_count()));
+        assert!((1..=MAX_IN_FLIGHT).contains(&limits.max_in_flight()));
+        let required_frame =
+            HEADER_BYTES as u64 + PAGE_METADATA_BYTES as u64 + u64::from(limits.page_size());
+        assert!(u64::from(limits.max_frame_bytes()) >= required_frame);
+        assert!(limits.max_frame_bytes() as usize <= MAX_FRAME_BYTES);
+        assert_eq!(limits.operations(), PagerOperations::v1());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

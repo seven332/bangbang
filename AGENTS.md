@@ -48,6 +48,12 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
   --guest-workflow-final`: certify the exact terminal macOS API/no-API guest
   workflow and its two promoted Firecracker corpus identities.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --formal-verification-final`: certify the exact five-record targeted Kani
+  authority and its single promoted Firecracker corpus identity.
+- `python3 scripts/run-kani.py`: on Linux after the pinned setup in
+  `docs/formal-verification.md`, compare per-package compiled harness lists and
+  execute every exact manifest-owned Kani proof.
 - `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`: run portable
   guest artifact and macOS workflow policy/failure tests.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.

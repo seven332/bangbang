@@ -251,33 +251,26 @@ impl TokenBucket {
         let elapsed_nanos = physical_elapsed
             .as_nanos()
             .saturating_add(u128::from(self.elapsed_refill_credit_nanos));
-        let refill_time_nanos = u128::from(self.refill_time_nanos);
-        if elapsed_nanos >= refill_time_nanos {
-            self.budget = self.size;
-            self.last_update = now;
-            self.elapsed_refill_credit_nanos = 0;
-            return;
-        }
-
-        let tokens = elapsed_nanos * u128::from(self.size) / refill_time_nanos;
-        if tokens == 0 {
-            return;
-        }
-
-        let budget = u128::from(self.budget)
-            .saturating_add(tokens)
-            .min(u128::from(self.size));
-        self.budget = match u64::try_from(budget) {
-            Ok(value) => value,
-            Err(_) => self.size,
-        };
-
-        let adjusted_nanos = tokens
-            .saturating_mul(refill_time_nanos)
-            .div_ceil(u128::from(self.size));
-        let adjusted_nanos = match u64::try_from(adjusted_nanos) {
-            Ok(value) => value,
-            Err(_) => self.refill_time_nanos,
+        let adjusted_nanos = match token_bucket_refill(
+            self.size,
+            self.budget,
+            self.refill_time_nanos,
+            elapsed_nanos,
+        ) {
+            TokenBucketRefill::Unchanged => return,
+            TokenBucketRefill::Full => {
+                self.budget = self.size;
+                self.last_update = now;
+                self.elapsed_refill_credit_nanos = 0;
+                return;
+            }
+            TokenBucketRefill::Partial {
+                budget,
+                adjusted_nanos,
+            } => {
+                self.budget = budget;
+                adjusted_nanos
+            }
         };
         let consumed_credit = self.elapsed_refill_credit_nanos.min(adjusted_nanos);
         self.elapsed_refill_credit_nanos -= consumed_credit;
@@ -310,10 +303,97 @@ impl TokenBucket {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenBucketRefill {
+    Unchanged,
+    Full,
+    Partial { budget: u64, adjusted_nanos: u64 },
+}
+
+fn token_bucket_refill(
+    size: u64,
+    budget: u64,
+    refill_time_nanos: u64,
+    elapsed_nanos: u128,
+) -> TokenBucketRefill {
+    if size == 0 || refill_time_nanos == 0 {
+        return TokenBucketRefill::Unchanged;
+    }
+
+    let refill_time_nanos_u128 = u128::from(refill_time_nanos);
+    if elapsed_nanos >= refill_time_nanos_u128 {
+        return TokenBucketRefill::Full;
+    }
+
+    let tokens = elapsed_nanos * u128::from(size) / refill_time_nanos_u128;
+    if tokens == 0 {
+        return TokenBucketRefill::Unchanged;
+    }
+
+    let new_budget = u128::from(budget)
+        .saturating_add(tokens)
+        .min(u128::from(size));
+    let budget = match u64::try_from(new_budget) {
+        Ok(value) => value,
+        Err(_) => size,
+    };
+    let adjusted_nanos = tokens
+        .saturating_mul(refill_time_nanos_u128)
+        .div_ceil(u128::from(size));
+    let adjusted_nanos = match u64::try_from(adjusted_nanos) {
+        Ok(value) => value,
+        Err(_) => refill_time_nanos,
+    };
+
+    TokenBucketRefill::Partial {
+        budget,
+        adjusted_nanos,
+    }
+}
+
 fn duration_from_nanos_saturating(nanos: u128) -> Duration {
     match u64::try_from(nanos) {
         Ok(value) => Duration::from_nanos(value),
         Err(_) => Duration::from_nanos(u64::MAX),
+    }
+}
+
+#[cfg(kani)]
+#[allow(dead_code)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_token_bucket_refill_accounting() {
+        let size: u64 = kani::any();
+        let budget: u64 = kani::any();
+        let refill_time_nanos: u64 = kani::any();
+        let elapsed_nanos: u128 = kani::any();
+
+        kani::assume((1..=4_096).contains(&size));
+        kani::assume(budget <= size);
+        kani::assume((1..=1_000_000_000).contains(&refill_time_nanos));
+        kani::assume(elapsed_nanos <= u128::from(refill_time_nanos));
+
+        match token_bucket_refill(size, budget, refill_time_nanos, elapsed_nanos) {
+            TokenBucketRefill::Unchanged => {
+                let tokens = elapsed_nanos * u128::from(size) / u128::from(refill_time_nanos);
+                assert_eq!(tokens, 0);
+            }
+            TokenBucketRefill::Full => {
+                assert_eq!(elapsed_nanos, u128::from(refill_time_nanos));
+            }
+            TokenBucketRefill::Partial {
+                budget: new_budget,
+                adjusted_nanos,
+            } => {
+                assert!(new_budget >= budget);
+                assert!(new_budget <= size);
+                assert!(adjusted_nanos != 0);
+                assert!(u128::from(adjusted_nanos) <= elapsed_nanos);
+                assert!(adjusted_nanos < refill_time_nanos);
+            }
+        }
     }
 }
 
@@ -412,8 +492,39 @@ mod tests {
 
     use super::{
         PersistedTokenBucketState, PersistedTokenBucketStateError, TokenBucket, TokenBucketConfig,
-        TokenBucketReduction,
+        TokenBucketReduction, TokenBucketRefill, token_bucket_refill,
     };
+
+    #[test]
+    fn refill_calculation_classifies_exact_boundaries() {
+        assert_eq!(
+            token_bucket_refill(0, 0, 100, 100),
+            TokenBucketRefill::Unchanged
+        );
+        assert_eq!(
+            token_bucket_refill(4, 0, 0, 100),
+            TokenBucketRefill::Unchanged
+        );
+        assert_eq!(
+            token_bucket_refill(4, 1, 100, 24),
+            TokenBucketRefill::Unchanged
+        );
+        assert_eq!(
+            token_bucket_refill(4, 1, 100, 25),
+            TokenBucketRefill::Partial {
+                budget: 2,
+                adjusted_nanos: 25,
+            }
+        );
+        assert_eq!(
+            token_bucket_refill(4, 3, 100, 99),
+            TokenBucketRefill::Partial {
+                budget: 4,
+                adjusted_nanos: 75,
+            }
+        );
+        assert_eq!(token_bucket_refill(4, 0, 100, 100), TokenBucketRefill::Full);
+    }
 
     #[test]
     fn consumes_burst_budget_and_refills_by_time() {

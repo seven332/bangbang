@@ -1,0 +1,296 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "delivery_issue": "#1797",
+  "toolchain": {
+    "version": "0.67.0",
+    "release_tag": "kani-0.67.0",
+    "release_commit": "4feaaad1d6a2378a6ff6caa3b4fc5d6999c7bb5d",
+    "compiler_toolchain": "nightly-2025-11-21",
+    "list_format_version": "0.1",
+    "install_command": [
+      "cargo",
+      "+nightly-2025-11-21",
+      "install",
+      "--locked",
+      "--version",
+      "0.67.0",
+      "kani-verifier"
+    ],
+    "setup_command": [
+      "cargo",
+      "kani",
+      "setup"
+    ]
+  },
+  "execution": {
+    "platform": "ubuntu-24.04",
+    "runner": "scripts/run-kani.py",
+    "command": [
+      "python3",
+      "scripts/run-kani.py"
+    ],
+    "packages": [
+      "bangbang-pager",
+      "bangbang-runtime"
+    ],
+    "workflow": ".github/workflows/ci.yml",
+    "timeout_minutes": 45,
+    "sequential": true
+  },
+  "harnesses": [
+    {
+      "id": "pager-limits-admission",
+      "category": "capability-input-arithmetic",
+      "package": "bangbang-pager",
+      "source": "crates/pager/src/frame.rs",
+      "harness": "frame::verification::verify_pager_limits_admission",
+      "command": [
+        "cargo",
+        "kani",
+        "--package",
+        "bangbang-pager",
+        "--lib",
+        "--harness",
+        "frame::verification::verify_pager_limits_admission",
+        "--exact"
+      ],
+      "owner": "crates/pager/src/frame.rs::PagerLimits::new",
+      "assumptions": [
+        "No kani::assume constraints; the invariant applies to every successful constructor result over the Rust input types."
+      ],
+      "bounds": [
+        "page_size, max_frame_bytes, and operation bits cover the full u32 domain; region_count and max_in_flight cover the full u16 domain."
+      ],
+      "invariant": "Every admitted pager limit set has a supported power-of-two page size, nonzero bounded counts, the exact v1 operation set, and a nonoverflowing frame bound large enough for one page but no larger than the protocol maximum.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/pager/src/frame.rs",
+          "anchor": "fn verify_pager_limits_admission()"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/pager/src/frame.rs",
+          "anchor": "exact_global_edges_succeed_and_one_over_edges_fail"
+        }
+      ]
+    },
+    {
+      "id": "virtqueue-ranges",
+      "category": "queue-index-ranges",
+      "package": "bangbang-runtime",
+      "source": "crates/runtime/src/virtio_queue.rs",
+      "harness": "virtio_queue::verification::verify_virtqueue_ranges",
+      "command": [
+        "cargo",
+        "kani",
+        "--package",
+        "bangbang-runtime",
+        "--lib",
+        "--harness",
+        "virtio_queue::verification::verify_virtqueue_ranges",
+        "--exact"
+      ],
+      "owner": "crates/runtime/src/virtio_queue.rs::virtqueue geometry and EVENT_IDX",
+      "assumptions": [
+        "queue_size is a nonzero power of two, matching the production virtqueue admission contract."
+      ],
+      "bounds": [
+        "queue_size, descriptor index, and EVENT_IDX values otherwise cover the full u16 domain; the ring base covers the full u64 domain."
+      ],
+      "invariant": "Descriptor, available, and used ring ranges have exact sizes and succeed exactly when their exclusive end does not overflow; descriptor index admission is exact, an empty used interval never notifies, and the next used entry notifies its matching event.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_queue.rs",
+          "anchor": "fn verify_virtqueue_ranges()"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_queue.rs",
+          "anchor": "event_idx_notification_formula_handles_boundaries"
+        }
+      ]
+    },
+    {
+      "id": "token-bucket-refill-accounting",
+      "category": "rate-limit-accounting",
+      "package": "bangbang-runtime",
+      "source": "crates/runtime/src/token_bucket.rs",
+      "harness": "token_bucket::verification::verify_token_bucket_refill_accounting",
+      "command": [
+        "cargo",
+        "kani",
+        "--package",
+        "bangbang-runtime",
+        "--lib",
+        "--harness",
+        "token_bucket::verification::verify_token_bucket_refill_accounting",
+        "--exact"
+      ],
+      "owner": "crates/runtime/src/token_bucket.rs::token_bucket_refill",
+      "assumptions": [
+        "The current budget does not exceed the configured bucket size.",
+        "The elapsed logical refill time does not exceed one complete refill interval."
+      ],
+      "bounds": [
+        "1 <= size <= 4096, 1 <= refill_time_nanos <= 1000000000, budget <= size, and elapsed_nanos <= refill_time_nanos."
+      ],
+      "invariant": "Refill classification is exact at zero-token and full-interval boundaries; a partial refill never decreases or overfills budget and consumes a positive logical duration smaller than the interval and no greater than elapsed time.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "fn verify_token_bucket_refill_accounting()"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/token_bucket.rs",
+          "anchor": "refill_calculation_classifies_exact_boundaries"
+        }
+      ]
+    },
+    {
+      "id": "pager-artifact-ranges",
+      "category": "artifact-range-validation",
+      "package": "bangbang-pager",
+      "source": "crates/pager/src/state.rs",
+      "harness": "state::verification::verify_pager_artifact_ranges",
+      "command": [
+        "cargo",
+        "kani",
+        "--package",
+        "bangbang-pager",
+        "--lib",
+        "--harness",
+        "state::verification::verify_pager_artifact_ranges",
+        "--exact"
+      ],
+      "owner": "crates/pager/src/state.rs::pager source range validation",
+      "assumptions": [
+        "page_size is 1 << shift for 12 <= shift <= 21.",
+        "Both symbolic PagerRegion values pass the production constructor for that page size."
+      ],
+      "bounds": [
+        "Admitted source offsets, region lengths, page/removal offsets, and removal lengths cover the full u64 domain; page request length covers the full u32 domain."
+      ],
+      "invariant": "Every accepted page/removal request is aligned, nonempty where applicable, nonoverflowing, and contained in the admitted source region, while overlap classification is symmetric for admitted regions.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/pager/src/state.rs",
+          "anchor": "fn verify_pager_artifact_ranges()"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/pager/src/state.rs",
+          "anchor": "invalid_selection_ranges_shutdown_and_request_overflow_fail"
+        }
+      ]
+    },
+    {
+      "id": "virtio-mmio-status-transitions",
+      "category": "state-transitions",
+      "package": "bangbang-runtime",
+      "source": "crates/runtime/src/virtio_mmio.rs",
+      "harness": "virtio_mmio::verification::verify_virtio_mmio_status_transitions",
+      "command": [
+        "cargo",
+        "kani",
+        "--package",
+        "bangbang-runtime",
+        "--lib",
+        "--harness",
+        "virtio_mmio::verification::verify_virtio_mmio_status_transitions",
+        "--exact"
+      ],
+      "owner": "crates/runtime/src/virtio_mmio.rs::is_valid_status_transition",
+      "assumptions": [
+        "No kani::assume constraints; assertions apply to every accepted non-reset transition over the full current/requested pair."
+      ],
+      "bounds": [
+        "current and requested each cover the full u32 domain."
+      ],
+      "invariant": "Every accepted non-reset status transition is exactly one of the four ordered virtio advances, preserves all current bits, adds one prescribed bit, and contains no bit outside the final DRIVER_OK status mask.",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "fn verify_virtio_mmio_status_transitions()"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "device_registers_reject_invalid_status_transitions"
+        }
+      ]
+    }
+  ],
+  "evidence": {
+    "implementation": [
+      {
+        "kind": "local",
+        "path": "scripts/run-kani.py",
+        "anchor": "def main("
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/src/formal_verification_audit_validate.rs",
+        "anchor": "validate_formal_verification_audit"
+      }
+    ],
+    "validation": [
+      {
+        "kind": "local",
+        "path": ".github/workflows/ci.yml",
+        "anchor": "kani:"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/tests/test_run_kani.py",
+        "anchor": "class RunKaniTests"
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/tests/formal_verification_audit.rs",
+        "anchor": "checked_formal_verification_audit_is_canonical_and_fail_closed"
+      }
+    ],
+    "documentation": [
+      {
+        "kind": "local",
+        "path": "compat/firecracker/v1.16.0/formal-verification-contract.md",
+        "anchor": "# Formal Verification Contract"
+      },
+      {
+        "kind": "local",
+        "path": "docs/formal-verification.md",
+        "anchor": "# Targeted Formal Verification"
+      }
+    ]
+  },
+  "nonclaims": [
+    "unrestricted-or-whole-system-correctness",
+    "ffi-or-hvf-behavior",
+    "guest-memory-or-descriptor-traversal",
+    "wall-clock-or-timer-behavior",
+    "concurrency-or-liveness",
+    "filesystem-or-transport-behavior",
+    "performance-or-resource-bounds"
+  ]
+}

@@ -24,6 +24,9 @@ Each detailed subject has one primary document:
 - [macOS Guest Workflow](docs/macos-guest-workflow.md) owns the public,
   rootless API and no-API guest boot commands, exact artifact identities,
   cleanup policy, troubleshooting, and workflow nonclaims.
+- [Targeted Formal Verification](docs/formal-verification.md) owns the pinned
+  Linux Kani setup, exact checked runner, five bounded proof records,
+  assumptions, evidence interpretation, and nonclaims.
 - [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
   owns the pinned structural scope, reviewed dispositions, and evidence rules.
 - [Firecracker-shaped Developer Tracing](compat/firecracker/v1.16.0/tracing-contract.md)
@@ -176,7 +179,8 @@ terminal and map to ten implemented shared device profiles. The dedicated
 device gate verifies that exact profile set, its resolvable evidence, the
 212/2/17 field census, and the terminal #1790 lifecycle handoff.
 
-The terminal tracing, CPU-template dump/verify, portable CPU-template strip,
+The terminal tracing, targeted formal verification, CPU-template dump/verify,
+portable CPU-template strip,
 platform-tagged CPU-fingerprint dump, deterministic fingerprint compare,
 aggregate CPU-template workflow,
 69-field API/process,
@@ -185,6 +189,7 @@ fail-closed certification gates:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --formal-verification-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
@@ -194,6 +199,12 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
 ```
+
+On Linux with the exact pinned Kani setup, compile, inventory, and execute all
+five manifest-owned proofs with `python3 scripts/run-kani.py`. The command and
+bounded interpretation are owned by the
+[formal-verification guide](docs/formal-verification.md); normal macOS builds
+do not install or invoke Kani.
 
 The CPU-template aggregate gate promotes exactly its two corpus rows and CPU
 semantic after validating the five-operation producer ledger, implemented and

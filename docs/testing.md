@@ -2008,6 +2008,7 @@ cargo fmt --all -- --check
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --formal-verification-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
@@ -3062,6 +3063,38 @@ scripts/run-integration-tests.sh --allow-unsupported
 That option is for CI-style build/sign validation on runners that cannot
 execute HVF. Local Apple Silicon verification should omit it so unsupported or
 misconfigured hosts fail.
+
+## Targeted Formal Verification
+
+The pinned setup, exact five-record proof table, assumptions, bounds and
+nonclaims are owned by the
+[Targeted Formal Verification guide](formal-verification.md). This testing
+guide owns the evidence-layer distinction.
+
+On every host, the ordinary and scoped audit commands validate the canonical
+JSON, independently derive every tracked proof symbol, require exact manifest
+bijection, and certify only the one terminal corpus row:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --formal-verification-final
+python3 -m unittest scripts/tests/test_run_kani.py
+```
+
+On Linux after the guide's exact Kani 0.67.0 setup, run the actual compiled
+proof gate:
+
+```sh
+python3 scripts/run-kani.py
+```
+
+The runner lists `bangbang-pager` and `bangbang-runtime` separately, compares
+Kani's compiled package/source/symbol identities, and then executes every
+manifest command sequentially with `--exact`. Portable tests fake the external
+process boundary and cover version, lock/list, missing/extra/duplicate/
+ambiguous identity, command, fail-fast, ordering, and temporary cleanup paths;
+only the Linux runner is formal-proof execution. Normal macOS and signed HVF
+gates remain independent evidence.
 
 ## macOS Guest Workflow
 

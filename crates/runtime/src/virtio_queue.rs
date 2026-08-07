@@ -1754,6 +1754,75 @@ fn parse_raw_descriptor(bytes: [u8; VIRTQUEUE_DESCRIPTOR_SIZE]) -> RawVirtqueueD
     }
 }
 
+#[cfg(kani)]
+#[allow(dead_code)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_virtqueue_ranges() {
+        let queue_size: u16 = kani::any();
+        kani::assume(is_valid_queue_size(queue_size));
+        let base: u64 = kani::any();
+        let address = GuestAddress::new(base);
+
+        let descriptor_size = u64::from(queue_size) * VIRTQUEUE_DESCRIPTOR_SIZE_U64;
+        let available_size = VIRTQUEUE_AVAILABLE_RING_HEADER_SIZE_U64
+            + u64::from(queue_size) * VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64
+            + VIRTQUEUE_AVAILABLE_RING_USED_EVENT_SIZE_U64;
+        let used_size = VIRTQUEUE_USED_RING_HEADER_SIZE_U64
+            + u64::from(queue_size) * VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64
+            + VIRTQUEUE_USED_RING_AVAIL_EVENT_SIZE_U64;
+
+        let descriptor = descriptor_table_range(address, queue_size);
+        assert_eq!(
+            descriptor.is_ok(),
+            base.checked_add(descriptor_size).is_some()
+        );
+        if let Ok(range) = descriptor {
+            assert_eq!(range.start(), address);
+            assert_eq!(range.size(), descriptor_size);
+            assert_eq!(range.end_exclusive().raw_value(), base + descriptor_size);
+        }
+
+        let available = available_ring_range(address, queue_size);
+        assert_eq!(
+            available.is_ok(),
+            base.checked_add(available_size).is_some()
+        );
+        if let Ok(range) = available {
+            assert_eq!(range.start(), address);
+            assert_eq!(range.size(), available_size);
+            assert_eq!(range.end_exclusive().raw_value(), base + available_size);
+        }
+
+        let used = used_ring_range(address, queue_size);
+        assert_eq!(used.is_ok(), base.checked_add(used_size).is_some());
+        if let Ok(range) = used {
+            assert_eq!(range.start(), address);
+            assert_eq!(range.size(), used_size);
+            assert_eq!(range.end_exclusive().raw_value(), base + used_size);
+        }
+
+        let descriptor_index: u16 = kani::any();
+        assert_eq!(
+            validate_descriptor_index(descriptor_index, queue_size).is_ok(),
+            descriptor_index < queue_size
+        );
+
+        let old_used: u16 = kani::any();
+        let used_event: u16 = kani::any();
+        assert!(!virtqueue_event_idx_needs_notification(
+            old_used, old_used, used_event
+        ));
+        assert!(virtqueue_event_idx_needs_notification(
+            old_used,
+            old_used.wrapping_add(1),
+            old_used
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;

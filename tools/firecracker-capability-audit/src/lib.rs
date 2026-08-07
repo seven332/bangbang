@@ -3,6 +3,9 @@
 mod cpu_template_helper_audit_model;
 mod cpu_template_helper_audit_validate;
 mod cpu_template_helper_certify;
+mod formal_verification_audit_model;
+mod formal_verification_audit_validate;
+mod formal_verification_certify;
 mod guest_workflow_audit_model;
 mod guest_workflow_audit_validate;
 mod guest_workflow_certify;
@@ -51,6 +54,19 @@ pub use cpu_template_helper_certify::{
     validate_cpu_template_fingerprint_dump_compatibility,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
     validate_cpu_template_strip_compatibility,
+};
+pub use formal_verification_audit_model::{
+    FormalVerificationAudit, FormalVerificationCategory, FormalVerificationEvidence,
+    FormalVerificationExecution, FormalVerificationHarness, FormalVerificationNonclaim,
+    FormalVerificationToolchain,
+};
+pub use formal_verification_audit_validate::{
+    FORMAL_VERIFICATION_AUDIT_PATH, FORMAL_VERIFICATION_AUDIT_SCHEMA_VERSION,
+    FORMAL_VERIFICATION_HARNESS_IDS, KANI_COMPILER_TOOLCHAIN, KANI_VERSION,
+    validate_formal_verification_audit,
+};
+pub use formal_verification_certify::{
+    FORMAL_VERIFICATION_COMPATIBILITY_CAPABILITY_IDS, validate_formal_verification_compatibility,
 };
 pub use guest_workflow_audit_model::{
     Ext4Classification, Ext4Recipe, Ext4SidecarPolicy, GeneratedDeterminism,
@@ -321,6 +337,18 @@ pub fn read_guest_workflow_audit(path: &Path) -> Result<GuestWorkflowAudit, Audi
         .map_err(|error| AuditError::new(format!("failed to parse guest workflow audit: {error}")))
 }
 
+/// Read and parse the checked targeted formal-verification authority.
+pub fn read_formal_verification_audit(path: &Path) -> Result<FormalVerificationAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read formal verification audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse formal verification audit: {error}"
+        ))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -402,6 +430,13 @@ pub fn cpu_template_helper_audit_json(
 /// Serialize the checked guest-workflow authority using canonical pretty JSON.
 pub fn guest_workflow_audit_json(audit: &GuestWorkflowAudit) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "guest workflow audit")
+}
+
+/// Serialize the checked targeted formal-verification authority using canonical pretty JSON.
+pub fn formal_verification_audit_json(
+    audit: &FormalVerificationAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "formal verification audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {

@@ -3390,6 +3390,36 @@ fn validate_queue_address(
     }
 }
 
+#[cfg(kani)]
+#[allow(dead_code)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_virtio_mmio_status_transitions() {
+        let current: u32 = kani::any();
+        let requested: u32 = kani::any();
+
+        if !is_valid_status_transition(current, requested) {
+            return;
+        }
+
+        let acknowledge = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE;
+        let driver = acknowledge | VIRTIO_DEVICE_STATUS_DRIVER;
+        let features_ok = driver | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+        let driver_ok = features_ok | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+        assert!(
+            (current == VIRTIO_DEVICE_STATUS_INIT && requested == acknowledge)
+                || (current == acknowledge && requested == driver)
+                || (current == driver && requested == features_ok)
+                || (current == features_ok && requested == driver_ok)
+        );
+        assert_eq!(requested & current, current);
+        assert_eq!((requested ^ current).count_ones(), 1);
+        assert_eq!(requested & !VIRTIO_DEVICE_DRIVER_OK_STATUS, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
