@@ -354,8 +354,9 @@ producer ledger, exact runtime-foundation dispositions, signed five-command
 composition, lifecycle/guest-boot, native-v1 snapshot-boundary, documentation,
 and fail-closed transition gates pass. The current inventory is therefore
 #1872 then certifies #1796's exact two getting-started and rootfs/kernel corpus
-rows through the pinned macOS API and no-API guest workflow, signed HVF
-execution, and fail-closed terminal audit. The current inventory is therefore
+rows through the pinned [macOS API and no-API guest
+workflow](../../../docs/macos-guest-workflow.md), signed HVF execution, and
+fail-closed terminal audit. The current inventory is therefore
 exactly 367 implemented, 18 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the

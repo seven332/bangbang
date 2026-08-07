@@ -2335,6 +2335,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
     );
     assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
+    assert!(normalized_contract.contains("../../../docs/macos-guest-workflow.md"));
     assert!(normalized_contract.contains("367 implemented, 18 audit-required"));
     assert!(normalized_contract.contains("376/9/3/30"));
 }
