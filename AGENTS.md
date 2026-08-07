@@ -31,6 +31,10 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
   --cpu-template-helper-final`: certify the exact terminal seven-row
   CPU-template dump/verify scope while retaining strip, fingerprint, and corpus work.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --cpu-template-final`: certify the terminal aggregate CPU-template scope,
+  including the canonical five-operation ledger, exact runtime foundations,
+  signed composition, snapshot boundary, and explicit platform/nonclaim set.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
   --metrics-process-final`: certify the exact terminal 69-field API/process metrics
   producer scope while retaining separately certified device and aggregate work.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate

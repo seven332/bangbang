@@ -1184,6 +1184,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-te
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
 scripts/run-integration-tests.sh --test cpu_template_helper
 ```
 
@@ -1193,10 +1194,14 @@ format round trips, identity-bound provider profiles, optional availability,
 filter comparison, bounded regular-file input, value/path redaction, and the
 exclusive publication fault matrix. Portable actual-process cases additionally
 prove strict help/version/invocation behavior and that unsupported or unsigned
-HVF failures publish nothing. The signed six-case harness proves real
+HVF failures publish nothing. The signed seven-case harness proves real
 two-vCPU canonical dump, mixed-width verify and selection precedence, explicit
 ACTLR/ZFR0/SMFR0 availability outcomes, mismatch/collision/retry behavior, and
-boot-owned X0/PC/PSTATE checkpoint semantics. Run the wrapper without
+boot-owned X0/PC/PSTATE checkpoint semantics. Its aggregate composition case
+runs all five operations through the actual signed binary, checks default and
+explicit `None`, private canonical dump/strip/fingerprint artifacts, mixed
+custom verify, equal comparison, stable selected guest differences, and input
+nonmutation. Run the wrapper without
 `--allow-unsupported` for local or self-hosted evidence so a host that cannot
 execute HVF fails rather than silently omitting the gate.
 
@@ -1225,8 +1230,17 @@ repeat, strict schema/platform/inapplicable failures, descriptor-bound alias and
 special-file behavior, input nonmutation, provider-zero-call execution, and
 exact equal/difference/error streams and exits. Compare needs no signature and
 publishes nothing. Its scoped gate promotes exactly four compare rows and
-retains only the three #1795 aggregates. The full signed helper harness remains
-the regression gate for the dump/provider dependency.
+remains valid after the aggregate transition. The full signed helper harness
+remains the regression gate for the dump/provider dependency.
+
+The aggregate `--cpu-template-final` gate consumes the canonical checked
+producer ledger. It requires exact ownership of all five operations and
+thirteen arguments, exact implemented runtime/API foundations, exact terminal
+CPUID/MSR/KVM/static-template platform exclusions, fourteen closed scenarios,
+and seven nonclaims. The fleet scenario proves the applicable artifact
+creation, inspection, strip, verify, and platform-tagged comparison workflow;
+it does not claim distinct-host equivalence or safety, artifact authenticity,
+migration safety, or snapshot portability.
 SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
 and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,
@@ -1998,6 +2012,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-te
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

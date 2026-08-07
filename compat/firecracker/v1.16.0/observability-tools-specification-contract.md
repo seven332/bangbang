@@ -170,10 +170,24 @@ platform-honest filters, deterministic bounded selected-value diagnostics,
 and exact guest common-bit stripping without calling either provider.
 
 All earlier scoped gates remain valid after these ordered transitions. The
-three #1795 corpus/semantic aggregates remain their exact evidence-free
-`audit-required` handoff. No helper slice infers cross-host portability, guest
-execution, artifact authenticity, or completion of that later aggregate
-scope. The detailed command, format, publication, and security contracts are in
+aggregate `validate --cpu-template-final` gate then promotes exactly the three
+#1795 corpus/semantic rows from one versioned checked producer ledger. Its five
+operation records own all thirteen arguments and five operations exactly once;
+its closed scenarios compose the installed CLI, canonical artifact pipelines,
+runtime selection, real all-vCPU apply/readback, boot precedence, native-v1
+no-template snapshot boundary, and applicable fleet workflow.
+
+The gate separately requires the exact implemented CPU/machine/config-export
+foundations and `corpus:cpu-boot-protocol`, plus the exact terminal CPUID/MSR,
+KVM-vCPU, and complete static-template platform exclusions. The signed
+five-command helper flow proves artifact composition; existing signed lifecycle
+and guest-boot tests retain authority for effective state and boot behavior.
+Terminal heterogeneous-fleet coverage means the applicable creation,
+inspection, strip, verify, and platform-tagged comparison workflow plus expert
+and platform guidance. It does not infer distinct-host equivalence or safety,
+template correctness, artifact authenticity, x86/KVM mechanism identity,
+snapshot portability, or migration safety. The detailed command, format,
+publication, and security contracts are in
 [CPU-template helper dump and verify](cpu-template-helper-contract.md) and
 [CPU-template strip](cpu-template-strip-contract.md),
 [CPU-template fingerprint dump](cpu-template-fingerprint-contract.md), and
@@ -285,9 +299,9 @@ remain in the CPU-template contract.
 | `tool-argument:cpu-template-helper/fingerprint/dump/template` | #1794 | `implemented-and-verified` |
 | `tool-operation:cpu-template-helper/fingerprint/compare` | #1794 | `implemented-and-verified` |
 | `tool-operation:cpu-template-helper/fingerprint/dump` | #1794 | `implemented-and-verified` |
-| `corpus:cpu-template-helper` | #1795 | `audit-required` |
-| `corpus:cpu-templates` | #1795 | `audit-required` |
-| `semantic.cpu:configuration-templates-and-feature-state` | #1795 | `audit-required` |
+| `corpus:cpu-template-helper` | #1795 | `implemented-and-verified` |
+| `corpus:cpu-templates` | #1795 | `implemented-and-verified` |
+| `semantic.cpu:configuration-templates-and-feature-state` | #1795 | `implemented-and-verified` |
 | `corpus:getting-started` | #1796 | `audit-required` |
 | `corpus:rootfs-and-kernel` | #1796 | `audit-required` |
 | `corpus:formal-verification` | #1797 | `audit-required` |
@@ -335,8 +349,11 @@ effective-state, publication, and scoped-audit gates pass; compare and #1795
 aggregate rows remain unchanged. #1867 then promotes the three compare
 arguments and operation after strict persisted-input, platform/filter,
 canonical-diagnostic, guest-strip, portable-process, and scoped-audit gates
-pass; #1795 remains unchanged. The current inventory is therefore exactly
-362 implemented, 23 audit-required, three
+pass. #1795 finally promotes its exact three aggregate rows after the canonical
+producer ledger, exact runtime-foundation dispositions, signed five-command
+composition, lifecycle/guest-boot, native-v1 snapshot-boundary, documentation,
+and fail-closed transition gates pass. The current inventory is therefore
+exactly 365 implemented, 20 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

@@ -6,7 +6,7 @@ fingerprint dump` command surface, Bangbang's platform-tagged document, public
 macOS host-fact substitution, real effective guest capture, and failure-aware
 publication. Compare/filter behavior is terminally certified by #1867 in the
 separate [compare contract](cpu-template-fingerprint-compare-contract.md);
-corpus and aggregate certification remain #1795.
+the corpus and aggregate scope is terminally composed by #1795.
 
 ## Pinned upstream boundary
 
@@ -203,8 +203,9 @@ zero-publication failure. It runs through
 
 The scoped audit preserves the ordered historical, #1792 helper, #1793 strip,
 #1866 fingerprint-dump, and later #1867 fingerprint-compare phases. It rejects
-partial evidence, reordered dependencies, and aggregate leakage. The existing
-helper, strip, and dump final gates remain valid after the compare transition.
+partial evidence, reordered dependencies, and partial aggregate transitions.
+The existing helper, strip, and dump final gates remain valid after the #1795
+aggregate transition.
 
 ## Terminal certification
 
@@ -219,5 +220,7 @@ The compare `curr`, `prev`, and `filters` arguments and compare operation are
 independently terminal in the checked
 [compare contract](cpu-template-fingerprint-compare-contract.md).
 `corpus:cpu-template-helper`, `corpus:cpu-templates`, and
-`semantic.cpu:configuration-templates-and-feature-state` remain exact
-`audit-required` handoffs to #1795.
+`semantic.cpu:configuration-templates-and-feature-state` are terminally
+composed by the checked
+[`cpu-template-helper-audit.json`](cpu-template-helper-audit.json), without
+turning fingerprints into authentication, migration, or portability authority.

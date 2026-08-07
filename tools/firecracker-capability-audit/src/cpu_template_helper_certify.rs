@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::{
-    AuditMode, Capability, CapabilityInventory, Disposition, Reference, SourceManifest,
-    ValidationErrors, validate,
+    AuditMode, Capability, CapabilityInventory, CpuTemplateHelperAudit, Disposition, Reference,
+    SourceManifest, ValidationErrors, validate, validate_cpu_template_helper_audit,
 };
 
 const HELPER_CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/cpu-template-helper-contract.md";
@@ -49,15 +49,15 @@ pub const CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS: [&str; 
     "tool-operation:cpu-template-helper/fingerprint/compare",
 ];
 
-/// Exact later aggregate capabilities that #1867 must leave nonterminal.
-pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 3] = [
+/// Exact aggregate CPU-template capabilities certified by #1795.
+pub const CPU_TEMPLATE_AGGREGATE_CAPABILITY_IDS: [&str; 3] = [
     "corpus:cpu-template-helper",
     "corpus:cpu-templates",
     "semantic.cpu:configuration-templates-and-feature-state",
 ];
 
 /// Require the CPU-template helper inventory to be one exact ordered delivery
-/// phase through helper, strip, and fingerprint-dump certification.
+/// phase through helper, strip, fingerprint, and aggregate certification.
 pub fn validate_cpu_template_helper_transition(
     inventory: &CapabilityInventory,
 ) -> Result<(), ValidationErrors> {
@@ -93,12 +93,20 @@ pub fn validate_cpu_template_helper_transition(
         &mut errors,
     );
 
+    let aggregate = collect_scope(
+        &capabilities,
+        &CPU_TEMPLATE_AGGREGATE_CAPABILITY_IDS,
+        "CPU-template aggregate certification",
+        &mut errors,
+    );
+
     if helper.len() == CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS.len()
         && strip.len() == CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.len()
         && fingerprint_dump.len()
             == CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS.len()
         && fingerprint_compare.len()
             == CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS.len()
+        && aggregate.len() == CPU_TEMPLATE_AGGREGATE_CAPABILITY_IDS.len()
     {
         let (helper_implementation, helper_validation) = helper_capability_evidence();
         let (strip_implementation, strip_validation) = strip_capability_evidence();
@@ -132,47 +140,63 @@ pub fn validate_cpu_template_helper_transition(
         let compare_terminal = fingerprint_compare.iter().all(|capability| {
             is_exact_terminal(capability, &compare_implementation, &compare_validation)
         });
+        let aggregate_historical = aggregate
+            .iter()
+            .all(|capability| is_exact_retained(capability));
+        let aggregate_terminal = aggregate.iter().all(|capability| {
+            let (implementation, validation) = aggregate_capability_evidence(&capability.id);
+            is_exact_terminal(capability, &implementation, &validation)
+        });
 
-        let valid_historical =
-            helper_historical && strip_historical && fingerprint_historical && compare_historical;
-        let valid_helper_terminal =
-            helper_terminal && strip_historical && fingerprint_historical && compare_historical;
-        let valid_strip_terminal =
-            helper_terminal && strip_terminal && fingerprint_historical && compare_historical;
-        let valid_fingerprint_terminal =
-            helper_terminal && strip_terminal && fingerprint_terminal && compare_historical;
-        let valid_compare_terminal =
-            helper_terminal && strip_terminal && fingerprint_terminal && compare_terminal;
+        let valid_historical = helper_historical
+            && strip_historical
+            && fingerprint_historical
+            && compare_historical
+            && aggregate_historical;
+        let valid_helper_terminal = helper_terminal
+            && strip_historical
+            && fingerprint_historical
+            && compare_historical
+            && aggregate_historical;
+        let valid_strip_terminal = helper_terminal
+            && strip_terminal
+            && fingerprint_historical
+            && compare_historical
+            && aggregate_historical;
+        let valid_fingerprint_terminal = helper_terminal
+            && strip_terminal
+            && fingerprint_terminal
+            && compare_historical
+            && aggregate_historical;
+        let valid_compare_terminal = helper_terminal
+            && strip_terminal
+            && fingerprint_terminal
+            && compare_terminal
+            && aggregate_historical;
+        let valid_aggregate_terminal = helper_terminal
+            && strip_terminal
+            && fingerprint_terminal
+            && compare_terminal
+            && aggregate_terminal;
         if !valid_historical
             && !valid_helper_terminal
             && !valid_strip_terminal
             && !valid_fingerprint_terminal
             && !valid_compare_terminal
+            && !valid_aggregate_terminal
         {
             errors.push(
-                "CPU-template helper certification requires one exact ordered historical, #1792 helper, #1793 strip, #1866 fingerprint-dump, or #1867 fingerprint-compare phase"
+                "CPU-template helper certification requires one exact ordered historical, #1792 helper, #1793 strip, #1866 fingerprint-dump, #1867 fingerprint-compare, or #1795 aggregate phase"
                     .to_string(),
             );
-        }
-    }
-
-    for id in CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS {
-        match capabilities.get(id).copied() {
-            Some(capability) if is_exact_retained(capability) => {}
-            Some(_) => errors.push(format!(
-                "CPU-template helper certification requires the later capability to remain exactly audit-required: {id}"
-            )),
-            None => errors.push(format!(
-                "CPU-template helper retained capability is missing: {id}"
-            )),
         }
     }
 
     finish(errors)
 }
 
-/// Validate the terminal #1866 fingerprint-dump scope while retaining compare,
-/// corpus, and aggregate owners.
+/// Validate the terminal #1866 fingerprint-dump scope while allowing exact
+/// later compare and aggregate phases.
 pub fn validate_cpu_template_fingerprint_dump_compatibility(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,
@@ -226,8 +250,8 @@ pub fn validate_cpu_template_fingerprint_dump_compatibility(
     finish(errors)
 }
 
-/// Validate the terminal #1867 fingerprint-compare scope while retaining the
-/// independently owned corpus and aggregate capabilities.
+/// Validate the terminal #1867 fingerprint-compare scope while allowing the
+/// exact later aggregate phase.
 pub fn validate_cpu_template_fingerprint_compare_compatibility(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,
@@ -376,6 +400,68 @@ pub fn validate_cpu_template_strip_compatibility(
         &mut errors,
     );
 
+    finish(errors)
+}
+
+/// Validate the complete terminal #1795 CPU-template helper, runtime, and fleet scope.
+pub fn validate_cpu_template_compatibility(
+    manifest: &SourceManifest,
+    inventory: &CapabilityInventory,
+    audit: &CpuTemplateHelperAudit,
+    repository_root: &Path,
+) -> Result<(), ValidationErrors> {
+    let mut errors = common_validation(manifest, inventory, repository_root);
+    if let Err(validation_errors) =
+        validate_cpu_template_helper_audit(audit, inventory, repository_root)
+    {
+        errors.extend(validation_errors.messages().iter().cloned());
+    }
+    let capabilities = capability_map(inventory);
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template aggregate helper dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template aggregate strip dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template aggregate fingerprint-dump dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template aggregate fingerprint-compare dependency",
+        &mut errors,
+    );
+    for id in CPU_TEMPLATE_AGGREGATE_CAPABILITY_IDS {
+        let Some(capability) = capabilities.get(id).copied() else {
+            errors.push(format!(
+                "CPU-template aggregate certification capability is missing: {id}"
+            ));
+            continue;
+        };
+        let (implementation, validation) = aggregate_capability_evidence(id);
+        if !is_exact_terminal(capability, &implementation, &validation) {
+            errors.push(format!(
+                "CPU-template aggregate certification requires exact terminal capability evidence: {id}"
+            ));
+        }
+    }
+    read_contract(
+        repository_root,
+        OWNERSHIP_CONTRACT_PATH,
+        "CPU-template aggregate certification cannot read the Wave 7 ownership contract",
+        validate_aggregate_ownership_contract,
+        &mut errors,
+    );
     finish(errors)
 }
 
@@ -659,6 +745,112 @@ fn fingerprint_compare_capability_evidence() -> (Vec<Reference>, Vec<Reference>)
     )
 }
 
+fn aggregate_capability_evidence(id: &str) -> (Vec<Reference>, Vec<Reference>) {
+    match id {
+        "corpus:cpu-template-helper" => (
+            local_references(&[
+                (
+                    "compat/firecracker/v1.16.0/cpu-template-helper-audit.json",
+                    "tool-operation:cpu-template-helper/fingerprint/compare",
+                ),
+                (
+                    "tools/cpu-template-helper/src/cli.rs",
+                    "pub fn run_cli_with_provider",
+                ),
+                (
+                    "tools/firecracker-capability-audit/src/cpu_template_helper_audit_validate.rs",
+                    "pub fn validate_cpu_template_helper_audit",
+                ),
+            ]),
+            local_references(&[
+                (
+                    "tools/cpu-template-helper/tests/cli.rs",
+                    "fn help_and_version_are_the_only_portable_stdout_successes",
+                ),
+                (
+                    "tools/cpu-template-helper/tests/hvf_e2e.rs",
+                    "fn signed_all_operations_compose_canonical_artifacts",
+                ),
+                (
+                    "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+                    "fn checked_cpu_template_aggregate_compatibility_is_terminal_and_fail_closed",
+                ),
+                (
+                    "tools/firecracker-capability-audit/tests/cpu_template_helper_audit.rs",
+                    "fn checked_cpu_template_helper_audit_is_canonical_and_fail_closed",
+                ),
+            ]),
+        ),
+        "corpus:cpu-templates" => (
+            local_references(&[
+                (
+                    "compat/firecracker/v1.16.0/cpu-template-contract.md",
+                    "Executable custom subset",
+                ),
+                (
+                    "compat/firecracker/v1.16.0/cpu-template-helper-audit.json",
+                    "heterogeneous-fleet-workflow",
+                ),
+                ("tools/cpu-template-helper/src/cli.rs", "enum Command"),
+            ]),
+            local_references(&[
+                (
+                    "crates/hvf/tests/guest_boot.rs",
+                    "fn two_cpu_linux_observes_exact_custom_id_register_mask_results",
+                ),
+                (
+                    "crates/hvf/tests/hvf_lifecycle.rs",
+                    "fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus",
+                ),
+                (
+                    "tools/cpu-template-helper/tests/hvf_e2e.rs",
+                    "fn signed_all_operations_compose_canonical_artifacts",
+                ),
+                (
+                    "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+                    "fn checked_cpu_template_aggregate_compatibility_is_terminal_and_fail_closed",
+                ),
+            ]),
+        ),
+        "semantic.cpu:configuration-templates-and-feature-state" => (
+            local_references(&[
+                (
+                    "compat/firecracker/v1.16.0/cpu-template-contract.md",
+                    "HVF startup and failure atomicity",
+                ),
+                (
+                    "crates/hvf/src/cpu_template.rs",
+                    "pub(crate) fn capture_common_arm64_cpu_template_values",
+                ),
+                ("crates/runtime/src/cpu.rs", "pub struct CustomCpuTemplate"),
+                (
+                    "tools/firecracker-capability-audit/src/cpu_template_helper_audit_validate.rs",
+                    "CPU_TEMPLATE_IMPLEMENTED_FOUNDATION_IDS",
+                ),
+            ]),
+            local_references(&[
+                (
+                    "crates/hvf/tests/guest_boot.rs",
+                    "fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu",
+                ),
+                (
+                    "crates/hvf/tests/hvf_lifecycle.rs",
+                    "fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus",
+                ),
+                (
+                    "crates/runtime/src/lib.rs",
+                    "fn controller_native_v1_create_profile_is_fail_closed",
+                ),
+                (
+                    "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+                    "fn checked_cpu_template_aggregate_compatibility_is_terminal_and_fail_closed",
+                ),
+            ]),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
 fn validate_helper_ownership_contract(contract: &str, errors: &mut Vec<String>) {
     validate_contract_rows(
         contract,
@@ -691,16 +883,29 @@ fn validate_fingerprint_compare_ownership_contract(contract: &str, errors: &mut 
     validate_fingerprint_ownership_contract(contract, errors);
 }
 
+fn validate_aggregate_ownership_contract(contract: &str, errors: &mut Vec<String>) {
+    validate_fingerprint_compare_ownership_contract(contract, errors);
+    validate_contract_rows(
+        contract,
+        Some("#1795"),
+        CPU_TEMPLATE_AGGREGATE_CAPABILITY_IDS,
+        "implemented-and-verified",
+        "#1795 ownership contract",
+        errors,
+    );
+}
+
 fn validate_fingerprint_ownership_rows(contract: &str, errors: &mut Vec<String>) {
-    let retained = CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS
+    let aggregate = CPU_TEMPLATE_AGGREGATE_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
     let terminal = CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
         .into_iter()
         .chain(CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS)
         .collect::<BTreeSet<_>>();
-    let expected = retained.union(&terminal).copied().collect::<BTreeSet<_>>();
+    let expected = aggregate.union(&terminal).copied().collect::<BTreeSet<_>>();
     let mut found = BTreeSet::new();
+    let mut aggregate_dispositions = BTreeSet::new();
     for row in contract.lines().filter(|line| {
         line.starts_with("| `") && (line.contains("| #1794 |") || line.contains("| #1795 |"))
     }) {
@@ -719,8 +924,19 @@ fn validate_fingerprint_ownership_rows(contract: &str, errors: &mut Vec<String>)
                 "CPU-template helper certification found a duplicate retained ownership row: {id}"
             ));
         }
-        let disposition = if retained.contains(id) {
-            "audit-required"
+        let disposition = if aggregate.contains(id) {
+            if row.contains("| `audit-required` |") {
+                aggregate_dispositions.insert("audit-required");
+                "audit-required"
+            } else if row.contains("| `implemented-and-verified` |") {
+                aggregate_dispositions.insert("implemented-and-verified");
+                "implemented-and-verified"
+            } else {
+                errors.push(format!(
+                    "CPU-template helper certification requires a historical or terminal aggregate ownership row: {id}"
+                ));
+                continue;
+            }
         } else if terminal.contains(id) {
             "implemented-and-verified"
         } else {
@@ -739,6 +955,12 @@ fn validate_fingerprint_ownership_rows(contract: &str, errors: &mut Vec<String>)
         errors.push(format!(
             "CPU-template helper certification requires the exact #1794-#1795 fingerprint ownership set: expected {expected:?}, found {found:?}"
         ));
+    }
+    if aggregate_dispositions.len() != 1 {
+        errors.push(
+            "CPU-template helper certification requires one all-or-none historical or terminal #1795 ownership phase"
+                .to_string(),
+        );
     }
 }
 

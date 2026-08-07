@@ -12410,20 +12410,98 @@
     {
       "id": "corpus:cpu-template-helper",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the complete public cpu-template-helper executable, artifact formats, dump, verify, strip, fingerprint, and comparison behavior. It consumes Wave 2's bounded CPU model and paused capture/apply primitives without treating those foundations as helper delivery.",
+      "summary": "The complete public cpu-template-helper executable is certified across all five operations and thirteen arguments, strict canonical artifacts, signed effective-state capture, portable transforms, installed help/errors/exits, collision and nonmutation behavior, platform failures, redaction, and the exact runtime foundations consumed by the aggregate.",
       "source_refs": [
         "corpus:cpu-template-helper"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-audit.json",
+          "anchor": "tool-operation:cpu-template-helper/fingerprint/compare"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "pub fn run_cli_with_provider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/cpu_template_helper_audit_validate.rs",
+          "anchor": "pub fn validate_cpu_template_helper_audit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_aggregate_compatibility_is_terminal_and_fail_closed"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/cpu_template_helper_audit.rs",
+          "anchor": "fn checked_cpu_template_helper_audit_is_canonical_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "corpus:cpu-templates",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the final pinned CPU-template corpus audit across heterogeneous-fleet outcomes, helper integration, expert security guidance, and architecture-wide static/custom behavior after consuming Wave 6 portability evidence. Wave 2 supplies only the terminal bounded arm64 runtime policy.",
+      "summary": "The applicable CPU-template corpus is terminal across bounded arm64 static/custom policy, public creation, inspection, strip, verify, and platform-tagged comparison workflows, expert security guidance, architecture exclusions, and deterministic fleet diagnostics. Distinct-host safety/equivalence, migration, snapshot portability, and template correctness remain explicit nonclaims rather than unverified success promises.",
       "source_refs": [
         "corpus:cpu-templates"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "Executable custom subset"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-helper-audit.json",
+          "anchor": "heterogeneous-fleet-workflow"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "enum Command"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn two_cpu_linux_observes_exact_custom_id_register_mask_results"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_all_operations_compose_canonical_artifacts"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_aggregate_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "corpus:design",
@@ -14857,12 +14935,56 @@
     {
       "id": "semantic.cpu:configuration-templates-and-feature-state",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the aggregate CPU configuration/template/feature claim because it explicitly includes applicable helper operations plus fleet and persisted-artifact outcomes. It consumes Wave 2's terminal bounded arm64 schema, modifier policy, boot precedence, and capture/apply primitives and Wave 6 portability evidence.",
+      "summary": "CPU configuration, template selection, and effective feature state are terminal across the exact supported API/schema foundations, exact x86/KVM/static platform exclusions, transactional static/custom replacement, all-vCPU common-baseline apply/readback, primary and secondary boot precedence, guest-visible masks, helper artifacts, and the native-v1 no-template create/load boundary.",
       "source_refs": [
         "corpus:cpu-template-helper",
         "corpus:cpu-templates"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-contract.md",
+          "anchor": "HVF startup and failure atomicity"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/cpu_template.rs",
+          "anchor": "pub(crate) fn capture_common_arm64_cpu_template_values"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/cpu.rs",
+          "anchor": "pub struct CustomCpuTemplate"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/cpu_template_helper_audit_validate.rs",
+          "anchor": "CPU_TEMPLATE_IMPLEMENTED_FOUNDATION_IDS"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn boots_firecracker_kernel_and_executes_userspace_on_secondary_cpu"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/hvf_lifecycle.rs",
+          "anchor": "fn applies_and_verifies_mixed_width_arm64_cpu_template_on_two_hvf_vcpus"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/lib.rs",
+          "anchor": "fn controller_native_v1_create_profile_is_fail_closed"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_aggregate_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "semantic.cross-capability:state-errors-metrics-security-and-snapshots",

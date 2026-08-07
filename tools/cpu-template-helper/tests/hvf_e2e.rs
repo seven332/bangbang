@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bangbang_api::config::parse_cpu_config_document;
 use bangbang_cpu_template_helper::HelperExitClass;
 use bangbang_cpu_template_helper::cli::run_cli_with_provider;
-use bangbang_cpu_template_helper::document::decode_cpu_template_document;
+use bangbang_cpu_template_helper::document::{CpuTemplateDocument, decode_cpu_template_document};
 use bangbang_cpu_template_helper::fingerprint::{
     CpuFingerprintDocument, CpuFingerprintPlatform, decode_cpu_fingerprint_document,
 };
@@ -180,6 +180,219 @@ fn assert_canonical_fingerprint(path: &Path) -> CpuFingerprintDocument {
     assert!(contents.contains("\"target\":"));
     assert!(contents.contains("\"cpu_family\":"));
     document
+}
+
+fn assert_canonical_private_template(path: &Path) -> CpuTemplateDocument {
+    let metadata = fs::metadata(path).expect("CPU-template output should exist");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    let contents = fs::read_to_string(path).expect("CPU-template output should be UTF-8");
+    let document = decode_cpu_template_document(&contents)
+        .expect("CPU-template output should strictly reparse");
+    parse_cpu_config_document(&contents)
+        .expect("CPU-template output should re-enter the public CPU parser");
+    assert_eq!(
+        document
+            .canonical_bytes()
+            .expect("CPU-template output should re-encode"),
+        contents.as_bytes()
+    );
+    document
+}
+
+#[test]
+fn signed_all_operations_compose_canonical_artifacts() {
+    let directory = TestDirectory::new("all-operations");
+    let default_config = directory.0.join("default-config.json");
+    let none_config = directory.0.join("none-config.json");
+    write_config(&default_config, 2, None);
+    write_static_config(&none_config, 2, "None");
+    let default_config_bytes =
+        fs::read(&default_config).expect("default config should be readable");
+    let none_config_bytes = fs::read(&none_config).expect("None config should be readable");
+
+    let default_template = directory.0.join("default-template.json");
+    let none_template = directory.0.join("none-template.json");
+    for (config, output) in [
+        (&default_config, &default_template),
+        (&none_config, &none_template),
+    ] {
+        let mut command = Command::new(signed_helper());
+        command
+            .args(["template", "dump", "--config"])
+            .arg(config)
+            .args(["--output"])
+            .arg(output)
+            .current_dir(&directory.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        assert_silent_success(run_with_timeout(&mut command));
+    }
+    let default_document = assert_canonical_private_template(&default_template);
+    let none_document = assert_canonical_private_template(&none_template);
+    assert_eq!(none_document, default_document);
+
+    let default_template_bytes =
+        fs::read(&default_template).expect("default template should be readable");
+    let none_template_bytes = fs::read(&none_template).expect("None template should be readable");
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["template", "strip", "--paths"])
+        .arg(&default_template)
+        .arg(&none_template)
+        .args(["--suffix", ".portable"])
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    assert_silent_success(run_with_timeout(&mut command));
+    assert_eq!(
+        fs::read(&default_template).expect("default template should remain readable"),
+        default_template_bytes
+    );
+    assert_eq!(
+        fs::read(&none_template).expect("None template should remain readable"),
+        none_template_bytes
+    );
+    for output in [
+        directory.0.join("default-template.portable.json"),
+        directory.0.join("none-template.portable.json"),
+    ] {
+        assert!(
+            assert_canonical_private_template(&output)
+                .modifiers()
+                .is_empty(),
+            "equal effective templates should strip to an empty document"
+        );
+    }
+
+    let sp_el0 = default_document
+        .modifiers()
+        .iter()
+        .find(|entry| entry.identity() == KVM_REG_ARM64_CORE_SP_EL0)
+        .expect("SP_EL0 should be captured");
+    let q0 = kvm_reg_arm64_core_q(0).expect("Q0 identity should exist");
+    let custom_template = directory.0.join("custom-template.json");
+    fs::write(
+        &custom_template,
+        template(&[
+            modifier(KVM_REG_ARM64_CORE_FPCR, 32, None),
+            modifier(KVM_REG_ARM64_CORE_SP_EL0, 64, Some(sp_el0.value() & 1 == 0)),
+            modifier(q0, 128, None),
+        ]),
+    )
+    .expect("mixed-width custom template should be written");
+    let custom_template_bytes =
+        fs::read(&custom_template).expect("custom template should be readable");
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["template", "verify", "--config"])
+        .arg(&default_config)
+        .args(["--template"])
+        .arg(&custom_template)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    assert_silent_success(run_with_timeout(&mut command));
+
+    let default_fingerprint = directory.0.join("default-fingerprint.json");
+    let none_fingerprint = directory.0.join("none-fingerprint.json");
+    let custom_fingerprint = directory.0.join("custom-fingerprint.json");
+    for (config, template, output) in [
+        (&default_config, None, &default_fingerprint),
+        (&none_config, None, &none_fingerprint),
+        (
+            &default_config,
+            Some(custom_template.as_path()),
+            &custom_fingerprint,
+        ),
+    ] {
+        let mut command = Command::new(signed_helper());
+        command
+            .args(["fingerprint", "dump", "--config"])
+            .arg(config);
+        if let Some(template) = template {
+            command.args(["--template"]).arg(template);
+        }
+        command
+            .args(["--output"])
+            .arg(output)
+            .current_dir(&directory.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        assert_silent_success(run_with_timeout(&mut command));
+    }
+    let default_fingerprint_document = assert_canonical_fingerprint(&default_fingerprint);
+    let none_fingerprint_document = assert_canonical_fingerprint(&none_fingerprint);
+    let custom_fingerprint_document = assert_canonical_fingerprint(&custom_fingerprint);
+    assert_eq!(
+        none_fingerprint_document.guest_cpu_config(),
+        default_fingerprint_document.guest_cpu_config()
+    );
+    assert_ne!(
+        custom_fingerprint_document.guest_cpu_config(),
+        default_fingerprint_document.guest_cpu_config()
+    );
+
+    let fingerprint_inputs = [
+        fs::read(&default_fingerprint).expect("default fingerprint should be readable"),
+        fs::read(&none_fingerprint).expect("None fingerprint should be readable"),
+        fs::read(&custom_fingerprint).expect("custom fingerprint should be readable"),
+    ];
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["fingerprint", "compare", "--prev"])
+        .arg(&default_fingerprint)
+        .args(["--curr"])
+        .arg(&none_fingerprint)
+        .args(["--filters", "guest_cpu_config"])
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    assert_silent_success(run_with_timeout(&mut command));
+
+    let compare_difference = || {
+        let mut command = Command::new(signed_helper());
+        command
+            .args(["fingerprint", "compare", "--prev"])
+            .arg(&default_fingerprint)
+            .args(["--curr"])
+            .arg(&custom_fingerprint)
+            .args(["--filters", "guest_cpu_config"])
+            .current_dir(&directory.0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        run_with_timeout(&mut command)
+    };
+    let first = compare_difference();
+    let second = compare_difference();
+    for output in [&first, &second] {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.len() < 4_096);
+    }
+    assert_eq!(second.stderr, first.stderr);
+    let diagnostic = String::from_utf8(first.stderr).expect("difference stderr should be UTF-8");
+    assert!(diagnostic.starts_with("{\n  \"differences\": ["));
+    assert_eq!(
+        diagnostic.matches("\"name\": \"guest_cpu_config\"").count(),
+        1
+    );
+    assert!(diagnostic.contains(&format!("0x{KVM_REG_ARM64_CORE_SP_EL0:016x}")));
+    assert!(diagnostic.ends_with("}\n"));
+    assert!(!diagnostic.contains("default-fingerprint"));
+    assert!(!diagnostic.contains("custom-fingerprint"));
+
+    assert_eq!(fs::read(&default_config).unwrap(), default_config_bytes);
+    assert_eq!(fs::read(&none_config).unwrap(), none_config_bytes);
+    assert_eq!(fs::read(&custom_template).unwrap(), custom_template_bytes);
+    assert_eq!(
+        fs::read(&default_fingerprint).unwrap(),
+        fingerprint_inputs[0]
+    );
+    assert_eq!(fs::read(&none_fingerprint).unwrap(), fingerprint_inputs[1]);
+    assert_eq!(
+        fs::read(&custom_fingerprint).unwrap(),
+        fingerprint_inputs[2]
+    );
 }
 
 #[test]

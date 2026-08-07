@@ -20,9 +20,9 @@ exactly these three checked identities:
 
 The scoped `validate --cpu-template-strip-final` gate requires the prior seven
 dump/verify identities and these exact three rows to be terminal with exact
-evidence. It also requires all eleven fingerprint, helper-corpus,
-template-corpus, and aggregate CPU-template identities owned by #1794 and
-#1795 to remain evidence-free `audit-required` handoffs.
+evidence. It remains valid through the exact ordered #1866, #1867, and #1795
+terminal transitions without borrowing their evidence, and rejects every
+partial or reordered transition.
 
 ## Command and input closure
 
@@ -123,4 +123,7 @@ pre-stage and split-commit boundary in both publication modes, racing winners,
 identity replacement, reverse best-effort rollback, unknown-stage
 preservation, durability uncertainty, and cleanup uncertainty across multiple
 directories. The dedicated audit gate pins the exact three terminal identities
-and the eleven retained later scopes.
+and remains valid after every later helper transition. The aggregate
+[`cpu-template-helper-audit.json`](cpu-template-helper-audit.json) consumes this
+portable operation without weakening its explicit global/crash-atomic
+nonclaim.

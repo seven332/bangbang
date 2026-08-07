@@ -5,7 +5,8 @@ This document is the checked terminal contract for #1867, the second and final
 `cpu-template-helper fingerprint compare` command, Bangbang's platform-honest
 field vocabulary, strict persisted inputs, deterministic selected-value
 diagnostic, portable execution, and scoped capability transition. Fingerprint
-dump remains owned by #1866; corpus and aggregate certification remain #1795.
+dump remains owned by #1866; #1795 terminally composes the corpus and aggregate
+scope without changing this command's four-row ownership.
 
 ## Pinned upstream boundary
 
@@ -215,8 +216,8 @@ unsupported skips so earlier dump and effective-HVF behavior cannot regress.
 
 The scoped audit accepts only the ordered historical, #1792 helper, #1793
 strip, #1866 fingerprint-dump, and #1867 fingerprint-compare phases. It rejects
-partial evidence, reordered dependencies, and aggregate leakage. Every earlier
-scoped gate remains valid at the terminal compare phase.
+partial evidence, reordered dependencies, and partial aggregate transitions.
+Every earlier scoped gate remains valid at the terminal #1795 aggregate phase.
 
 ## Terminal certification
 
@@ -228,5 +229,8 @@ scoped gate remains valid at the terminal compare phase.
 | `tool-operation:cpu-template-helper/fingerprint/compare` | `implemented-and-verified` | Typed platform admission, canonical selected-value diagnostic, exact guest strip, portable zero-provider execution, tests, and scoped audit above. |
 
 `corpus:cpu-template-helper`, `corpus:cpu-templates`, and
-`semantic.cpu:configuration-templates-and-feature-state` remain exact
-evidence-free `audit-required` handoffs to #1795.
+`semantic.cpu:configuration-templates-and-feature-state` are terminally
+composed by the checked
+[`cpu-template-helper-audit.json`](cpu-template-helper-audit.json). The
+aggregate result still does not infer distinct-host equivalence, artifact
+authenticity, migration safety, or snapshot portability from comparison.

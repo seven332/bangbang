@@ -178,6 +178,7 @@ device gate verifies that exact profile set, its resolvable evidence, the
 
 The terminal tracing, CPU-template dump/verify, portable CPU-template strip,
 platform-tagged CPU-fingerprint dump, deterministic fingerprint compare,
+aggregate CPU-template workflow,
 69-field API/process,
 231-field device, and ten-scenario aggregate metrics scopes have separate
 fail-closed certification gates:
@@ -188,13 +189,21 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-te
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
 ```
 
-The aggregate gate promotes exactly the metrics corpus and lifecycle semantic.
-Its checked ledger covers initial, real 60-second, explicit, terminal,
+The CPU-template aggregate gate promotes exactly its two corpus rows and CPU
+semantic after validating the five-operation producer ledger, implemented and
+platform-impossible foundations, signed artifact composition, runtime
+selection/application/boot behavior, native-v1 no-template boundary, and the
+bounded heterogeneous-fleet workflow. It does not infer distinct-host safety,
+artifact authenticity, migration safety, or snapshot portability.
+
+The metrics aggregate gate promotes exactly the metrics corpus and lifecycle
+semantic. Its checked ledger covers initial, real 60-second, explicit, terminal,
 backpressure, retry, configured cardinality, snapshot-destination freshness,
 hotplug/reuse, and process isolation behavior without claiming durable or
 exactly-once output.

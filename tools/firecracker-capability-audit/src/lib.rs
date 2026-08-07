@@ -1,5 +1,7 @@
 //! Firecracker capability inventory parsing, validation, and source comparison.
 
+mod cpu_template_helper_audit_model;
+mod cpu_template_helper_audit_validate;
 mod cpu_template_helper_certify;
 mod logger_certify;
 mod logger_model;
@@ -25,11 +27,23 @@ mod tracing_validate;
 mod upstream;
 mod validate;
 
+pub use cpu_template_helper_audit_model::{
+    CpuTemplateHelperArtifact, CpuTemplateHelperAudit, CpuTemplateHelperExecution,
+    CpuTemplateHelperFoundations, CpuTemplateHelperNonclaim, CpuTemplateHelperOperationEvidence,
+    CpuTemplateHelperOperationRecord, CpuTemplateHelperOutcome, CpuTemplateHelperProvider,
+    CpuTemplateHelperScenario, CpuTemplateHelperScenarioRecord, CpuTemplateHelperSelection,
+};
+pub use cpu_template_helper_audit_validate::{
+    CPU_TEMPLATE_HELPER_OPERATION_IDS, CPU_TEMPLATE_HELPER_SCENARIOS,
+    CPU_TEMPLATE_IMPLEMENTED_FOUNDATION_IDS, CPU_TEMPLATE_PLATFORM_IMPOSSIBLE_FOUNDATION_IDS,
+    validate_cpu_template_helper_audit,
+};
 pub use cpu_template_helper_certify::{
+    CPU_TEMPLATE_AGGREGATE_CAPABILITY_IDS,
     CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS,
     CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
-    CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS, CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS,
-    CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+    CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+    CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS, validate_cpu_template_compatibility,
     validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
@@ -124,6 +138,8 @@ pub const METRICS_DEVICE_PRODUCER_AUDIT_SCHEMA_VERSION: u32 = 1;
 pub const METRICS_LIFECYCLE_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Current checked developer-tracing audit format.
 pub const TRACING_AUDIT_SCHEMA_VERSION: u32 = 1;
+/// Current checked aggregate CPU-template-helper audit format.
+pub const CPU_TEMPLATE_HELPER_AUDIT_SCHEMA_VERSION: u32 = 1;
 /// Repository-relative generated source manifest path.
 pub const SOURCE_MANIFEST_PATH: &str = "compat/firecracker/v1.16.0/source-manifest.json";
 /// Repository-relative human capability overlay path.
@@ -147,6 +163,9 @@ pub const METRICS_LIFECYCLE_AUDIT_PATH: &str =
     "compat/firecracker/v1.16.0/metrics-lifecycle-audit.json";
 /// Repository-relative developer-tracing audit path.
 pub const TRACING_AUDIT_PATH: &str = "compat/firecracker/v1.16.0/tracing-audit.json";
+/// Repository-relative aggregate CPU-template-helper audit path.
+pub const CPU_TEMPLATE_HELPER_AUDIT_PATH: &str =
+    "compat/firecracker/v1.16.0/cpu-template-helper-audit.json";
 
 /// Error produced while reading, parsing, or deriving an inventory.
 #[derive(Debug)]
@@ -263,6 +282,18 @@ pub fn read_tracing_audit(path: &Path) -> Result<TracingAudit, AuditError> {
         .map_err(|error| AuditError::new(format!("failed to parse tracing audit: {error}")))
 }
 
+/// Read and parse the checked aggregate CPU-template-helper audit.
+pub fn read_cpu_template_helper_audit(path: &Path) -> Result<CpuTemplateHelperAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read CPU-template helper audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse CPU-template helper audit: {error}"
+        ))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -332,6 +363,13 @@ pub fn metrics_lifecycle_audit_json(audit: &MetricsLifecycleAudit) -> Result<Vec
 /// Serialize the checked developer-tracing audit using canonical pretty JSON.
 pub fn tracing_audit_json(audit: &TracingAudit) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "tracing audit")
+}
+
+/// Serialize the aggregate CPU-template-helper audit using canonical pretty JSON.
+pub fn cpu_template_helper_audit_json(
+    audit: &CpuTemplateHelperAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "CPU-template helper audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {
