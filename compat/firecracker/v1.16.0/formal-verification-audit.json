@@ -139,17 +139,17 @@
         "--solver",
         "kissat"
       ],
-      "owner": "crates/runtime/src/token_bucket.rs::token_bucket_refill_native",
+      "owner": "crates/runtime/src/token_bucket.rs::token_bucket_refill_bounded_millis",
       "assumptions": [
         "The current budget does not exceed the configured bucket size.",
         "The elapsed logical refill time does not exceed one complete refill interval."
       ],
       "bounds": [
         "1 <= size <= 4096, 1 <= refill_time_millis <= 1000, 0 <= elapsed_millis <= refill_time_millis, refill/elapsed nanoseconds equal the millisecond values times 1000000, and budget <= size.",
-        "Symbolic u16 size/budget/refill-millisecond/elapsed-millisecond sources exactly cover those admitted intervals before widening to the production u64 types.",
-        "The scaled elapsed and adjusted-time numerators are each at most 4096000000000, so the native helper cannot return None."
+        "Symbolic u16 size/budget/refill-millisecond/elapsed-millisecond sources exactly cover those admitted intervals in the production bounded-millisecond helper.",
+        "The token numerator is at most 4096000 and the adjusted remainder in nanoseconds is below 4096000000, so every proved arithmetic operation fits u32 before the exact u64 nanosecond result is assembled."
       ],
-      "invariant": "The native-width refill path is available for every bounded input; classification is exact at zero-token and full-interval boundaries, while a partial refill never decreases or overfills budget and consumes a positive logical duration smaller than the interval and no greater than elapsed time.",
+      "invariant": "The bounded whole-millisecond production path classifies zero-token and full-interval inputs exactly, while a partial refill never decreases or overfills budget and consumes a positive logical duration smaller than the interval and no greater than elapsed time.",
       "implementation": [
         {
           "kind": "local",
