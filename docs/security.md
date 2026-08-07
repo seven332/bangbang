@@ -1890,6 +1890,26 @@ is resource-specific:
   authorization, or snapshot portability claim. Its exact fact bounds,
   platform variants, privacy consequences, and signed evidence are checked in
   `compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md`.
+  Portable `fingerprint compare` reads two untrusted persisted artifacts
+  through the same no-follow, nonblocking, regular UTF-8 and 1 MiB boundary,
+  then admits both through that strict tagged schema before inspecting a fact.
+  Cross-platform pairs and wrong-platform filters fail rather than treating
+  absent Linux/macOS provenance as interchangeable null. Same-path and
+  hard-link aliases are allowed because the operation is read-only; each read
+  binds its own opened descriptor, but the result is not a simultaneous
+  filesystem snapshot and does not protect against an external in-place writer.
+  Unknown, empty, and duplicate filter syntax fails before path access.
+  A detected difference is the sole helper stderr path that intentionally
+  includes artifact values: one closed enum selects the exposed scalar/null or
+  stripped guest values, the result is fully serialized and capped at 1 MiB
+  before writing, and unselected fields, paths, malformed bytes, schema
+  identities, and errors remain category-only. Custom `Debug` output redacts
+  the complete diagnostic. Equal input is silent; compare never calls a host
+  or effective provider and never publishes a file. The result does not
+  authenticate either artifact, prove freshness, validate a CPU template,
+  authorize migration, establish snapshot portability, or decide whether a
+  change is consequential. The checked boundary is
+  `compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md`.
   Portable `template strip` does not construct a provider or VM, but it retains
   the invoking user's direct filesystem authority over every supplied parent.
   All inputs and outputs are descriptor/identity bound; unsafe suffixes,

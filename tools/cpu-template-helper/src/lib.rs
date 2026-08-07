@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod document;
 pub mod fingerprint;
+pub mod fingerprint_compare;
 pub mod host;
 pub mod input;
 pub mod profile;

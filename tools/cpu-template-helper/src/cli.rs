@@ -13,8 +13,13 @@ use crate::document::{
     CpuTemplateDocumentError, CpuTemplateEncodeError, decode_cpu_template_document,
 };
 use crate::fingerprint::{
-    CpuFingerprintOperationError, HostFingerprint, HostFingerprintProvider,
-    HostFingerprintProviderError, dump_with_providers as dump_fingerprint_with_providers,
+    CpuFingerprintDocumentError, CpuFingerprintOperationError, HostFingerprint,
+    HostFingerprintProvider, HostFingerprintProviderError, decode_cpu_fingerprint_document,
+    dump_with_providers as dump_fingerprint_with_providers,
+};
+use crate::fingerprint_compare::{
+    CpuFingerprintCompareError, CpuFingerprintCompareOutcome, CpuFingerprintField,
+    CpuFingerprintFilterSelection, compare_cpu_fingerprints,
 };
 use crate::input::{
     InputError, StripInputError, prepare_strip_input, read_regular_utf8,
@@ -105,6 +110,18 @@ enum FingerprintOperation {
         #[arg(short, long, value_name = "PATH", default_value = "fingerprint.json")]
         output: PathBuf,
     },
+    /// Compare two persisted fingerprints with optional field selection.
+    Compare {
+        /// Previous CPU-fingerprint document.
+        #[arg(short, long, value_name = "PATH")]
+        prev: PathBuf,
+        /// Current CPU-fingerprint document.
+        #[arg(short, long, value_name = "PATH")]
+        curr: PathBuf,
+        /// Fields to compare; absence selects every applicable field.
+        #[arg(short, long, value_enum, value_name = "FIELD", num_args = 1..)]
+        filters: Option<Vec<CpuFingerprintField>>,
+    },
 }
 
 /// Run one complete public command with an explicitly supplied effective
@@ -161,8 +178,17 @@ where
         }
     };
 
+    if !filter_arguments_are_valid(&cli) {
+        let _ = writeln!(stderr, "{INVOCATION_ERROR}");
+        return HelperExitClass::InvocationFailure;
+    }
+
     match execute(cli, host_provider, effective_provider) {
-        Ok(()) => HelperExitClass::Success,
+        Ok(CliExecutionOutcome::Complete) => HelperExitClass::Success,
+        Ok(CliExecutionOutcome::Differences(bytes)) => {
+            let _ = stderr.write_all(&bytes);
+            HelperExitClass::OperationalFailure
+        }
         Err(error) => {
             let _ = writeln!(stderr, "cpu-template-helper: {error}");
             HelperExitClass::OperationalFailure
@@ -174,7 +200,7 @@ fn execute(
     cli: Cli,
     host_provider: &mut impl HostFingerprintProvider,
     effective_provider: &mut impl EffectiveCpuTemplateProvider,
-) -> Result<(), CliOperationError> {
+) -> Result<CliExecutionOutcome, CliOperationError> {
     match cli.command {
         Command::Template(TemplateOperation::Dump {
             config,
@@ -184,7 +210,8 @@ fn execute(
             let request = prepare_from_paths(config.as_deref(), template.as_deref())?;
             let bytes = dump_with_provider(effective_provider, &request)
                 .map_err(CliOperationError::Operation)?;
-            publish_new_artifact(&output, &bytes).map_err(CliOperationError::Publication)
+            publish_new_artifact(&output, &bytes).map_err(CliOperationError::Publication)?;
+            Ok(CliExecutionOutcome::Complete)
         }
         Command::Template(TemplateOperation::Strip { paths, suffix }) => {
             let mut prepared_inputs = Vec::with_capacity(paths.len());
@@ -207,11 +234,14 @@ fn execute(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(CliOperationError::StripEncoding)?;
             publish_strip_artifacts(prepared_inputs, artifacts)
-                .map_err(CliOperationError::StripPublication)
+                .map_err(CliOperationError::StripPublication)?;
+            Ok(CliExecutionOutcome::Complete)
         }
         Command::Template(TemplateOperation::Verify { config, template }) => {
             let request = prepare_from_paths(config.as_deref(), template.as_deref())?;
-            verify_with_provider(effective_provider, &request).map_err(CliOperationError::Operation)
+            verify_with_provider(effective_provider, &request)
+                .map_err(CliOperationError::Operation)?;
+            Ok(CliExecutionOutcome::Complete)
         }
         Command::Fingerprint(FingerprintOperation::Dump {
             config,
@@ -222,9 +252,53 @@ fn execute(
             let bytes =
                 dump_fingerprint_with_providers(host_provider, effective_provider, &request)
                     .map_err(CliOperationError::Fingerprint)?;
-            publish_new_artifact(&output, &bytes).map_err(CliOperationError::Publication)
+            publish_new_artifact(&output, &bytes).map_err(CliOperationError::Publication)?;
+            Ok(CliExecutionOutcome::Complete)
+        }
+        Command::Fingerprint(FingerprintOperation::Compare {
+            prev,
+            curr,
+            filters,
+        }) => {
+            let filters = filters.map_or_else(
+                || Ok(CpuFingerprintFilterSelection::all_applicable()),
+                |filters| {
+                    CpuFingerprintFilterSelection::explicit(filters)
+                        .map_err(CliOperationError::FingerprintFilter)
+                },
+            )?;
+            let prev = read_regular_utf8(&prev).map_err(CliOperationError::Input)?;
+            let prev = decode_cpu_fingerprint_document(&prev)
+                .map_err(CliOperationError::FingerprintDocument)?;
+            let curr = read_regular_utf8(&curr).map_err(CliOperationError::Input)?;
+            let curr = decode_cpu_fingerprint_document(&curr)
+                .map_err(CliOperationError::FingerprintDocument)?;
+            match compare_cpu_fingerprints(&prev, &curr, &filters)
+                .map_err(CliOperationError::FingerprintCompare)?
+            {
+                CpuFingerprintCompareOutcome::Equal => Ok(CliExecutionOutcome::Complete),
+                CpuFingerprintCompareOutcome::Different(bytes) => {
+                    Ok(CliExecutionOutcome::Differences(bytes))
+                }
+            }
         }
     }
+}
+
+fn filter_arguments_are_valid(cli: &Cli) -> bool {
+    let Command::Fingerprint(FingerprintOperation::Compare {
+        filters: Some(filters),
+        ..
+    }) = &cli.command
+    else {
+        return true;
+    };
+    CpuFingerprintFilterSelection::explicit(filters.clone()).is_ok()
+}
+
+enum CliExecutionOutcome {
+    Complete,
+    Differences(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -255,6 +329,9 @@ fn prepare_from_paths(
 #[derive(Debug)]
 enum CliOperationError {
     Fingerprint(CpuFingerprintOperationError),
+    FingerprintCompare(CpuFingerprintCompareError),
+    FingerprintDocument(CpuFingerprintDocumentError),
+    FingerprintFilter(crate::fingerprint_compare::CpuFingerprintFilterError),
     Input(InputError),
     StripInput(StripInputError),
     StripDocument(CpuTemplateDocumentError),
@@ -270,6 +347,9 @@ impl fmt::Display for CliOperationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fingerprint(source) => write!(formatter, "{source}"),
+            Self::FingerprintCompare(source) => write!(formatter, "{source}"),
+            Self::FingerprintDocument(source) => write!(formatter, "{source}"),
+            Self::FingerprintFilter(source) => write!(formatter, "{source}"),
             Self::Input(source) => write!(formatter, "{source}"),
             Self::StripInput(source) => write!(formatter, "{source}"),
             Self::StripDocument(source) => write!(formatter, "{source}"),
@@ -295,7 +375,8 @@ mod tests {
 
     use super::*;
     use crate::fingerprint::{
-        CpuFingerprintPlatform, HostFingerprint, decode_cpu_fingerprint_document,
+        CpuFingerprintDocument, CpuFingerprintPlatform, HostFingerprint,
+        decode_cpu_fingerprint_document,
     };
     use crate::profile::{
         ArmCpuTemplateValue, EffectiveCpuTemplateProfile, EffectiveCpuTemplateProfileEntry,
@@ -401,6 +482,25 @@ mod tests {
             Some(0x1b588bb3),
         )
         .expect("fixture host should validate")
+    }
+
+    fn write_macos_fingerprint(path: &Path, release: &str, product: Option<&str>) {
+        let host = HostFingerprint::try_macos(
+            "Darwin".to_owned(),
+            release.to_owned(),
+            "arm64".to_owned(),
+            product.map(str::to_owned),
+            None,
+            None,
+        )
+        .expect("fixture host should validate");
+        let guest =
+            decode_cpu_template_document(EMPTY_TEMPLATE).expect("empty template should decode");
+        let bytes = CpuFingerprintDocument::new_current(host, guest)
+            .expect("fingerprint should construct")
+            .canonical_bytes()
+            .expect("fingerprint should encode");
+        fs::write(path, bytes).expect("fingerprint fixture should be written");
     }
 
     #[test]
@@ -639,5 +739,196 @@ mod tests {
             "cpu-template-helper: host fingerprint capture failed\n"
         );
         assert!(!String::from_utf8_lossy(&stderr).contains("product"));
+    }
+
+    #[test]
+    fn fingerprint_compare_is_ordered_portable_and_provider_free() {
+        let directory = TestDirectory::new();
+        let prev = directory.0.join("previous.json");
+        let curr = directory.0.join("current.json");
+        write_macos_fingerprint(&prev, "25.4.0", None);
+        write_macos_fingerprint(&curr, "25.5.0", Some("Mac16,1"));
+        let mut host_provider = FakeHostProvider {
+            host: baseline_host(),
+            error: Some(HostFingerprintProviderError::Product),
+            calls: 0,
+            events: None,
+        };
+        let mut effective_provider = FakeProvider {
+            profile: baseline_profile(),
+            error: Some(EffectiveProfileProviderError::Capture),
+            calls: 0,
+            events: None,
+        };
+        let args = vec![
+            OsString::from("cpu-template-helper"),
+            OsString::from("fingerprint"),
+            OsString::from("compare"),
+            OsString::from("--prev"),
+            prev.clone().into_os_string(),
+            OsString::from("--curr"),
+            curr.clone().into_os_string(),
+            OsString::from("--filters"),
+            OsString::from("macos_product"),
+            OsString::from("kernel_release"),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_cli_with_providers(
+                args,
+                &mut host_provider,
+                &mut effective_provider,
+                &mut stdout,
+                &mut stderr,
+            ),
+            HelperExitClass::OperationalFailure
+        );
+        assert!(stdout.is_empty());
+        let diagnostic = String::from_utf8(stderr).expect("diagnostic should be UTF-8");
+        let kernel = diagnostic
+            .find("kernel_release")
+            .expect("kernel difference should be present");
+        let product = diagnostic
+            .find("macos_product")
+            .expect("product difference should be present");
+        assert!(kernel < product);
+        assert!(diagnostic.ends_with("}\n"));
+        assert_eq!(host_provider.calls, 0);
+        assert_eq!(effective_provider.calls, 0);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let args = vec![
+            OsString::from("cpu-template-helper"),
+            OsString::from("fingerprint"),
+            OsString::from("compare"),
+            OsString::from("-p"),
+            prev.into_os_string(),
+            OsString::from("-c"),
+            curr.into_os_string(),
+            OsString::from("-f"),
+            OsString::from("producer_version"),
+        ];
+        assert_eq!(
+            run_cli_with_providers(
+                args,
+                &mut host_provider,
+                &mut effective_provider,
+                &mut stdout,
+                &mut stderr,
+            ),
+            HelperExitClass::Success
+        );
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(host_provider.calls, 0);
+        assert_eq!(effective_provider.calls, 0);
+    }
+
+    #[test]
+    fn duplicate_compare_filters_fail_as_invocation_before_path_or_provider_access() {
+        let mut host_provider = FakeHostProvider {
+            host: baseline_host(),
+            error: Some(HostFingerprintProviderError::Product),
+            calls: 0,
+            events: None,
+        };
+        let mut effective_provider = FakeProvider {
+            profile: baseline_profile(),
+            error: Some(EffectiveProfileProviderError::Capture),
+            calls: 0,
+            events: None,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run_cli_with_providers(
+                [
+                    "cpu-template-helper",
+                    "fingerprint",
+                    "compare",
+                    "--prev",
+                    "private-missing-prev",
+                    "--curr",
+                    "private-missing-curr",
+                    "--filters",
+                    "kernel_release",
+                    "kernel_release",
+                ],
+                &mut host_provider,
+                &mut effective_provider,
+                &mut stdout,
+                &mut stderr,
+            ),
+            HelperExitClass::InvocationFailure
+        );
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&stderr),
+            format!("{INVOCATION_ERROR}\n")
+        );
+        assert!(!String::from_utf8_lossy(&stderr).contains("private"));
+        assert_eq!(host_provider.calls, 0);
+        assert_eq!(effective_provider.calls, 0);
+    }
+
+    #[test]
+    fn compare_stream_failure_retains_the_difference_exit_without_provider_calls() {
+        #[derive(Debug)]
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected write failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let directory = TestDirectory::new();
+        let prev = directory.0.join("previous.json");
+        let curr = directory.0.join("current.json");
+        write_macos_fingerprint(&prev, "25.4.0", None);
+        write_macos_fingerprint(&curr, "25.5.0", None);
+        let mut host_provider = FakeHostProvider {
+            host: baseline_host(),
+            error: None,
+            calls: 0,
+            events: None,
+        };
+        let mut effective_provider = FakeProvider {
+            profile: baseline_profile(),
+            error: None,
+            calls: 0,
+            events: None,
+        };
+        let args = vec![
+            OsString::from("cpu-template-helper"),
+            OsString::from("fingerprint"),
+            OsString::from("compare"),
+            OsString::from("--prev"),
+            prev.into_os_string(),
+            OsString::from("--curr"),
+            curr.into_os_string(),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = FailingWriter;
+        assert_eq!(
+            run_cli_with_providers(
+                args,
+                &mut host_provider,
+                &mut effective_provider,
+                &mut stdout,
+                &mut stderr,
+            ),
+            HelperExitClass::OperationalFailure
+        );
+        assert!(stdout.is_empty());
+        assert_eq!(host_provider.calls, 0);
+        assert_eq!(effective_provider.calls, 0);
     }
 }

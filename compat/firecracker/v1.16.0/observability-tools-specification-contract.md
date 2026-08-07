@@ -159,13 +159,25 @@ strict inputs, canonical outputs, and per-path atomic multi-directory
 publication with explicit rollback and uncertainty semantics. It does not
 claim a global or crash-atomic multi-path transaction.
 
-Both gates pin all eleven #1794–#1795 fingerprint, corpus, and aggregate rows
-to their exact evidence-free `audit-required` handoff. They do not infer a
-host fingerprint, cross-host portability, guest execution, or completion of
-those separately owned scopes. The detailed command, format, publication, and
-security contracts are in
+The ordered transition additionally preserves an independent
+`validate --cpu-template-fingerprint-dump-final` gate for #1866's exact three
+dump arguments and operation, and a
+`validate --cpu-template-fingerprint-compare-final` gate for #1867's exact
+three compare arguments and operation. Dump certifies the versioned tagged
+document, reviewed macOS facts, signed effective capture, strict reparse, and
+absent-only publication. Compare certifies portable strict persisted inputs,
+platform-honest filters, deterministic bounded selected-value diagnostics,
+and exact guest common-bit stripping without calling either provider.
+
+All earlier scoped gates remain valid after these ordered transitions. The
+three #1795 corpus/semantic aggregates remain their exact evidence-free
+`audit-required` handoff. No helper slice infers cross-host portability, guest
+execution, artifact authenticity, or completion of that later aggregate
+scope. The detailed command, format, publication, and security contracts are in
 [CPU-template helper dump and verify](cpu-template-helper-contract.md) and
-[CPU-template strip](cpu-template-strip-contract.md).
+[CPU-template strip](cpu-template-strip-contract.md),
+[CPU-template fingerprint dump](cpu-template-fingerprint-contract.md), and
+[CPU-template fingerprint compare](cpu-template-fingerprint-compare-contract.md).
 
 ## X86 CPUID/MSR platform boundary
 
@@ -265,13 +277,13 @@ remain in the CPU-template contract.
 | `tool-argument:cpu-template-helper/template/strip/paths` | #1793 | `implemented-and-verified` |
 | `tool-argument:cpu-template-helper/template/strip/suffix` | #1793 | `implemented-and-verified` |
 | `tool-operation:cpu-template-helper/template/strip` | #1793 | `implemented-and-verified` |
-| `tool-argument:cpu-template-helper/fingerprint/compare/curr` | #1794 | `audit-required` |
-| `tool-argument:cpu-template-helper/fingerprint/compare/filters` | #1794 | `audit-required` |
-| `tool-argument:cpu-template-helper/fingerprint/compare/prev` | #1794 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/compare/curr` | #1794 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/fingerprint/compare/filters` | #1794 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/fingerprint/compare/prev` | #1794 | `implemented-and-verified` |
 | `tool-argument:cpu-template-helper/fingerprint/dump/config` | #1794 | `implemented-and-verified` |
 | `tool-argument:cpu-template-helper/fingerprint/dump/output` | #1794 | `implemented-and-verified` |
 | `tool-argument:cpu-template-helper/fingerprint/dump/template` | #1794 | `implemented-and-verified` |
-| `tool-operation:cpu-template-helper/fingerprint/compare` | #1794 | `audit-required` |
+| `tool-operation:cpu-template-helper/fingerprint/compare` | #1794 | `implemented-and-verified` |
 | `tool-operation:cpu-template-helper/fingerprint/dump` | #1794 | `implemented-and-verified` |
 | `corpus:cpu-template-helper` | #1795 | `audit-required` |
 | `corpus:cpu-templates` | #1795 | `audit-required` |
@@ -320,8 +332,11 @@ exact three portable strip rows after transformation, publication, process,
 and audit gates pass. #1866 promotes the three fingerprint-dump arguments and
 operation after the closed platform document, public macOS fact, signed
 effective-state, publication, and scoped-audit gates pass; compare and #1795
-aggregate rows remain unchanged. The current inventory is therefore exactly
-358 implemented, 27 audit-required, three
+aggregate rows remain unchanged. #1867 then promotes the three compare
+arguments and operation after strict persisted-input, platform/filter,
+canonical-diagnostic, guest-strip, portable-process, and scoped-audit gates
+pass; #1795 remains unchanged. The current inventory is therefore exactly
+362 implemented, 23 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

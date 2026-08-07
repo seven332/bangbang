@@ -115,6 +115,7 @@ scripts/sign-hvf-binary.sh target/debug/cpu-template-helper /tmp/cpu-template-he
 /tmp/cpu-template-helper template verify --config /path/to/config.json --template /path/to/template.json
 /tmp/cpu-template-helper fingerprint dump --config /path/to/config.json --output /path/to/fingerprint.json
 target/debug/cpu-template-helper template strip --paths /path/to/first.json /path/to/second.json
+target/debug/cpu-template-helper fingerprint compare --prev /path/to/previous.json --curr /path/to/current.json
 ```
 
 Dump output defaults to a new `cpu_config.json` and never replaces an existing
@@ -125,11 +126,16 @@ migration, or snapshot-portability authority. Verify requires a selected
 nonempty custom template. Strip is portable
 and needs no HVF signature; it defaults to sibling `_stripped` outputs, while
 `--suffix ''` atomically replaces exact single-link inputs. Its multiple paths
-are not one global or crash-atomic transaction. The exact command, format,
+are not one global or crash-atomic transaction. Fingerprint compare is also
+portable and unsigned: it strictly reads two platform-matched artifacts,
+defaults to every applicable fact, succeeds silently when selected state is
+equal, and writes one bounded canonical JSON difference to stderr with exit 1.
+The exact command, format,
 redaction, and platform boundaries are in
-[CPU-template dump and verify](docs/firecracker-compatibility.md#cpu-template-dump-and-verify-helper)
-[CPU-template strip](docs/firecracker-compatibility.md#cpu-template-strip), and
-[CPU-template fingerprint dump](docs/firecracker-compatibility.md#cpu-template-fingerprint-dump).
+[CPU-template dump and verify](docs/firecracker-compatibility.md#cpu-template-dump-and-verify-helper),
+[CPU-template strip](docs/firecracker-compatibility.md#cpu-template-strip),
+[CPU-template fingerprint dump](docs/firecracker-compatibility.md#cpu-template-fingerprint-dump),
+and [CPU-template fingerprint compare](docs/firecracker-compatibility.md#cpu-template-fingerprint-compare).
 The snapshot rebase, deterministic state-inspection, and reviewed register-edit
 surfaces are in [Snapshot Rebase Tools](docs/firecracker-compatibility.md#snapshot-rebase-tools)
 and [Snapshot State Inspection and Reviewed Editing](docs/firecracker-compatibility.md#snapshot-state-inspection-and-reviewed-editing).
@@ -171,7 +177,8 @@ device gate verifies that exact profile set, its resolvable evidence, the
 212/2/17 field census, and the terminal #1790 lifecycle handoff.
 
 The terminal tracing, CPU-template dump/verify, portable CPU-template strip,
-platform-tagged CPU-fingerprint dump, 69-field API/process,
+platform-tagged CPU-fingerprint dump, deterministic fingerprint compare,
+69-field API/process,
 231-field device, and ten-scenario aggregate metrics scopes have separate
 fail-closed certification gates:
 
@@ -180,6 +187,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracin
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
