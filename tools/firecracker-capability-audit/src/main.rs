@@ -6,20 +6,21 @@ use std::process::{Command, ExitCode};
 
 use bangbang_firecracker_capability_audit::{
     AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, CPU_TEMPLATE_HELPER_AUDIT_PATH,
-    LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
-    METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
-    METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH, TRACING_AUDIT_PATH,
-    derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
-    logger_producer_manifest_json, metrics_schema_source_candidate_json, read_capability_inventory,
-    read_cpu_template_helper_audit, read_logger_producer_audit, read_logger_producer_manifest,
-    read_metrics_device_producer_audit, read_metrics_lifecycle_audit,
-    read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
-    read_tracing_audit, source_manifest_json, validate, validate_cpu_template_compatibility,
+    GUEST_WORKFLOW_AUDIT_PATH, LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH,
+    METRICS_DEVICE_PRODUCER_AUDIT_PATH, METRICS_LIFECYCLE_AUDIT_PATH,
+    METRICS_PROCESS_PRODUCER_AUDIT_PATH, METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH,
+    TRACING_AUDIT_PATH, derive_logger_producer_manifest, derive_metrics_schema_source,
+    derive_source_manifest, logger_producer_manifest_json, metrics_schema_source_candidate_json,
+    read_capability_inventory, read_cpu_template_helper_audit, read_guest_workflow_audit,
+    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
+    read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
+    read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
+    validate, validate_cpu_template_compatibility,
     validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility, validate_cpu_template_helper_audit,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
-    validate_cpu_template_strip_compatibility, validate_logger_compatibility,
-    validate_logger_producers, validate_metrics_compatibility,
+    validate_cpu_template_strip_compatibility, validate_guest_workflow_audit,
+    validate_logger_compatibility, validate_logger_producers, validate_metrics_compatibility,
     validate_metrics_device_compatibility, validate_metrics_device_producers,
     validate_metrics_lifecycle, validate_metrics_process_compatibility,
     validate_metrics_process_producers, validate_metrics_schema,
@@ -118,6 +119,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let tracing_audit = read_tracing_audit(&root.join(TRACING_AUDIT_PATH))?;
     let cpu_template_helper_audit =
         read_cpu_template_helper_audit(&root.join(CPU_TEMPLATE_HELPER_AUDIT_PATH))?;
+    let guest_workflow_audit = read_guest_workflow_audit(&root.join(GUEST_WORKFLOW_AUDIT_PATH))?;
     validate_cpu_template_helper_transition(&inventory).map_err(|errors| {
         AuditError::new(format!(
             "CPU-template helper transition validation errors:\n{errors}"
@@ -130,6 +132,9 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             ))
         },
     )?;
+    validate_guest_workflow_audit(&guest_workflow_audit, &inventory, &root).map_err(|errors| {
+        AuditError::new(format!("guest workflow audit validation errors:\n{errors}"))
+    })?;
     let audit_mode = match mode {
         ValidateMode::Delivery => AuditMode::Delivery,
         ValidateMode::Final => AuditMode::Final,

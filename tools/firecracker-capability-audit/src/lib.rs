@@ -3,6 +3,8 @@
 mod cpu_template_helper_audit_model;
 mod cpu_template_helper_audit_validate;
 mod cpu_template_helper_certify;
+mod guest_workflow_audit_model;
+mod guest_workflow_audit_validate;
 mod logger_certify;
 mod logger_model;
 mod logger_upstream;
@@ -48,6 +50,17 @@ pub use cpu_template_helper_certify::{
     validate_cpu_template_fingerprint_dump_compatibility,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
     validate_cpu_template_strip_compatibility,
+};
+pub use guest_workflow_audit_model::{
+    Ext4Classification, Ext4Recipe, Ext4SidecarPolicy, GeneratedDeterminism,
+    GeneratedGuestArtifact, GuestArtifact, GuestArtifactKind, GuestNetworking, GuestOutputClass,
+    GuestOutputPolicy, GuestShutdown, GuestSourceNamespace, GuestWorkflowAudit,
+    GuestWorkflowDelivery, GuestWorkflowDeliveryState, GuestWorkflowEvidence, GuestWorkflowMode,
+    GuestWorkflowNonclaim, GuestWorkflowProfile, GuestWorkflowProfileState,
+};
+pub use guest_workflow_audit_validate::{
+    GUEST_ARTIFACT_IDS, GUEST_EXT4_RECIPE_IDS, GUEST_WORKFLOW_AUDIT_PATH,
+    GUEST_WORKFLOW_AUDIT_SCHEMA_VERSION, GUEST_WORKFLOW_PROFILE_IDS, validate_guest_workflow_audit,
 };
 pub use logger_certify::{LOGGER_COMPATIBILITY_CAPABILITY_IDS, validate_logger_compatibility};
 pub use logger_model::{
@@ -294,6 +307,15 @@ pub fn read_cpu_template_helper_audit(path: &Path) -> Result<CpuTemplateHelperAu
     })
 }
 
+/// Read and parse the checked guest-workflow artifact authority.
+pub fn read_guest_workflow_audit(path: &Path) -> Result<GuestWorkflowAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read guest workflow audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AuditError::new(format!("failed to parse guest workflow audit: {error}")))
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -370,6 +392,11 @@ pub fn cpu_template_helper_audit_json(
     audit: &CpuTemplateHelperAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "CPU-template helper audit")
+}
+
+/// Serialize the checked guest-workflow authority using canonical pretty JSON.
+pub fn guest_workflow_audit_json(audit: &GuestWorkflowAudit) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "guest workflow audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {

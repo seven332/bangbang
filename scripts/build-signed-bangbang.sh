@@ -6,11 +6,11 @@ usage() {
 Usage: scripts/build-signed-bangbang.sh --output PATH
 
 Build the bangbang executable for aarch64-apple-darwin, copy it to PATH, and
-sign PATH with the Hypervisor.framework entitlement. This script does not run
-the signed executable.
+sign PATH with the Hypervisor.framework entitlement. PATH must be absent and is
+never replaced. This script does not run the signed executable.
 
 Options:
-  --output PATH  Destination path for the signed bangbang executable.
+  --output PATH  Absent destination path for the signed bangbang executable.
   -h, --help     Show this help.
 EOF
 }

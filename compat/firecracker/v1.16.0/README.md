@@ -58,6 +58,11 @@ For commands and test-layer selection, see the
   and thirteen arguments once, the implemented and platform-impossible CPU
   foundations, fourteen closed composition/runtime/snapshot/fleet scenarios,
   seven explicit nonclaims, and aggregate evidence.
+- [`guest-workflow-audit.json`](guest-workflow-audit.json) is the human-owned
+  #1796 guest artifact authority. In the #1871 preparation slice it owns exact
+  download pins, generated and recipe cache policy, output ownership classes,
+  planned API/no-API profiles, evidence, and nonclaims without promoting the
+  two parent corpus rows.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -124,6 +129,30 @@ Only [`capabilities.json`](capabilities.json) and the validator are
 authoritative for current global totals. Contract-local selected-record counts
 may be retained where they are part of a mechanically checked closure.
 Historical delivery arithmetic belongs in Git and GitHub.
+
+## Guest workflow artifact authority
+
+The guest-workflow audit deliberately separates the pinned Firecracker v1.16.0
+source/API baseline from the v1.15 Firecracker CI artifact namespace used by
+the signed arm64 tests. Downloaded kernel and squashfs bytes are never vendored
+or redistributed by Bangbang. Their manifest-owned caches require exact size
+and SHA-256 validation and use announced repair under a nonblocking advisory
+lock.
+
+The generated initrd has byte-identical cache semantics. Prepared ext4 images
+are only recipe-deterministic: a sidecar binds each local result to the source,
+requested size, variant, tracked recipe, bounded tool identities, output
+digest/size, and a successful `e2fsck -fn`. The sidecar is committed last as a
+validity marker; the image and sidecar are not claimed to be one crash-atomic
+transaction.
+
+Runtime sidecars stay under the ignored cache root and never count as checked
+inventory or terminal workflow evidence.
+
+Both public workflow profiles remain `planned` with empty terminal evidence in
+#1871. #1872 owns the public composer, signed API/no-API lifecycle proof,
+operator guide, and any final transition of `corpus:getting-started` and
+`corpus:rootfs-and-kernel`.
 
 The inventory is not evidence by itself. A terminal claim depends on the
 referenced production behavior and validation, and a broad corpus reference
