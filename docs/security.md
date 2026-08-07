@@ -1870,6 +1870,23 @@ is resource-specific:
   ancestor directories. The complete helper-specific boundary and signed
   real-HVF evidence are checked in
   `compat/firecracker/v1.16.0/cpu-template-helper-contract.md`.
+  Portable `template strip` does not construct a provider or VM, but it retains
+  the invoking user's direct filesystem authority over every supplied parent.
+  All inputs and outputs are descriptor/identity bound; unsafe suffixes,
+  duplicate inodes or entries, output aliases, and ambiguous empty-suffix
+  hardlinks fail before mutation. Nonempty outputs are atomic no-clobber
+  renames. Empty suffixes exchange only exact validated single-link inputs, keep
+  displaced inodes private until batch commit and directory synchronization,
+  then identity-check cleanup. Failure handling attempts every reverse rollback
+  and owned cleanup even after one becomes uncertain, never removes an unknown
+  replacement, and distinguishes rolled-back, rollback-uncertain, committed-
+  durability-uncertain, and committed-cleanup-uncertain outcomes. This does not
+  create global or crash-atomic multi-path publication and does not authenticate
+  template contents or hostile ancestor directories. Descriptor identity also
+  cannot serialize a separate process already writing an open input inode;
+  operators must quiesce input writers during strip, especially in replacement
+  mode. The complete boundary is checked in
+  `compat/firecracker/v1.16.0/cpu-template-strip-contract.md`.
   Breakpoint value registers can expose guest virtual addresses, Context IDs,
   or VMIDs. Watchpoint value registers expose guest data virtual addresses, and
   their controls can encode access type, byte selection, linking, and enabled

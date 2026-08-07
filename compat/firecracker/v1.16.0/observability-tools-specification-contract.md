@@ -140,7 +140,7 @@ absence are directly tested. The contract does not claim Firecracker's source
 rewrite mechanism, durable delivery, tracing enabled by default, sensitive
 dynamic fields, or portable timing thresholds.
 
-## CPU-template dump and verify certification
+## CPU-template helper certification
 
 The exact seven #1792 rows are terminal under
 `validate --cpu-template-helper-final`. The gate requires one coherent
@@ -152,12 +152,20 @@ availability, and teardown-before-success. Canonical dump publication is
 private and absent-only; verify success is silent; every failure is bounded
 and value/path-redacted.
 
-The gate also pins all 14 #1793–#1795 strip, fingerprint, corpus, and aggregate
-rows to their exact evidence-free `audit-required` handoff. It does not infer a
+The independent `validate --cpu-template-strip-final` gate requires the seven
+dump/verify dependencies and promotes the exact three #1793 path, suffix, and
+operation rows. It certifies portable normalized arm64 common-bit stripping,
+strict inputs, canonical outputs, and per-path atomic multi-directory
+publication with explicit rollback and uncertainty semantics. It does not
+claim a global or crash-atomic multi-path transaction.
+
+Both gates pin all eleven #1794–#1795 fingerprint, corpus, and aggregate rows
+to their exact evidence-free `audit-required` handoff. They do not infer a
 host fingerprint, cross-host portability, guest execution, or completion of
 those separately owned scopes. The detailed command, format, publication, and
-security contract is in
-[CPU-template helper dump and verify](cpu-template-helper-contract.md).
+security contracts are in
+[CPU-template helper dump and verify](cpu-template-helper-contract.md) and
+[CPU-template strip](cpu-template-strip-contract.md).
 
 ## X86 CPUID/MSR platform boundary
 
@@ -254,9 +262,9 @@ remain in the CPU-template contract.
 | `tool-argument:cpu-template-helper/template/verify/template` | #1792 | `implemented-and-verified` |
 | `tool-operation:cpu-template-helper/template/dump` | #1792 | `implemented-and-verified` |
 | `tool-operation:cpu-template-helper/template/verify` | #1792 | `implemented-and-verified` |
-| `tool-argument:cpu-template-helper/template/strip/paths` | #1793 | `audit-required` |
-| `tool-argument:cpu-template-helper/template/strip/suffix` | #1793 | `audit-required` |
-| `tool-operation:cpu-template-helper/template/strip` | #1793 | `audit-required` |
+| `tool-argument:cpu-template-helper/template/strip/paths` | #1793 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/template/strip/suffix` | #1793 | `implemented-and-verified` |
+| `tool-operation:cpu-template-helper/template/strip` | #1793 | `implemented-and-verified` |
 | `tool-argument:cpu-template-helper/fingerprint/compare/curr` | #1794 | `audit-required` |
 | `tool-argument:cpu-template-helper/fingerprint/compare/filters` | #1794 | `audit-required` |
 | `tool-argument:cpu-template-helper/fingerprint/compare/prev` | #1794 | `audit-required` |
@@ -307,8 +315,10 @@ after the schema, process, device, lifecycle, and signed gates pass. #1791
 promotes the single tracing corpus row after its feature, AST, privacy,
 delivery, process, device, tool, and release-marker gates pass. #1792 promotes
 its exact seven CPU-template dump/verify operation and argument rows after the
-portable actual-process and signed real-HVF gates pass, while #1793–#1795 stay
-unchanged. The current inventory is therefore exactly 351 implemented, 34 audit-required, three
+portable actual-process and signed real-HVF gates pass. #1793 promotes its
+exact three portable strip rows after transformation, publication, process,
+and audit gates pass, while #1794–#1795 stay unchanged. The current inventory
+is therefore exactly 354 implemented, 31 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

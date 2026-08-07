@@ -7,6 +7,7 @@ use crate::{
 };
 
 const HELPER_CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/cpu-template-helper-contract.md";
+const STRIP_CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/cpu-template-strip-contract.md";
 const OWNERSHIP_CONTRACT_PATH: &str =
     "compat/firecracker/v1.16.0/observability-tools-specification-contract.md";
 
@@ -21,8 +22,15 @@ pub const CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS: [&str; 7] = [
     "tool-operation:cpu-template-helper/template/verify",
 ];
 
-/// Exact later helper capabilities that #1792 must leave nonterminal.
-pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 14] = [
+/// Exact portable template-strip capability scope certified by #1793.
+pub const CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS: [&str; 3] = [
+    "tool-argument:cpu-template-helper/template/strip/paths",
+    "tool-argument:cpu-template-helper/template/strip/suffix",
+    "tool-operation:cpu-template-helper/template/strip",
+];
+
+/// Exact later helper capabilities that #1793 must leave nonterminal.
+pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 11] = [
     "corpus:cpu-template-helper",
     "corpus:cpu-templates",
     "semantic.cpu:configuration-templates-and-feature-state",
@@ -32,15 +40,12 @@ pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 14] = [
     "tool-argument:cpu-template-helper/fingerprint/dump/config",
     "tool-argument:cpu-template-helper/fingerprint/dump/output",
     "tool-argument:cpu-template-helper/fingerprint/dump/template",
-    "tool-argument:cpu-template-helper/template/strip/paths",
-    "tool-argument:cpu-template-helper/template/strip/suffix",
     "tool-operation:cpu-template-helper/fingerprint/compare",
     "tool-operation:cpu-template-helper/fingerprint/dump",
-    "tool-operation:cpu-template-helper/template/strip",
 ];
 
-/// Require #1792 to be either its exact historical handoff or its exact
-/// terminal state, while retaining the separately owned helper capabilities.
+/// Require the CPU-template helper inventory to be one exact ordered delivery
+/// phase: historical, dump/verify terminal, or dump/verify plus strip terminal.
 pub fn validate_cpu_template_helper_transition(
     inventory: &CapabilityInventory,
 ) -> Result<(), ValidationErrors> {
@@ -51,38 +56,40 @@ pub fn validate_cpu_template_helper_transition(
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
 
-    let owned = CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS
-        .iter()
-        .filter_map(|id| match capabilities.get(id).copied() {
-            Some(capability) => Some(capability),
-            None => {
-                errors.push(format!(
-                    "CPU-template helper certification capability is missing: {id}"
-                ));
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    let helper = collect_scope(
+        &capabilities,
+        &CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template helper certification",
+        &mut errors,
+    );
+    let strip = collect_scope(
+        &capabilities,
+        &CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template strip certification",
+        &mut errors,
+    );
 
-    if owned.len() == CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS.len() {
-        let historical = owned.iter().all(|capability| {
-            capability.disposition == Disposition::AuditRequired
-                && capability.implementation.is_empty()
-                && capability.validation.is_empty()
-                && capability.delivery_issue.is_none()
-                && capability.exclusion.is_none()
+    if helper.len() == CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS.len()
+        && strip.len() == CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.len()
+    {
+        let (helper_implementation, helper_validation) = helper_capability_evidence();
+        let (strip_implementation, strip_validation) = strip_capability_evidence();
+        let helper_historical = helper
+            .iter()
+            .all(|capability| is_exact_retained(capability));
+        let helper_terminal = helper.iter().all(|capability| {
+            is_exact_terminal(capability, &helper_implementation, &helper_validation)
         });
-        let (implementation, validation) = capability_evidence();
-        let terminal = owned.iter().all(|capability| {
-            capability.disposition == Disposition::ImplementedAndVerified
-                && capability.implementation == implementation
-                && capability.validation == validation
-                && capability.delivery_issue.is_none()
-                && capability.exclusion.is_none()
+        let strip_historical = strip.iter().all(|capability| is_exact_retained(capability));
+        let strip_terminal = strip.iter().all(|capability| {
+            is_exact_terminal(capability, &strip_implementation, &strip_validation)
         });
-        if !historical && !terminal {
+
+        let valid_handoff = strip_historical && (helper_historical || helper_terminal);
+        let valid_strip_terminal = helper_terminal && strip_terminal;
+        if !valid_handoff && !valid_strip_terminal {
             errors.push(
-                "CPU-template helper certification requires the exact historical #1792 handoff or the exact terminal transition"
+                "CPU-template helper certification requires the exact historical handoff, the exact #1792 terminal handoff, or the exact #1793 strip terminal transition"
                     .to_string(),
             );
         }
@@ -100,22 +107,107 @@ pub fn validate_cpu_template_helper_transition(
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ValidationErrors::from_messages(errors))
-    }
+    finish(errors)
 }
 
-/// Validate the terminal #1792 dump and verify scope without requiring later
-/// strip, fingerprint, corpus, or aggregate owners to be complete.
+/// Validate the terminal #1792 dump and verify scope without requiring strip,
+/// fingerprint, corpus, or aggregate owners to be complete.
 pub fn validate_cpu_template_helper_compatibility(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,
     repository_root: &Path,
 ) -> Result<(), ValidationErrors> {
-    let mut errors = Vec::new();
+    let mut errors = common_validation(manifest, inventory, repository_root);
+    let capabilities = capability_map(inventory);
 
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template helper certification",
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        HELPER_CONTRACT_PATH,
+        "CPU-template helper certification cannot read the helper contract",
+        |contract, errors| {
+            validate_contract_rows(
+                contract,
+                None,
+                CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+                "implemented-and-verified",
+                "helper contract",
+                errors,
+            );
+        },
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        OWNERSHIP_CONTRACT_PATH,
+        "CPU-template helper certification cannot read the Wave 7 ownership contract",
+        validate_helper_ownership_contract,
+        &mut errors,
+    );
+
+    finish(errors)
+}
+
+/// Validate the terminal #1793 portable strip scope while retaining the
+/// independently owned fingerprint, corpus, and aggregate capabilities.
+pub fn validate_cpu_template_strip_compatibility(
+    manifest: &SourceManifest,
+    inventory: &CapabilityInventory,
+    repository_root: &Path,
+) -> Result<(), ValidationErrors> {
+    let mut errors = common_validation(manifest, inventory, repository_root);
+    let capabilities = capability_map(inventory);
+
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template strip certification dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template strip certification",
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        STRIP_CONTRACT_PATH,
+        "CPU-template strip certification cannot read the strip contract",
+        |contract, errors| {
+            validate_contract_rows(
+                contract,
+                None,
+                CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+                "implemented-and-verified",
+                "strip contract",
+                errors,
+            );
+        },
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        OWNERSHIP_CONTRACT_PATH,
+        "CPU-template strip certification cannot read the Wave 7 ownership contract",
+        validate_strip_ownership_contract,
+        &mut errors,
+    );
+
+    finish(errors)
+}
+
+fn common_validation(
+    manifest: &SourceManifest,
+    inventory: &CapabilityInventory,
+    repository_root: &Path,
+) -> Vec<String> {
+    let mut errors = Vec::new();
     if let Err(validation_errors) =
         validate(manifest, inventory, repository_root, AuditMode::Delivery)
     {
@@ -124,41 +216,48 @@ pub fn validate_cpu_template_helper_compatibility(
     if let Err(validation_errors) = validate_cpu_template_helper_transition(inventory) {
         errors.extend(validation_errors.messages().iter().cloned());
     }
+    errors
+}
 
-    let capabilities = inventory
+fn capability_map(inventory: &CapabilityInventory) -> BTreeMap<&str, &Capability> {
+    inventory
         .capabilities
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
-        .collect::<BTreeMap<_, _>>();
-    for id in CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS {
+        .collect()
+}
+
+fn collect_scope<'a, const N: usize>(
+    capabilities: &BTreeMap<&str, &'a Capability>,
+    ids: &[&str; N],
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Vec<&'a Capability> {
+    ids.iter()
+        .filter_map(|id| match capabilities.get(id).copied() {
+            Some(capability) => Some(capability),
+            None => {
+                errors.push(format!("{label} capability is missing: {id}"));
+                None
+            }
+        })
+        .collect()
+}
+
+fn require_terminal_scope<const N: usize>(
+    capabilities: &BTreeMap<&str, &Capability>,
+    ids: &[&str; N],
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    for id in ids {
         match capabilities.get(id) {
             Some(capability) if capability.disposition == Disposition::ImplementedAndVerified => {}
             Some(_) => errors.push(format!(
-                "CPU-template helper certification requires implemented-and-verified capability: {id}"
+                "{label} requires implemented-and-verified capability: {id}"
             )),
-            None => errors.push(format!(
-                "CPU-template helper certification capability is missing: {id}"
-            )),
+            None => errors.push(format!("{label} capability is missing: {id}")),
         }
-    }
-
-    match std::fs::read_to_string(repository_root.join(HELPER_CONTRACT_PATH)) {
-        Ok(contract) => validate_helper_contract(&contract, &mut errors),
-        Err(_) => errors
-            .push("CPU-template helper certification cannot read the helper contract".to_string()),
-    }
-    match std::fs::read_to_string(repository_root.join(OWNERSHIP_CONTRACT_PATH)) {
-        Ok(contract) => validate_ownership_contract(&contract, &mut errors),
-        Err(_) => errors.push(
-            "CPU-template helper certification cannot read the Wave 7 ownership contract"
-                .to_string(),
-        ),
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ValidationErrors::from_messages(errors))
     }
 }
 
@@ -170,7 +269,19 @@ fn is_exact_retained(capability: &Capability) -> bool {
         && capability.exclusion.is_none()
 }
 
-fn capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
+fn is_exact_terminal(
+    capability: &Capability,
+    implementation: &[Reference],
+    validation: &[Reference],
+) -> bool {
+    capability.disposition == Disposition::ImplementedAndVerified
+        && capability.implementation == implementation
+        && capability.validation == validation
+        && capability.delivery_issue.is_none()
+        && capability.exclusion.is_none()
+}
+
+fn helper_capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
     (
         local_references(&[
             (
@@ -223,18 +334,49 @@ fn capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
     )
 }
 
-fn validate_helper_contract(contract: &str, errors: &mut Vec<String>) {
-    validate_contract_rows(
-        contract,
-        None,
-        CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
-        "implemented-and-verified",
-        "helper contract",
-        errors,
-    );
+fn strip_capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
+    (
+        local_references(&[
+            ("tools/cpu-template-helper/src/cli.rs", "Strip {"),
+            (
+                "tools/cpu-template-helper/src/input.rs",
+                "pub(crate) fn prepare_strip_input",
+            ),
+            (
+                "tools/cpu-template-helper/src/strip.rs",
+                "pub fn strip_cpu_template_documents",
+            ),
+            (
+                "tools/cpu-template-helper/src/strip_publication.rs",
+                "pub(crate) fn publish_strip_artifacts",
+            ),
+        ]),
+        local_references(&[
+            (
+                "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+                "Terminal certification",
+            ),
+            (
+                "tools/cpu-template-helper/src/strip.rs",
+                "fn strips_native_width_differences_and_preserves_missing_entries",
+            ),
+            (
+                "tools/cpu-template-helper/src/strip_publication.rs",
+                "fn rolls_back_every_observed_split_boundary_in_both_modes",
+            ),
+            (
+                "tools/cpu-template-helper/tests/cli.rs",
+                "fn strip_default_and_explicit_suffixes_are_portable_and_silent",
+            ),
+            (
+                "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+                "fn checked_cpu_template_strip_compatibility_is_terminal_and_fail_closed",
+            ),
+        ]),
+    )
 }
 
-fn validate_ownership_contract(contract: &str, errors: &mut Vec<String>) {
+fn validate_helper_ownership_contract(contract: &str, errors: &mut Vec<String>) {
     validate_contract_rows(
         contract,
         Some("#1792"),
@@ -243,16 +385,28 @@ fn validate_ownership_contract(contract: &str, errors: &mut Vec<String>) {
         "#1792 ownership contract",
         errors,
     );
+    validate_retained_ownership_contract(contract, errors);
+}
 
+fn validate_strip_ownership_contract(contract: &str, errors: &mut Vec<String>) {
+    validate_helper_ownership_contract(contract, errors);
+    validate_contract_rows(
+        contract,
+        Some("#1793"),
+        CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+        "implemented-and-verified",
+        "#1793 ownership contract",
+        errors,
+    );
+}
+
+fn validate_retained_ownership_contract(contract: &str, errors: &mut Vec<String>) {
     let expected = CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
     let mut found = BTreeSet::new();
     for row in contract.lines().filter(|line| {
-        line.starts_with("| `")
-            && (line.contains("| #1793 |")
-                || line.contains("| #1794 |")
-                || line.contains("| #1795 |"))
+        line.starts_with("| `") && (line.contains("| #1794 |") || line.contains("| #1795 |"))
     }) {
         let Some((id, _)) = row
             .strip_prefix("| `")
@@ -277,7 +431,7 @@ fn validate_ownership_contract(contract: &str, errors: &mut Vec<String>) {
     }
     if found != expected {
         errors.push(format!(
-            "CPU-template helper certification requires the exact #1793-#1795 retained capability set: expected {expected:?}, found {found:?}"
+            "CPU-template helper certification requires the exact #1794-#1795 retained capability set: expected {expected:?}, found {found:?}"
         ));
     }
 }
@@ -322,6 +476,19 @@ fn validate_contract_rows<const N: usize>(
     }
 }
 
+fn read_contract(
+    repository_root: &Path,
+    path: &str,
+    read_error: &str,
+    validate_contract: impl FnOnce(&str, &mut Vec<String>),
+    errors: &mut Vec<String>,
+) {
+    match std::fs::read_to_string(repository_root.join(path)) {
+        Ok(contract) => validate_contract(&contract, errors),
+        Err(_) => errors.push(read_error.to_string()),
+    }
+}
+
 fn local_references(entries: &[(&str, &str)]) -> Vec<Reference> {
     entries
         .iter()
@@ -330,6 +497,14 @@ fn local_references(entries: &[(&str, &str)]) -> Vec<Reference> {
             anchor: Some((*anchor).to_string()),
         })
         .collect()
+}
+
+fn finish(errors: Vec<String>) -> Result<(), ValidationErrors> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors::from_messages(errors))
+    }
 }
 
 #[cfg(test)]
@@ -344,12 +519,26 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut errors = Vec::new();
-        validate_helper_contract(&exact, &mut errors);
+        validate_contract_rows(
+            &exact,
+            None,
+            CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "helper contract",
+            &mut errors,
+        );
         assert!(errors.is_empty());
 
         let hybrid = exact.replacen("`implemented-and-verified`", "`audit-required`", 1);
         let mut errors = Vec::new();
-        validate_helper_contract(&hybrid, &mut errors);
+        validate_contract_rows(
+            &hybrid,
+            None,
+            CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "helper contract",
+            &mut errors,
+        );
         assert!(
             errors
                 .iter()
@@ -360,7 +549,45 @@ mod tests {
             "{exact}\n| `tool-operation:cpu-template-helper/template/extra` | `implemented-and-verified` |"
         );
         let mut errors = Vec::new();
-        validate_helper_contract(&extra, &mut errors);
+        validate_contract_rows(
+            &extra,
+            None,
+            CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "helper contract",
+            &mut errors,
+        );
         assert!(errors.iter().any(|error| error.contains("exact helper")));
+    }
+
+    #[test]
+    fn exact_strip_contract_scope_is_fail_closed() {
+        let exact = CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS
+            .into_iter()
+            .map(|id| format!("| `{id}` | `implemented-and-verified` |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut errors = Vec::new();
+        validate_contract_rows(
+            &exact,
+            None,
+            CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "strip contract",
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+
+        let missing = exact.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let mut errors = Vec::new();
+        validate_contract_rows(
+            &missing,
+            None,
+            CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "strip contract",
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| error.contains("exact strip")));
     }
 }

@@ -1181,6 +1181,7 @@ cargo test -p bangbang-runtime --all-features --locked --lib cpu
 cargo test -p bangbang-cpu-template-helper --all-targets --all-features --locked
 cargo test -p bangbang --all-features --locked helper_cpu_inspection_projection_matches_production_actions
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 scripts/run-integration-tests.sh --test cpu_template_helper
 ```
 
@@ -1196,6 +1197,16 @@ ACTLR/ZFR0/SMFR0 availability outcomes, mismatch/collision/retry behavior, and
 boot-owned X0/PC/PSTATE checkpoint semantics. Run the wrapper without
 `--allow-unsupported` for local or self-hosted evidence so a host that cannot
 execute HVF fails rather than silently omitting the gate.
+
+The portable strip cases additionally prove exact Firecracker arity/default
+suffix behavior, provider independence, strict bounded inputs, native-width
+common-bit transformation, canonical empty and all-`x` outputs, duplicate and
+hardlink admission, absent-only and exact-replacement publication, and silent
+redacted process behavior. Fault injection covers every observed pre-stage and
+split-commit boundary in both modes, multi-directory synchronization, racing
+winners, unknown-object preservation, best-effort reverse rollback, and each
+uncertain outcome. Strip needs no signing; the signed helper harness remains a
+dump/verify provider gate.
 SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
 and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,
@@ -1964,6 +1975,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

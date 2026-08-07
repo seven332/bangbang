@@ -59,7 +59,7 @@ crates/vhost-user Portable vhost-user frontend protocol foundations
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 tools/cpu-template-helper
-                  Signed Firecracker-shaped CPU-template dump/verify helper
+                  Signed dump/verify and portable Firecracker-shaped strip helper
 tools/seccompiler Firecracker-compatible offline seccompiler artifact tool
 tools/snapshot-tools
                   Firecracker-shaped native memory rebase, inspection, and reviewed editing
@@ -113,12 +113,17 @@ cargo build -p bangbang-cpu-template-helper --bin cpu-template-helper --locked
 scripts/sign-hvf-binary.sh target/debug/cpu-template-helper /tmp/cpu-template-helper
 /tmp/cpu-template-helper template dump --config /path/to/config.json --output /path/to/cpu_config.json
 /tmp/cpu-template-helper template verify --config /path/to/config.json --template /path/to/template.json
+target/debug/cpu-template-helper template strip --paths /path/to/first.json /path/to/second.json
 ```
 
 Dump output defaults to a new `cpu_config.json` and never replaces an existing
-path. Verify requires a selected nonempty custom template. The exact command,
-format, redaction, and platform boundary is in
-[CPU-template dump and verify](docs/firecracker-compatibility.md#cpu-template-dump-and-verify-helper).
+path. Verify requires a selected nonempty custom template. Strip is portable
+and needs no HVF signature; it defaults to sibling `_stripped` outputs, while
+`--suffix ''` atomically replaces exact single-link inputs. Its multiple paths
+are not one global or crash-atomic transaction. The exact command, format,
+redaction, and platform boundaries are in
+[CPU-template dump and verify](docs/firecracker-compatibility.md#cpu-template-dump-and-verify-helper)
+and [CPU-template strip](docs/firecracker-compatibility.md#cpu-template-strip).
 The snapshot rebase, deterministic state-inspection, and reviewed register-edit
 surfaces are in [Snapshot Rebase Tools](docs/firecracker-compatibility.md#snapshot-rebase-tools)
 and [Snapshot State Inspection and Reviewed Editing](docs/firecracker-compatibility.md#snapshot-state-inspection-and-reviewed-editing).
@@ -159,13 +164,14 @@ terminal and map to ten implemented shared device profiles. The dedicated
 device gate verifies that exact profile set, its resolvable evidence, the
 212/2/17 field census, and the terminal #1790 lifecycle handoff.
 
-The terminal tracing, CPU-template dump/verify, 69-field API/process,
+The terminal tracing, CPU-template dump/verify, portable CPU-template strip, 69-field API/process,
 231-field device, and ten-scenario aggregate metrics scopes have separate
 fail-closed certification gates:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final

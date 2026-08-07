@@ -16754,20 +16754,118 @@
     {
       "id": "tool-argument:cpu-template-helper/template/strip/paths",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template strip paths argument and its persisted-JSON path semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Accept the pinned Firecracker template strip paths argument with two or more ordered strict 1 MiB UTF-8 template documents, descriptor-bound no-follow regular-file input, duplicate identity and path rejection, complete-batch preflight, bounded redaction, and no HVF dependency.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/strip/paths"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Strip {"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub(crate) fn prepare_strip_input"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip_publication.rs",
+          "anchor": "pub(crate) fn publish_strip_artifacts"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "fn strips_native_width_differences_and_preserves_missing_entries"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip_publication.rs",
+          "anchor": "fn rolls_back_every_observed_split_boundary_in_both_modes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn strip_default_and_explicit_suffixes_are_portable_and_silent"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_strip_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/template/strip/suffix",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template strip suffix argument and its output-naming semantics; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Accept the pinned suffix argument and default, reject path separators and batch collisions, derive same-directory stem-plus-suffix-plus-extension outputs, publish nonempty suffixes absent-only, and replace only exact single-link inputs when the suffix is empty.",
       "source_refs": [
         "tool-argument:cpu-template-helper/template/strip/suffix"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Strip {"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub(crate) fn prepare_strip_input"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip_publication.rs",
+          "anchor": "pub(crate) fn publish_strip_artifacts"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "fn strips_native_width_differences_and_preserves_missing_entries"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip_publication.rs",
+          "anchor": "fn rolls_back_every_observed_split_boundary_in_both_modes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn strip_default_and_explicit_suffixes_are_portable_and_silent"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_strip_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/template/verify/config",
@@ -18370,11 +18468,60 @@
     {
       "id": "tool-operation:cpu-template-helper/template/strip",
       "family": "cpu-and-machine",
-      "summary": "Wave 7 owns the public cpu-template-helper template strip operation and persisted-JSON path/suffix transformation; Wave 2 supplies only the consumed CPU model and capture primitives.",
+      "summary": "Run portable arm64 common-bit stripping over normalized U32/U64/U128 modifiers, preserve identities missing from any input, emit only canonical strict documents, and publish a pre-staged multi-path batch with per-path atomic no-clobber or exact replacement, reverse best-effort rollback, identity-safe cleanup, explicit uncertainty, and no global or crash-atomic claim.",
       "source_refs": [
         "tool-operation:cpu-template-helper/template/strip"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Strip {"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub(crate) fn prepare_strip_input"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip_publication.rs",
+          "anchor": "pub(crate) fn publish_strip_artifacts"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-strip-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "fn strips_native_width_differences_and_preserves_missing_entries"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip_publication.rs",
+          "anchor": "fn rolls_back_every_observed_split_boundary_in_both_modes"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn strip_default_and_explicit_suffixes_are_portable_and_silent"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_strip_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-operation:cpu-template-helper/template/verify",
