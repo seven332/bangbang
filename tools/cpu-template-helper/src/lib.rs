@@ -2,6 +2,8 @@
 
 pub mod cli;
 pub mod document;
+pub mod fingerprint;
+pub mod host;
 pub mod input;
 pub mod profile;
 pub mod projection;

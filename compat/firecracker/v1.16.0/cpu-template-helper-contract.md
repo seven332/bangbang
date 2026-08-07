@@ -146,7 +146,9 @@ paths, config values, register identities, filters, target values, effective
 values, and provider internals. This contract admits `template dump` and
 `template verify` with the pinned five Firecracker arguments; the independent
 [`template strip` contract](cpu-template-strip-contract.md) governs its two
-arguments and portable persistence behavior. Help and version write stdout and
+arguments and portable persistence behavior, while the
+[`fingerprint dump` contract](cpu-template-fingerprint-contract.md) governs its
+versioned platform facts and four independently certified rows. Help and version write stdout and
 exit 0; command success is silent; invalid invocation writes one fixed stderr
 line and exits 2; operational failure writes one fixed, category-only stderr
 line and exits 1.
@@ -158,10 +160,11 @@ bounded no-follow input, collision preservation, short writes, synchronization
 faults, identity replacement, cleanup uncertainty, and postcommit uncertainty.
 Portable actual-process tests cover help/version, strict invocation, bounded
 input, redaction, no-template behavior, and unsupported or unsigned HVF
-failure without publication. A separately signed five-case harness covers
+failure without publication. A separately signed harness covers
 two-vCPU canonical dump and permissions, mixed U32/U64/U128 verify and
 selection precedence, explicit optional-register outcomes, mismatch and
 collision retry, unsigned rejection, and boot-owned X0/PC/PSTATE checkpoint
-semantics. The harness runs through `scripts/run-integration-tests.sh` and the
+semantics. It additionally carries the separately contracted real fingerprint
+dump cases without broadening this contract's seven-row scope. The harness runs through `scripts/run-integration-tests.sh` and the
 audit guard proves the exact seven terminal rows and retained independent
 scopes.

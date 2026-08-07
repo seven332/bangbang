@@ -62,6 +62,9 @@ jobs:
       - name: Certify portable CPU-template strip scope
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 
+      - name: Certify platform-tagged CPU-fingerprint dump scope
+        run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 

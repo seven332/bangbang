@@ -8,6 +8,8 @@ use crate::{
 
 const HELPER_CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/cpu-template-helper-contract.md";
 const STRIP_CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/cpu-template-strip-contract.md";
+const FINGERPRINT_DUMP_CONTRACT_PATH: &str =
+    "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md";
 const OWNERSHIP_CONTRACT_PATH: &str =
     "compat/firecracker/v1.16.0/observability-tools-specification-contract.md";
 
@@ -29,23 +31,27 @@ pub const CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS: [&str; 3] = [
     "tool-operation:cpu-template-helper/template/strip",
 ];
 
-/// Exact later helper capabilities that #1793 must leave nonterminal.
-pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 11] = [
+/// Exact fingerprint-dump capability scope certified by #1866.
+pub const CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS: [&str; 4] = [
+    "tool-argument:cpu-template-helper/fingerprint/dump/config",
+    "tool-argument:cpu-template-helper/fingerprint/dump/output",
+    "tool-argument:cpu-template-helper/fingerprint/dump/template",
+    "tool-operation:cpu-template-helper/fingerprint/dump",
+];
+
+/// Exact later helper capabilities that #1866 must leave nonterminal.
+pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 7] = [
     "corpus:cpu-template-helper",
     "corpus:cpu-templates",
     "semantic.cpu:configuration-templates-and-feature-state",
     "tool-argument:cpu-template-helper/fingerprint/compare/curr",
     "tool-argument:cpu-template-helper/fingerprint/compare/filters",
     "tool-argument:cpu-template-helper/fingerprint/compare/prev",
-    "tool-argument:cpu-template-helper/fingerprint/dump/config",
-    "tool-argument:cpu-template-helper/fingerprint/dump/output",
-    "tool-argument:cpu-template-helper/fingerprint/dump/template",
     "tool-operation:cpu-template-helper/fingerprint/compare",
-    "tool-operation:cpu-template-helper/fingerprint/dump",
 ];
 
 /// Require the CPU-template helper inventory to be one exact ordered delivery
-/// phase: historical, dump/verify terminal, or dump/verify plus strip terminal.
+/// phase through helper, strip, and fingerprint-dump certification.
 pub fn validate_cpu_template_helper_transition(
     inventory: &CapabilityInventory,
 ) -> Result<(), ValidationErrors> {
@@ -68,12 +74,22 @@ pub fn validate_cpu_template_helper_transition(
         "CPU-template strip certification",
         &mut errors,
     );
+    let fingerprint_dump = collect_scope(
+        &capabilities,
+        &CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-dump certification",
+        &mut errors,
+    );
 
     if helper.len() == CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS.len()
         && strip.len() == CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.len()
+        && fingerprint_dump.len()
+            == CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS.len()
     {
         let (helper_implementation, helper_validation) = helper_capability_evidence();
         let (strip_implementation, strip_validation) = strip_capability_evidence();
+        let (fingerprint_implementation, fingerprint_validation) =
+            fingerprint_dump_capability_evidence();
         let helper_historical = helper
             .iter()
             .all(|capability| is_exact_retained(capability));
@@ -84,12 +100,28 @@ pub fn validate_cpu_template_helper_transition(
         let strip_terminal = strip.iter().all(|capability| {
             is_exact_terminal(capability, &strip_implementation, &strip_validation)
         });
+        let fingerprint_historical = fingerprint_dump
+            .iter()
+            .all(|capability| is_exact_retained(capability));
+        let fingerprint_terminal = fingerprint_dump.iter().all(|capability| {
+            is_exact_terminal(
+                capability,
+                &fingerprint_implementation,
+                &fingerprint_validation,
+            )
+        });
 
-        let valid_handoff = strip_historical && (helper_historical || helper_terminal);
-        let valid_strip_terminal = helper_terminal && strip_terminal;
-        if !valid_handoff && !valid_strip_terminal {
+        let valid_historical = helper_historical && strip_historical && fingerprint_historical;
+        let valid_helper_terminal = helper_terminal && strip_historical && fingerprint_historical;
+        let valid_strip_terminal = helper_terminal && strip_terminal && fingerprint_historical;
+        let valid_fingerprint_terminal = helper_terminal && strip_terminal && fingerprint_terminal;
+        if !valid_historical
+            && !valid_helper_terminal
+            && !valid_strip_terminal
+            && !valid_fingerprint_terminal
+        {
             errors.push(
-                "CPU-template helper certification requires the exact historical handoff, the exact #1792 terminal handoff, or the exact #1793 strip terminal transition"
+                "CPU-template helper certification requires one exact ordered historical, #1792 helper, #1793 strip, or #1866 fingerprint-dump phase"
                     .to_string(),
             );
         }
@@ -106,6 +138,61 @@ pub fn validate_cpu_template_helper_transition(
             )),
         }
     }
+
+    finish(errors)
+}
+
+/// Validate the terminal #1866 fingerprint-dump scope while retaining compare,
+/// corpus, and aggregate owners.
+pub fn validate_cpu_template_fingerprint_dump_compatibility(
+    manifest: &SourceManifest,
+    inventory: &CapabilityInventory,
+    repository_root: &Path,
+) -> Result<(), ValidationErrors> {
+    let mut errors = common_validation(manifest, inventory, repository_root);
+    let capabilities = capability_map(inventory);
+
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-dump certification helper dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-dump certification strip dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-dump certification",
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        FINGERPRINT_DUMP_CONTRACT_PATH,
+        "CPU-template fingerprint-dump certification cannot read the fingerprint contract",
+        |contract, errors| {
+            validate_contract_rows(
+                contract,
+                None,
+                CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+                "implemented-and-verified",
+                "fingerprint-dump contract",
+                errors,
+            );
+        },
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        OWNERSHIP_CONTRACT_PATH,
+        "CPU-template fingerprint-dump certification cannot read the Wave 7 ownership contract",
+        validate_fingerprint_ownership_contract,
+        &mut errors,
+    );
 
     finish(errors)
 }
@@ -376,6 +463,59 @@ fn strip_capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
     )
 }
 
+fn fingerprint_dump_capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
+    (
+        local_references(&[
+            (
+                "tools/cpu-template-helper/src/cli.rs",
+                "Fingerprint(FingerprintOperation::Dump",
+            ),
+            (
+                "tools/cpu-template-helper/src/fingerprint.rs",
+                "pub fn dump_with_providers",
+            ),
+            (
+                "tools/cpu-template-helper/src/host.rs",
+                "pub struct SystemHostFingerprintProvider",
+            ),
+            (
+                "tools/cpu-template-helper/src/provider.rs",
+                "pub struct HvfEffectiveCpuTemplateProvider",
+            ),
+            (
+                "tools/cpu-template-helper/src/publication.rs",
+                "pub fn publish_new_artifact",
+            ),
+        ]),
+        local_references(&[
+            (
+                "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md",
+                "Terminal certification",
+            ),
+            (
+                "tools/cpu-template-helper/src/fingerprint.rs",
+                "fn macos_golden_bytes_round_trip_and_accept_other_canonical_producer_versions",
+            ),
+            (
+                "tools/cpu-template-helper/src/host.rs",
+                "fn capture_queries_exact_public_facts_once_in_order",
+            ),
+            (
+                "tools/cpu-template-helper/tests/cli.rs",
+                "fn fingerprint_failures_are_bounded_and_publish_neither_default_nor_explicit_output",
+            ),
+            (
+                "tools/cpu-template-helper/tests/hvf_e2e.rs",
+                "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection",
+            ),
+            (
+                "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+                "fn checked_cpu_template_fingerprint_dump_compatibility_is_terminal_and_fail_closed",
+            ),
+        ]),
+    )
+}
+
 fn validate_helper_ownership_contract(contract: &str, errors: &mut Vec<String>) {
     validate_contract_rows(
         contract,
@@ -385,7 +525,7 @@ fn validate_helper_ownership_contract(contract: &str, errors: &mut Vec<String>) 
         "#1792 ownership contract",
         errors,
     );
-    validate_retained_ownership_contract(contract, errors);
+    validate_fingerprint_ownership_rows(contract, errors);
 }
 
 fn validate_strip_ownership_contract(contract: &str, errors: &mut Vec<String>) {
@@ -400,10 +540,18 @@ fn validate_strip_ownership_contract(contract: &str, errors: &mut Vec<String>) {
     );
 }
 
-fn validate_retained_ownership_contract(contract: &str, errors: &mut Vec<String>) {
-    let expected = CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS
+fn validate_fingerprint_ownership_contract(contract: &str, errors: &mut Vec<String>) {
+    validate_strip_ownership_contract(contract, errors);
+}
+
+fn validate_fingerprint_ownership_rows(contract: &str, errors: &mut Vec<String>) {
+    let retained = CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let terminal = CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let expected = retained.union(&terminal).copied().collect::<BTreeSet<_>>();
     let mut found = BTreeSet::new();
     for row in contract.lines().filter(|line| {
         line.starts_with("| `") && (line.contains("| #1794 |") || line.contains("| #1795 |"))
@@ -423,15 +571,25 @@ fn validate_retained_ownership_contract(contract: &str, errors: &mut Vec<String>
                 "CPU-template helper certification found a duplicate retained ownership row: {id}"
             ));
         }
-        if !row.contains("| `audit-required` |") {
+        let disposition = if retained.contains(id) {
+            "audit-required"
+        } else if terminal.contains(id) {
+            "implemented-and-verified"
+        } else {
             errors.push(format!(
-                "CPU-template helper certification requires retained ownership row to remain audit-required: {id}"
+                "CPU-template helper certification found an unexpected #1794-#1795 ownership row: {id}"
+            ));
+            continue;
+        };
+        if !row.contains(&format!("| `{disposition}` |")) {
+            errors.push(format!(
+                "CPU-template helper certification requires {disposition} ownership row: {id}"
             ));
         }
     }
     if found != expected {
         errors.push(format!(
-            "CPU-template helper certification requires the exact #1794-#1795 retained capability set: expected {expected:?}, found {found:?}"
+            "CPU-template helper certification requires the exact #1794-#1795 fingerprint ownership set: expected {expected:?}, found {found:?}"
         ));
     }
 }
@@ -589,5 +747,40 @@ mod tests {
             &mut errors,
         );
         assert!(errors.iter().any(|error| error.contains("exact strip")));
+    }
+
+    #[test]
+    fn exact_fingerprint_dump_contract_scope_is_fail_closed() {
+        let exact = CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
+            .into_iter()
+            .map(|id| format!("| `{id}` | `implemented-and-verified` |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut errors = Vec::new();
+        validate_contract_rows(
+            &exact,
+            None,
+            CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "fingerprint-dump contract",
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+
+        let hybrid = exact.replacen("`implemented-and-verified`", "`audit-required`", 1);
+        let mut errors = Vec::new();
+        validate_contract_rows(
+            &hybrid,
+            None,
+            CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "fingerprint-dump contract",
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("requires terminal"))
+        );
     }
 }

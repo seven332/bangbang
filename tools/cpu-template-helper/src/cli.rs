@@ -12,6 +12,10 @@ use crate::HelperExitClass;
 use crate::document::{
     CpuTemplateDocumentError, CpuTemplateEncodeError, decode_cpu_template_document,
 };
+use crate::fingerprint::{
+    CpuFingerprintOperationError, HostFingerprint, HostFingerprintProvider,
+    HostFingerprintProviderError, dump_with_providers as dump_fingerprint_with_providers,
+};
 use crate::input::{
     InputError, StripInputError, prepare_strip_input, read_regular_utf8,
     validate_prepared_strip_inputs,
@@ -48,6 +52,9 @@ enum Command {
     /// Template-related operations.
     #[command(subcommand)]
     Template(TemplateOperation),
+    /// Fingerprint-related operations.
+    #[command(subcommand)]
+    Fingerprint(FingerprintOperation),
 }
 
 #[derive(Debug, Subcommand)]
@@ -84,11 +91,49 @@ enum TemplateOperation {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum FingerprintOperation {
+    /// Dump host and effective guest CPU change-awareness facts.
+    Dump {
+        /// Path of a Firecracker-shaped configuration document.
+        #[arg(short, long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Path of an explicit CPU template applied after the configuration.
+        #[arg(short, long, value_name = "PATH")]
+        template: Option<PathBuf>,
+        /// Absent output path to publish.
+        #[arg(short, long, value_name = "PATH", default_value = "fingerprint.json")]
+        output: PathBuf,
+    },
+}
+
 /// Run one complete public command with an explicitly supplied effective
 /// provider and output streams.
 pub fn run_cli_with_provider<I, T>(
     args: I,
     provider: &mut impl EffectiveCpuTemplateProvider,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> HelperExitClass
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    run_cli_with_providers(
+        args,
+        &mut UnsupportedHostFingerprintProvider,
+        provider,
+        stdout,
+        stderr,
+    )
+}
+
+/// Run one complete public command with explicitly supplied host/effective
+/// providers and output streams.
+pub fn run_cli_with_providers<I, T>(
+    args: I,
+    host_provider: &mut impl HostFingerprintProvider,
+    effective_provider: &mut impl EffectiveCpuTemplateProvider,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> HelperExitClass
@@ -116,7 +161,7 @@ where
         }
     };
 
-    match execute(cli, provider) {
+    match execute(cli, host_provider, effective_provider) {
         Ok(()) => HelperExitClass::Success,
         Err(error) => {
             let _ = writeln!(stderr, "cpu-template-helper: {error}");
@@ -127,7 +172,8 @@ where
 
 fn execute(
     cli: Cli,
-    provider: &mut impl EffectiveCpuTemplateProvider,
+    host_provider: &mut impl HostFingerprintProvider,
+    effective_provider: &mut impl EffectiveCpuTemplateProvider,
 ) -> Result<(), CliOperationError> {
     match cli.command {
         Command::Template(TemplateOperation::Dump {
@@ -136,8 +182,8 @@ fn execute(
             output,
         }) => {
             let request = prepare_from_paths(config.as_deref(), template.as_deref())?;
-            let bytes =
-                dump_with_provider(provider, &request).map_err(CliOperationError::Operation)?;
+            let bytes = dump_with_provider(effective_provider, &request)
+                .map_err(CliOperationError::Operation)?;
             publish_new_artifact(&output, &bytes).map_err(CliOperationError::Publication)
         }
         Command::Template(TemplateOperation::Strip { paths, suffix }) => {
@@ -165,8 +211,28 @@ fn execute(
         }
         Command::Template(TemplateOperation::Verify { config, template }) => {
             let request = prepare_from_paths(config.as_deref(), template.as_deref())?;
-            verify_with_provider(provider, &request).map_err(CliOperationError::Operation)
+            verify_with_provider(effective_provider, &request).map_err(CliOperationError::Operation)
         }
+        Command::Fingerprint(FingerprintOperation::Dump {
+            config,
+            template,
+            output,
+        }) => {
+            let request = prepare_from_paths(config.as_deref(), template.as_deref())?;
+            let bytes =
+                dump_fingerprint_with_providers(host_provider, effective_provider, &request)
+                    .map_err(CliOperationError::Fingerprint)?;
+            publish_new_artifact(&output, &bytes).map_err(CliOperationError::Publication)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UnsupportedHostFingerprintProvider;
+
+impl HostFingerprintProvider for UnsupportedHostFingerprintProvider {
+    fn capture(&mut self) -> Result<HostFingerprint, HostFingerprintProviderError> {
+        Err(HostFingerprintProviderError::Unsupported)
     }
 }
 
@@ -188,6 +254,7 @@ fn prepare_from_paths(
 
 #[derive(Debug)]
 enum CliOperationError {
+    Fingerprint(CpuFingerprintOperationError),
     Input(InputError),
     StripInput(StripInputError),
     StripDocument(CpuTemplateDocumentError),
@@ -202,6 +269,7 @@ enum CliOperationError {
 impl fmt::Display for CliOperationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Fingerprint(source) => write!(formatter, "{source}"),
             Self::Input(source) => write!(formatter, "{source}"),
             Self::StripInput(source) => write!(formatter, "{source}"),
             Self::StripDocument(source) => write!(formatter, "{source}"),
@@ -217,13 +285,18 @@ impl fmt::Display for CliOperationError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::fs;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::cpu::arm64_cpu_template_register_descriptors;
 
     use super::*;
+    use crate::fingerprint::{
+        CpuFingerprintPlatform, HostFingerprint, decode_cpu_fingerprint_document,
+    };
     use crate::profile::{
         ArmCpuTemplateValue, EffectiveCpuTemplateProfile, EffectiveCpuTemplateProfileEntry,
         EffectiveProfileProviderError, EffectiveRegisterStatus,
@@ -264,6 +337,7 @@ mod tests {
         profile: EffectiveCpuTemplateProfile,
         error: Option<EffectiveProfileProviderError>,
         calls: usize,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
 
     impl EffectiveCpuTemplateProvider for FakeProvider {
@@ -272,7 +346,28 @@ mod tests {
             _: &crate::projection::PreparedCpuTemplateInspection,
         ) -> Result<EffectiveCpuTemplateProfile, EffectiveProfileProviderError> {
             self.calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("effective");
+            }
             self.error.map_or_else(|| Ok(self.profile.clone()), Err)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeHostProvider {
+        host: HostFingerprint,
+        error: Option<HostFingerprintProviderError>,
+        calls: usize,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    impl HostFingerprintProvider for FakeHostProvider {
+        fn capture(&mut self) -> Result<HostFingerprint, HostFingerprintProviderError> {
+            self.calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("host");
+            }
+            self.error.map_or_else(|| Ok(self.host.clone()), Err)
         }
     }
 
@@ -296,12 +391,25 @@ mod tests {
         EffectiveCpuTemplateProfile::try_new(entries).expect("fixture profile should validate")
     }
 
+    fn baseline_host() -> HostFingerprint {
+        HostFingerprint::try_macos(
+            "Darwin".to_owned(),
+            "25.5.0".to_owned(),
+            "arm64".to_owned(),
+            Some("Mac16,1".to_owned()),
+            Some("J475cAP".to_owned()),
+            Some(0x1b588bb3),
+        )
+        .expect("fixture host should validate")
+    }
+
     #[test]
     fn help_and_invalid_invocation_use_only_their_reserved_streams() {
         let mut provider = FakeProvider {
             profile: baseline_profile(),
             error: None,
             calls: 0,
+            events: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -315,6 +423,7 @@ mod tests {
             HelperExitClass::Success
         );
         assert!(String::from_utf8_lossy(&stdout).contains("template"));
+        assert!(String::from_utf8_lossy(&stdout).contains("fingerprint"));
         assert!(stderr.is_empty());
         assert_eq!(provider.calls, 0);
 
@@ -343,6 +452,7 @@ mod tests {
             profile: baseline_profile(),
             error: None,
             calls: 0,
+            events: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -369,6 +479,7 @@ mod tests {
             profile: baseline_profile(),
             error: Some(EffectiveProfileProviderError::Capture),
             calls: 0,
+            events: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -400,6 +511,7 @@ mod tests {
             profile: baseline_profile(),
             error: Some(EffectiveProfileProviderError::Capture),
             calls: 0,
+            events: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -427,5 +539,105 @@ mod tests {
     fn status_debug_never_exposes_effective_values() {
         let status = EffectiveRegisterStatus::Available(ArmCpuTemplateValue::U64(u64::MAX));
         assert_eq!(format!("{status:?}"), "Available(\"<redacted>\")");
+    }
+
+    #[test]
+    fn fingerprint_dump_captures_host_then_effective_and_publishes_strict_bytes() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("fingerprint.json");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut host_provider = FakeHostProvider {
+            host: baseline_host(),
+            error: None,
+            calls: 0,
+            events: Some(Rc::clone(&events)),
+        };
+        let mut effective_provider = FakeProvider {
+            profile: baseline_profile(),
+            error: None,
+            calls: 0,
+            events: Some(Rc::clone(&events)),
+        };
+        let args = vec![
+            OsString::from("cpu-template-helper"),
+            OsString::from("fingerprint"),
+            OsString::from("dump"),
+            OsString::from("-o"),
+            output.clone().into_os_string(),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_cli_with_providers(
+                args,
+                &mut host_provider,
+                &mut effective_provider,
+                &mut stdout,
+                &mut stderr,
+            ),
+            HelperExitClass::Success
+        );
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(host_provider.calls, 1);
+        assert_eq!(effective_provider.calls, 1);
+        assert_eq!(*events.borrow(), ["host", "effective"]);
+
+        let contents = fs::read_to_string(output).expect("fingerprint should be published");
+        let document =
+            decode_cpu_fingerprint_document(&contents).expect("fingerprint should decode");
+        assert_eq!(document.host().platform(), CpuFingerprintPlatform::Macos);
+        assert_eq!(
+            document.canonical_bytes().as_deref(),
+            Ok(contents.as_bytes())
+        );
+    }
+
+    #[test]
+    fn fingerprint_host_failure_stops_before_effective_capture_and_publication() {
+        let directory = TestDirectory::new();
+        let output = directory.0.join("must-not-exist.json");
+        let mut host_provider = FakeHostProvider {
+            host: baseline_host(),
+            error: Some(HostFingerprintProviderError::Product),
+            calls: 0,
+            events: None,
+        };
+        let mut effective_provider = FakeProvider {
+            profile: baseline_profile(),
+            error: None,
+            calls: 0,
+            events: None,
+        };
+        let args = vec![
+            OsString::from("cpu-template-helper"),
+            OsString::from("fingerprint"),
+            OsString::from("dump"),
+            OsString::from("--output"),
+            output.clone().into_os_string(),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_cli_with_providers(
+                args,
+                &mut host_provider,
+                &mut effective_provider,
+                &mut stdout,
+                &mut stderr,
+            ),
+            HelperExitClass::OperationalFailure
+        );
+        assert_eq!(host_provider.calls, 1);
+        assert_eq!(effective_provider.calls, 0);
+        assert!(!output.exists());
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&stderr),
+            "cpu-template-helper: host fingerprint capture failed\n"
+        );
+        assert!(!String::from_utf8_lossy(&stderr).contains("product"));
     }
 }

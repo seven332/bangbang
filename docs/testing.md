@@ -1182,6 +1182,7 @@ cargo test -p bangbang-cpu-template-helper --all-targets --all-features --locked
 cargo test -p bangbang --all-features --locked helper_cpu_inspection_projection_matches_production_actions
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
 scripts/run-integration-tests.sh --test cpu_template_helper
 ```
 
@@ -1191,7 +1192,7 @@ format round trips, identity-bound provider profiles, optional availability,
 filter comparison, bounded regular-file input, value/path redaction, and the
 exclusive publication fault matrix. Portable actual-process cases additionally
 prove strict help/version/invocation behavior and that unsupported or unsigned
-HVF failures publish nothing. The signed five-case harness proves real
+HVF failures publish nothing. The signed six-case harness proves real
 two-vCPU canonical dump, mixed-width verify and selection precedence, explicit
 ACTLR/ZFR0/SMFR0 availability outcomes, mismatch/collision/retry behavior, and
 boot-owned X0/PC/PSTATE checkpoint semantics. Run the wrapper without
@@ -1205,8 +1206,18 @@ hardlink admission, absent-only and exact-replacement publication, and silent
 redacted process behavior. Fault injection covers every observed pre-stage and
 split-commit boundary in both modes, multi-directory synchronization, racing
 winners, unknown-object preservation, best-effort reverse rollback, and each
-uncertain outcome. Strip needs no signing; the signed helper harness remains a
-dump/verify provider gate.
+uncertain outcome. Strip needs no signing; the signed helper harness is the
+shared dump/verify/fingerprint provider gate.
+
+Fingerprint cases additionally prove the closed macOS-present/null and Linux
+document variants, canonical SemVer and platform/kernel correlation, exact
+64/255/256-byte fact bounds, strict semantic reparse with harmless JSON
+whitespace, public macOS query order and malformed C-string failures, host-
+before-effective ordering, and zero-output process failures. The signed case
+proves real macOS facts without logging them, two-vCPU default and explicit
+`None` capture, explicit custom precedence, unrepresentable V1N1 rejection,
+collision preservation/retry, and unsigned failure. The fingerprint scoped
+gate promotes exactly four dump rows and retains compare plus #1795 aggregates.
 SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
 and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,
@@ -1976,6 +1987,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --logger
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

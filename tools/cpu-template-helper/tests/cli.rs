@@ -53,6 +53,8 @@ fn help_and_version_are_the_only_portable_stdout_successes() {
         vec!["template", "dump", "--help"],
         vec!["template", "strip", "--help"],
         vec!["template", "verify", "--help"],
+        vec!["fingerprint", "--help"],
+        vec!["fingerprint", "dump", "--help"],
     ] {
         let output = run(&args, None);
         assert!(output.status.success(), "help should succeed: {args:?}");
@@ -84,6 +86,9 @@ fn every_invalid_invocation_is_fixed_and_does_not_echo_values() {
         vec!["template", "dump", "--unknown", "/private/value"],
         vec!["template", "dump", "--config"],
         vec!["template", "verify", "extra-private-value"],
+        vec!["fingerprint"],
+        vec!["fingerprint", "dump", "--output"],
+        vec!["fingerprint", "dump", "--private", "/private/value"],
     ] {
         let output = run(&args, None);
         assert_eq!(output.status.code(), Some(2), "args: {args:?}");
@@ -155,6 +160,63 @@ fn no_template_and_unavailable_hvf_never_publish_output() {
     );
     assert!(!explicit.exists());
     assert!(!directory.0.join("cpu_config.json").exists());
+}
+
+#[test]
+fn fingerprint_failures_are_bounded_and_publish_neither_default_nor_explicit_output() {
+    let directory = TestDirectory::new();
+    let output = run(&["fingerprint", "dump"], Some(&directory.0));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "cpu-template-helper: effective CPU fingerprint capture failed\n"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "cpu-template-helper: host fingerprint capture failed\n"
+    );
+    assert!(!directory.0.join("fingerprint.json").exists());
+
+    let explicit = directory.0.join("private-fingerprint-output.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_cpu-template-helper"))
+        .args(["fingerprint", "dump", "-o"])
+        .arg(&explicit)
+        .output()
+        .expect("helper process should execute");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("private")
+    );
+    assert!(!explicit.exists());
+}
+
+#[test]
+fn fingerprint_inputs_fail_before_host_or_effective_capture() {
+    let directory = TestDirectory::new();
+    let malformed = directory.0.join("private-malformed-config.json");
+    let explicit = directory.0.join("private-fingerprint-output.json");
+    fs::write(&malformed, r#"{"private-secret":true}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cpu-template-helper"))
+        .args(["fingerprint", "dump", "--config"])
+        .arg(&malformed)
+        .args(["--output"])
+        .arg(&explicit)
+        .output()
+        .expect("helper process should execute");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "cpu-template-helper: invalid helper configuration document\n"
+    );
+    assert!(!explicit.exists());
 }
 
 fn assert_canonical_template(path: &Path) {

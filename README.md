@@ -113,17 +113,23 @@ cargo build -p bangbang-cpu-template-helper --bin cpu-template-helper --locked
 scripts/sign-hvf-binary.sh target/debug/cpu-template-helper /tmp/cpu-template-helper
 /tmp/cpu-template-helper template dump --config /path/to/config.json --output /path/to/cpu_config.json
 /tmp/cpu-template-helper template verify --config /path/to/config.json --template /path/to/template.json
+/tmp/cpu-template-helper fingerprint dump --config /path/to/config.json --output /path/to/fingerprint.json
 target/debug/cpu-template-helper template strip --paths /path/to/first.json /path/to/second.json
 ```
 
 Dump output defaults to a new `cpu_config.json` and never replaces an existing
-path. Verify requires a selected nonempty custom template. Strip is portable
+path. Fingerprint dump defaults to a new `fingerprint.json`, records a closed
+platform-tagged macOS host/kernel envelope plus the same effective guest CPU
+state, and is diagnostic change-awareness evidence rather than host,
+migration, or snapshot-portability authority. Verify requires a selected
+nonempty custom template. Strip is portable
 and needs no HVF signature; it defaults to sibling `_stripped` outputs, while
 `--suffix ''` atomically replaces exact single-link inputs. Its multiple paths
 are not one global or crash-atomic transaction. The exact command, format,
 redaction, and platform boundaries are in
 [CPU-template dump and verify](docs/firecracker-compatibility.md#cpu-template-dump-and-verify-helper)
-and [CPU-template strip](docs/firecracker-compatibility.md#cpu-template-strip).
+[CPU-template strip](docs/firecracker-compatibility.md#cpu-template-strip), and
+[CPU-template fingerprint dump](docs/firecracker-compatibility.md#cpu-template-fingerprint-dump).
 The snapshot rebase, deterministic state-inspection, and reviewed register-edit
 surfaces are in [Snapshot Rebase Tools](docs/firecracker-compatibility.md#snapshot-rebase-tools)
 and [Snapshot State Inspection and Reviewed Editing](docs/firecracker-compatibility.md#snapshot-state-inspection-and-reviewed-editing).
@@ -164,7 +170,8 @@ terminal and map to ten implemented shared device profiles. The dedicated
 device gate verifies that exact profile set, its resolvable evidence, the
 212/2/17 field census, and the terminal #1790 lifecycle handoff.
 
-The terminal tracing, CPU-template dump/verify, portable CPU-template strip, 69-field API/process,
+The terminal tracing, CPU-template dump/verify, portable CPU-template strip,
+platform-tagged CPU-fingerprint dump, 69-field API/process,
 231-field device, and ten-scenario aggregate metrics scopes have separate
 fail-closed certification gates:
 
@@ -172,6 +179,7 @@ fail-closed certification gates:
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracing-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final

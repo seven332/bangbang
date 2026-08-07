@@ -30,9 +30,9 @@ with one explicit Wave 7 owner, and one `proven-platform-impossible` record.
 | `tool-argument:cpu-template-helper/fingerprint/compare/curr` | audit required | Wave 7 owns the persisted current-fingerprint input. |
 | `tool-argument:cpu-template-helper/fingerprint/compare/filters` | audit required | Wave 7 owns helper comparison filtering. |
 | `tool-argument:cpu-template-helper/fingerprint/compare/prev` | audit required | Wave 7 owns the persisted previous-fingerprint input. |
-| `tool-argument:cpu-template-helper/fingerprint/dump/config` | audit required | Wave 7 owns helper preboot configuration input. |
-| `tool-argument:cpu-template-helper/fingerprint/dump/output` | audit required | Wave 7 owns fingerprint artifact publication. |
-| `tool-argument:cpu-template-helper/fingerprint/dump/template` | audit required | Wave 7 owns helper template application. |
+| `tool-argument:cpu-template-helper/fingerprint/dump/config` | implemented and verified | Strict bounded config projection supplies the signed topology-common fingerprint capture. |
+| `tool-argument:cpu-template-helper/fingerprint/dump/output` | implemented and verified | The versioned artifact defaults to `fingerprint.json` and uses owner-only absent publication. |
+| `tool-argument:cpu-template-helper/fingerprint/dump/template` | implemented and verified | A strict explicit custom template has final precedence before effective fingerprint capture. |
 | `tool-argument:cpu-template-helper/template/dump/config` | implemented and verified | Strict bounded config parsing projects only machine/CPU actions before real HVF inspection. |
 | `tool-argument:cpu-template-helper/template/dump/output` | implemented and verified | Canonical private output uses synchronized absent-only publication. |
 | `tool-argument:cpu-template-helper/template/dump/template` | implemented and verified | An explicit strict custom template has final selection precedence. |
@@ -41,7 +41,7 @@ with one explicit Wave 7 owner, and one `proven-platform-impossible` record.
 | `tool-argument:cpu-template-helper/template/verify/config` | implemented and verified | Strict bounded config parsing supplies the requested vCPU topology and config selection. |
 | `tool-argument:cpu-template-helper/template/verify/template` | implemented and verified | Strict custom input is applied and compared against the all-vCPU effective checkpoint. |
 | `tool-operation:cpu-template-helper/fingerprint/compare` | audit required | Wave 7 owns deterministic persisted-fingerprint comparison. |
-| `tool-operation:cpu-template-helper/fingerprint/dump` | audit required | Wave 7 owns preboot capture, host fingerprinting, and artifact publication. |
+| `tool-operation:cpu-template-helper/fingerprint/dump` | implemented and verified | The signed helper combines reviewed public macOS facts with real effective guest state in one strict platform-tagged artifact. |
 | `tool-operation:cpu-template-helper/template/dump` | implemented and verified | The signed helper captures a topology-common real HVF profile and publishes canonical retained modifiers. |
 | `tool-operation:cpu-template-helper/template/strip` | implemented and verified | Portable native-width common-bit stripping publishes canonical outputs with explicit multi-path rollback and uncertainty. |
 | `tool-operation:cpu-template-helper/template/verify` | implemented and verified | The signed helper applies through production HVF, captures every vCPU, and verifies masked requested state. |
