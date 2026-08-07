@@ -310,6 +310,32 @@ enum TokenBucketRefill {
     Partial { budget: u64, adjusted_nanos: u64 },
 }
 
+fn token_bucket_refill_native(
+    size: u64,
+    budget: u64,
+    refill_time_nanos: u64,
+    elapsed_nanos: u64,
+) -> Option<TokenBucketRefill> {
+    if size == 0 || refill_time_nanos == 0 {
+        return Some(TokenBucketRefill::Unchanged);
+    }
+    if elapsed_nanos >= refill_time_nanos {
+        return Some(TokenBucketRefill::Full);
+    }
+
+    let tokens = elapsed_nanos.checked_mul(size)? / refill_time_nanos;
+    if tokens == 0 {
+        return Some(TokenBucketRefill::Unchanged);
+    }
+
+    let budget = budget.saturating_add(tokens).min(size);
+    let adjusted_nanos = tokens.checked_mul(refill_time_nanos)?.div_ceil(size);
+    Some(TokenBucketRefill::Partial {
+        budget,
+        adjusted_nanos,
+    })
+}
+
 fn token_bucket_refill(
     size: u64,
     budget: u64,
@@ -320,43 +346,36 @@ fn token_bucket_refill(
         return TokenBucketRefill::Unchanged;
     }
 
-    let refill_time_nanos_u128 = u128::from(refill_time_nanos);
-    if elapsed_nanos >= refill_time_nanos_u128 {
-        return TokenBucketRefill::Full;
-    }
-
     let elapsed_nanos_u64 = match u64::try_from(elapsed_nanos) {
         Ok(value) => value,
         Err(_) => return TokenBucketRefill::Full,
     };
-    // Keep common refill calculations at native width while retaining the
-    // original wide arithmetic for products that do not fit in u64.
-    let tokens = match elapsed_nanos_u64.checked_mul(size) {
-        Some(scaled_elapsed) => scaled_elapsed / refill_time_nanos,
-        None => {
-            let wide_tokens = elapsed_nanos * u128::from(size) / refill_time_nanos_u128;
-            match u64::try_from(wide_tokens) {
-                Ok(value) => value,
-                Err(_) => size,
-            }
-        }
-    };
+    if let Some(refill) =
+        token_bucket_refill_native(size, budget, refill_time_nanos, elapsed_nanos_u64)
+    {
+        return refill;
+    }
+
+    // Retain wide arithmetic for extreme products that do not fit in u64.
+    let refill_time_nanos_u128 = u128::from(refill_time_nanos);
+    let tokens = elapsed_nanos * u128::from(size) / refill_time_nanos_u128;
     if tokens == 0 {
         return TokenBucketRefill::Unchanged;
     }
 
-    let budget = budget.saturating_add(tokens).min(size);
-    let adjusted_nanos = match tokens.checked_mul(refill_time_nanos) {
-        Some(scaled_tokens) => scaled_tokens.div_ceil(size),
-        None => {
-            let wide_adjusted = u128::from(tokens)
-                .saturating_mul(refill_time_nanos_u128)
-                .div_ceil(u128::from(size));
-            match u64::try_from(wide_adjusted) {
-                Ok(value) => value,
-                Err(_) => refill_time_nanos,
-            }
-        }
+    let new_budget = u128::from(budget)
+        .saturating_add(tokens)
+        .min(u128::from(size));
+    let budget = match u64::try_from(new_budget) {
+        Ok(value) => value,
+        Err(_) => size,
+    };
+    let adjusted_nanos = tokens
+        .saturating_mul(refill_time_nanos_u128)
+        .div_ceil(u128::from(size));
+    let adjusted_nanos = match u64::try_from(adjusted_nanos) {
+        Ok(value) => value,
+        Err(_) => refill_time_nanos,
     };
 
     TokenBucketRefill::Partial {
@@ -396,23 +415,24 @@ mod verification {
         let size = u64::from(size_input);
         let budget = u64::from(budget_input);
         let refill_time_nanos = u64::from(refill_time_nanos_input);
-        let elapsed_nanos = u128::from(elapsed_nanos_input);
+        let elapsed_nanos = u64::from(elapsed_nanos_input);
 
         let invariant_holds =
-            match token_bucket_refill(size, budget, refill_time_nanos, elapsed_nanos) {
-                TokenBucketRefill::Unchanged => {
-                    let tokens = u64::from(elapsed_nanos_input) * size / refill_time_nanos;
+            match token_bucket_refill_native(size, budget, refill_time_nanos, elapsed_nanos) {
+                None => false,
+                Some(TokenBucketRefill::Unchanged) => {
+                    let tokens = elapsed_nanos * size / refill_time_nanos;
                     tokens == 0
                 }
-                TokenBucketRefill::Full => elapsed_nanos == u128::from(refill_time_nanos),
-                TokenBucketRefill::Partial {
+                Some(TokenBucketRefill::Full) => elapsed_nanos == refill_time_nanos,
+                Some(TokenBucketRefill::Partial {
                     budget: new_budget,
                     adjusted_nanos,
-                } => {
+                }) => {
                     new_budget >= budget
                         && new_budget <= size
                         && adjusted_nanos != 0
-                        && u128::from(adjusted_nanos) <= elapsed_nanos
+                        && adjusted_nanos <= elapsed_nanos
                         && adjusted_nanos < refill_time_nanos
                 }
             };

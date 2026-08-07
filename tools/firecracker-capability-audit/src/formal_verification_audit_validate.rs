@@ -74,7 +74,7 @@ const HARNESS_SPECS: [HarnessSpec; 5] = [
         package: "bangbang-runtime",
         source: "crates/runtime/src/token_bucket.rs",
         harness: "token_bucket::verification::verify_token_bucket_refill_accounting",
-        owner: "crates/runtime/src/token_bucket.rs::token_bucket_refill",
+        owner: "crates/runtime/src/token_bucket.rs::token_bucket_refill_native",
     },
     HarnessSpec {
         id: "pager-artifact-ranges",
