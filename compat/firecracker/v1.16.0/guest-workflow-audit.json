@@ -111,6 +111,7 @@
         "compat/firecracker/v1.16.0/guest-workflow-audit.json",
         "scripts/fetch-firecracker-rootfs.sh",
         "scripts/guest/arm64-id-register-report.rs",
+        "scripts/guest/specification-benchmark.rs",
         "scripts/guest_artifact_policy.py"
       ],
       "sidecar": {

@@ -24,7 +24,7 @@ Environment:
   BANGBANG_GUEST_ARTIFACTS_DIR  Override the guest artifact cache root.
   BANGBANG_MKFS_EXT4            Override the mkfs.ext4 executable path.
   BANGBANG_RUSTC                Override the rustc executable used to build the
-                                static arm64 ID-register report helper.
+                                checked static arm64 guest helpers.
 EOF
 }
 
@@ -122,9 +122,109 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 direct_boot_variant="direct-boot-v109"
 extract_dir=""
 
-install_arm64_id_register_report_helper() {
-  local helper_source="${repo_root}/scripts/guest/arm64-id-register-report.rs"
-  local helper_path="${extract_dir}/bangbang-arm64-id-register-report"
+validate_static_arm64_guest_helper() {
+  local helper_path="$1"
+  local helper_description="$2"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to validate the checked static arm64 guest helpers" >&2
+    exit 1
+  fi
+  if ! python3 - "$helper_path" <<'PY'
+import os
+import stat
+import struct
+import sys
+
+path = sys.argv[1]
+
+
+def reject(message):
+    raise SystemExit(message)
+
+
+try:
+    metadata = os.lstat(path)
+    with open(path, "rb") as binary:
+        data = binary.read()
+except OSError as error:
+    reject(f"guest helper could not be inspected: {error}")
+
+if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    reject("guest helper is not a regular non-symlink file")
+if stat.S_IMODE(metadata.st_mode) != 0o755:
+    reject("guest helper does not have mode 0755")
+if len(data) < 64:
+    reject("guest helper is shorter than an ELF64 header")
+
+header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
+(
+    identity,
+    elf_type,
+    machine,
+    version,
+    entry,
+    program_offset,
+    section_offset,
+    _flags,
+    header_size,
+    program_entry_size,
+    program_count,
+    section_entry_size,
+    section_count,
+    _section_names,
+) = header
+if identity[:7] != b"\x7fELF\x02\x01\x01":
+    reject("guest helper is not a little-endian ELF64 executable")
+if elf_type != 2 or machine != 183 or version != 1 or header_size != 64 or entry == 0:
+    reject("guest helper is not an aarch64 ET_EXEC image")
+if program_entry_size < 56 or program_count == 0:
+    reject("guest helper has no valid program-header table")
+program_end = program_offset + program_entry_size * program_count
+if program_offset < header_size or program_end > len(data):
+    reject("guest helper program-header table is out of bounds")
+
+has_load = False
+entry_is_executable = False
+for index in range(program_count):
+    offset = program_offset + index * program_entry_size
+    segment_type, segment_flags, file_offset, virtual_address, _, file_size, memory_size, _ = (
+        struct.unpack_from("<IIQQQQQQ", data, offset)
+    )
+    if segment_type in (2, 3):
+        reject("guest helper contains a dynamic or interpreter segment")
+    if segment_type != 1:
+        continue
+    has_load = True
+    if file_size > memory_size or file_offset + file_size > len(data):
+        reject("guest helper load segment is out of bounds")
+    if segment_flags & 1 and virtual_address <= entry < virtual_address + memory_size:
+        entry_is_executable = True
+if not has_load or not entry_is_executable:
+    reject("guest helper has no executable load segment covering its entry point")
+
+if section_count:
+    if section_entry_size < 64:
+        reject("guest helper has an invalid section-header table")
+    section_end = section_offset + section_entry_size * section_count
+    if section_offset == 0 or section_end > len(data):
+        reject("guest helper section-header table is out of bounds")
+    for index in range(section_count):
+        offset = section_offset + index * section_entry_size
+        section_type = struct.unpack_from("<I", data, offset + 4)[0]
+        if section_type in (2, 11):
+            reject("guest helper retains a symbol table")
+PY
+  then
+    echo "$helper_description output is not a stripped static aarch64 ELF: $helper_path" >&2
+    exit 1
+  fi
+}
+
+build_static_arm64_guest_helper() {
+  local helper_source="$1"
+  local helper_path="$2"
+  local helper_description="$3"
   local rustc_path="${BANGBANG_RUSTC:-rustc}"
   local host_target
   local rust_lld
@@ -132,11 +232,11 @@ install_arm64_id_register_report_helper() {
   local target_libdir
 
   if [[ ! -f "$helper_source" ]]; then
-    echo "arm64 ID-register report helper source is missing: $helper_source" >&2
+    echo "$helper_description source is missing: $helper_source" >&2
     exit 1
   fi
   if ! command -v "$rustc_path" >/dev/null 2>&1; then
-    echo "rustc is required to build the arm64 ID-register report helper" >&2
+    echo "rustc is required to build the checked static arm64 guest helpers" >&2
     exit 1
   fi
 
@@ -154,7 +254,7 @@ install_arm64_id_register_report_helper() {
     exit 1
   fi
 
-  echo "building static arm64 ID-register report helper" >&2
+  echo "building static $helper_description" >&2
   "$rustc_path" \
     "$helper_source" \
     --edition 2024 \
@@ -171,6 +271,18 @@ install_arm64_id_register_report_helper() {
     -C relocation-model=static \
     -o "$helper_path"
   chmod 0755 "$helper_path"
+  validate_static_arm64_guest_helper "$helper_path" "$helper_description"
+}
+
+install_static_arm64_guest_helpers() {
+  build_static_arm64_guest_helper \
+    "${repo_root}/scripts/guest/arm64-id-register-report.rs" \
+    "${extract_dir}/bangbang-arm64-id-register-report" \
+    "arm64 ID-register report helper"
+  build_static_arm64_guest_helper \
+    "${repo_root}/scripts/guest/specification-benchmark.rs" \
+    "${extract_dir}/bangbang-specification-benchmark" \
+    "arm64 specification benchmark workload"
 }
 
 install_direct_boot_init() {
@@ -5165,7 +5277,7 @@ if [[ -n "$internal_populate_dir" ]]; then
     exit 1
   fi
   extract_dir="$internal_populate_dir"
-  install_arm64_id_register_report_helper
+  install_static_arm64_guest_helpers
   install_direct_boot_init
   extract_dir=""
   exit 0

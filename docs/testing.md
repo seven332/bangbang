@@ -2571,6 +2571,23 @@ second writable drive. A boot-timer scenario starts the signed executable with
 `--boot-timer`, boots the Firecracker rootfs-provided `/usr/local/bin/init`
 wrapper, and waits for `Guest-boot-time` in the configured logger output after
 that wrapper writes the Firecracker magic byte to the boot-timer MMIO address.
+The companion `signed_executable_runs_released_guest_specification_workload`
+scenario boots the checked `/bangbang-specification-benchmark` PID 1 with one
+vCPU, 256 MiB, and that same production boot timer. The guest establishes
+devtmpfs (accepting the pinned kernel's existing mount), opens its read-only
+root block device, emits its versioned ready record, and blocks on one exact
+serial byte. The host proves that no timed record exists before release, then
+validates guest-monotonic compute and sequential 16 MiB
+root-drive durations, fixed counts, the fixed compute checksum, a checksum of
+the actual pinned root image bytes, guest-requested poweroff, and API-socket
+cleanup. Durations are evidence values, not numeric pass/fail thresholds. Run
+the signed oracle alone with:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  macos_arm64::signed_executable_runs_released_guest_specification_workload --exact
+```
+
 This verifies the public process/API/config-file/HVF path, including public
 serial output redirection and implemented observability reachability. The executable HVF
 e2e target also includes direct-rootfs MMDS v1 and v2 token-flow scenarios that
@@ -3186,7 +3203,13 @@ deterministic direct-rootfs boot. For those scenarios,
 `.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v109.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
-`/bangbang-direct-rootfs-init` script added before image creation. The test
+`/bangbang-direct-rootfs-init` script plus static
+`/bangbang-arm64-id-register-report` and
+`/bangbang-specification-benchmark` helpers added before image creation. Both
+Rust helpers use the same closed `aarch64-unknown-linux-musl`, `rust-lld`,
+path-remapping, static-link, relocation, and stripping flags. Their checked
+sources are direct-rootfs recipe-digest inputs, so changing or omitting either
+source invalidates the sidecar-verified cache. The test
 boots without the tiny initrd, attaches that ext4 image as a read-only root
 drive, and passes `init=/bangbang-direct-rootfs-init`. The `guest_boot` target
 expects deterministic serial markers plus Ubuntu os-release content from
