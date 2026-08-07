@@ -365,15 +365,22 @@ mod verification {
 
     #[kani::proof]
     fn verify_token_bucket_refill_accounting() {
-        let size: u64 = kani::any();
-        let budget: u64 = kani::any();
-        let refill_time_nanos: u64 = kani::any();
-        let elapsed_nanos: u128 = kani::any();
+        let size_input: u16 = kani::any();
+        let budget_input: u16 = kani::any();
+        let refill_time_nanos_input: u32 = kani::any();
+        let elapsed_nanos_input: u32 = kani::any();
 
-        kani::assume((1..=4_096).contains(&size));
-        kani::assume(budget <= size);
-        kani::assume((1..=1_000_000_000).contains(&refill_time_nanos));
-        kani::assume(elapsed_nanos <= u128::from(refill_time_nanos));
+        kani::assume((1..=4_096).contains(&size_input));
+        kani::assume(budget_input <= size_input);
+        kani::assume((1..=1_000_000_000).contains(&refill_time_nanos_input));
+        kani::assume(elapsed_nanos_input <= refill_time_nanos_input);
+
+        // These widths exactly cover the bounded domain above while avoiding
+        // unconstrained high bits before the values enter the production types.
+        let size = u64::from(size_input);
+        let budget = u64::from(budget_input);
+        let refill_time_nanos = u64::from(refill_time_nanos_input);
+        let elapsed_nanos = u128::from(elapsed_nanos_input);
 
         match token_bucket_refill(size, budget, refill_time_nanos, elapsed_nanos) {
             TokenBucketRefill::Unchanged => {

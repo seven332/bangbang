@@ -19,6 +19,7 @@ EXPECTED_KANI_VERSION = "0.67.0"
 EXPECTED_VERSION_OUTPUT = "cargo-kani 0.67.0"
 EXPECTED_LIST_FORMAT = "0.1"
 EXPECTED_PACKAGES = ["bangbang-pager", "bangbang-runtime"]
+KISSAT_HARNESS_ID = "token-bucket-refill-accounting"
 
 HarnessIdentity = Tuple[str, str, str]
 Invoke = Callable[[Sequence[str], Path, bool], subprocess.CompletedProcess[str]]
@@ -39,11 +40,12 @@ def load_authority(path: Path = AUTHORITY_PATH) -> Dict[str, Any]:
 
 
 def canonical_command(record: Mapping[str, Any]) -> List[str]:
+    harness_id = record.get("id")
     package = record.get("package")
     harness = record.get("harness")
-    if not isinstance(package, str) or not isinstance(harness, str):
-        raise RunnerError("formal verification record has invalid package or harness")
-    return [
+    if not all(isinstance(value, str) for value in [harness_id, package, harness]):
+        raise RunnerError("formal verification record has invalid id, package, or harness")
+    command = [
         "cargo",
         "kani",
         "--package",
@@ -53,6 +55,9 @@ def canonical_command(record: Mapping[str, Any]) -> List[str]:
         harness,
         "--exact",
     ]
+    if harness_id == KISSAT_HARNESS_ID:
+        command.extend(["--solver", "kissat"])
+    return command
 
 
 def validate_authority_for_execution(authority: Mapping[str, Any]) -> List[Mapping[str, Any]]:

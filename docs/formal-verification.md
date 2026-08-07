@@ -43,7 +43,11 @@ JSON mapping does not preserve package ownership for each source key. Every
 reported path must resolve uniquely inside its package, the compiled set must
 equal the checked `(package, source, symbol)` set, and then all five canonical
 `--harness ... --exact` commands run in manifest order. Commands are argument
-arrays and are never evaluated by a shell.
+arrays and are never evaluated by a shell. The token-bucket command pins the
+Kani 0.67.0 bundle's Kissat solver; its bounded symbolic inputs use the smallest
+integer widths that still cover every recorded value before widening into the
+production `u64`/`u128` helper. This avoids unconstrained high-bit SAT state
+without narrowing the checked interval.
 
 Normal macOS builds do not install or invoke Kani. Proof modules are elided by
 `cfg(kani)`, while workspace check-cfg policy makes ordinary Rust and Clippy

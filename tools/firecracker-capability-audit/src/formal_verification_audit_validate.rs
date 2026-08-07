@@ -196,7 +196,7 @@ fn validate_harness_records(harnesses: &[FormalVerificationHarness], errors: &mu
             || harness.source != spec.source
             || harness.harness != spec.harness
             || harness.owner != spec.owner
-            || harness.command != canonical_harness_command(spec.package, spec.harness)
+            || harness.command != canonical_harness_command(spec.id, spec.package, spec.harness)
         {
             errors.push(format!(
                 "formal verification harness has stale identity, owner, or command: {}",
@@ -225,8 +225,8 @@ fn validate_harness_records(harnesses: &[FormalVerificationHarness], errors: &mu
     }
 }
 
-fn canonical_harness_command(package: &str, harness: &str) -> Vec<String> {
-    [
+fn canonical_harness_command(id: &str, package: &str, harness: &str) -> Vec<String> {
+    let mut command = [
         "cargo",
         "kani",
         "--package",
@@ -238,7 +238,11 @@ fn canonical_harness_command(package: &str, harness: &str) -> Vec<String> {
     ]
     .into_iter()
     .map(str::to_string)
-    .collect()
+    .collect::<Vec<_>>();
+    if id == "token-bucket-refill-accounting" {
+        command.extend(["--solver".to_string(), "kissat".to_string()]);
+    }
+    command
 }
 
 fn has_empty_or_duplicate_strings(values: &[String]) -> bool {
@@ -583,6 +587,8 @@ fn validate_execution_sources(repository_root: &Path, errors: &mut Vec<String>) 
             "--format",
             "json",
             "--exact",
+            "--solver",
+            "kissat",
             "TemporaryDirectory",
         ],
         errors,
