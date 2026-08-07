@@ -1183,6 +1183,7 @@ cargo test -p bangbang --all-features --locked helper_cpu_inspection_projection_
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
 scripts/run-integration-tests.sh --test cpu_template_helper
 ```
 
@@ -1217,7 +1218,15 @@ before-effective ordering, and zero-output process failures. The signed case
 proves real macOS facts without logging them, two-vCPU default and explicit
 `None` capture, explicit custom precedence, unrepresentable V1N1 rejection,
 collision preservation/retry, and unsigned failure. The fingerprint scoped
-gate promotes exactly four dump rows and retains compare plus #1795 aggregates.
+dump gate promotes exactly four dump rows. Portable fingerprint compare tests
+add both platform defaults, closed unique filters, fixed order, producer/kernel/
+nullable host differences, exact native-width guest stripping, canonical
+repeat, strict schema/platform/inapplicable failures, descriptor-bound alias and
+special-file behavior, input nonmutation, provider-zero-call execution, and
+exact equal/difference/error streams and exits. Compare needs no signature and
+publishes nothing. Its scoped gate promotes exactly four compare rows and
+retains only the three #1795 aggregates. The full signed helper harness remains
+the regression gate for the dump/provider dependency.
 SVE/SME identification signed tests require macOS 15.2 and must capture ZFR0
 and SMFR0 twice from one idle real vCPU. They may assert same-vCPU stability but
 must not hard-code one feature model, enable SVE/SME, enter streaming mode,
@@ -1988,6 +1997,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --tracin
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-strip-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

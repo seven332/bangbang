@@ -348,8 +348,8 @@ readbacks, and provider internals are never reported.
 
 This dump/verify scope does not itself certify fingerprint operations, the
 upstream helper/template corpora, a persistent inspection VM, guest execution,
-or a distinct-host compatibility decision. Fingerprint dump is independently
-certified below; compare and aggregate identities remain #1867/#1795. The exact
+or a distinct-host compatibility decision. Fingerprint dump and compare are
+independently certified below; aggregate identities remain #1795. The exact
 format, publication, security, evidence, and terminal audit gate are in the checked
 [CPU-template helper contract](../compat/firecracker/v1.16.0/cpu-template-helper-contract.md).
 
@@ -421,11 +421,47 @@ Silicon and fail before output; an explicit custom template can replace a
 pending selection and is captured through the real signed path. The artifact
 is diagnostic change-awareness evidence only—not host authentication,
 template validity, migration authorization, or snapshot-portability proof.
-Fingerprint compare/filter behavior remains #1867.
+Fingerprint compare/filter behavior is independently certified below.
 
 The exact fields, 64/255/256-byte fact bounds, 1 MiB artifact bound, privacy,
 publication, signed evidence, and four-row audit gate are in the checked
 [CPU-template fingerprint contract](../compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md).
+
+### CPU-Template Fingerprint Compare
+
+The same helper implements portable Firecracker-shaped `fingerprint compare`
+with required `--prev/-p` and `--curr/-c` paths plus optional one-or-more
+`--filters/-f` values. It requires no HVF signature or live provider. Both
+inputs use the existing 1 MiB no-follow, nonblocking regular UTF-8 reader and
+the strict version-1 fingerprint decoder; comparison performs no host capture,
+VM construction, or filesystem publication.
+
+The closed global filter order is `producer_version`, `kernel_release`, the
+three macOS facts, the three Linux facts, and `guest_cpu_config`. An absent
+filter option selects the two common facts, exactly the admitted platform's
+three host facts, and guest state. Explicit caller order does not change output;
+duplicates are invalid invocation, and a known fact from the other platform is
+operationally unavailable. Different platform tags always fail rather than
+turning unrelated Linux and Apple provenance into comparable nulls. Applicable
+nullable macOS facts retain real null/value comparison semantics.
+
+Equal selected state is silent exit 0. Differences produce one pretty JSON
+object on stderr with an ordered `differences` array of `name`, `prev`, and
+`curr` records, exactly one newline, a 1 MiB bound, and exit 1. Selected scalar
+values use the fingerprint wire representation. Unequal guest state reuses the
+exact two-document native-width strip transform, so common bits disappear,
+differing masks narrow, and identities missing from one side remain in the
+other. All bytes are constructed and bounded before writing; ordinary errors
+remain category-only and path/value-redacted. Unknown, empty, or duplicate
+filter syntax stays fixed exit 2 before input access.
+
+Same-path and hard-link inputs are valid read-only comparisons. This does not
+authenticate either artifact or establish a simultaneous filesystem snapshot.
+The diagnostic reports selected change awareness only; it does not prove
+template invalidity, host identity, migration safety, or snapshot portability.
+The exact vocabulary, JSON schema, admission/alias/security rules, tests, and
+four-row audit gate are in the checked
+[CPU-template fingerprint compare contract](../compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md).
 
 ## X86 CPUID and MSR platform boundary
 

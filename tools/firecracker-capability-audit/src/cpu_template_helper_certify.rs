@@ -10,6 +10,8 @@ const HELPER_CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/cpu-template-help
 const STRIP_CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/cpu-template-strip-contract.md";
 const FINGERPRINT_DUMP_CONTRACT_PATH: &str =
     "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md";
+const FINGERPRINT_COMPARE_CONTRACT_PATH: &str =
+    "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md";
 const OWNERSHIP_CONTRACT_PATH: &str =
     "compat/firecracker/v1.16.0/observability-tools-specification-contract.md";
 
@@ -39,15 +41,19 @@ pub const CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS: [&str; 4] 
     "tool-operation:cpu-template-helper/fingerprint/dump",
 ];
 
-/// Exact later helper capabilities that #1866 must leave nonterminal.
-pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 7] = [
-    "corpus:cpu-template-helper",
-    "corpus:cpu-templates",
-    "semantic.cpu:configuration-templates-and-feature-state",
+/// Exact fingerprint-compare capability scope certified by #1867.
+pub const CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS: [&str; 4] = [
     "tool-argument:cpu-template-helper/fingerprint/compare/curr",
     "tool-argument:cpu-template-helper/fingerprint/compare/filters",
     "tool-argument:cpu-template-helper/fingerprint/compare/prev",
     "tool-operation:cpu-template-helper/fingerprint/compare",
+];
+
+/// Exact later aggregate capabilities that #1867 must leave nonterminal.
+pub const CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS: [&str; 3] = [
+    "corpus:cpu-template-helper",
+    "corpus:cpu-templates",
+    "semantic.cpu:configuration-templates-and-feature-state",
 ];
 
 /// Require the CPU-template helper inventory to be one exact ordered delivery
@@ -80,16 +86,26 @@ pub fn validate_cpu_template_helper_transition(
         "CPU-template fingerprint-dump certification",
         &mut errors,
     );
+    let fingerprint_compare = collect_scope(
+        &capabilities,
+        &CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-compare certification",
+        &mut errors,
+    );
 
     if helper.len() == CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS.len()
         && strip.len() == CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.len()
         && fingerprint_dump.len()
             == CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS.len()
+        && fingerprint_compare.len()
+            == CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS.len()
     {
         let (helper_implementation, helper_validation) = helper_capability_evidence();
         let (strip_implementation, strip_validation) = strip_capability_evidence();
         let (fingerprint_implementation, fingerprint_validation) =
             fingerprint_dump_capability_evidence();
+        let (compare_implementation, compare_validation) =
+            fingerprint_compare_capability_evidence();
         let helper_historical = helper
             .iter()
             .all(|capability| is_exact_retained(capability));
@@ -110,18 +126,31 @@ pub fn validate_cpu_template_helper_transition(
                 &fingerprint_validation,
             )
         });
+        let compare_historical = fingerprint_compare
+            .iter()
+            .all(|capability| is_exact_retained(capability));
+        let compare_terminal = fingerprint_compare.iter().all(|capability| {
+            is_exact_terminal(capability, &compare_implementation, &compare_validation)
+        });
 
-        let valid_historical = helper_historical && strip_historical && fingerprint_historical;
-        let valid_helper_terminal = helper_terminal && strip_historical && fingerprint_historical;
-        let valid_strip_terminal = helper_terminal && strip_terminal && fingerprint_historical;
-        let valid_fingerprint_terminal = helper_terminal && strip_terminal && fingerprint_terminal;
+        let valid_historical =
+            helper_historical && strip_historical && fingerprint_historical && compare_historical;
+        let valid_helper_terminal =
+            helper_terminal && strip_historical && fingerprint_historical && compare_historical;
+        let valid_strip_terminal =
+            helper_terminal && strip_terminal && fingerprint_historical && compare_historical;
+        let valid_fingerprint_terminal =
+            helper_terminal && strip_terminal && fingerprint_terminal && compare_historical;
+        let valid_compare_terminal =
+            helper_terminal && strip_terminal && fingerprint_terminal && compare_terminal;
         if !valid_historical
             && !valid_helper_terminal
             && !valid_strip_terminal
             && !valid_fingerprint_terminal
+            && !valid_compare_terminal
         {
             errors.push(
-                "CPU-template helper certification requires one exact ordered historical, #1792 helper, #1793 strip, or #1866 fingerprint-dump phase"
+                "CPU-template helper certification requires one exact ordered historical, #1792 helper, #1793 strip, #1866 fingerprint-dump, or #1867 fingerprint-compare phase"
                     .to_string(),
             );
         }
@@ -191,6 +220,67 @@ pub fn validate_cpu_template_fingerprint_dump_compatibility(
         OWNERSHIP_CONTRACT_PATH,
         "CPU-template fingerprint-dump certification cannot read the Wave 7 ownership contract",
         validate_fingerprint_ownership_contract,
+        &mut errors,
+    );
+
+    finish(errors)
+}
+
+/// Validate the terminal #1867 fingerprint-compare scope while retaining the
+/// independently owned corpus and aggregate capabilities.
+pub fn validate_cpu_template_fingerprint_compare_compatibility(
+    manifest: &SourceManifest,
+    inventory: &CapabilityInventory,
+    repository_root: &Path,
+) -> Result<(), ValidationErrors> {
+    let mut errors = common_validation(manifest, inventory, repository_root);
+    let capabilities = capability_map(inventory);
+
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-compare certification helper dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-compare certification strip dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-compare certification dump dependency",
+        &mut errors,
+    );
+    require_terminal_scope(
+        &capabilities,
+        &CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS,
+        "CPU-template fingerprint-compare certification",
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        FINGERPRINT_COMPARE_CONTRACT_PATH,
+        "CPU-template fingerprint-compare certification cannot read the compare contract",
+        |contract, errors| {
+            validate_contract_rows(
+                contract,
+                None,
+                CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS,
+                "implemented-and-verified",
+                "fingerprint-compare contract",
+                errors,
+            );
+        },
+        &mut errors,
+    );
+    read_contract(
+        repository_root,
+        OWNERSHIP_CONTRACT_PATH,
+        "CPU-template fingerprint-compare certification cannot read the Wave 7 ownership contract",
+        validate_fingerprint_compare_ownership_contract,
         &mut errors,
     );
 
@@ -516,6 +606,59 @@ fn fingerprint_dump_capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
     )
 }
 
+fn fingerprint_compare_capability_evidence() -> (Vec<Reference>, Vec<Reference>) {
+    (
+        local_references(&[
+            (
+                "tools/cpu-template-helper/src/cli.rs",
+                "Fingerprint(FingerprintOperation::Compare",
+            ),
+            (
+                "tools/cpu-template-helper/src/fingerprint.rs",
+                "pub fn decode_cpu_fingerprint_document",
+            ),
+            (
+                "tools/cpu-template-helper/src/fingerprint_compare.rs",
+                "pub fn compare_cpu_fingerprints",
+            ),
+            (
+                "tools/cpu-template-helper/src/input.rs",
+                "pub fn read_regular_utf8",
+            ),
+            (
+                "tools/cpu-template-helper/src/strip.rs",
+                "pub fn strip_cpu_template_documents",
+            ),
+        ]),
+        local_references(&[
+            (
+                "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+                "Terminal certification",
+            ),
+            (
+                "tools/cpu-template-helper/src/fingerprint_compare.rs",
+                "fn guest_difference_reuses_native_width_strip_and_preserves_missing_identity",
+            ),
+            (
+                "tools/cpu-template-helper/src/fingerprint_compare.rs",
+                "fn macos_defaults_emit_all_differences_in_public_order_and_repeat",
+            ),
+            (
+                "tools/cpu-template-helper/tests/cli.rs",
+                "fn fingerprint_compare_emits_exact_canonical_difference_and_fixed_order",
+            ),
+            (
+                "tools/cpu-template-helper/tests/cli.rs",
+                "fn fingerprint_compare_rejects_strict_document_and_file_failures_without_mutation",
+            ),
+            (
+                "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+                "fn checked_cpu_template_fingerprint_compare_compatibility_is_terminal_and_fail_closed",
+            ),
+        ]),
+    )
+}
+
 fn validate_helper_ownership_contract(contract: &str, errors: &mut Vec<String>) {
     validate_contract_rows(
         contract,
@@ -544,12 +687,17 @@ fn validate_fingerprint_ownership_contract(contract: &str, errors: &mut Vec<Stri
     validate_strip_ownership_contract(contract, errors);
 }
 
+fn validate_fingerprint_compare_ownership_contract(contract: &str, errors: &mut Vec<String>) {
+    validate_fingerprint_ownership_contract(contract, errors);
+}
+
 fn validate_fingerprint_ownership_rows(contract: &str, errors: &mut Vec<String>) {
     let retained = CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
     let terminal = CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
         .into_iter()
+        .chain(CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS)
         .collect::<BTreeSet<_>>();
     let expected = retained.union(&terminal).copied().collect::<BTreeSet<_>>();
     let mut found = BTreeSet::new();
@@ -781,6 +929,41 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("requires terminal"))
+        );
+    }
+
+    #[test]
+    fn exact_fingerprint_compare_contract_scope_is_fail_closed() {
+        let exact = CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS
+            .into_iter()
+            .map(|id| format!("| `{id}` | `implemented-and-verified` |"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut errors = Vec::new();
+        validate_contract_rows(
+            &exact,
+            None,
+            CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "fingerprint-compare contract",
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+
+        let missing = exact.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let mut errors = Vec::new();
+        validate_contract_rows(
+            &missing,
+            None,
+            CPU_TEMPLATE_FINGERPRINT_COMPARE_COMPATIBILITY_CAPABILITY_IDS,
+            "implemented-and-verified",
+            "fingerprint-compare contract",
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("exact fingerprint-compare"))
         );
     }
 }

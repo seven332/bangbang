@@ -12,8 +12,9 @@ ledger.
 
 ## Original 28-record ledger
 
-The final split is five `implemented-and-verified`, 22 `audit-required` records
-with one explicit Wave 7 owner, and one `proven-platform-impossible` record.
+The current split is 23 `implemented-and-verified`, four `audit-required`
+records with one explicit Wave 7 owner, and one
+`proven-platform-impossible` record.
 
 | Identity | Final disposition | Evidence or later owner |
 | --- | --- | --- |
@@ -27,9 +28,9 @@ with one explicit Wave 7 owner, and one `proven-platform-impossible` record.
 | `semantic.lifecycle:pause-resume-quiescence-and-failure` | implemented and verified | #1389/#1390 provide topology-wide idempotent pause/resume and the current complete quiescence/publication transaction with unit and signed evidence. |
 | `semantic.lifecycle:smp-psci-and-vcpu-ownership` | implemented and verified | Fixed owner-thread SMP, all-MPIDR FDT input, indexed PSCI, timer suspend, interrupt routing, topology-wide pause ordering, guest terminal outcomes, and cleanup are covered by HVF unit and signed tests. |
 | `semantic.memory:machine-sizing-hugepages-and-dirty-tracking` | implemented and verified | #1391/#1395/#1396 provide target-bounded configured-equals-realized sizing, exact `2M` policy, mapped-memory ownership, and complete failure-atomic dirty epochs. |
-| `tool-argument:cpu-template-helper/fingerprint/compare/curr` | audit required | Wave 7 owns the persisted current-fingerprint input. |
-| `tool-argument:cpu-template-helper/fingerprint/compare/filters` | audit required | Wave 7 owns helper comparison filtering. |
-| `tool-argument:cpu-template-helper/fingerprint/compare/prev` | audit required | Wave 7 owns the persisted previous-fingerprint input. |
+| `tool-argument:cpu-template-helper/fingerprint/compare/curr` | implemented and verified | The required current path uses strict bounded no-follow persisted input and the versioned fingerprint decoder. |
+| `tool-argument:cpu-template-helper/fingerprint/compare/filters` | implemented and verified | Closed platform-honest defaults/subsets produce fixed-order selected-value diagnostics and reject duplicates or inapplicable facts. |
+| `tool-argument:cpu-template-helper/fingerprint/compare/prev` | implemented and verified | The required previous path uses strict bounded no-follow persisted input and the versioned fingerprint decoder. |
 | `tool-argument:cpu-template-helper/fingerprint/dump/config` | implemented and verified | Strict bounded config projection supplies the signed topology-common fingerprint capture. |
 | `tool-argument:cpu-template-helper/fingerprint/dump/output` | implemented and verified | The versioned artifact defaults to `fingerprint.json` and uses owner-only absent publication. |
 | `tool-argument:cpu-template-helper/fingerprint/dump/template` | implemented and verified | A strict explicit custom template has final precedence before effective fingerprint capture. |
@@ -40,7 +41,7 @@ with one explicit Wave 7 owner, and one `proven-platform-impossible` record.
 | `tool-argument:cpu-template-helper/template/strip/suffix` | implemented and verified | Safe same-directory output naming supports absent-only suffixes and exact single-link replacement. |
 | `tool-argument:cpu-template-helper/template/verify/config` | implemented and verified | Strict bounded config parsing supplies the requested vCPU topology and config selection. |
 | `tool-argument:cpu-template-helper/template/verify/template` | implemented and verified | Strict custom input is applied and compared against the all-vCPU effective checkpoint. |
-| `tool-operation:cpu-template-helper/fingerprint/compare` | audit required | Wave 7 owns deterministic persisted-fingerprint comparison. |
+| `tool-operation:cpu-template-helper/fingerprint/compare` | implemented and verified | Portable typed comparison emits bounded canonical differences and reuses exact guest common-bit stripping without provider or publication access. |
 | `tool-operation:cpu-template-helper/fingerprint/dump` | implemented and verified | The signed helper combines reviewed public macOS facts with real effective guest state in one strict platform-tagged artifact. |
 | `tool-operation:cpu-template-helper/template/dump` | implemented and verified | The signed helper captures a topology-common real HVF profile and publishes canonical retained modifiers. |
 | `tool-operation:cpu-template-helper/template/strip` | implemented and verified | Portable native-width common-bit stripping publishes canonical outputs with explicit multi-path rollback and uncertainty. |

@@ -16500,7 +16500,66 @@
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/compare/curr"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Compare"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn decode_cpu_fingerprint_document"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "pub fn compare_cpu_fingerprints"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub fn read_regular_utf8"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn guest_difference_reuses_native_width_strip_and_preserves_missing_identity"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn macos_defaults_emit_all_differences_in_public_order_and_repeat"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_emits_exact_canonical_difference_and_fixed_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_rejects_strict_document_and_file_failures_without_mutation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_compare_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/compare/filters",
@@ -16509,7 +16568,66 @@
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/compare/filters"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Compare"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn decode_cpu_fingerprint_document"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "pub fn compare_cpu_fingerprints"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub fn read_regular_utf8"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn guest_difference_reuses_native_width_strip_and_preserves_missing_identity"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn macos_defaults_emit_all_differences_in_public_order_and_repeat"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_emits_exact_canonical_difference_and_fixed_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_rejects_strict_document_and_file_failures_without_mutation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_compare_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/compare/prev",
@@ -16518,7 +16636,66 @@
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/compare/prev"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Compare"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn decode_cpu_fingerprint_document"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "pub fn compare_cpu_fingerprints"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub fn read_regular_utf8"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn guest_difference_reuses_native_width_strip_and_preserves_missing_identity"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn macos_defaults_emit_all_differences_in_public_order_and_repeat"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_emits_exact_canonical_difference_and_fixed_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_rejects_strict_document_and_file_failures_without_mutation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_compare_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/dump/config",
@@ -18563,7 +18740,66 @@
       "source_refs": [
         "tool-operation:cpu-template-helper/fingerprint/compare"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Compare"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn decode_cpu_fingerprint_document"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "pub fn compare_cpu_fingerprints"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/input.rs",
+          "anchor": "pub fn read_regular_utf8"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/strip.rs",
+          "anchor": "pub fn strip_cpu_template_documents"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-compare-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn guest_difference_reuses_native_width_strip_and_preserves_missing_identity"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint_compare.rs",
+          "anchor": "fn macos_defaults_emit_all_differences_in_public_order_and_repeat"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_emits_exact_canonical_difference_and_fixed_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_compare_rejects_strict_document_and_file_failures_without_mutation"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_compare_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-operation:cpu-template-helper/fingerprint/dump",
