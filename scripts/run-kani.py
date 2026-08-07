@@ -16,7 +16,7 @@ AUTHORITY_PATH = ROOT / "compat/firecracker/v1.16.0/formal-verification-audit.js
 VERSION_COMMAND_LABEL = "cargo kani --version"
 LIST_COMMAND_LABEL = "cargo kani list --format json"
 EXPECTED_KANI_VERSION = "0.67.0"
-EXPECTED_VERSION_OUTPUT = "Kani Rust Verifier 0.67.0 (cargo plugin)"
+EXPECTED_VERSION_OUTPUT = "cargo-kani 0.67.0"
 EXPECTED_LIST_FORMAT = "0.1"
 EXPECTED_PACKAGES = ["bangbang-pager", "bangbang-runtime"]
 
