@@ -36,17 +36,17 @@ with one explicit Wave 7 owner, and one `proven-platform-impossible` record.
 | `tool-argument:cpu-template-helper/template/dump/config` | implemented and verified | Strict bounded config parsing projects only machine/CPU actions before real HVF inspection. |
 | `tool-argument:cpu-template-helper/template/dump/output` | implemented and verified | Canonical private output uses synchronized absent-only publication. |
 | `tool-argument:cpu-template-helper/template/dump/template` | implemented and verified | An explicit strict custom template has final selection precedence. |
-| `tool-argument:cpu-template-helper/template/strip/paths` | audit required | Wave 7 owns persisted-template path input. |
-| `tool-argument:cpu-template-helper/template/strip/suffix` | audit required | Wave 7 owns strip output naming. |
+| `tool-argument:cpu-template-helper/template/strip/paths` | implemented and verified | Strict bounded descriptor-bound inputs require at least two duplicate-free normalized templates. |
+| `tool-argument:cpu-template-helper/template/strip/suffix` | implemented and verified | Safe same-directory output naming supports absent-only suffixes and exact single-link replacement. |
 | `tool-argument:cpu-template-helper/template/verify/config` | implemented and verified | Strict bounded config parsing supplies the requested vCPU topology and config selection. |
 | `tool-argument:cpu-template-helper/template/verify/template` | implemented and verified | Strict custom input is applied and compared against the all-vCPU effective checkpoint. |
 | `tool-operation:cpu-template-helper/fingerprint/compare` | audit required | Wave 7 owns deterministic persisted-fingerprint comparison. |
 | `tool-operation:cpu-template-helper/fingerprint/dump` | audit required | Wave 7 owns preboot capture, host fingerprinting, and artifact publication. |
 | `tool-operation:cpu-template-helper/template/dump` | implemented and verified | The signed helper captures a topology-common real HVF profile and publishes canonical retained modifiers. |
-| `tool-operation:cpu-template-helper/template/strip` | audit required | Wave 7 owns persisted-JSON strip transformation. |
+| `tool-operation:cpu-template-helper/template/strip` | implemented and verified | Portable native-width common-bit stripping publishes canonical outputs with explicit multi-path rollback and uncertainty. |
 | `tool-operation:cpu-template-helper/template/verify` | implemented and verified | The signed helper applies through production HVF, captures every vCPU, and verifies masked requested state. |
 
-The 22 Wave 7 handoffs are nonterminal because their complete public behavior
+The 19 remaining Wave 7 handoffs are nonterminal because their complete public behavior
 does not exist yet. They are not platform exclusions. Wave 2's CPU model and
 paused capture/apply primitives are dependencies, not evidence that the helper
 or whole-corpus fleet workflows have been delivered.

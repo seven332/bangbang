@@ -346,12 +346,47 @@ failure exits 1 with a bounded category-only diagnostic; help, version, and
 successful operations exit 0. Paths, register identities, masks, values,
 readbacks, and provider internals are never reported.
 
-This scope does not implement `template strip`, fingerprint dump/compare, the
-upstream helper/template corpora, a persistent inspection VM, guest execution,
-or a distinct-host compatibility decision. Those identities remain separately
-owned by #1793–#1795. The exact format, publication, security, evidence, and
+This dump/verify scope does not certify fingerprint dump/compare, the upstream
+helper/template corpora, a persistent inspection VM, guest execution, or a
+distinct-host compatibility decision. Those identities remain separately
+owned by #1794–#1795. The exact format, publication, security, evidence, and
 terminal audit gate are in the checked
 [CPU-template helper contract](../compat/firecracker/v1.16.0/cpu-template-helper-contract.md).
+
+### CPU-Template Strip
+
+The same executable implements the pinned Firecracker v1.16.0 `template strip
+--paths/-p PATH PATH... --suffix/-s SUFFIX` surface. At least two paths are
+required, there is no fixed maximum, and the suffix defaults to `_stripped`.
+An empty suffix replaces each exact input. Strip is portable host-side work:
+it never asks the HVF provider to inspect a VM and does not require an
+entitlement or supported Hypervisor.framework host.
+
+Every input passes through the strict bounded custom-template decoder. The
+normalized transform removes an identity selected to the same value by every
+input, narrows identities with differing selected values to only their
+difference bits, and preserves identities missing from any input. U32, U64,
+and U128 widths remain native, and each result uses the same deterministic
+canonical JSON accepted by dump/verify.
+
+Inputs are descriptor-bound no-follow regular files. The batch rejects unsafe
+suffix separators, duplicate file identities or entries, duplicate outputs,
+and input/output aliases before staging. Nonempty suffixes derive
+stem-plus-suffix-plus-extension names in the same directory and commit only to
+absent paths with atomic `NOREPLACE`. Empty suffixes require exact single-link
+inputs and atomically `EXCHANGE` each output with its validated input. All
+outputs are encoded, owner-only staged, file-synchronized, and directory-
+synchronized before the first final rename.
+
+A later commit failure triggers best-effort reverse rollback and cleanup of
+every independently owned object, preserving concurrent winners and unknown
+replacements. Postcommit durability and old-input cleanup failures have
+separate uncertainty classes. Each rename is atomic, but multiple final paths
+do not form one global or crash-atomic transaction; a crash may expose a
+committed prefix or private stages. Success is silent, and failures never echo
+paths, identities, or values. The exact algorithm, persistence boundary,
+fault matrix, and three-row terminal audit are in the checked
+[CPU-template strip contract](../compat/firecracker/v1.16.0/cpu-template-strip-contract.md).
 
 ## X86 CPUID and MSR platform boundary
 

@@ -26,9 +26,11 @@ checked identities:
 | `tool-operation:cpu-template-helper/template/verify` | `implemented-and-verified` |
 
 The scoped `validate --cpu-template-helper-final` gate requires that exact
-seven-row terminal transition and exact evidence. It also fails if any strip,
-fingerprint, helper-corpus, template-corpus, or aggregate CPU-template row
-owned by #1793–#1795 moves from `audit-required`.
+seven-row terminal transition and exact evidence. It accepts the separately
+certified #1793 strip transition without treating strip as dump/verify
+evidence, and still fails if any fingerprint, helper-corpus, template-corpus,
+or aggregate CPU-template row owned by #1794–#1795 moves from
+`audit-required`.
 
 ## Configuration and selection
 
@@ -141,11 +143,13 @@ permissions of the selected directory.
 
 All errors and custom `Debug` implementations are bounded and omit
 paths, config values, register identities, filters, target values, effective
-values, and provider internals. The executable admits only `template dump` and
-`template verify` with the pinned five Firecracker arguments. Help and version
-write stdout and exit 0; command success is silent; invalid invocation writes
-one fixed stderr line and exits 2; operational failure writes one fixed,
-category-only stderr line and exits 1.
+values, and provider internals. This contract admits `template dump` and
+`template verify` with the pinned five Firecracker arguments; the independent
+[`template strip` contract](cpu-template-strip-contract.md) governs its two
+arguments and portable persistence behavior. Help and version write stdout and
+exit 0; command success is silent; invalid invocation writes one fixed stderr
+line and exits 2; operational failure writes one fixed, category-only stderr
+line and exits 1.
 
 Portable tests cover parser sharing, production projection parity, descriptor
 census and decoder closure, canonical round trips, selection precedence,
@@ -159,4 +163,5 @@ two-vCPU canonical dump and permissions, mixed U32/U64/U128 verify and
 selection precedence, explicit optional-register outcomes, mismatch and
 collision retry, unsigned rejection, and boot-owned X0/PC/PSTATE checkpoint
 semantics. The harness runs through `scripts/run-integration-tests.sh` and the
-audit guard proves the exact seven terminal rows and retained later scopes.
+audit guard proves the exact seven terminal rows and retained independent
+scopes.

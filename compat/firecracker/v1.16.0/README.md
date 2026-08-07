@@ -78,6 +78,7 @@ reviewed delta.
 | [Machine lifecycle](machine-lifecycle-audit.md) | VM lifecycle, vCPU ownership, pause/resume, power sessions, and snapshot-ready coordination |
 | [CPU templates](cpu-template-contract.md) | Reviewed arm64 profile, selection, application, snapshot boundary, and KVM/static exclusions |
 | [CPU-template dump and verify helper](cpu-template-helper-contract.md) | Strict public CLI, real all-vCPU HVF capture, portable format, config projection, bounded input, redaction, and absent-only publication |
+| [CPU-template strip](cpu-template-strip-contract.md) | Portable normalized common-bit transformation, path and suffix admission, canonical output, multi-path publication, rollback, and uncertainty |
 | [Device hotplug](device-hotplug-contract.md) | Runtime block, pmem, and network transactions and their aggregate ownership |
 | [Storage](storage-contract.md) | Block/pmem live and snapshot composition |
 | [Balloon](balloon-contract.md) | Balloon API, queue/accounting behavior, and native-v2 state |

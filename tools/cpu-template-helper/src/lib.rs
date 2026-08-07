@@ -7,6 +7,8 @@ pub mod profile;
 pub mod projection;
 pub mod provider;
 pub mod publication;
+pub mod strip;
+pub mod strip_publication;
 
 /// Maximum accepted config, template, or emitted template document size.
 pub const CPU_TEMPLATE_DOCUMENT_MAX_BYTES: usize = 1024 * 1024;
