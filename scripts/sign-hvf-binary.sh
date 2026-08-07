@@ -5,11 +5,12 @@ usage() {
   cat <<'EOF'
 Usage: scripts/sign-hvf-binary.sh INPUT OUTPUT
 
-Copy INPUT to OUTPUT and sign OUTPUT with the Hypervisor.framework entitlement.
+Copy INPUT to a private sibling stage, sign it with the Hypervisor.framework
+entitlement, and publish it only when OUTPUT is absent.
 
 Arguments:
   INPUT   Existing binary to copy and sign.
-  OUTPUT  Destination path for the signed binary.
+  OUTPUT  Absent destination path for the signed binary.
 EOF
 }
 
@@ -56,6 +57,12 @@ if ! command -v codesign >/dev/null 2>&1; then
   echo "codesign is required to sign HVF binaries" >&2
   exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required to publish signed HVF binaries" >&2
+  exit 1
+fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/bangbang-hvf-sign.XXXXXX")"
 signed_tmp=""
@@ -100,5 +107,9 @@ esac
 signed_tmp="$(mktemp "$output_tmp_dir/.$output_name.signed.XXXXXX")"
 cp -p -- "$input" "$signed_tmp"
 codesign --force --sign - --entitlements "$entitlements" "$signed_tmp"
-mv -f -- "$signed_tmp" "$output"
+python3 "$repo_root/scripts/guest_artifact_policy.py" \
+  publish signed \
+  --stage "$signed_tmp" \
+  --output "$output" \
+  >/dev/null
 signed_tmp=""

@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "delivery": {
+    "parent_issue": "#1796",
+    "preparation_issue": "#1871",
+    "completion_issue": "#1872",
+    "state": "preparation"
+  },
+  "source_namespace": {
+    "release": "v1.15",
+    "architecture": "aarch64",
+    "provider": "Firecracker CI",
+    "provenance_url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/rootfs-and-kernel-setup.md",
+    "redistribution": "download-only; Bangbang does not redistribute guest artifact bytes"
+  },
+  "artifacts": [
+    {
+      "id": "kernel",
+      "kind": "linux-kernel",
+      "filename": "vmlinux-6.1.155",
+      "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155",
+      "sha256": "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591",
+      "size_bytes": 17111552,
+      "cache_path": "firecracker-ci/v1.15/aarch64/vmlinux-6.1.155",
+      "output_class": "verified-repairable-cache",
+      "provenance": "Firecracker CI arm64 kernel artifact",
+      "redistribution": "not vendored; downloaded from the pinned HTTPS URL"
+    },
+    {
+      "id": "rootfs",
+      "kind": "squashfs-rootfs",
+      "filename": "ubuntu-24.04.squashfs",
+      "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/ubuntu-24.04.squashfs",
+      "sha256": "0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608",
+      "size_bytes": 105332736,
+      "cache_path": "firecracker-ci/v1.15/aarch64/ubuntu-24.04.squashfs",
+      "output_class": "verified-repairable-cache",
+      "provenance": "Firecracker CI Ubuntu 24.04 arm64 rootfs artifact",
+      "redistribution": "not vendored; downloaded from the pinned HTTPS URL"
+    }
+  ],
+  "generated": [
+    {
+      "id": "guest-boot-initrd",
+      "generator_path": "scripts/build-guest-boot-initrd.py",
+      "cache_path": "bangbang/guest-boot/initrd.cpio",
+      "sha256": "f1cd1318caf1e7f1cbff1e095dce9a9958b84320746d763a01a3fd5048008050",
+      "size_bytes": 52224,
+      "output_class": "deterministic-generated-cache",
+      "determinism": "byte-identical"
+    }
+  ],
+  "ext4_recipes": [
+    {
+      "id": "rootfs-ext4",
+      "source_artifact": "rootfs",
+      "variant": "normal",
+      "filename_template": "ubuntu-24.04-{size}.ext4",
+      "default_size": "1G",
+      "minimum_size_bytes": 1024,
+      "classification": "recipe-deterministic",
+      "output_class": "verified-repairable-cache",
+      "tool_roles": [
+        "unsquashfs",
+        "mkfs.ext4",
+        "e2fsck"
+      ],
+      "tracked_inputs": [
+        "compat/firecracker/v1.16.0/guest-workflow-audit.json",
+        "scripts/fetch-firecracker-rootfs.sh",
+        "scripts/guest_artifact_policy.py"
+      ],
+      "sidecar": {
+        "schema_version": 1,
+        "suffix": ".bangbang.json",
+        "fields": [
+          "schema_version",
+          "source_sha256",
+          "source_size_bytes",
+          "requested_size_bytes",
+          "variant",
+          "recipe_sha256",
+          "tool_versions",
+          "output_sha256",
+          "output_size_bytes",
+          "filesystem_check"
+        ],
+        "filesystem_check": "e2fsck -fn"
+      }
+    },
+    {
+      "id": "rootfs-ext4-direct-boot-v109",
+      "source_artifact": "rootfs",
+      "variant": "direct-boot-v109",
+      "filename_template": "ubuntu-24.04-{size}-direct-boot-v109.ext4",
+      "default_size": "512M",
+      "minimum_size_bytes": 1024,
+      "classification": "recipe-deterministic",
+      "output_class": "verified-repairable-cache",
+      "tool_roles": [
+        "unsquashfs",
+        "mkfs.ext4",
+        "e2fsck"
+      ],
+      "tracked_inputs": [
+        "compat/firecracker/v1.16.0/guest-workflow-audit.json",
+        "scripts/fetch-firecracker-rootfs.sh",
+        "scripts/guest/arm64-id-register-report.rs",
+        "scripts/guest_artifact_policy.py"
+      ],
+      "sidecar": {
+        "schema_version": 1,
+        "suffix": ".bangbang.json",
+        "fields": [
+          "schema_version",
+          "source_sha256",
+          "source_size_bytes",
+          "requested_size_bytes",
+          "variant",
+          "recipe_sha256",
+          "tool_versions",
+          "output_sha256",
+          "output_size_bytes",
+          "filesystem_check"
+        ],
+        "filesystem_check": "e2fsck -fn"
+      }
+    }
+  ],
+  "output_classes": [
+    {
+      "id": "verified-repairable-cache",
+      "reuse": "manifest-size-sha-or-matching-sidecar-and-filesystem-check",
+      "repair": "announced-validated-replacement",
+      "publication": "validated-stage-with-sidecar-last-for-pairs",
+      "collision": "reject-final-symlink-or-nonregular",
+      "locking": "nonblocking-advisory"
+    },
+    {
+      "id": "deterministic-generated-cache",
+      "reuse": "byte-identical",
+      "repair": "announced-atomic-refresh",
+      "publication": "validated-sibling-stage",
+      "collision": "reject-final-symlink-or-nonregular",
+      "locking": "nonblocking-advisory"
+    },
+    {
+      "id": "caller-owned-absent-only",
+      "reuse": "byte-identical-when-explicitly-allowed",
+      "repair": "never",
+      "publication": "atomic-hard-link-no-clobber",
+      "collision": "leave-occupied-destination-unchanged",
+      "locking": "none"
+    },
+    {
+      "id": "unique-ephemeral-session",
+      "reuse": "never",
+      "repair": "never",
+      "publication": "owner-only-unique-creation",
+      "collision": "fail-closed",
+      "locking": "none"
+    }
+  ],
+  "profiles": [
+    {
+      "id": "macos-api-rootfs-smoke",
+      "state": "planned",
+      "mode": "api",
+      "kernel_artifact": "kernel",
+      "rootfs_artifact": "rootfs",
+      "initrd_artifact": "rootfs-poweroff-initrd",
+      "boot_args": "console=ttyS0 reboot=t panic=1 pci=off",
+      "rootfs_read_only": true,
+      "success_marker": "BANGBANG_ROOTFS_WORKFLOW_OK",
+      "shutdown": "guest-poweroff",
+      "networking": "none",
+      "platform": "aarch64-apple-darwin-hvf",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": "macos-no-api-rootfs-smoke",
+      "state": "planned",
+      "mode": "no-api",
+      "kernel_artifact": "kernel",
+      "rootfs_artifact": "rootfs",
+      "initrd_artifact": "rootfs-poweroff-initrd",
+      "boot_args": "console=ttyS0 reboot=t panic=1 pci=off",
+      "rootfs_read_only": true,
+      "success_marker": "BANGBANG_ROOTFS_WORKFLOW_OK",
+      "shutdown": "guest-poweroff",
+      "networking": "none",
+      "platform": "aarch64-apple-darwin-hvf",
+      "implementation": [],
+      "validation": []
+    }
+  ],
+  "evidence": {
+    "implementation": [
+      {
+        "kind": "local",
+        "path": "scripts/build-guest-boot-initrd.py",
+        "anchor": "publish_generated_bytes("
+      },
+      {
+        "kind": "local",
+        "path": "scripts/fetch-firecracker-kernel.sh",
+        "anchor": "guest_artifact_policy.py"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/fetch-firecracker-rootfs.sh",
+        "anchor": "--internal-populate-direct"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/guest_artifact_policy.py",
+        "anchor": "class ArtifactPolicyError"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/sign-hvf-binary.sh",
+        "anchor": "publish signed"
+      }
+    ],
+    "validation": [
+      {
+        "kind": "local",
+        "path": "scripts/tests/test_guest_artifact_policy.py",
+        "anchor": "class GuestArtifactPolicyTests"
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/tests/guest_workflow_audit.rs",
+        "anchor": "checked_guest_workflow_audit_is_canonical_and_fail_closed"
+      }
+    ],
+    "documentation": [
+      {
+        "kind": "local",
+        "path": "compat/firecracker/v1.16.0/README.md",
+        "anchor": "Guest workflow artifact authority"
+      },
+      {
+        "kind": "local",
+        "path": "docs/testing.md",
+        "anchor": "## Guest Boot Artifacts"
+      }
+    ]
+  },
+  "nonclaims": [
+    "byte-reproducible-ext4",
+    "hostile-parent-traversal-safety",
+    "artifact-redistribution-or-authentication",
+    "arbitrary-url-or-profile-input",
+    "production-workflow",
+    "external-guest-networking",
+    "arbitrary-distro-or-freebsd-guest-support",
+    "crash-atomic-image-sidecar-pair"
+  ]
+}

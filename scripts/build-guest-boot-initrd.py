@@ -7,8 +7,13 @@ import argparse
 import os
 import struct
 import sys
-import tempfile
 from pathlib import Path
+
+from guest_artifact_policy import (
+    ArtifactPolicyError,
+    load_manifest,
+    publish_generated_bytes,
+)
 
 BOOT_MARKER = b"BANGBANG_BOOT_OK\n"
 BLOCK_READ_MARKER = b"BANGBANG_BLOCK_READ_OK"
@@ -101,7 +106,6 @@ VDC_PATH = b"/dev/vdc\0"
 PMEM0_PATH = b"/dev/pmem0\0"
 PMEM1_PATH = b"/dev/pmem1\0"
 ROOTFS_OS_RELEASE_PATH = b"/mnt/etc/os-release\0"
-DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot/initrd.cpio")
 CPIO_NEWC_HEADER_SIZE = 110
 CPIO_TRAILER = "TRAILER!!!"
 
@@ -3367,43 +3371,7 @@ def default_output_path() -> Path:
             str(repo_root / ".tmp" / "guest-artifacts"),
         )
     )
-    return cache_root / DEFAULT_RELATIVE_OUTPUT
-
-
-def write_output(path: Path, data: bytes) -> None:
-    if path.is_symlink():
-        raise RuntimeError(f"guest initrd path must not be a symlink: {path}")
-    if path.exists():
-        if not path.is_file():
-            raise RuntimeError(f"guest initrd path exists but is not a regular file: {path}")
-        if path.read_bytes() == data:
-            return
-
-    parent = path.parent
-    if parent.exists() and not parent.is_dir():
-        raise RuntimeError(f"guest initrd parent path exists but is not a directory: {parent}")
-    parent.mkdir(parents=True, exist_ok=True)
-
-    temp_name = ""
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=f"{path.name}.",
-            suffix=".tmp",
-            dir=parent,
-            delete=False,
-        ) as temp_file:
-            temp_name = temp_file.name
-            temp_file.write(data)
-        os.chmod(temp_name, 0o644)
-        os.replace(temp_name, path)
-        temp_name = ""
-    finally:
-        if temp_name:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
+    return cache_root / load_manifest().generated["guest-boot-initrd"].cache_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -3413,7 +3381,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=default_output_path(),
+        default=None,
         help="Output initrd path. Defaults under BANGBANG_GUEST_ARTIFACTS_DIR or .tmp/guest-artifacts.",
     )
     parser.add_argument(
@@ -3427,13 +3395,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        output_path = args.output
+        explicit_output = args.output is not None
+        output_path = args.output if explicit_output else default_output_path()
         data = build_initrd()
         if args.check:
             validate_initrd(data)
-        write_output(output_path, data)
+        publish_generated_bytes(
+            output_path,
+            data,
+            managed_cache=not explicit_output,
+        )
         if args.check:
             validate_initrd(output_path.read_bytes())
+    except ArtifactPolicyError as err:
+        print(f"guest initrd policy: {err.category}: {err}", file=sys.stderr)
+        return 1
     except OSError as err:
         print(f"failed to build guest boot initrd: {err}", file=sys.stderr)
         return 1
