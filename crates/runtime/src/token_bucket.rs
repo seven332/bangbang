@@ -368,13 +368,14 @@ mod verification {
         let size_input: u16 = kani::any();
         let budget_input: u16 = kani::any();
         let refill_time_millis_input: u16 = kani::any();
-        let elapsed_nanos_input: u32 = kani::any();
+        let elapsed_millis_input: u16 = kani::any();
 
         kani::assume((1..=4_096).contains(&size_input));
         kani::assume(budget_input <= size_input);
         kani::assume((1..=1_000).contains(&refill_time_millis_input));
+        kani::assume(elapsed_millis_input <= refill_time_millis_input);
         let refill_time_nanos_input = u32::from(refill_time_millis_input) * 1_000_000;
-        kani::assume(elapsed_nanos_input <= refill_time_nanos_input);
+        let elapsed_nanos_input = u32::from(elapsed_millis_input) * 1_000_000;
 
         // These widths exactly cover the bounded domain above while avoiding
         // unconstrained high bits before the values enter the production types.

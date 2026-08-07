@@ -145,8 +145,8 @@
         "The elapsed logical refill time does not exceed one complete refill interval."
       ],
       "bounds": [
-        "1 <= size <= 4096, 1 <= refill_time_millis <= 1000, refill_time_nanos = refill_time_millis * 1000000, budget <= size, and elapsed_nanos <= refill_time_nanos.",
-        "Symbolic u16 size/budget/refill-millisecond and u32 elapsed sources exactly cover those admitted intervals before widening to the production u64/u128 types."
+        "1 <= size <= 4096, 1 <= refill_time_millis <= 1000, 0 <= elapsed_millis <= refill_time_millis, refill/elapsed nanoseconds equal the millisecond values times 1000000, and budget <= size.",
+        "Symbolic u16 size/budget/refill-millisecond/elapsed-millisecond sources exactly cover those admitted intervals before widening to the production u64/u128 types."
       ],
       "invariant": "Refill classification is exact at zero-token and full-interval boundaries; a partial refill never decreases or overfills budget and consumes a positive logical duration smaller than the interval and no greater than elapsed time.",
       "implementation": [
