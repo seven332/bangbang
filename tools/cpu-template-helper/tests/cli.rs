@@ -291,6 +291,67 @@ fn strip_precommit_failures_preserve_inputs_winners_and_aliases() {
 }
 
 #[test]
+fn strip_bad_documents_and_file_types_fail_before_any_output() {
+    let directory = TestDirectory::new();
+    let valid = directory.0.join("private-valid.json");
+    let sentinel = directory.0.join("private-sentinel");
+    fs::write(&valid, EMPTY_TEMPLATE).unwrap();
+    fs::write(&sentinel, b"sentinel").unwrap();
+
+    let malformed = directory.0.join("private-malformed.json");
+    fs::write(&malformed, b"{").unwrap();
+    let oversized = directory.0.join("private-oversized.json");
+    fs::write(
+        &oversized,
+        vec![b'x'; bangbang_cpu_template_helper::CPU_TEMPLATE_DOCUMENT_MAX_BYTES + 1],
+    )
+    .unwrap();
+    let target = directory.0.join("private-target.json");
+    fs::write(&target, EMPTY_TEMPLATE).unwrap();
+    let link = directory.0.join("private-link.json");
+    symlink(&target, &link).unwrap();
+    let fifo = directory.0.join("private-fifo.json");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+
+    for input in [&malformed, &oversized, &link, &fifo] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cpu-template-helper"))
+            .args(["template", "strip", "-p"])
+            .arg(input)
+            .arg(&valid)
+            .output()
+            .expect("helper process should execute");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(
+            !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("private")
+        );
+        assert!(!directory.0.join("private-valid_stripped.json").exists());
+        let output_name = format!(
+            "{}_stripped.json",
+            input.file_stem().unwrap().to_string_lossy()
+        );
+        assert!(!directory.0.join(output_name).exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+    }
+
+    assert_eq!(fs::read(&malformed).unwrap(), b"{");
+    assert_eq!(
+        fs::metadata(&oversized).unwrap().len(),
+        (bangbang_cpu_template_helper::CPU_TEMPLATE_DOCUMENT_MAX_BYTES + 1) as u64
+    );
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&valid).unwrap(), EMPTY_TEMPLATE.as_bytes());
+}
+
+#[test]
 fn strip_unsafe_suffix_and_minimum_arity_use_bounded_exit_classes() {
     let directory = TestDirectory::new();
     let first = directory.0.join("private-first.json");

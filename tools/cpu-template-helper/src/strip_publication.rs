@@ -108,6 +108,7 @@ struct StripFaults {
     fail_precommit_sync_directory: Option<usize>,
     replace_stage_before_commit: Option<usize>,
     replace_output_before_commit: Option<usize>,
+    replace_captured_stage_after_exchange: Option<usize>,
     fail_commit_at: Option<usize>,
     fail_after_commits: Option<usize>,
     link_rollback_stage_at: Option<usize>,
@@ -524,6 +525,11 @@ fn publish_one(
                 RenameFlags::EXCHANGE,
             )
             .map_err(|_| PublishOneError::NoMutation(StripPublicationError::Commit))?;
+            if faults.replace_captured_stage_after_exchange == Some(index)
+                && replace_entry_for_test(entry.input.directory(), &entry.stage_name).is_err()
+            {
+                return Err(PublishOneError::MutationUncertain);
+            }
             if identities_at(
                 entry.input.directory(),
                 &entry.stage_name,
@@ -549,10 +555,20 @@ fn restore_captured_exchange(entry: &StagedArtifact) -> Result<(), PublishOneErr
         entry.staged_identity,
     )
     .map_err(|_| PublishOneError::MutationUncertain)?;
-    let captured = path_state(entry.input.directory(), &entry.stage_name)
-        .map_err(|_| PublishOneError::MutationUncertain)?
-        .filter(|state| state.file_type == FileType::RegularFile)
-        .ok_or(PublishOneError::MutationUncertain)?;
+    let captured = ensure_regular_identity(
+        entry.input.directory(),
+        &entry.stage_name,
+        entry.input.input_identity(),
+    )
+    .map_err(|_| PublishOneError::MutationUncertain)?;
+    let descriptor = state_from_metadata(
+        &fstat(entry.input.input()).map_err(|_| PublishOneError::MutationUncertain)?,
+    )
+    .map_err(|_| PublishOneError::MutationUncertain)?;
+    if !is_expected_regular(descriptor, entry.input.input_identity()) {
+        return Err(PublishOneError::MutationUncertain);
+    }
+    let link_count_changed = captured.link_count != 1 || descriptor.link_count != 1;
     renameat_with(
         entry.input.directory(),
         &entry.stage_name,
@@ -570,12 +586,16 @@ fn restore_captured_exchange(entry: &StagedArtifact) -> Result<(), PublishOneErr
     ensure_regular_identity(
         entry.input.directory(),
         entry.input.output_name(),
-        captured.identity,
+        entry.input.input_identity(),
     )
     .map_err(|_| PublishOneError::MutationUncertain)?;
-    Err(PublishOneError::NoMutation(
-        StripPublicationError::InputChanged,
-    ))
+    if link_count_changed {
+        Err(PublishOneError::MutationUncertain)
+    } else {
+        Err(PublishOneError::NoMutation(
+            StripPublicationError::InputChanged,
+        ))
+    }
 }
 
 fn rollback_after_failure(
@@ -1381,6 +1401,42 @@ mod tests {
                     .starts_with(".bangbang-cpu-template-helper.stage.")
             })
             .expect("unknown stage should remain");
+        assert_eq!(fs::read(private.path()).unwrap(), b"racing-replacement");
+    }
+
+    #[test]
+    fn unknown_captured_input_after_exchange_is_preserved_and_reported() {
+        let directory = TestDirectory::new();
+        let first = directory.0.join("first.json");
+        let second = directory.0.join("second.json");
+        fs::write(&first, b"first-original").unwrap();
+        fs::write(&second, b"second-original").unwrap();
+        let inputs = prepare(&[&first, &second], "");
+
+        let error = publish_strip_with_faults(
+            inputs,
+            vec![b"first-new".to_vec(), b"second-new".to_vec()],
+            &StripFaults {
+                replace_captured_stage_after_exchange: Some(1),
+                ..StripFaults::default()
+            },
+        )
+        .expect_err("unknown captured input should make rollback uncertain");
+
+        assert_eq!(error, StripPublicationError::RollbackUncertain);
+        assert_eq!(fs::read(&first).unwrap(), b"first-original");
+        assert_eq!(fs::read(&second).unwrap(), b"second-new");
+        assert_eq!(directory.stage_count(), 1);
+        let private = fs::read_dir(&directory.0)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".bangbang-cpu-template-helper.stage.")
+            })
+            .expect("unknown captured input must be preserved");
         assert_eq!(fs::read(private.path()).unwrap(), b"racing-replacement");
     }
 
