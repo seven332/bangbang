@@ -145,11 +145,11 @@
         "The elapsed logical refill time does not exceed one complete refill interval."
       ],
       "bounds": [
-        "1 <= size <= 4096, 1 <= refill_time_millis <= 1000, 0 <= elapsed_millis <= refill_time_millis, refill/elapsed nanoseconds equal the millisecond values times 1000000, and budget <= size.",
-        "Symbolic u16 size/budget/refill-millisecond/elapsed-millisecond sources exactly cover those admitted intervals in the production bounded-millisecond helper.",
-        "The token numerator is at most 4096000 and the adjusted remainder in nanoseconds is below 4096000000, so every proved arithmetic operation fits u32 before the exact u64 nanosecond result is assembled."
+        "1 <= size < 15, 1 <= refill_time_millis < 15, 0 <= elapsed_millis <= refill_time_millis, and budget <= size, matching the pinned Firecracker refill-proof bounds.",
+        "Symbolic u8 size/budget/refill-millisecond/elapsed-millisecond sources exactly cover those admitted intervals in the production bounded-millisecond helper.",
+        "The token numerator and quotient-characterization products are at most 210, so every proved arithmetic operation fits u16."
       ],
-      "invariant": "The bounded whole-millisecond production path classifies zero-token and full-interval inputs exactly, while a partial refill never decreases or overfills budget and consumes a positive logical duration smaller than the interval and no greater than elapsed time.",
+      "invariant": "The bounded whole-millisecond production path classifies zero-token and full-interval inputs exactly; a partial refill returns the unique positive floor token quotient and updates budget to exactly min(previous budget + tokens, size) without decreasing or overfilling it.",
       "implementation": [
         {
           "kind": "local",

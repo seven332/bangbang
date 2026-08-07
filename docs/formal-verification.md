@@ -45,11 +45,12 @@ equal the checked `(package, source, symbol)` set, and then all five canonical
 `--harness ... --exact` commands run in manifest order. Commands are argument
 arrays and are never evaluated by a shell. The token-bucket command pins the
 Kani 0.67.0 bundle's Kissat solver. Its production path recognizes the recorded
-whole-millisecond domain and performs the equivalent quotient/remainder
-calculation with bounded `u16`/`u32` operands before assembling the exact `u64`
-nanosecond result. Sub-millisecond inputs retain the general `u64` path, and
-ordinary extreme-value tests retain coverage of the production `u128` overflow
-fallback.
+whole-millisecond domain and computes the classification, exact floor token
+quotient, and resulting budget with bounded `u8`/`u16` operands. The `< 15`
+size/refill bounds match Firecracker's pinned
+`src/vmm/src/rate_limiter/mod.rs::verify_token_bucket_auto_replenish` harness.
+Ordinary tests retain exact adjusted-nanosecond, sub-millisecond, and
+extreme-value coverage of the production `u64` and `u128` paths.
 
 Normal macOS builds do not install or invoke Kani. Proof modules are elided by
 `cfg(kani)`, while workspace check-cfg policy makes ordinary Rust and Clippy
@@ -61,7 +62,7 @@ builds reject misspelled conditional names.
 | --- | --- | --- | --- |
 | `pager-limits-admission` | `PagerLimits::new` | No `kani::assume`; full `u32`/`u16` input domains, claim applies to successful construction | Accepted limits have the supported power-of-two page/count/operation/frame contract without overflow. |
 | `virtqueue-ranges` | virtqueue geometry, index, and EVENT_IDX helpers | Queue size is a valid nonzero power of two; other `u16` and base `u64` inputs are unrestricted | Ring sizes/ranges and descriptor index admission are exact; empty EVENT_IDX intervals do not notify and the matching next event does. |
-| `token-bucket-refill-accounting` | private `token_bucket_refill_bounded_millis` path used by `token_bucket_refill_native`, `token_bucket_refill`, and `replenish_at` | `1 <= size <= 4096`, `budget <= size`, every `1..=1000ms` refill interval, and every whole-millisecond elapsed point through that interval; bounded arithmetic is assembled into the exact nanosecond result | Classification is exact at zero/full boundaries, and partial accounting cannot reduce/overfill budget or consume time beyond elapsed/refill bounds. |
+| `token-bucket-refill-accounting` | private `token_bucket_refill_bounded_millis` path used by `token_bucket_refill_native`, `token_bucket_refill`, and `replenish_at` | `1 <= size < 15`, `budget <= size`, `1 <= refill_time_millis < 15`, and every whole-millisecond elapsed point through that interval, matching the pinned Firecracker proof bounds | Classification is exact at zero/full boundaries; partial results contain the unique positive floor token quotient and update budget to exactly `min(previous + tokens, size)`. |
 | `pager-artifact-ranges` | pager snapshot source range predicates | Supported page shift `12..=21`; both symbolic regions pass the production constructor; offsets/lengths otherwise use full integer domains | Accepted page/removal ranges are aligned, nonempty where required, nonoverflowing and contained; overlap is symmetric. |
 | `virtio-mmio-status-transitions` | `is_valid_status_transition` | No `kani::assume`; full `u32` current/requested pairs | Every accepted non-reset transition is exactly one ordered status advance, preserves prior bits, adds one required bit, and introduces no unknown bit. |
 
@@ -88,8 +89,9 @@ The proof set deliberately makes no claim about:
 
 Those surfaces remain owned by the repository's ordinary, property, process,
 signed, and integration tests. In particular, token-bucket tests still own
-burst/retry/time-reset/persistence behavior; virtqueue tests own mapped guest
-memory and descriptor traversal; pager tests own framing, transport, sessions,
+adjusted-nanosecond credit, burst/retry/time-reset/persistence behavior;
+virtqueue tests own mapped guest memory and descriptor traversal; pager tests
+own framing, transport, sessions,
 timeouts and cancellation; virtio-MMIO tests own reset and `FAILED` handling.
 
 ## Updating a proof

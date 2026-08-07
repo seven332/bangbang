@@ -310,40 +310,40 @@ enum TokenBucketRefill {
     Partial { budget: u64, adjusted_nanos: u64 },
 }
 
-const VERIFIED_MAX_TOKEN_BUCKET_SIZE: u16 = 4_096;
-const VERIFIED_MAX_REFILL_MILLIS: u16 = 1_000;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedMillisRefill {
+    Unchanged,
+    Full,
+    Partial { budget: u16, tokens: u16 },
+}
+
+const VERIFIED_TOKEN_BUCKET_BOUND: u8 = 15;
+const VERIFIED_REFILL_MILLIS_BOUND: u8 = 15;
 
 fn token_bucket_refill_bounded_millis(
-    size: u16,
-    budget: u16,
-    refill_time_millis: u16,
-    elapsed_millis: u16,
-) -> TokenBucketRefill {
-    debug_assert!((1..=VERIFIED_MAX_TOKEN_BUCKET_SIZE).contains(&size));
+    size: u8,
+    budget: u8,
+    refill_time_millis: u8,
+    elapsed_millis: u8,
+) -> BoundedMillisRefill {
+    debug_assert!((1..VERIFIED_TOKEN_BUCKET_BOUND).contains(&size));
     debug_assert!(budget <= size);
-    debug_assert!((1..=VERIFIED_MAX_REFILL_MILLIS).contains(&refill_time_millis));
+    debug_assert!((1..VERIFIED_REFILL_MILLIS_BOUND).contains(&refill_time_millis));
     debug_assert!(elapsed_millis <= refill_time_millis);
 
     if elapsed_millis == refill_time_millis {
-        return TokenBucketRefill::Full;
+        return BoundedMillisRefill::Full;
     }
 
-    let size = u32::from(size);
-    let tokens = u32::from(elapsed_millis) * size / u32::from(refill_time_millis);
+    let size = u16::from(size);
+    let tokens = u16::from(elapsed_millis) * size / u16::from(refill_time_millis);
     if tokens == 0 {
-        return TokenBucketRefill::Unchanged;
+        return BoundedMillisRefill::Unchanged;
     }
 
-    let budget = u32::from(budget).saturating_add(tokens).min(size);
-    let adjusted_millis_numerator = tokens * u32::from(refill_time_millis);
-    let whole_millis = adjusted_millis_numerator / size;
-    let remainder = adjusted_millis_numerator % size;
-    let remainder_nanos = remainder * 1_000_000;
-    let adjusted_nanos = whole_millis * 1_000_000 + remainder_nanos.div_ceil(size);
-
-    TokenBucketRefill::Partial {
-        budget: u64::from(budget),
-        adjusted_nanos: u64::from(adjusted_nanos),
+    BoundedMillisRefill::Partial {
+        budget: u16::from(budget).saturating_add(tokens).min(size),
+        tokens,
     }
 }
 
@@ -356,22 +356,36 @@ fn token_bucket_refill_native(
     if size == 0 || refill_time_nanos == 0 {
         return Some(TokenBucketRefill::Unchanged);
     }
-    if size <= u64::from(VERIFIED_MAX_TOKEN_BUCKET_SIZE)
+    if size < u64::from(VERIFIED_TOKEN_BUCKET_BOUND)
         && budget <= size
         && refill_time_nanos.is_multiple_of(NANOS_PER_MILLISECOND)
         && elapsed_nanos.is_multiple_of(NANOS_PER_MILLISECOND)
     {
         let refill_time_millis = refill_time_nanos / NANOS_PER_MILLISECOND;
         let elapsed_millis = elapsed_nanos / NANOS_PER_MILLISECOND;
-        if (1..=u64::from(VERIFIED_MAX_REFILL_MILLIS)).contains(&refill_time_millis)
+        if (1..u64::from(VERIFIED_REFILL_MILLIS_BOUND)).contains(&refill_time_millis)
             && elapsed_millis <= refill_time_millis
         {
-            return Some(token_bucket_refill_bounded_millis(
-                u16::try_from(size).ok()?,
-                u16::try_from(budget).ok()?,
-                u16::try_from(refill_time_millis).ok()?,
-                u16::try_from(elapsed_millis).ok()?,
-            ));
+            return Some(
+                match token_bucket_refill_bounded_millis(
+                    u8::try_from(size).ok()?,
+                    u8::try_from(budget).ok()?,
+                    u8::try_from(refill_time_millis).ok()?,
+                    u8::try_from(elapsed_millis).ok()?,
+                ) {
+                    BoundedMillisRefill::Unchanged => TokenBucketRefill::Unchanged,
+                    BoundedMillisRefill::Full => TokenBucketRefill::Full,
+                    BoundedMillisRefill::Partial { budget, tokens } => {
+                        let adjusted_nanos = u64::from(tokens)
+                            .checked_mul(refill_time_nanos)?
+                            .div_ceil(size);
+                        TokenBucketRefill::Partial {
+                            budget: u64::from(budget),
+                            adjusted_nanos,
+                        }
+                    }
+                },
+            );
         }
     }
     if elapsed_nanos >= refill_time_nanos {
@@ -453,35 +467,39 @@ mod verification {
 
     #[kani::proof]
     fn verify_token_bucket_refill_accounting() {
-        let size_input: u16 = kani::any();
-        let budget_input: u16 = kani::any();
-        let refill_time_millis_input: u16 = kani::any();
-        let elapsed_millis_input: u16 = kani::any();
+        let size_input: u8 = kani::any();
+        let budget_input: u8 = kani::any();
+        let refill_time_millis_input: u8 = kani::any();
+        let elapsed_millis_input: u8 = kani::any();
 
-        kani::assume((1..=4_096).contains(&size_input));
+        kani::assume((1..15).contains(&size_input));
         kani::assume(budget_input <= size_input);
-        kani::assume((1..=1_000).contains(&refill_time_millis_input));
+        kani::assume((1..15).contains(&refill_time_millis_input));
         kani::assume(elapsed_millis_input <= refill_time_millis_input);
+        let numerator = u16::from(elapsed_millis_input) * u16::from(size_input);
+        let denominator = u16::from(refill_time_millis_input);
         let invariant_holds = match token_bucket_refill_bounded_millis(
             size_input,
             budget_input,
             refill_time_millis_input,
             elapsed_millis_input,
         ) {
-            TokenBucketRefill::Unchanged => {
-                u32::from(elapsed_millis_input) * u32::from(size_input)
-                    < u32::from(refill_time_millis_input)
-            }
-            TokenBucketRefill::Full => elapsed_millis_input == refill_time_millis_input,
-            TokenBucketRefill::Partial {
+            BoundedMillisRefill::Unchanged => numerator < denominator,
+            BoundedMillisRefill::Full => elapsed_millis_input == refill_time_millis_input,
+            BoundedMillisRefill::Partial {
                 budget: new_budget,
-                adjusted_nanos,
+                tokens,
             } => {
-                new_budget >= u64::from(budget_input)
-                    && new_budget <= u64::from(size_input)
-                    && adjusted_nanos != 0
-                    && adjusted_nanos <= u64::from(u32::from(elapsed_millis_input) * 1_000_000)
-                    && adjusted_nanos < u64::from(u32::from(refill_time_millis_input) * 1_000_000)
+                tokens != 0
+                    && tokens < u16::from(size_input)
+                    && tokens * denominator <= numerator
+                    && (tokens + 1) * denominator > numerator
+                    && new_budget >= u16::from(budget_input)
+                    && new_budget <= u16::from(size_input)
+                    && new_budget
+                        == u16::from(budget_input)
+                            .saturating_add(tokens)
+                            .min(u16::from(size_input))
             }
         };
         assert!(invariant_holds);

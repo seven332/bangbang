@@ -23,7 +23,7 @@ pins Kani 0.67.0 (`kani-0.67.0`, release commit
 | --- | --- | --- |
 | `pager-limits-admission` | pager handshake limit construction | Full scalar input domains prove all successfully admitted page/count/operation/frame limits. |
 | `virtqueue-ranges` | virtqueue range/index/EVENT_IDX helpers | A valid power-of-two queue-size assumption proves exact scalar geometry, index and notification boundaries without guest-memory traversal. |
-| `token-bucket-refill-accounting` | bounded whole-millisecond private refill path used by the runtime bucket | Explicit small capacity/refill bounds establish partial/full/unchanged accounting with exact nanosecond results; timers, sub-millisecond progress and persistence remain tested, not modeled. |
+| `token-bucket-refill-accounting` | bounded whole-millisecond private refill path used by the runtime bucket | Firecracker-matching `< 15` capacity/refill bounds establish exact partial/full/unchanged classification, token quotient and budget accounting; adjusted nanosecond credit, timers, sub-millisecond progress and persistence remain tested, not modeled. |
 | `pager-artifact-ranges` | peer-owned snapshot source range predicates | Admitted supported-page regions prove request containment and overlap symmetry without source/transport/concurrency claims. |
 | `virtio-mmio-status-transitions` | pure virtio status transition gate | Full `u32` pairs prove exactly the four non-reset ordered advances; reset and `FAILED` are separate tested branches. |
 
