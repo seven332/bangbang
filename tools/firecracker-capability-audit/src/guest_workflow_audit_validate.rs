@@ -283,6 +283,7 @@ fn validate_ext4_recipes(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
                     GUEST_WORKFLOW_AUDIT_PATH,
                     "scripts/fetch-firecracker-rootfs.sh",
                     "scripts/guest/arm64-id-register-report.rs",
+                    "scripts/guest/specification-benchmark.rs",
                     "scripts/guest_artifact_policy.py",
                 ],
             )

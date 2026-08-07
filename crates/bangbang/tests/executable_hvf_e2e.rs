@@ -70,6 +70,17 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_BLOCK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BLOCK_OK";
     const DIRECT_ROOTFS_BOOT_OK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
     const BOOT_TIMER_LOG_MARKER: &[u8] = b"Guest-boot-time =";
+    const SPECIFICATION_WORKLOAD_HEADER: &str = "BANGBANG_SPEC_WORKLOAD_V1";
+    const SPECIFICATION_WORKLOAD_READY: &str = "BANGBANG_SPEC_INIT_READY release_byte=82";
+    const SPECIFICATION_WORKLOAD_SUCCESS: &str = "BANGBANG_SPEC_WORKLOAD_OK";
+    const SPECIFICATION_WORKLOAD_FAILURE: &str = "BANGBANG_SPEC_WORKLOAD_FAIL";
+    const SPECIFICATION_WORKLOAD_RELEASE: &[u8] = b"R";
+    const SPECIFICATION_COMPUTE_OPERATIONS: u64 = 5_000_000;
+    const SPECIFICATION_COMPUTE_CHECKSUM: u64 = 8_398_723_902_783_368_615;
+    const SPECIFICATION_STORAGE_BYTES: usize = 16 * 1024 * 1024;
+    const SPECIFICATION_STORAGE_BLOCK_BYTES: usize = 4096;
+    const SPECIFICATION_STORAGE_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const SPECIFICATION_STORAGE_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     const DIRECT_ROOTFS_BALLOON_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.balloon-check=1";
     const DIRECT_ROOTFS_BALLOON_MARKER: &[u8] = b"BANGBANG_BALLOON_REPORTING_GUEST_CHECK_OK";
     const DIRECT_ROOTFS_MEMORY_HOTPLUG_READY_MARKER: &[u8] = b"BANGBANG_MEMORY_HOTPLUG_GUEST_READY";
@@ -416,6 +427,7 @@ mod macos_arm64 {
     const SNAPSHOT_PMEM_LIMITER_REFILL_MS: u64 = 5000;
     const ROOTFS_BOOT_TIMER_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 nomodule swiotlb=noforce init=/usr/local/bin/init";
+    const SPECIFICATION_WORKLOAD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 root=/dev/vda ro rootwait init=/bangbang-specification-benchmark";
     const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const DIRECT_ROOTFS_MMDS_MTU_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1 bangbang.mmds-mtu=1280";
@@ -432,6 +444,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const DIRECT_ROOTFS_HOST_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-multistream=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+    const SPECIFICATION_WORKLOAD_TIMEOUT: Duration = Duration::from_secs(60);
     const GUEST_STOP_TIMEOUT: Duration = Duration::from_secs(60);
     const PCI_ALL_VIRTIO_GUEST_TIMEOUT: Duration = Duration::from_secs(90);
     const SNAPSHOT_GUEST_IMAGE_HEADER_SIZE: usize = 64;
@@ -3515,6 +3528,125 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang direct rootfs boot timer",
+        );
+    }
+
+    #[test]
+    fn signed_executable_runs_released_guest_specification_workload() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let logger_path = test_dir.path().join("logger.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let expected_storage_checksum = specification_storage_checksum(&rootfs_path);
+        let instance_id = test_dir.instance_id();
+
+        let mut bangbang =
+            BangbangProcess::start_with_extra_args(&socket_path, &instance_id, &["--boot-timer"]);
+
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+            ),
+            "PUT /machine-config specification workload",
+        );
+
+        let boot_body = format!(
+            r#"{{"kernel_image_path":{},"boot_args":{}}}"#,
+            json_string(path_text(&kernel_path)),
+            json_string(SPECIFICATION_WORKLOAD_BOOT_ARGS),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/boot-source", &boot_body),
+            "PUT /boot-source specification workload",
+        );
+
+        let rootfs_body = format!(
+            r#"{{"drive_id":"rootfs","path_on_host":{},"is_root_device":true,"is_read_only":true}}"#,
+            json_string(path_text(&rootfs_path)),
+        );
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/drives/rootfs", &rootfs_body),
+            "PUT /drives/rootfs specification workload",
+        );
+
+        let logger_body = format!(r#"{{"log_path":{}}}"#, json_string(path_text(&logger_path)),);
+        assert_no_content_response(
+            &http_put_json(&socket_path, "/logger", &logger_body),
+            "PUT /logger specification workload",
+        );
+
+        assert_no_content_response(
+            &http_put_json(
+                &socket_path,
+                "/actions",
+                r#"{"action_type":"InstanceStart"}"#,
+            ),
+            "PUT /actions InstanceStart specification workload",
+        );
+
+        if let Err(error) =
+            bangbang.wait_for_stdout_marker(SPECIFICATION_WORKLOAD_READY, GUEST_EXECUTION_TIMEOUT)
+        {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "specification workload did not become ready: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        if let Err(error) = wait_for_file_contains_marker(
+            &logger_path,
+            BOOT_TIMER_LOG_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let logger_prefix = file_prefix_lossy(&logger_path, 1024);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "specification workload did not signal the production boot timer: {error}; logger: {logger_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        let running = http_get(&socket_path, "/");
+        assert_ok_response(&running, "GET / while specification workload is ready");
+        assert_response_contains(
+            &running,
+            r#""state":"Running""#,
+            "GET / while specification workload is ready",
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let waiting_transcript = bangbang.stdout_snapshot();
+        assert_specification_waiting_transcript(&waiting_transcript);
+
+        bangbang.write_stdin(SPECIFICATION_WORKLOAD_RELEASE);
+        if let Err(error) = bangbang.wait_for_stdout_marker(
+            SPECIFICATION_WORKLOAD_SUCCESS,
+            SPECIFICATION_WORKLOAD_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "released specification workload did not complete: {error}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        let output = bangbang.wait_for_exit_with_timeout(
+            SPECIFICATION_WORKLOAD_TIMEOUT,
+            "guest specification workload poweroff",
+        );
+        assert_specification_transcript(&output.stdout, expected_storage_checksum);
+        let logger_output = fs::read_to_string(&logger_path)
+            .expect("specification workload logger should be readable");
+        assert!(
+            logger_output.contains("Guest-boot-time ="),
+            "specification workload must exercise the production boot timer; logger:\n{logger_output}"
+        );
+        assert_clean_shutdown(
+            output,
+            &socket_path,
+            "bangbang guest specification workload",
         );
     }
 
@@ -18496,6 +18628,133 @@ mod macos_arm64 {
             .create_new(true)
             .open(path)
             .expect("empty test output file should create");
+    }
+
+    fn specification_storage_checksum(path: &Path) -> u64 {
+        let mut file = fs::File::open(path).unwrap_or_else(|error| {
+            panic!(
+                "specification root drive {} should be readable: {error}",
+                path.display()
+            )
+        });
+        let mut block = [0_u8; SPECIFICATION_STORAGE_BLOCK_BYTES];
+        let mut checksum = SPECIFICATION_STORAGE_FNV_OFFSET;
+        for _ in 0..(SPECIFICATION_STORAGE_BYTES / SPECIFICATION_STORAGE_BLOCK_BYTES) {
+            file.read_exact(&mut block).unwrap_or_else(|error| {
+                panic!(
+                    "specification root drive {} must contain the fixed read range: {error}",
+                    path.display()
+                )
+            });
+            for byte in block {
+                checksum ^= u64::from(byte);
+                checksum = checksum.wrapping_mul(SPECIFICATION_STORAGE_FNV_PRIME);
+            }
+        }
+        checksum
+    }
+
+    fn specification_marker_lines(transcript: &str) -> Vec<&str> {
+        transcript
+            .lines()
+            .filter_map(|raw_line| {
+                let line = raw_line.trim_end_matches('\r');
+                if !line.contains("BANGBANG_SPEC_") {
+                    return None;
+                }
+                assert!(
+                    line.starts_with("BANGBANG_SPEC_"),
+                    "specification workload record must be line-aligned: {line:?}"
+                );
+                Some(line)
+            })
+            .collect()
+    }
+
+    fn assert_specification_waiting_transcript(transcript: &str) {
+        let markers = specification_marker_lines(transcript);
+        assert_eq!(
+            markers,
+            [SPECIFICATION_WORKLOAD_HEADER, SPECIFICATION_WORKLOAD_READY,],
+            "the unreleased workload must expose only its version and ready records"
+        );
+        assert!(
+            !transcript.contains(SPECIFICATION_WORKLOAD_FAILURE),
+            "the waiting workload must not expose a failure record"
+        );
+    }
+
+    fn specification_record_values(
+        record: &str,
+        prefix: &str,
+        expected_fields: &[&str],
+    ) -> Vec<u64> {
+        let payload = record
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("specification record has the wrong prefix: {record:?}"));
+        let tokens = payload.split_ascii_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            tokens.len(),
+            expected_fields.len(),
+            "specification record has the wrong field count: {record:?}"
+        );
+        tokens
+            .iter()
+            .zip(expected_fields)
+            .map(|(token, expected_field)| {
+                let (field, value) = token.split_once('=').unwrap_or_else(|| {
+                    panic!("specification field must contain exactly one '=': {token:?}")
+                });
+                assert_eq!(
+                    field, *expected_field,
+                    "specification field order or identity drifted in {record:?}"
+                );
+                assert!(
+                    !value.is_empty()
+                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                        && (value == "0" || !value.starts_with('0')),
+                    "specification field must use canonical u64 decimal: {token:?}"
+                );
+                value.parse::<u64>().unwrap_or_else(|error| {
+                    panic!("specification field must fit u64: {token:?}: {error}")
+                })
+            })
+            .collect()
+    }
+
+    fn assert_specification_transcript(transcript: &str, expected_storage_checksum: u64) {
+        assert!(
+            !transcript.contains(SPECIFICATION_WORKLOAD_FAILURE),
+            "completed specification workload must not expose a failure record; transcript:\n{transcript}"
+        );
+        let markers = specification_marker_lines(transcript);
+        assert_eq!(
+            markers.len(),
+            5,
+            "completed specification transcript must contain exactly five records: {markers:?}"
+        );
+        assert_eq!(markers[0], SPECIFICATION_WORKLOAD_HEADER);
+        assert_eq!(markers[1], SPECIFICATION_WORKLOAD_READY);
+
+        let compute = specification_record_values(
+            markers[2],
+            "BANGBANG_SPEC_COMPUTE ",
+            &["duration_ns", "operations", "checksum"],
+        );
+        let _compute_duration_ns = compute[0];
+        assert_eq!(compute[1], SPECIFICATION_COMPUTE_OPERATIONS);
+        assert_eq!(compute[2], SPECIFICATION_COMPUTE_CHECKSUM);
+
+        let storage = specification_record_values(
+            markers[3],
+            "BANGBANG_SPEC_STORAGE ",
+            &["duration_ns", "bytes", "block_bytes", "checksum"],
+        );
+        let _storage_duration_ns = storage[0];
+        assert_eq!(storage[1], SPECIFICATION_STORAGE_BYTES as u64);
+        assert_eq!(storage[2], SPECIFICATION_STORAGE_BLOCK_BYTES as u64);
+        assert_eq!(storage[3], expected_storage_checksum);
+        assert_eq!(markers[4], SPECIFICATION_WORKLOAD_SUCCESS);
     }
 
     fn assert_metrics_output(
