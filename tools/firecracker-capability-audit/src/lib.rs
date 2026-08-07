@@ -26,9 +26,12 @@ mod upstream;
 mod validate;
 
 pub use cpu_template_helper_certify::{
+    CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
     CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS, CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS,
-    CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS, validate_cpu_template_helper_compatibility,
-    validate_cpu_template_helper_transition, validate_cpu_template_strip_compatibility,
+    CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
+    validate_cpu_template_fingerprint_dump_compatibility,
+    validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
+    validate_cpu_template_strip_compatibility,
 };
 pub use logger_certify::{LOGGER_COMPATIBILITY_CAPABILITY_IDS, validate_logger_compatibility};
 pub use logger_model::{

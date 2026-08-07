@@ -20,6 +20,9 @@ use bangbang_api::config::parse_cpu_config_document;
 use bangbang_cpu_template_helper::HelperExitClass;
 use bangbang_cpu_template_helper::cli::run_cli_with_provider;
 use bangbang_cpu_template_helper::document::decode_cpu_template_document;
+use bangbang_cpu_template_helper::fingerprint::{
+    CpuFingerprintDocument, CpuFingerprintPlatform, decode_cpu_fingerprint_document,
+};
 use bangbang_cpu_template_helper::profile::{
     ArmCpuTemplateValue, EffectiveCpuTemplateProfile, EffectiveCpuTemplateProfileEntry,
     EffectiveCpuTemplateProvider, EffectiveProfileProviderError, EffectiveRegisterStatus,
@@ -121,6 +124,16 @@ fn write_config(path: &Path, vcpu_count: u8, cpu_config: Option<&str>) {
     .expect("config fixture should be written");
 }
 
+fn write_static_config(path: &Path, vcpu_count: u8, cpu_template: &str) {
+    fs::write(
+        path,
+        format!(
+            "{{\"boot-source\":{{\"kernel_image_path\":\"/not-opened-by-helper\"}},\"machine-config\":{{\"vcpu_count\":{vcpu_count},\"mem_size_mib\":128,\"cpu_template\":\"{cpu_template}\"}}}}"
+        ),
+    )
+    .expect("static config fixture should be written");
+}
+
 fn modifier(identity: u64, width: usize, low_bit: Option<bool>) -> String {
     let mut bits = vec!['x'; width];
     if let Some(value) = low_bit {
@@ -146,6 +159,111 @@ fn assert_silent_success(output: Output) {
     );
     assert!(output.stdout.is_empty(), "operation stdout must be empty");
     assert!(output.stderr.is_empty(), "operation stderr must be empty");
+}
+
+fn assert_canonical_fingerprint(path: &Path) -> CpuFingerprintDocument {
+    let metadata = fs::metadata(path).expect("fingerprint output should exist");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    let contents = fs::read_to_string(path).expect("fingerprint should be UTF-8");
+    let document =
+        decode_cpu_fingerprint_document(&contents).expect("fingerprint should strictly reparse");
+    assert_eq!(document.host().platform(), CpuFingerprintPlatform::Macos);
+    assert_eq!(document.host().operating_system(), "Darwin");
+    assert_eq!(document.host().machine(), "arm64");
+    assert_eq!(
+        document
+            .canonical_bytes()
+            .expect("fingerprint should re-encode"),
+        contents.as_bytes()
+    );
+    assert!(contents.contains("\"product\":"));
+    assert!(contents.contains("\"target\":"));
+    assert!(contents.contains("\"cpu_family\":"));
+    document
+}
+
+#[test]
+fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection() {
+    let directory = TestDirectory::new("fingerprint");
+
+    let default_config = directory.0.join("default-config.json");
+    let default_output = directory.0.join("fingerprint.json");
+    write_config(&default_config, 2, None);
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["fingerprint", "dump", "--config"])
+        .arg(&default_config)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    assert_silent_success(run_with_timeout(&mut command));
+    let default = assert_canonical_fingerprint(&default_output);
+    assert!((74..=77).contains(&default.guest_cpu_config().modifiers().len()));
+
+    let none_config = directory.0.join("none-config.json");
+    let none_output = directory.0.join("none-fingerprint.json");
+    write_static_config(&none_config, 2, "None");
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["fingerprint", "dump", "-c"])
+        .arg(&none_config)
+        .args(["-o"])
+        .arg(&none_output)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    assert_silent_success(run_with_timeout(&mut command));
+    let none = assert_canonical_fingerprint(&none_output);
+    assert_eq!(none.guest_cpu_config(), default.guest_cpu_config());
+
+    let static_config = directory.0.join("static-config.json");
+    write_static_config(&static_config, 2, "V1N1");
+    let explicit = directory.0.join("explicit-template.json");
+    fs::write(
+        &explicit,
+        template(&[modifier(KVM_REG_ARM64_CORE_SP_EL0, 64, Some(true))]),
+    )
+    .expect("explicit template should be written");
+    let custom_output = directory.0.join("custom-fingerprint.json");
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["fingerprint", "dump", "--config"])
+        .arg(&static_config)
+        .args(["--template"])
+        .arg(&explicit)
+        .args(["--output"])
+        .arg(&custom_output)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    assert_silent_success(run_with_timeout(&mut command));
+    let custom = assert_canonical_fingerprint(&custom_output);
+    let selected = custom
+        .guest_cpu_config()
+        .modifiers()
+        .iter()
+        .find(|entry| entry.identity() == KVM_REG_ARM64_CORE_SP_EL0)
+        .expect("SP_EL0 should be captured");
+    assert_eq!(selected.value() & 1, 1, "explicit custom template must win");
+
+    let unsupported_output = directory.0.join("unsupported-static.json");
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["fingerprint", "dump", "--config"])
+        .arg(&static_config)
+        .args(["--output"])
+        .arg(&unsupported_output)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = run_with_timeout(&mut command);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(result.stderr).expect("stderr should be UTF-8"),
+        "cpu-template-helper: effective CPU fingerprint capture failed\n"
+    );
+    assert!(!unsupported_output.exists());
 }
 
 #[test]
@@ -448,6 +566,56 @@ fn signed_mismatch_collision_and_unsigned_failures_leave_resources_reusable() {
         "cpu-template-helper: effective CPU inspection failed\n"
     );
     assert!(!unsigned_output.exists());
+
+    let fingerprint_collision = directory.0.join("fingerprint-collision.json");
+    fs::write(&fingerprint_collision, "preserve-fingerprint-winner")
+        .expect("fingerprint collision fixture should be written");
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["fingerprint", "dump", "--output"])
+        .arg(&fingerprint_collision)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = run_with_timeout(&mut command);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(result.stderr).expect("stderr should be UTF-8"),
+        "cpu-template-helper: output target already exists\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&fingerprint_collision).expect("fingerprint collision should remain"),
+        "preserve-fingerprint-winner"
+    );
+
+    let fingerprint_retry = directory.0.join("fingerprint-retry.json");
+    let mut command = Command::new(signed_helper());
+    command
+        .args(["fingerprint", "dump", "--output"])
+        .arg(&fingerprint_retry)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    assert_silent_success(run_with_timeout(&mut command));
+    assert_canonical_fingerprint(&fingerprint_retry);
+
+    let unsigned_fingerprint = directory.0.join("unsigned-fingerprint.json");
+    let mut command = Command::new(unsigned_helper());
+    command
+        .args(["fingerprint", "dump", "--output"])
+        .arg(&unsigned_fingerprint)
+        .current_dir(&directory.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = run_with_timeout(&mut command);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(result.stderr).expect("stderr should be UTF-8"),
+        "cpu-template-helper: effective CPU fingerprint capture failed\n"
+    );
+    assert!(!unsigned_fingerprint.exists());
 }
 
 #[test]

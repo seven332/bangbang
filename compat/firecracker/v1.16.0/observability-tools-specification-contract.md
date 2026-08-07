@@ -268,11 +268,11 @@ remain in the CPU-template contract.
 | `tool-argument:cpu-template-helper/fingerprint/compare/curr` | #1794 | `audit-required` |
 | `tool-argument:cpu-template-helper/fingerprint/compare/filters` | #1794 | `audit-required` |
 | `tool-argument:cpu-template-helper/fingerprint/compare/prev` | #1794 | `audit-required` |
-| `tool-argument:cpu-template-helper/fingerprint/dump/config` | #1794 | `audit-required` |
-| `tool-argument:cpu-template-helper/fingerprint/dump/output` | #1794 | `audit-required` |
-| `tool-argument:cpu-template-helper/fingerprint/dump/template` | #1794 | `audit-required` |
+| `tool-argument:cpu-template-helper/fingerprint/dump/config` | #1794 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/fingerprint/dump/output` | #1794 | `implemented-and-verified` |
+| `tool-argument:cpu-template-helper/fingerprint/dump/template` | #1794 | `implemented-and-verified` |
 | `tool-operation:cpu-template-helper/fingerprint/compare` | #1794 | `audit-required` |
-| `tool-operation:cpu-template-helper/fingerprint/dump` | #1794 | `audit-required` |
+| `tool-operation:cpu-template-helper/fingerprint/dump` | #1794 | `implemented-and-verified` |
 | `corpus:cpu-template-helper` | #1795 | `audit-required` |
 | `corpus:cpu-templates` | #1795 | `audit-required` |
 | `semantic.cpu:configuration-templates-and-feature-state` | #1795 | `audit-required` |
@@ -317,8 +317,11 @@ delivery, process, device, tool, and release-marker gates pass. #1792 promotes
 its exact seven CPU-template dump/verify operation and argument rows after the
 portable actual-process and signed real-HVF gates pass. #1793 promotes its
 exact three portable strip rows after transformation, publication, process,
-and audit gates pass, while #1794–#1795 stay unchanged. The current inventory
-is therefore exactly 354 implemented, 31 audit-required, three
+and audit gates pass. #1866 promotes the three fingerprint-dump arguments and
+operation after the closed platform document, public macOS fact, signed
+effective-state, publication, and scoped-audit gates pass; compare and #1795
+aggregate rows remain unchanged. The current inventory is therefore exactly
+358 implemented, 27 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

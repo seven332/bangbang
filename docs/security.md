@@ -1870,6 +1870,26 @@ is resource-specific:
   ancestor directories. The complete helper-specific boundary and signed
   real-HVF evidence are checked in
   `compat/firecracker/v1.16.0/cpu-template-helper-contract.md`.
+  `fingerprint dump` deliberately persists change-awareness material and can
+  increase host fingerprintability. Its closed version-1 envelope collects
+  only `uname` system/release/machine plus public `hw.product`, `hw.target`, and
+  exact-width `hw.cpufamily`; it never queries or stores hostname, host ID/UUID,
+  serial number, private registry properties, unreviewed brand strings,
+  frequency, paths, or raw system diagnostics. Missing reviewed sysctls become
+  explicit `null`; malformed, oversized, non-UTF-8, non-normalized, width-raced,
+  or otherwise failed reads abort. Host values and effective register values
+  are redacted from errors and `Debug`, but remain intentionally present in the
+  owner-requested mode-`0600` artifact.
+  The schema cross-checks macOS with `Darwin`/`arm64` and Linux with
+  `Linux`/`aarch64`, rejects unknown/duplicate/mixed fields, and nests the one
+  existing strict CPU-template authority. Host capture, signed all-vCPU capture,
+  teardown, canonical encoding, semantic reparse, and byte-identical re-encode
+  all finish before the absent-only publisher can run. Unsupported targets,
+  unsigned HVF, and unrepresentable Linux/AWS static policies publish nothing.
+  A fingerprint is not an authenticator, template validity proof, migration
+  authorization, or snapshot portability claim. Its exact fact bounds,
+  platform variants, privacy consequences, and signed evidence are checked in
+  `compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md`.
   Portable `template strip` does not construct a provider or VM, but it retains
   the invoking user's direct filesystem authority over every supplied parent.
   All inputs and outputs are descriptor/identity bound; unsafe suffixes,

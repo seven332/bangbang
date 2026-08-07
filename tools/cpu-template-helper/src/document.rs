@@ -7,7 +7,7 @@ use bangbang_runtime::cpu::{
     ArmRegisterModifier, CpuConfigArmRegisterModifier, CpuConfigArmRegisterWidth, CpuConfigError,
     CpuConfigInput, CustomCpuTemplate, arm64_cpu_template_register_descriptors,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use crate::CPU_TEMPLATE_DOCUMENT_MAX_BYTES;
 use crate::projection::cpu_config_input_from_request;
@@ -145,7 +145,27 @@ impl CpuTemplateDocument {
 
     /// Encode fixed-field, fixed-width, sorted pretty JSON with one newline.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CpuTemplateEncodeError> {
-        let wire = WireDocument {
+        let mut bytes =
+            serde_json::to_vec_pretty(self).map_err(|_| CpuTemplateEncodeError::Serialization)?;
+        bytes.push(b'\n');
+        if bytes.len() > CPU_TEMPLATE_DOCUMENT_MAX_BYTES {
+            return Err(CpuTemplateEncodeError::TooLarge);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_modifiers(mut modifiers: Vec<CpuTemplateModifier>) -> Self {
+        modifiers.sort_by_key(|modifier| modifier.identity);
+        Self { modifiers }
+    }
+}
+
+impl Serialize for CpuTemplateDocument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        WireDocument {
             kvm_capabilities: Vec::new(),
             reg_modifiers: self
                 .modifiers
@@ -157,19 +177,8 @@ impl CpuTemplateDocument {
                 })
                 .collect(),
             vcpu_features: Vec::new(),
-        };
-        let mut bytes =
-            serde_json::to_vec_pretty(&wire).map_err(|_| CpuTemplateEncodeError::Serialization)?;
-        bytes.push(b'\n');
-        if bytes.len() > CPU_TEMPLATE_DOCUMENT_MAX_BYTES {
-            return Err(CpuTemplateEncodeError::TooLarge);
         }
-        Ok(bytes)
-    }
-
-    pub(crate) fn from_modifiers(mut modifiers: Vec<CpuTemplateModifier>) -> Self {
-        modifiers.sort_by_key(|modifier| modifier.identity);
-        Self { modifiers }
+        .serialize(serializer)
     }
 }
 

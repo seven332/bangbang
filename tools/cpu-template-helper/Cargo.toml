@@ -10,9 +10,11 @@ bangbang-api = { path = "../../crates/api" }
 bangbang-hvf = { path = "../../crates/hvf" }
 bangbang-runtime = { path = "../../crates/runtime" }
 clap = { version = "=4.6.1", features = ["derive"] }
+libc = "0.2"
 rustix = { version = "=1.1.4", features = ["fs"] }
+semver = "1"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.140"
+serde_json = { version = "1.0.140", features = ["raw_value"] }
 
 [[bin]]
 name = "cpu-template-helper"

@@ -346,11 +346,11 @@ failure exits 1 with a bounded category-only diagnostic; help, version, and
 successful operations exit 0. Paths, register identities, masks, values,
 readbacks, and provider internals are never reported.
 
-This dump/verify scope does not certify fingerprint dump/compare, the upstream
-helper/template corpora, a persistent inspection VM, guest execution, or a
-distinct-host compatibility decision. Those identities remain separately
-owned by #1794–#1795. The exact format, publication, security, evidence, and
-terminal audit gate are in the checked
+This dump/verify scope does not itself certify fingerprint operations, the
+upstream helper/template corpora, a persistent inspection VM, guest execution,
+or a distinct-host compatibility decision. Fingerprint dump is independently
+certified below; compare and aggregate identities remain #1867/#1795. The exact
+format, publication, security, evidence, and terminal audit gate are in the checked
 [CPU-template helper contract](../compat/firecracker/v1.16.0/cpu-template-helper-contract.md).
 
 ### CPU-Template Strip
@@ -387,6 +387,45 @@ committed prefix or private stages. Success is silent, and failures never echo
 paths, identities, or values. The exact algorithm, persistence boundary,
 fault matrix, and three-row terminal audit are in the checked
 [CPU-template strip contract](../compat/firecracker/v1.16.0/cpu-template-strip-contract.md).
+
+### CPU-Template Fingerprint Dump
+
+The signed helper also implements Firecracker v1.16.0 `fingerprint dump` with
+optional `--config/-c` and `--template/-t`, plus `--output/-o` defaulting to
+`fingerprint.json`. It reuses the exact config/template projection, explicit
+template precedence, topology-common effective provider, boot-owned exclusion,
+and owner-mode absent-only publisher described above.
+
+Bangbang emits a closed version-1 document rather than relabelling Apple facts
+as Linux sysfs/DMI evidence. Fixed producer/Firecracker compatibility metadata
+is followed by common kernel identity, exactly one tagged host variant, and the
+existing normalized guest CPU document. The schema defines both `macos` and
+`linux`: macOS requires `Darwin`/`arm64` and always includes nullable public
+`hw.product`, `hw.target`, and fixed-width `hw.cpufamily` facts; Linux requires
+`Linux`/`aarch64` and the actual upstream-semantic microcode/BIOS fields. The
+macOS production provider never emits the Linux variant, and unsupported
+targets fabricate neither.
+
+The provider uses only `uname(3)` and public `sysctlbyname(3)` selectors. It
+excludes hostname, UUID/host ID, serial, brand/private-registry, frequency, and
+raw diagnostic values. Facts are normalized and bounded; missing reviewed
+sysctls are explicit `null`, while malformed or failed available reads abort.
+Host capture precedes real HVF capture, and all capture, teardown, canonical
+encoding, strict semantic reparse, and byte-identical re-encoding complete
+before publication. Unknown/duplicate/mixed fields, platform/kernel mismatch,
+unsupported metadata, and invalid nested guest state fail closed.
+
+Default and explicit machine `None` selections capture successfully. The
+Linux/AWS T2CL, T2A, and V1N1 static policies remain unrepresentable on Apple
+Silicon and fail before output; an explicit custom template can replace a
+pending selection and is captured through the real signed path. The artifact
+is diagnostic change-awareness evidence only—not host authentication,
+template validity, migration authorization, or snapshot-portability proof.
+Fingerprint compare/filter behavior remains #1867.
+
+The exact fields, 64/255/256-byte fact bounds, 1 MiB artifact bound, privacy,
+publication, signed evidence, and four-row audit gate are in the checked
+[CPU-template fingerprint contract](../compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md).
 
 ## X86 CPUID and MSR platform boundary
 

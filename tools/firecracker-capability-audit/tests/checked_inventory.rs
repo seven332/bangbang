@@ -2,24 +2,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    AuditMode, CAPABILITY_INVENTORY_PATH, CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS,
-    CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS, CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS,
-    Disposition, LOGGER_COMPATIBILITY_CAPABILITY_IDS, LOGGER_PRODUCER_AUDIT_PATH,
-    LOGGER_PRODUCER_MANIFEST_PATH, LoggerClassDisposition, LoggerCompiledEvent,
-    LoggerDeliveryPolicy, LoggerNonApplicableReason, METRICS_AGGREGATE_CAPABILITY_IDS,
-    METRICS_DEVICE_PRODUCER_AUDIT_PATH, METRICS_LIFECYCLE_AUDIT_PATH,
-    METRICS_PROCESS_PRODUCER_AUDIT_PATH, METRICS_SCHEMA_AUTHORITY_PATH,
-    METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS, MetricsDeviceProducerDisposition,
-    MetricsProcessProducerDisposition, MetricsProducerDisposition, MetricsProducerOwner, Reference,
-    SOURCE_MANIFEST_PATH, TERMINAL_DEVICE_POLICY_PROFILE_IDS, TRACING_AUDIT_PATH,
-    TRACING_CALL_SITE_IDS, TRACING_COMPATIBILITY_CAPABILITY_IDS, logger_producer_audit_json,
+    AuditMode, CAPABILITY_INVENTORY_PATH,
+    CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS,
+    CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS, CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS,
+    CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS, Disposition,
+    LOGGER_COMPATIBILITY_CAPABILITY_IDS, LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH,
+    LoggerClassDisposition, LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerNonApplicableReason,
+    METRICS_AGGREGATE_CAPABILITY_IDS, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
+    METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
+    METRICS_SCHEMA_AUTHORITY_PATH, METRICS_SCHEMA_COMPATIBILITY_CAPABILITY_IDS,
+    MetricsDeviceProducerDisposition, MetricsProcessProducerDisposition,
+    MetricsProducerDisposition, MetricsProducerOwner, Reference, SOURCE_MANIFEST_PATH,
+    TERMINAL_DEVICE_POLICY_PROFILE_IDS, TRACING_AUDIT_PATH, TRACING_CALL_SITE_IDS,
+    TRACING_COMPATIBILITY_CAPABILITY_IDS, logger_producer_audit_json,
     logger_producer_manifest_json, read_capability_inventory, read_logger_producer_audit,
     read_logger_producer_manifest, read_metrics_device_producer_audit,
     read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
     read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
-    tracing_audit_json, validate, validate_cpu_template_helper_compatibility,
-    validate_cpu_template_helper_transition, validate_cpu_template_strip_compatibility,
-    validate_logger_compatibility, validate_logger_producers, validate_metrics_compatibility,
+    tracing_audit_json, validate, validate_cpu_template_fingerprint_dump_compatibility,
+    validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
+    validate_cpu_template_strip_compatibility, validate_logger_compatibility,
+    validate_logger_producers, validate_metrics_compatibility,
     validate_metrics_device_compatibility, validate_metrics_device_producers,
     validate_metrics_process_compatibility, validate_metrics_schema_compatibility,
     validate_tracing_audit, validate_tracing_compatibility,
@@ -753,7 +756,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        354
+        358
     );
     assert_eq!(
         inventory
@@ -761,7 +764,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        31
+        27
     );
     assert_eq!(
         inventory
@@ -1877,6 +1880,10 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let cpu_template_strip_implemented = CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let cpu_template_fingerprint_dump_implemented =
+        CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
+            .into_iter()
+            .collect::<BTreeSet<_>>();
     let impossible = X86_IMPOSSIBLE.into_iter().collect::<BTreeSet<_>>();
 
     assert_eq!(owned.len(), 93, "Wave 7 owner identities must be unique");
@@ -1889,6 +1896,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert_eq!(tracing_implemented.len(), 1);
     assert_eq!(cpu_template_helper_implemented.len(), 7);
     assert_eq!(cpu_template_strip_implemented.len(), 3);
+    assert_eq!(cpu_template_fingerprint_dump_implemented.len(), 4);
     assert_eq!(impossible.len(), 13);
     assert!(implemented.is_disjoint(&impossible));
     assert!(logger_implemented.is_disjoint(&implemented));
@@ -1918,6 +1926,16 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert!(cpu_template_strip_implemented.is_disjoint(&tracing_implemented));
     assert!(cpu_template_strip_implemented.is_disjoint(&cpu_template_helper_implemented));
     assert!(cpu_template_strip_implemented.is_disjoint(&impossible));
+    assert!(cpu_template_fingerprint_dump_implemented.is_disjoint(&implemented));
+    assert!(cpu_template_fingerprint_dump_implemented.is_disjoint(&logger_implemented));
+    assert!(cpu_template_fingerprint_dump_implemented.is_disjoint(&metrics_implemented));
+    assert!(cpu_template_fingerprint_dump_implemented.is_disjoint(&metrics_aggregate_implemented));
+    assert!(cpu_template_fingerprint_dump_implemented.is_disjoint(&tracing_implemented));
+    assert!(
+        cpu_template_fingerprint_dump_implemented.is_disjoint(&cpu_template_helper_implemented)
+    );
+    assert!(cpu_template_fingerprint_dump_implemented.is_disjoint(&cpu_template_strip_implemented));
+    assert!(cpu_template_fingerprint_dump_implemented.is_disjoint(&impossible));
     assert!(implemented.union(&impossible).all(|id| owned.contains(id)));
     assert!(logger_implemented.iter().all(|id| owned.contains(id)));
     assert!(metrics_implemented.iter().all(|id| owned.contains(id)));
@@ -1929,6 +1947,11 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert!(tracing_implemented.iter().all(|id| owned.contains(id)));
     assert!(
         cpu_template_helper_implemented
+            .iter()
+            .all(|id| owned.contains(id))
+    );
+    assert!(
+        cpu_template_fingerprint_dump_implemented
             .iter()
             .all(|id| owned.contains(id))
     );
@@ -2064,6 +2087,24 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         );
     }
 
+    for id in &cpu_template_fingerprint_dump_implemented {
+        let capability = by_id
+            .get(id)
+            .expect("CPU-template fingerprint dump identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "CPU-template fingerprint dump identity must be terminal: {id}"
+        );
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+        assert!(capability.exclusion.is_none());
+        assert!(
+            contract.contains(&format!("| `{id}` | #1794 | `implemented-and-verified` |")),
+            "contract must record implemented CPU-template fingerprint dump result: {id}"
+        );
+    }
+
     for id in &impossible {
         let capability = by_id.get(id).expect("x86 identity must exist");
         assert_eq!(capability.source_refs, [*id]);
@@ -2136,6 +2177,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .chain(tracing_implemented.iter())
         .chain(cpu_template_helper_implemented.iter())
         .chain(cpu_template_strip_implemented.iter())
+        .chain(cpu_template_fingerprint_dump_implemented.iter())
         .chain(impossible.iter())
         .copied()
         .collect::<BTreeSet<_>>();
@@ -2166,7 +2208,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             .contains("numeric startup/resource/performance or telemetry outcomes (#1798)")
     );
     assert!(normalized_contract.contains("final cross-capability interactions (Wave 8)"));
-    assert!(normalized_contract.contains("354 implemented, 31 audit-required"));
+    assert!(normalized_contract.contains("358 implemented, 27 audit-required"));
     assert!(normalized_contract.contains("376/9/3/30"));
 }
 
@@ -2247,11 +2289,14 @@ fn checked_cpu_template_helper_compatibility_is_terminal_and_fail_closed() {
     let error = validate_cpu_template_helper_transition(&hybrid)
         .expect_err("partial #1792 transition must fail")
         .to_string();
-    assert!(error.contains("exact #1793 strip terminal transition"));
+    assert!(error.contains("exact ordered"));
 
     let mut dump_verify_terminal = inventory.clone();
     for capability in &mut dump_verify_terminal.capabilities {
-        if CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.contains(&capability.id.as_str()) {
+        if CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.contains(&capability.id.as_str())
+            || CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
+                .contains(&capability.id.as_str())
+        {
             capability.disposition = Disposition::AuditRequired;
             capability.implementation.clear();
             capability.validation.clear();
@@ -2374,7 +2419,7 @@ fn checked_cpu_template_strip_compatibility_is_terminal_and_fail_closed() {
     let error = validate_cpu_template_helper_transition(&hybrid)
         .expect_err("partial #1793 transition must fail")
         .to_string();
-    assert!(error.contains("exact #1793 strip terminal transition"));
+    assert!(error.contains("exact ordered"));
 
     let mut dependency_regression = inventory.clone();
     for capability in &mut dependency_regression.capabilities {
@@ -2387,11 +2432,14 @@ fn checked_cpu_template_strip_compatibility_is_terminal_and_fail_closed() {
     let error = validate_cpu_template_helper_transition(&dependency_regression)
         .expect_err("strip cannot be terminal before dump and verify")
         .to_string();
-    assert!(error.contains("exact #1793 strip terminal transition"));
+    assert!(error.contains("exact ordered"));
 
     let mut historical = inventory.clone();
     for capability in &mut historical.capabilities {
-        if CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.contains(&capability.id.as_str()) {
+        if CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.contains(&capability.id.as_str())
+            || CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
+                .contains(&capability.id.as_str())
+        {
             capability.disposition = Disposition::AuditRequired;
             capability.implementation.clear();
             capability.validation.clear();
@@ -2402,6 +2450,137 @@ fn checked_cpu_template_strip_compatibility_is_terminal_and_fail_closed() {
     let error = validate_cpu_template_strip_compatibility(&manifest, &historical, &repository_root)
         .expect_err("strip final gate must reject the historical handoff")
         .to_string();
+    assert!(error.contains("requires implemented-and-verified capability"));
+}
+
+#[test]
+fn checked_cpu_template_fingerprint_dump_compatibility_is_terminal_and_fail_closed() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    let contract_path = "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md";
+    let contract = std::fs::read_to_string(repository_root.join(contract_path))
+        .expect("CPU-template fingerprint contract must be readable");
+
+    validate_cpu_template_fingerprint_dump_compatibility(&manifest, &inventory, &repository_root)
+        .expect("checked CPU-template fingerprint dump scope must be terminal");
+
+    let fingerprint_ids = CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fingerprint_ids.len(),
+        CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS.len(),
+        "CPU-template fingerprint dump capability set must remain exact and duplicate-free"
+    );
+    assert!(
+        fingerprint_ids.is_disjoint(
+            &CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS
+                .into_iter()
+                .collect()
+        )
+    );
+    assert!(
+        fingerprint_ids.is_disjoint(
+            &CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS
+                .into_iter()
+                .collect()
+        )
+    );
+    assert!(
+        fingerprint_ids.is_disjoint(
+            &CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS
+                .into_iter()
+                .collect()
+        )
+    );
+    for id in CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("CPU-template fingerprint capability must exist: {id}"));
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "fingerprint dump capability must remain terminal: {id}"
+        );
+        assert_eq!(
+            contract
+                .matches(&format!("| `{id}` | `implemented-and-verified` |"))
+                .count(),
+            1,
+            "fingerprint contract must contain one exact terminal row: {id}"
+        );
+    }
+    for id in CPU_TEMPLATE_HELPER_RETAINED_CAPABILITY_IDS {
+        let capability = by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("retained helper capability must exist: {id}"));
+        assert_eq!(capability.disposition, Disposition::AuditRequired, "{id}");
+        assert!(capability.implementation.is_empty(), "{id}");
+        assert!(capability.validation.is_empty(), "{id}");
+    }
+
+    let mut hybrid = inventory.clone();
+    let capability = hybrid
+        .capabilities
+        .iter_mut()
+        .find(|capability| {
+            capability.id == CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS[0]
+        })
+        .expect("fingerprint capability must exist");
+    capability.disposition = Disposition::AuditRequired;
+    capability.implementation.clear();
+    capability.validation.clear();
+    let error = validate_cpu_template_helper_transition(&hybrid)
+        .expect_err("partial #1866 transition must fail")
+        .to_string();
+    assert!(error.contains("exact ordered"));
+
+    let mut dependency_regression = inventory.clone();
+    for capability in &mut dependency_regression.capabilities {
+        if CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS.contains(&capability.id.as_str()) {
+            capability.disposition = Disposition::AuditRequired;
+            capability.implementation.clear();
+            capability.validation.clear();
+        }
+    }
+    let error = validate_cpu_template_helper_transition(&dependency_regression)
+        .expect_err("fingerprint dump cannot be terminal before strip")
+        .to_string();
+    assert!(error.contains("exact ordered"));
+
+    let mut strip_terminal = inventory.clone();
+    for capability in &mut strip_terminal.capabilities {
+        if CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS
+            .contains(&capability.id.as_str())
+        {
+            capability.disposition = Disposition::AuditRequired;
+            capability.implementation.clear();
+            capability.validation.clear();
+        }
+    }
+    validate_cpu_template_helper_transition(&strip_terminal)
+        .expect("exact #1793 terminal handoff must remain accepted");
+    validate_cpu_template_strip_compatibility(&manifest, &strip_terminal, &repository_root)
+        .expect("strip certification must not require fingerprint completion");
+    let error = validate_cpu_template_fingerprint_dump_compatibility(
+        &manifest,
+        &strip_terminal,
+        &repository_root,
+    )
+    .expect_err("fingerprint final gate must reject the historical handoff")
+    .to_string();
     assert!(error.contains("requires implemented-and-verified capability"));
 }
 
@@ -2866,8 +3045,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 354);
-    assert_eq!(count(Disposition::AuditRequired), 31);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 358);
+    assert_eq!(count(Disposition::AuditRequired), 27);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3596,8 +3775,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 354);
-    assert_eq!(count(Disposition::AuditRequired), 31);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 358);
+    assert_eq!(count(Disposition::AuditRequired), 27);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -3893,8 +4072,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 354);
-    assert_eq!(count(Disposition::AuditRequired), 31);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 358);
+    assert_eq!(count(Disposition::AuditRequired), 27);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4042,8 +4221,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 354);
-    assert_eq!(count(Disposition::AuditRequired), 31);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 358);
+    assert_eq!(count(Disposition::AuditRequired), 27);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4057,7 +4236,7 @@ fn delivery_closure_policy_is_stable() {
         "semantic.lifecycle:smp-psci-and-vcpu-ownership",
         "semantic.memory:machine-sizing-hugepages-and-dirty-tracking",
     ];
-    const WAVE_7_ORIGINAL: [&str; 12] = [
+    const WAVE_7_ORIGINAL: [&str; 8] = [
         "corpus:cpu-template-helper",
         "corpus:cpu-templates",
         "corpus:rootfs-and-kernel",
@@ -4065,11 +4244,7 @@ fn delivery_closure_policy_is_stable() {
         "tool-argument:cpu-template-helper/fingerprint/compare/curr",
         "tool-argument:cpu-template-helper/fingerprint/compare/filters",
         "tool-argument:cpu-template-helper/fingerprint/compare/prev",
-        "tool-argument:cpu-template-helper/fingerprint/dump/config",
-        "tool-argument:cpu-template-helper/fingerprint/dump/output",
-        "tool-argument:cpu-template-helper/fingerprint/dump/template",
         "tool-operation:cpu-template-helper/fingerprint/compare",
-        "tool-operation:cpu-template-helper/fingerprint/dump",
     ];
     const PROMOTED_API: [&str; 18] = [
         "api-operation:GET /machine-config",
@@ -4302,8 +4477,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 354);
-    assert_eq!(count(Disposition::AuditRequired), 31);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 358);
+    assert_eq!(count(Disposition::AuditRequired), 27);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 
@@ -4337,6 +4512,16 @@ fn delivery_closure_policy_is_stable() {
             "CPU-template strip record must remain terminal: {id}"
         );
     }
+    for id in CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS {
+        assert_eq!(
+            by_id
+                .get(id)
+                .expect("terminal CPU-template fingerprint dump record must exist")
+                .disposition,
+            Disposition::ImplementedAndVerified,
+            "CPU-template fingerprint dump record must remain terminal: {id}"
+        );
+    }
     for id in WAVE_7_ORIGINAL {
         let capability = by_id.get(id).expect("Wave 7 original record must exist");
         assert_eq!(
@@ -4362,6 +4547,7 @@ fn delivery_closure_policy_is_stable() {
         .chain(WAVE_7_ORIGINAL)
         .chain(CPU_TEMPLATE_HELPER_COMPATIBILITY_CAPABILITY_IDS)
         .chain(CPU_TEMPLATE_STRIP_COMPATIBILITY_CAPABILITY_IDS)
+        .chain(CPU_TEMPLATE_FINGERPRINT_DUMP_COMPATIBILITY_CAPABILITY_IDS)
         .chain(["corpus:hugepages"])
         .collect::<BTreeSet<_>>();
     assert_eq!(

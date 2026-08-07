@@ -16527,7 +16527,66 @@
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/dump/config"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Dump"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn dump_with_providers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "pub struct SystemHostFingerprintProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "fn macos_golden_bytes_round_trip_and_accept_other_canonical_producer_versions"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "fn capture_queries_exact_public_facts_once_in_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_failures_are_bounded_and_publish_neither_default_nor_explicit_output"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_dump_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/dump/output",
@@ -16536,7 +16595,66 @@
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/dump/output"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Dump"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn dump_with_providers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "pub struct SystemHostFingerprintProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "fn macos_golden_bytes_round_trip_and_accept_other_canonical_producer_versions"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "fn capture_queries_exact_public_facts_once_in_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_failures_are_bounded_and_publish_neither_default_nor_explicit_output"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_dump_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/fingerprint/dump/template",
@@ -16545,7 +16663,66 @@
       "source_refs": [
         "tool-argument:cpu-template-helper/fingerprint/dump/template"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Dump"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn dump_with_providers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "pub struct SystemHostFingerprintProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "fn macos_golden_bytes_round_trip_and_accept_other_canonical_producer_versions"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "fn capture_queries_exact_public_facts_once_in_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_failures_are_bounded_and_publish_neither_default_nor_explicit_output"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_dump_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-argument:cpu-template-helper/template/dump/config",
@@ -18395,7 +18572,66 @@
       "source_refs": [
         "tool-operation:cpu-template-helper/fingerprint/dump"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/cli.rs",
+          "anchor": "Fingerprint(FingerprintOperation::Dump"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "pub fn dump_with_providers"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "pub struct SystemHostFingerprintProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/provider.rs",
+          "anchor": "pub struct HvfEffectiveCpuTemplateProvider"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/publication.rs",
+          "anchor": "pub fn publish_new_artifact"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/cpu-template-fingerprint-contract.md",
+          "anchor": "Terminal certification"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/fingerprint.rs",
+          "anchor": "fn macos_golden_bytes_round_trip_and_accept_other_canonical_producer_versions"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/src/host.rs",
+          "anchor": "fn capture_queries_exact_public_facts_once_in_order"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn fingerprint_failures_are_bounded_and_publish_neither_default_nor_explicit_output"
+        },
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/hvf_e2e.rs",
+          "anchor": "fn signed_fingerprint_dump_covers_real_macos_default_static_and_custom_selection"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+          "anchor": "fn checked_cpu_template_fingerprint_dump_compatibility_is_terminal_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "tool-operation:cpu-template-helper/template/dump",

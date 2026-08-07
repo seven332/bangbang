@@ -282,6 +282,16 @@ pub fn dump_with_provider(
     provider: &mut impl EffectiveCpuTemplateProvider,
     request: &PreparedCpuTemplateInspection,
 ) -> Result<Vec<u8>, CpuTemplateOperationError> {
+    capture_document_with_provider(provider, request)?
+        .canonical_bytes()
+        .map_err(CpuTemplateOperationError::Encoding)
+}
+
+/// Capture every available retained profile entry as one normalized document.
+pub fn capture_document_with_provider(
+    provider: &mut impl EffectiveCpuTemplateProvider,
+    request: &PreparedCpuTemplateInspection,
+) -> Result<CpuTemplateDocument, CpuTemplateOperationError> {
     let profile = provider
         .inspect(request)
         .map_err(CpuTemplateOperationError::Provider)?;
@@ -306,9 +316,7 @@ pub fn dump_with_provider(
             ))
         })
         .collect();
-    CpuTemplateDocument::from_modifiers(modifiers)
-        .canonical_bytes()
-        .map_err(CpuTemplateOperationError::Encoding)
+    Ok(CpuTemplateDocument::from_modifiers(modifiers))
 }
 
 /// Capture once and compare the selected custom template under its filters.
