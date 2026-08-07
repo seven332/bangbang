@@ -135,8 +135,9 @@ process retains its nonzero result and makes no filesystem mutation.
 The selected values are intentionally user-requested diagnostic material and
 are not category-only errors. They are emitted without the ordinary
 `cpu-template-helper:` prefix so the payload remains one canonical JSON value.
-Every actual admission, transform, encoding, size, or stream failure remains a
-bounded value/path-free category instead.
+Every actual admission, transform, encoding, or size failure remains a bounded
+value/path-free category instead. A stream failure cannot add another
+diagnostic reliably; it exposes no extra values and retains exit 1.
 
 ## Guest CPU difference semantics
 
@@ -164,8 +165,10 @@ the terminal diagnostic stream.
 - Help/version use stdout and exit 0.
 - Equal selected state is silent and exits 0.
 - A detected difference writes the canonical JSON to stderr and exits 1.
-- Input, document, platform, unavailable-filter, transform, encoding, bound,
-  or stream failure uses a fixed category and exits 1.
+- Input, document, platform, unavailable-filter, transform, encoding, or bound
+  failure uses a fixed category and exits 1.
+- A terminal stream failure retains exit 1; no additional output is guaranteed
+  once that stream rejects bytes.
 - Missing/extra arguments and unknown, empty, or duplicate filters write the
   existing fixed invalid-arguments line and exit 2 before path access.
 
