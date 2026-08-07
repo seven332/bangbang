@@ -110,6 +110,7 @@ reviewed delta.
 | [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and the device-final ten-profile/231-field #1789 certification with #1838–#1846 terminal |
 | [Developer tracing](tracing-contract.md) | Terminal opt-in feature contract, exact eight-call AST closure, fixed nesting/record/tool-delivery bounds, privacy, loss/result preservation, runtime tool admission, release diagnostics, and explicit mechanism/timing nonclaims |
 | [macOS guest workflow](guest-workflow-contract.md) | Terminal two-corpus mapping, exact pinned guest identity, public API/no-API lifecycle, process/cache ownership, signed execution and platform/nonclaim boundary |
+| [Targeted formal verification](formal-verification-contract.md) | Terminal one-corpus mapping, exact Kani/toolchain pins, five source/compiled-bijective bounded proofs, retained tests, and explicit whole-system/mechanism nonclaims |
 
 ## Dispositions
 
@@ -301,6 +302,21 @@ cross-producer transaction proves coherent process/device commit and
 success-only baselines after a visible prefix; existing process tests prove
 the final attempt is best effort and consumed once.
 
+## Targeted Formal-Verification Certification
+
+The terminal `corpus:formal-verification` row has one fail-closed gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --formal-verification-final
+```
+
+This gate validates the exact five-record authority, independently derives all
+tracked `cfg(kani)` proof symbols, requires the single owned corpus row to be
+terminal, and retains all unrelated delivery rows. The Linux-only
+`python3 scripts/run-kani.py` command adds Kani's per-package compiled-list
+bijection and executes every exact proof; its setup and bounded interpretation
+live in the [formal-verification guide](../../../docs/formal-verification.md).
+
 ## Contributor Update Rule
 
 Every pull request that changes a Firecracker-facing capability must update all
@@ -316,5 +332,6 @@ Review candidate identity changes before updating a machine-owned projection.
 Never use regeneration to alter `capabilities.json`,
 `logger-producer-audit.json`, `metrics-process-producer-audit.json`, or the
 human policy projections in `metrics-schema.json`. The human-owned
-`metrics-device-producer-audit.json`, `metrics-lifecycle-audit.json`, and
-`tracing-audit.json` likewise have no regeneration command.
+`metrics-device-producer-audit.json`, `metrics-lifecycle-audit.json`,
+`tracing-audit.json`, and `formal-verification-audit.json` likewise have no
+regeneration command.

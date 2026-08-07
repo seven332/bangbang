@@ -6,12 +6,13 @@ use std::process::{Command, ExitCode};
 
 use bangbang_firecracker_capability_audit::{
     AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, CPU_TEMPLATE_HELPER_AUDIT_PATH,
-    GUEST_WORKFLOW_AUDIT_PATH, LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH,
-    METRICS_DEVICE_PRODUCER_AUDIT_PATH, METRICS_LIFECYCLE_AUDIT_PATH,
-    METRICS_PROCESS_PRODUCER_AUDIT_PATH, METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH,
-    TRACING_AUDIT_PATH, derive_logger_producer_manifest, derive_metrics_schema_source,
-    derive_source_manifest, logger_producer_manifest_json, metrics_schema_source_candidate_json,
-    read_capability_inventory, read_cpu_template_helper_audit, read_guest_workflow_audit,
+    FORMAL_VERIFICATION_AUDIT_PATH, GUEST_WORKFLOW_AUDIT_PATH, LOGGER_PRODUCER_AUDIT_PATH,
+    LOGGER_PRODUCER_MANIFEST_PATH, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
+    METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
+    METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH, TRACING_AUDIT_PATH,
+    derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
+    logger_producer_manifest_json, metrics_schema_source_candidate_json, read_capability_inventory,
+    read_cpu_template_helper_audit, read_formal_verification_audit, read_guest_workflow_audit,
     read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
     read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
     read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
@@ -19,7 +20,8 @@ use bangbang_firecracker_capability_audit::{
     validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility, validate_cpu_template_helper_audit,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
-    validate_cpu_template_strip_compatibility, validate_guest_workflow_audit,
+    validate_cpu_template_strip_compatibility, validate_formal_verification_audit,
+    validate_formal_verification_compatibility, validate_guest_workflow_audit,
     validate_guest_workflow_compatibility, validate_logger_compatibility,
     validate_logger_producers, validate_metrics_compatibility,
     validate_metrics_device_compatibility, validate_metrics_device_producers,
@@ -76,6 +78,7 @@ enum ValidateMode {
     CpuTemplateFingerprintCompareFinal,
     CpuTemplateFinal,
     GuestWorkflowFinal,
+    FormalVerificationFinal,
 }
 
 fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
@@ -98,8 +101,11 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
         }
         [flag] if flag == "--cpu-template-final" => Ok(ValidateMode::CpuTemplateFinal),
         [flag] if flag == "--guest-workflow-final" => Ok(ValidateMode::GuestWorkflowFinal),
+        [flag] if flag == "--formal-verification-final" => {
+            Ok(ValidateMode::FormalVerificationFinal)
+        }
         _ => Err(AuditError::new(
-            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, or --guest-workflow-final flag",
+            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, --guest-workflow-final, or --formal-verification-final flag",
         )),
     }
 }
@@ -123,6 +129,8 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let cpu_template_helper_audit =
         read_cpu_template_helper_audit(&root.join(CPU_TEMPLATE_HELPER_AUDIT_PATH))?;
     let guest_workflow_audit = read_guest_workflow_audit(&root.join(GUEST_WORKFLOW_AUDIT_PATH))?;
+    let formal_verification_audit =
+        read_formal_verification_audit(&root.join(FORMAL_VERIFICATION_AUDIT_PATH))?;
     validate_cpu_template_helper_transition(&inventory).map_err(|errors| {
         AuditError::new(format!(
             "CPU-template helper transition validation errors:\n{errors}"
@@ -137,6 +145,11 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     )?;
     validate_guest_workflow_audit(&guest_workflow_audit, &inventory, &root).map_err(|errors| {
         AuditError::new(format!("guest workflow audit validation errors:\n{errors}"))
+    })?;
+    validate_formal_verification_audit(&formal_verification_audit, &root).map_err(|errors| {
+        AuditError::new(format!(
+            "formal verification audit validation errors:\n{errors}"
+        ))
     })?;
     let audit_mode = match mode {
         ValidateMode::Delivery => AuditMode::Delivery,
@@ -742,6 +755,65 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
                     .to_string(),
             );
         }
+        ValidateMode::FormalVerificationFinal => {
+            validate_formal_verification_compatibility(
+                &manifest,
+                &inventory,
+                &formal_verification_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "formal verification compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_logger_producers(&logger_manifest, &logger_audit, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("logger producer validation errors:\n{errors}"))
+                })?;
+            validate_metrics_schema(&metrics_authority, &manifest, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("metrics schema validation errors:\n{errors}"))
+                })?;
+            validate_metrics_process_producers(
+                &metrics_process_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics process producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_device_producers(
+                &metrics_device_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics device producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_lifecycle(
+                &metrics_lifecycle_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
+            })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
+            return Ok(
+                "Firecracker capability inventory, canonical formal verification audit, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal targeted Kani compatibility scope"
+                    .to_string(),
+            );
+        }
     };
     let mut failures = Vec::new();
     if let Err(errors) = validate(&manifest, &inventory, &root, audit_mode) {
@@ -794,7 +866,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         AuditMode::Final => "final",
     };
     Ok(format!(
-        "Firecracker capability inventory, canonical CPU-template helper audit, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
+        "Firecracker capability inventory, canonical CPU-template helper, guest-workflow, and formal-verification audits, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
     ))
 }
 
@@ -1100,7 +1172,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final | --formal-verification-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -1171,6 +1243,10 @@ mod tests {
             parse_validate_mode(&["--guest-workflow-final".to_string()]).unwrap(),
             ValidateMode::GuestWorkflowFinal
         );
+        assert_eq!(
+            parse_validate_mode(&["--formal-verification-final".to_string()]).unwrap(),
+            ValidateMode::FormalVerificationFinal
+        );
 
         for invalid in [
             vec!["--unknown".to_string()],
@@ -1211,6 +1287,10 @@ mod tests {
             vec![
                 "--cpu-template-fingerprint-compare-final".to_string(),
                 "--cpu-template-final".to_string(),
+            ],
+            vec![
+                "--guest-workflow-final".to_string(),
+                "--formal-verification-final".to_string(),
             ],
         ] {
             let error = parse_validate_mode(&invalid).expect_err("mode should be rejected");

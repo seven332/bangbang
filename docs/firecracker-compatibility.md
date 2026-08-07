@@ -1295,6 +1295,13 @@ also preserves the independent logger, metrics, tools, corpus, performance,
 formal-verification, and final cross-capability owners rather than promoting
 them through that aggregate result.
 
+The independent `corpus:formal-verification` owner is now terminal through the
+[Targeted Formal Verification](formal-verification.md) boundary and checked
+[v1.16.0 contract](../compat/firecracker/v1.16.0/formal-verification-contract.md).
+Its five Kani records prove only their stated pure functions, assumptions and
+bounds; the core API aggregate still does not inherit formal, FFI/HVF, timer,
+concurrency, I/O, performance, or whole-system correctness claims.
+
 Current global disposition totals are derived from `capabilities.json` and
 checked by the capability-audit tests. Human-readable documents deliberately
 do not publish a second total.

@@ -805,6 +805,62 @@ fn remove_range_is_valid(region: PagerRegion, offset: u64, length: u64, page_siz
             .is_some_and(|end| end <= region.length())
 }
 
+#[cfg(kani)]
+#[allow(dead_code)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_pager_artifact_ranges() {
+        let page_shift: u32 = kani::any();
+        kani::assume((12..=21).contains(&page_shift));
+        let page_size = 1_u32 << page_shift;
+
+        let Ok(first_id) = PagerRegionId::new(1) else {
+            return;
+        };
+        let Ok(second_id) = PagerRegionId::new(2) else {
+            return;
+        };
+        let first = PagerRegion::new(first_id, kani::any(), kani::any(), page_size);
+        let second = PagerRegion::new(second_id, kani::any(), kani::any(), page_size);
+        kani::assume(first.is_ok());
+        kani::assume(second.is_ok());
+        let Ok(first) = first else {
+            return;
+        };
+        let Ok(second) = second else {
+            return;
+        };
+
+        let page_offset: u64 = kani::any();
+        let page_length: u32 = kani::any();
+        if page_range_is_valid(first, page_offset, page_length, page_size) {
+            assert_eq!(page_length, page_size);
+            assert!(page_offset.is_multiple_of(u64::from(page_size)));
+            let end = page_offset.checked_add(u64::from(page_length));
+            assert!(end.is_some());
+            assert!(end.is_some_and(|end| end <= first.length()));
+        }
+
+        let remove_offset: u64 = kani::any();
+        let remove_length: u64 = kani::any();
+        if remove_range_is_valid(first, remove_offset, remove_length, page_size) {
+            assert_ne!(remove_length, 0);
+            assert!(remove_offset.is_multiple_of(u64::from(page_size)));
+            assert!(remove_length.is_multiple_of(u64::from(page_size)));
+            let end = remove_offset.checked_add(remove_length);
+            assert!(end.is_some());
+            assert!(end.is_some_and(|end| end <= first.length()));
+        }
+
+        assert_eq!(
+            source_ranges_overlap(first, second),
+            source_ranges_overlap(second, first)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

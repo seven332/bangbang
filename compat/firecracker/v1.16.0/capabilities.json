@@ -12640,11 +12640,45 @@
     {
       "id": "corpus:formal-verification",
       "family": "specifications",
-      "summary": "Audit all applicable capability claims owned by the pinned formal-verification source corpus.",
+      "summary": "Target five high-risk pure Bangbang boundaries with Kani 0.67.0: pager input limits, virtqueue geometry and indices, bounded token-refill accounting, pager artifact ranges, and virtio-MMIO status transitions; exact assumptions, bounds, source/compiled harness bijection, pinned Linux execution, retained tests, and explicit whole-system/FFI/time/concurrency/I/O/performance nonclaims keep the evidence bounded.",
       "source_refs": [
         "corpus:formal-verification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/formal-verification-audit.json",
+          "anchor": "virtio-mmio-status-transitions"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-kani.py",
+          "anchor": "def run_verification("
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/formal_verification_audit_validate.rs",
+          "anchor": "pub fn validate_formal_verification_audit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": ".github/workflows/ci.yml",
+          "anchor": "name: kani"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_run_kani.py",
+          "anchor": "class RunKaniTests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/formal_verification_audit.rs",
+          "anchor": "fn checked_formal_verification_audit_is_canonical_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "corpus:getting-started",
