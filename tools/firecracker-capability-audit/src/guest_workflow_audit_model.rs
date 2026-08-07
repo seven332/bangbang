@@ -7,6 +7,7 @@ use crate::{Baseline, Reference};
 #[serde(rename_all = "kebab-case")]
 pub enum GuestWorkflowDeliveryState {
     Preparation,
+    Complete,
 }
 
 /// Issues that own the two-slice guest-workflow delivery.
@@ -135,6 +136,7 @@ pub struct GuestOutputPolicy {
 #[serde(rename_all = "kebab-case")]
 pub enum GuestWorkflowProfileState {
     Planned,
+    ImplementedAndVerified,
 }
 
 /// Closed public workflow modes reserved for the completion slice.
@@ -172,11 +174,33 @@ pub struct GuestWorkflowProfile {
     pub boot_args: String,
     pub rootfs_read_only: bool,
     pub success_marker: String,
+    pub failure_marker: String,
     pub shutdown: GuestShutdown,
     pub networking: GuestNetworking,
     pub platform: String,
     pub implementation: Vec<Reference>,
     pub validation: Vec<Reference>,
+}
+
+/// Exact stable guest content verified by both public profiles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestWorkflowIdentity {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// Closed wall-clock bounds for external workflow operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestWorkflowTimeouts {
+    pub artifact_seconds: u64,
+    pub build_seconds: u64,
+    pub startup_seconds: u64,
+    pub request_seconds: u64,
+    pub guest_seconds: u64,
+    pub terminate_seconds: u64,
 }
 
 /// Categorized checked evidence for the preparation slice.
@@ -214,6 +238,8 @@ pub struct GuestWorkflowAudit {
     pub generated: Vec<GeneratedGuestArtifact>,
     pub ext4_recipes: Vec<Ext4Recipe>,
     pub output_classes: Vec<GuestOutputPolicy>,
+    pub guest_identity: GuestWorkflowIdentity,
+    pub timeouts: GuestWorkflowTimeouts,
     pub profiles: Vec<GuestWorkflowProfile>,
     pub evidence: GuestWorkflowEvidence,
     pub nonclaims: Vec<GuestWorkflowNonclaim>,
@@ -232,7 +258,7 @@ mod tests {
         assert!(unknown.to_string().contains("unknown field"));
 
         let state = serde_json::from_str::<GuestWorkflowProfileState>(r#""complete""#)
-            .expect_err("terminal profile state must not parse in the preparation schema");
+            .expect_err("unreviewed terminal profile state must not parse");
         assert!(state.to_string().contains("unknown variant"));
     }
 }

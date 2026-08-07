@@ -7,7 +7,8 @@ use crate::{
     FIRECRACKER_VERSION, GeneratedDeterminism, GuestArtifact, GuestArtifactKind, GuestNetworking,
     GuestOutputClass, GuestOutputPolicy, GuestShutdown, GuestWorkflowAudit,
     GuestWorkflowDeliveryState, GuestWorkflowMode, GuestWorkflowNonclaim,
-    GuestWorkflowProfileState, Reference, ValidationErrors, guest_workflow_audit_json,
+    GuestWorkflowProfileState, GuestWorkflowTimeouts, Reference, ValidationErrors,
+    guest_workflow_audit_json,
 };
 
 /// Current checked guest-workflow authority schema.
@@ -25,9 +26,15 @@ pub const GUEST_WORKFLOW_PROFILE_IDS: [&str; 2] =
 
 const KERNEL_SHA256: &str = "e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591";
 const ROOTFS_SHA256: &str = "0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608";
-const INITRD_SHA256: &str = "f1cd1318caf1e7f1cbff1e095dce9a9958b84320746d763a01a3fd5048008050";
-const BOOT_ARGS: &str = "console=ttyS0 reboot=t panic=1 pci=off";
+const INITRD_SHA256: &str = "1057079b072452a762396113867ebc5afa699a0b5c3121e28970ecadd4ba11d0";
+const GUEST_IDENTITY_SHA256: &str =
+    "3e5851448bae5b36f351becde037a8b13b77307279f484eda808f8177d9a4293";
+const BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/rootfs-poweroff-init";
 const SUCCESS_MARKER: &str = "BANGBANG_ROOTFS_WORKFLOW_OK";
+const FAILURE_MARKER: &str = "BANGBANG_ROOTFS_WORKFLOW_FAIL";
+const GETTING_STARTED_SUMMARY: &str = "Provide a checked rootless networkless Apple Silicon workflow that prepares pinned guest artifacts and proves signed API and no-api rootfs boot, exact guest identity, guest-requested poweroff, process exit, and session/socket cleanup; Linux/KVM, root, TAP/iptables, jailer, and production deployment instructions remain explicit nonclaims.";
+const ROOTFS_AND_KERNEL_SUMMARY: &str = "Prepare and verify the pinned Firecracker CI arm64 kernel and read-only squashfs plus Bangbang's deterministic initrd, then prove exact guest-visible os-release bytes and poweroff; upstream Linux/FreeBSD build recipes, arbitrary images, redistribution, and byte-reproducible ext4 remain outside the macOS workflow.";
 const SIDECAR_FIELDS: [&str; 10] = [
     "schema_version",
     "source_sha256",
@@ -64,9 +71,10 @@ pub fn validate_guest_workflow_audit(
     validate_generated(audit, &mut errors);
     validate_ext4_recipes(audit, &mut errors);
     validate_output_classes(audit, &mut errors);
+    validate_runtime_contract(audit, &mut errors);
     validate_profiles(audit, &mut errors);
     validate_nonclaims(audit, &mut errors);
-    validate_capability_transition(inventory, &mut errors);
+    validate_capability_transition(audit, inventory, &mut errors);
 
     let tracked = tracked_repository_files(repository_root, &mut errors);
     validate_evidence(audit, repository_root, &tracked, &mut errors);
@@ -96,10 +104,9 @@ fn validate_baseline(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
     if audit.delivery.parent_issue != "#1796"
         || audit.delivery.preparation_issue != "#1871"
         || audit.delivery.completion_issue != "#1872"
-        || audit.delivery.state != GuestWorkflowDeliveryState::Preparation
     {
         errors.push(
-            "guest workflow audit requires the exact preparation delivery boundary".to_string(),
+            "guest workflow audit requires the exact two-slice delivery ownership".to_string(),
         );
     }
     let namespace = &audit.source_namespace;
@@ -204,7 +211,7 @@ fn validate_generated(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
         || generated.generator_path != "scripts/build-guest-boot-initrd.py"
         || generated.cache_path != "bangbang/guest-boot/initrd.cpio"
         || generated.sha256 != INITRD_SHA256
-        || generated.size_bytes != 52_224
+        || generated.size_bytes != 54_272
         || generated.output_class != GuestOutputClass::DeterministicGeneratedCache
         || generated.determinism != GeneratedDeterminism::ByteIdentical
     {
@@ -219,6 +226,28 @@ fn validate_generated(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
         errors.push(
             "guest workflow audit generated artifact has invalid paths or digest".to_string(),
         );
+    }
+}
+
+fn validate_runtime_contract(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
+    if audit.guest_identity.path != "/etc/os-release"
+        || audit.guest_identity.size_bytes != 400
+        || audit.guest_identity.sha256 != GUEST_IDENTITY_SHA256
+        || !is_sha256(&audit.guest_identity.sha256)
+    {
+        errors.push("guest workflow audit requires the exact pinned guest identity".to_string());
+    }
+    if audit.timeouts
+        != (GuestWorkflowTimeouts {
+            artifact_seconds: 600,
+            build_seconds: 900,
+            startup_seconds: 30,
+            request_seconds: 5,
+            guest_seconds: 60,
+            terminate_seconds: 5,
+        })
+    {
+        errors.push("guest workflow audit requires the exact bounded timeout policy".to_string());
     }
 }
 
@@ -344,33 +373,56 @@ fn validate_profiles(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
         .map(|profile| profile.id.as_str())
         .collect::<Vec<_>>();
     if ids != GUEST_WORKFLOW_PROFILE_IDS {
-        errors.push(
-            "guest workflow audit requires the exact ordered planned workflow profiles".to_string(),
-        );
+        errors
+            .push("guest workflow audit requires the exact ordered workflow profiles".to_string());
         return;
     }
+    let terminal = audit.delivery.state == GuestWorkflowDeliveryState::Complete;
     for (index, profile) in audit.profiles.iter().enumerate() {
         let expected_mode = if index == 0 {
             GuestWorkflowMode::Api
         } else {
             GuestWorkflowMode::NoApi
         };
-        if profile.state != GuestWorkflowProfileState::Planned
+        let expected_implementation = vec![local_reference(
+            "scripts/run-macos-guest-workflow.py",
+            "def run_workflow(",
+        )];
+        let expected_validation = vec![local_reference(
+            "scripts/run-integration-tests.sh",
+            if index == 0 {
+                "scripts/run-macos-guest-workflow.py api"
+            } else {
+                "scripts/run-macos-guest-workflow.py no-api"
+            },
+        )];
+        let expected_state = if terminal {
+            GuestWorkflowProfileState::ImplementedAndVerified
+        } else {
+            GuestWorkflowProfileState::Planned
+        };
+        let evidence_matches = if terminal {
+            profile.implementation == expected_implementation
+                && profile.validation == expected_validation
+        } else {
+            profile.implementation.is_empty() && profile.validation.is_empty()
+        };
+        if profile.state != expected_state
             || profile.mode != expected_mode
             || profile.kernel_artifact != "kernel"
             || profile.rootfs_artifact != "rootfs"
-            || profile.initrd_artifact != "rootfs-poweroff-initrd"
+            || profile.initrd_artifact != "guest-boot-initrd"
             || profile.boot_args != BOOT_ARGS
             || !profile.rootfs_read_only
             || profile.success_marker != SUCCESS_MARKER
+            || profile.failure_marker != FAILURE_MARKER
             || profile.shutdown != GuestShutdown::GuestPoweroff
             || profile.networking != GuestNetworking::None
             || profile.platform != "aarch64-apple-darwin-hvf"
-            || !profile.implementation.is_empty()
-            || !profile.validation.is_empty()
+            || !evidence_matches
         {
             errors.push(format!(
-                "guest workflow profile must remain exact, planned, and evidence-empty: {}",
+                "guest workflow profile does not match its exact delivery state: {}",
                 profile.id
             ));
         }
@@ -383,25 +435,90 @@ fn validate_nonclaims(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_capability_transition(inventory: &CapabilityInventory, errors: &mut Vec<String>) {
+fn validate_capability_transition(
+    audit: &GuestWorkflowAudit,
+    inventory: &CapabilityInventory,
+    errors: &mut Vec<String>,
+) {
     let capabilities = inventory
         .capabilities
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
-    for id in ["corpus:getting-started", "corpus:rootfs-and-kernel"] {
+    for (id, family, summary) in [
+        ("corpus:getting-started", "process", GETTING_STARTED_SUMMARY),
+        (
+            "corpus:rootfs-and-kernel",
+            "boot-and-lifecycle",
+            ROOTFS_AND_KERNEL_SUMMARY,
+        ),
+    ] {
         match capabilities.get(id) {
-            Some(capability)
-                if capability.disposition == Disposition::AuditRequired
-                    && capability.delivery_issue.is_none()
-                    && capability.implementation.is_empty()
-                    && capability.validation.is_empty() => {}
-            Some(_) => errors.push(format!(
-                "guest workflow preparation requires {id} to remain exactly audit-required"
-            )),
+            Some(capability) if audit.delivery.state == GuestWorkflowDeliveryState::Preparation => {
+                if capability.disposition != Disposition::AuditRequired
+                    || capability.delivery_issue.is_some()
+                    || capability.exclusion.is_some()
+                    || !capability.implementation.is_empty()
+                    || !capability.validation.is_empty()
+                {
+                    errors.push(format!(
+                        "guest workflow preparation requires {id} to remain exactly audit-required"
+                    ));
+                }
+            }
+            Some(capability) => {
+                if capability.family != family
+                    || capability.summary != summary
+                    || capability.source_refs != [id]
+                    || capability.disposition != Disposition::ImplementedAndVerified
+                    || capability.implementation != terminal_capability_implementation()
+                    || capability.validation != terminal_capability_validation()
+                    || capability.delivery_issue.is_some()
+                    || capability.exclusion.is_some()
+                {
+                    errors.push(format!(
+                        "guest workflow completion requires exact implemented-and-verified evidence: {id}"
+                    ));
+                }
+            }
             None => errors.push(format!("guest workflow capability is missing: {id}")),
         }
     }
+}
+
+fn terminal_capability_implementation() -> Vec<Reference> {
+    vec![
+        local_reference(
+            "scripts/build-guest-boot-initrd.py",
+            "def build_rootfs_poweroff_init_code(",
+        ),
+        local_reference(
+            "scripts/guest_artifact_policy.py",
+            "class GuestWorkflowProfile",
+        ),
+        local_reference("scripts/run-macos-guest-workflow.py", "def run_workflow("),
+    ]
+}
+
+fn terminal_capability_validation() -> Vec<Reference> {
+    vec![
+        local_reference(
+            "scripts/run-integration-tests.sh",
+            "scripts/run-macos-guest-workflow.py api",
+        ),
+        local_reference(
+            "scripts/run-integration-tests.sh",
+            "scripts/run-macos-guest-workflow.py no-api",
+        ),
+        local_reference(
+            "scripts/tests/test_macos_guest_workflow.py",
+            "class MacosGuestWorkflowTests",
+        ),
+        local_reference(
+            "tools/firecracker-capability-audit/tests/guest_workflow_audit.rs",
+            "guest_workflow_terminal_scope_is_exact",
+        ),
+    ]
 }
 
 fn validate_evidence(
@@ -410,49 +527,102 @@ fn validate_evidence(
     tracked: &BTreeSet<PathBuf>,
     errors: &mut Vec<String>,
 ) {
-    let expected_implementation = vec![
-        local_reference(
-            "scripts/build-guest-boot-initrd.py",
-            "publish_generated_bytes(",
-        ),
-        local_reference(
-            "scripts/fetch-firecracker-kernel.sh",
-            "guest_artifact_policy.py",
-        ),
-        local_reference(
-            "scripts/fetch-firecracker-rootfs.sh",
-            "--internal-populate-direct",
-        ),
-        local_reference(
-            "scripts/guest_artifact_policy.py",
-            "class ArtifactPolicyError",
-        ),
-        local_reference("scripts/sign-hvf-binary.sh", "publish signed"),
-    ];
-    let expected_validation = vec![
-        local_reference(
-            "scripts/tests/test_guest_artifact_policy.py",
-            "class GuestArtifactPolicyTests",
-        ),
-        local_reference(
-            "tools/firecracker-capability-audit/tests/guest_workflow_audit.rs",
-            "checked_guest_workflow_audit_is_canonical_and_fail_closed",
-        ),
-    ];
-    let expected_documentation = vec![
-        local_reference(
-            "compat/firecracker/v1.16.0/README.md",
-            "Guest workflow artifact authority",
-        ),
-        local_reference("docs/testing.md", "## Guest Boot Artifacts"),
-    ];
+    let expected_implementation = if audit.delivery.state == GuestWorkflowDeliveryState::Complete {
+        vec![
+            local_reference(
+                "scripts/build-guest-boot-initrd.py",
+                "def build_rootfs_poweroff_init_code(",
+            ),
+            local_reference(
+                "scripts/fetch-firecracker-kernel.sh",
+                "guest_artifact_policy.py",
+            ),
+            local_reference(
+                "scripts/fetch-firecracker-rootfs.sh",
+                "--internal-populate-direct",
+            ),
+            local_reference(
+                "scripts/guest_artifact_policy.py",
+                "class GuestWorkflowProfile",
+            ),
+            local_reference("scripts/run-macos-guest-workflow.py", "def run_workflow("),
+            local_reference("scripts/sign-hvf-binary.sh", "publish signed"),
+        ]
+    } else {
+        vec![
+            local_reference(
+                "scripts/build-guest-boot-initrd.py",
+                "publish_generated_bytes(",
+            ),
+            local_reference(
+                "scripts/fetch-firecracker-kernel.sh",
+                "guest_artifact_policy.py",
+            ),
+            local_reference(
+                "scripts/fetch-firecracker-rootfs.sh",
+                "--internal-populate-direct",
+            ),
+            local_reference(
+                "scripts/guest_artifact_policy.py",
+                "class ArtifactPolicyError",
+            ),
+            local_reference("scripts/sign-hvf-binary.sh", "publish signed"),
+        ]
+    };
+    let expected_validation = if audit.delivery.state == GuestWorkflowDeliveryState::Complete {
+        vec![
+            local_reference(
+                "scripts/run-integration-tests.sh",
+                "scripts/run-macos-guest-workflow.py api",
+            ),
+            local_reference(
+                "scripts/tests/test_guest_artifact_policy.py",
+                "class GuestArtifactPolicyTests",
+            ),
+            local_reference(
+                "scripts/tests/test_macos_guest_workflow.py",
+                "class MacosGuestWorkflowTests",
+            ),
+            local_reference(
+                "tools/firecracker-capability-audit/tests/guest_workflow_audit.rs",
+                "checked_guest_workflow_audit_is_canonical_and_fail_closed",
+            ),
+        ]
+    } else {
+        vec![
+            local_reference(
+                "scripts/tests/test_guest_artifact_policy.py",
+                "class GuestArtifactPolicyTests",
+            ),
+            local_reference(
+                "tools/firecracker-capability-audit/tests/guest_workflow_audit.rs",
+                "checked_guest_workflow_audit_is_canonical_and_fail_closed",
+            ),
+        ]
+    };
+    let expected_documentation = if audit.delivery.state == GuestWorkflowDeliveryState::Complete {
+        vec![
+            local_reference(
+                "compat/firecracker/v1.16.0/guest-workflow-contract.md",
+                "# macOS Guest Workflow Contract",
+            ),
+            local_reference("docs/macos-guest-workflow.md", "# macOS Guest Workflow"),
+        ]
+    } else {
+        vec![
+            local_reference(
+                "compat/firecracker/v1.16.0/README.md",
+                "Guest workflow artifact authority",
+            ),
+            local_reference("docs/testing.md", "## Guest Boot Artifacts"),
+        ]
+    };
     if audit.evidence.implementation != expected_implementation
         || audit.evidence.validation != expected_validation
         || audit.evidence.documentation != expected_documentation
     {
-        errors.push(
-            "guest workflow audit requires exact categorized preparation evidence".to_string(),
-        );
+        errors
+            .push("guest workflow audit requires exact categorized delivery evidence".to_string());
     }
     for (kind, references) in [
         ("implementation", audit.evidence.implementation.as_slice()),
@@ -505,11 +675,21 @@ fn validate_source_tokens(repository_root: &Path, errors: &mut Vec<String>) {
     for (path, tokens) in [
         (
             ".github/workflows/ci.yml",
-            &["vmlinux-6.1.155", KERNEL_SHA256, ROOTFS_SHA256][..],
+            &[
+                "vmlinux-6.1.155",
+                KERNEL_SHA256,
+                ROOTFS_SHA256,
+                "--guest-workflow-final",
+            ][..],
         ),
         (
             "scripts/guest_artifact_policy.py",
-            &[GUEST_WORKFLOW_AUDIT_PATH, "fetch", "prepare-ext4"][..],
+            &[
+                GUEST_WORKFLOW_AUDIT_PATH,
+                "class GuestWorkflowProfile",
+                "fetch",
+                "prepare-ext4",
+            ][..],
         ),
         (
             "scripts/fetch-firecracker-kernel.sh",
@@ -525,11 +705,39 @@ fn validate_source_tokens(repository_root: &Path, errors: &mut Vec<String>) {
                 "load_manifest",
                 "guest-boot-initrd",
                 "publish_generated_bytes",
+                "ROOTFS_WORKFLOW_OS_RELEASE",
+                "rootfs-poweroff-init",
+            ][..],
+        ),
+        (
+            "scripts/run-macos-guest-workflow.py",
+            &[
+                "def run_workflow(",
+                "EXPECTED_NO_CONTENT_RESPONSE",
+                "profile.failure_marker.encode",
+            ][..],
+        ),
+        (
+            "scripts/run-integration-tests.sh",
+            &[
+                "scripts/run-macos-guest-workflow.py api",
+                "scripts/run-macos-guest-workflow.py no-api",
             ][..],
         ),
         (
             "scripts/sign-hvf-binary.sh",
             &["guest_artifact_policy.py", "publish signed"][..],
+        ),
+        (
+            "compat/firecracker/v1.16.0/guest-workflow-contract.md",
+            &["# macOS Guest Workflow Contract", "corpus:getting-started"][..],
+        ),
+        (
+            "docs/macos-guest-workflow.md",
+            &[
+                "# macOS Guest Workflow",
+                "scripts/run-macos-guest-workflow.py api",
+            ][..],
         ),
     ] {
         let source = match std::fs::read_to_string(repository_root.join(path)) {

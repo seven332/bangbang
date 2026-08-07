@@ -5,6 +5,7 @@ mod cpu_template_helper_audit_validate;
 mod cpu_template_helper_certify;
 mod guest_workflow_audit_model;
 mod guest_workflow_audit_validate;
+mod guest_workflow_certify;
 mod logger_certify;
 mod logger_model;
 mod logger_upstream;
@@ -55,12 +56,16 @@ pub use guest_workflow_audit_model::{
     Ext4Classification, Ext4Recipe, Ext4SidecarPolicy, GeneratedDeterminism,
     GeneratedGuestArtifact, GuestArtifact, GuestArtifactKind, GuestNetworking, GuestOutputClass,
     GuestOutputPolicy, GuestShutdown, GuestSourceNamespace, GuestWorkflowAudit,
-    GuestWorkflowDelivery, GuestWorkflowDeliveryState, GuestWorkflowEvidence, GuestWorkflowMode,
-    GuestWorkflowNonclaim, GuestWorkflowProfile, GuestWorkflowProfileState,
+    GuestWorkflowDelivery, GuestWorkflowDeliveryState, GuestWorkflowEvidence,
+    GuestWorkflowIdentity, GuestWorkflowMode, GuestWorkflowNonclaim, GuestWorkflowProfile,
+    GuestWorkflowProfileState, GuestWorkflowTimeouts,
 };
 pub use guest_workflow_audit_validate::{
     GUEST_ARTIFACT_IDS, GUEST_EXT4_RECIPE_IDS, GUEST_WORKFLOW_AUDIT_PATH,
     GUEST_WORKFLOW_AUDIT_SCHEMA_VERSION, GUEST_WORKFLOW_PROFILE_IDS, validate_guest_workflow_audit,
+};
+pub use guest_workflow_certify::{
+    GUEST_WORKFLOW_COMPATIBILITY_CAPABILITY_IDS, validate_guest_workflow_compatibility,
 };
 pub use logger_certify::{LOGGER_COMPATIBILITY_CAPABILITY_IDS, validate_logger_compatibility};
 pub use logger_model::{

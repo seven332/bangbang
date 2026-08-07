@@ -59,10 +59,10 @@ For commands and test-layer selection, see the
   foundations, fourteen closed composition/runtime/snapshot/fleet scenarios,
   seven explicit nonclaims, and aggregate evidence.
 - [`guest-workflow-audit.json`](guest-workflow-audit.json) is the human-owned
-  #1796 guest artifact authority. In the #1871 preparation slice it owns exact
-  download pins, generated and recipe cache policy, output ownership classes,
-  planned API/no-API profiles, evidence, and nonclaims without promoting the
-  two parent corpus rows.
+  terminal #1796 guest workflow authority. It owns exact download pins,
+  generated and recipe cache policy, output ownership classes, the implemented
+  API/no-API profiles, guest identity and timeouts, evidence, and nonclaims for
+  the exact two promoted corpus rows.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -109,6 +109,7 @@ reviewed delta.
 | [Logger producers](logger-contract.md) | Certified 11-row logger aggregate with exact 468-invocation source closure, 24 implemented classes, 7 exact platform/developer exclusions, no planned producer classes, safe fields, and bounded default-stdout admission/forwarding policy |
 | [Metrics schema and producer audits](metrics-contract.md) | Terminal twelve-row #1787 API/schema certification, exact 24-root/243-static-field arm64 line shape, 24/29/5 configured dynamic families, source fingerprints, closed units/reset/aggregation policy, a terminal 69-field #1788 process audit, and the device-final ten-profile/231-field #1789 certification with #1838–#1846 terminal |
 | [Developer tracing](tracing-contract.md) | Terminal opt-in feature contract, exact eight-call AST closure, fixed nesting/record/tool-delivery bounds, privacy, loss/result preservation, runtime tool admission, release diagnostics, and explicit mechanism/timing nonclaims |
+| [macOS guest workflow](guest-workflow-contract.md) | Terminal two-corpus mapping, exact pinned guest identity, public API/no-API lifecycle, process/cache ownership, signed execution and platform/nonclaim boundary |
 
 ## Dispositions
 
@@ -149,10 +150,13 @@ transaction.
 Runtime sidecars stay under the ignored cache root and never count as checked
 inventory or terminal workflow evidence.
 
-Both public workflow profiles remain `planned` with empty terminal evidence in
-#1871. #1872 owns the public composer, signed API/no-API lifecycle proof,
-operator guide, and any final transition of `corpus:getting-started` and
-`corpus:rootfs-and-kernel`.
+Both public workflow profiles are `implemented-and-verified`. The public
+composer executes the exact API and no-API lifecycle against the same pinned
+guest identity, and the signed integration selection runs both literal public
+commands. The terminal contract and audit jointly close
+`corpus:getting-started` and `corpus:rootfs-and-kernel`; the
+[operator guide](../../../docs/macos-guest-workflow.md) owns usage and
+troubleshooting.
 
 The inventory is not evidence by itself. A terminal claim depends on the
 referenced production behavior and validation, and a broad corpus reference

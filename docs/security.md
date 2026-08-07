@@ -1182,6 +1182,30 @@ ownership and permissions match the intended control boundary. Do not share a
 world-writable parent directory unless the sticky-bit and naming policy are
 understood and acceptable for the deployment.
 
+## Public macOS Guest Workflow Authority
+
+The public `scripts/run-macos-guest-workflow.py api|no-api` path is a direct,
+uncontained development workflow, not the production launcher/App Sandbox
+boundary. Its CLI admits only the two literal profiles and takes no arbitrary
+URL, digest, binary, device, socket, cache or configuration argument. It
+removes artifact-override environment variables before invoking the fixed
+repository producers, then verifies every manifest-owned size and SHA-256.
+Shared verified caches remain outside the per-run session and are never deleted
+as cleanup side effects.
+
+Each run creates one random mode-0700 short session, captures its device,
+inode, owner and mode, and places only the signed VMM copy, optional mode-0600
+config and private socket inside it. Cleanup refuses a replaced session root
+and recursively examines entries without following symlinks. The command owns
+one process group, concurrently drains bounded diagnostics, applies fixed
+deadlines, and on error or catchable signal performs TERM-to-KILL escalation,
+reaping and still-owned-session cleanup. API mode relies on the owner-only local
+socket boundary described above; no-API mode watches for any transient socket
+publication. A hostile parent directory, uncatchable host death and system-wide
+stale-session collection remain operator boundaries. Exact usage and nonclaims
+are in the [operator guide](macos-guest-workflow.md) and
+[checked workflow contract](../compat/firecracker/v1.16.0/guest-workflow-contract.md).
+
 ## Host File Paths
 
 Host paths configured through the API are untrusted input. The current behavior

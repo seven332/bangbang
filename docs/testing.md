@@ -3063,7 +3063,49 @@ That option is for CI-style build/sign validation on runners that cannot
 execute HVF. Local Apple Silicon verification should omit it so unsupported or
 misconfigured hosts fail.
 
+## macOS Guest Workflow
+
+The public workflow itself and its operator-facing artifact, cache, cleanup and
+troubleshooting policy are owned by the
+[macOS Guest Workflow](macos-guest-workflow.md). This testing guide owns its
+portable failure suite and signed product gate.
+
+Run the portable policy, boundary and failure-injection suite on Python 3.9 or
+newer:
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+```
+
+On Apple Silicon macOS, execute both literal public profiles through the signed
+integration wrapper:
+
+```sh
+scripts/run-integration-tests.sh --test guest_workflow
+```
+
+That selection performs the normal host/HVF preflight and then invokes
+`scripts/run-macos-guest-workflow.py api` and
+`scripts/run-macos-guest-workflow.py no-api`. It must run without
+`--allow-unsupported` for local or self-hosted certification so lack of real HVF
+execution fails. The terminal two-corpus compatibility gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --guest-workflow-final
+```
+
+The portable suite covers the closed two-value CLI, exact manifest profiles and
+guest identity, Python 3.9 syntax, API request bytes, private canonical no-API
+config, split markers and pipe pressure, malformed/oversized responses,
+timeouts, signal escalation and reaping, socket invariants, bounded retained
+diagnostics, no-follow session cleanup and wrapper composition. Only the signed
+wrapper run is real guest/HVF evidence.
+
 ## Guest Boot Artifacts
+
+This section owns lower-level integration-test fixtures and scenarios. The
+public two-mode smoke workflow uses the same manifest authority but its exact
+operator contract is documented separately above.
 
 Guest boot, executable HVF e2e, and production-bundle tests use the pinned
 Firecracker arm64 kernel, a deterministic tiny initrd, and rootfs artifacts

@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence, TextIO
 from urllib.parse import urlparse
@@ -76,10 +76,51 @@ class Ext4Recipe:
 
 
 @dataclass(frozen=True)
+class ManifestReference:
+    path: Path
+    anchor: str
+
+
+@dataclass(frozen=True)
+class GuestIdentity:
+    path: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class WorkflowTimeouts:
+    artifact_seconds: int
+    build_seconds: int
+    startup_seconds: int
+    request_seconds: int
+    guest_seconds: int
+    terminate_seconds: int
+
+
+@dataclass(frozen=True)
+class GuestWorkflowProfile:
+    profile_id: str
+    mode: str
+    kernel_artifact: str
+    rootfs_artifact: str
+    initrd_artifact: str
+    boot_args: str
+    rootfs_read_only: bool
+    success_marker: str
+    failure_marker: str
+    implementation: tuple[ManifestReference, ...]
+    validation: tuple[ManifestReference, ...]
+
+
+@dataclass(frozen=True)
 class GuestWorkflowManifest:
     downloads: Mapping[str, DownloadArtifact]
     generated: Mapping[str, GeneratedArtifact]
     recipes: Mapping[str, Ext4Recipe]
+    profiles: Mapping[str, GuestWorkflowProfile] = field(default_factory=dict)
+    guest_identity: Optional[GuestIdentity] = None
+    timeouts: Optional[WorkflowTimeouts] = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +222,16 @@ def _require_exact_strings(value: Any, expected: Sequence[str], label: str) -> N
         raise ArtifactPolicyError("manifest", f"{label} does not match the checked contract")
 
 
+def _require_reference(value: Any, label: str) -> ManifestReference:
+    reference = _require_object(value, ("kind", "path", "anchor"), label)
+    if reference["kind"] != "local":
+        raise ArtifactPolicyError("manifest", f"{label} must be local evidence")
+    return ManifestReference(
+        path=_require_relative_path(reference["path"], f"{label}.path"),
+        anchor=_require_string(reference["anchor"], f"{label}.anchor"),
+    )
+
+
 def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
     """Load the repository-owned manifest with duplicate and closed-field checks."""
 
@@ -208,6 +259,8 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
             "generated",
             "ext4_recipes",
             "output_classes",
+            "guest_identity",
+            "timeouts",
             "profiles",
             "evidence",
             "nonclaims",
@@ -235,7 +288,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
         delivery["preparation_issue"],
         delivery["completion_issue"],
         delivery["state"],
-    ] != ["#1796", "#1871", "#1872", "preparation"]:
+    ] != ["#1796", "#1871", "#1872", "complete"]:
         raise ArtifactPolicyError("manifest", "checked manifest delivery boundary drifted")
 
     namespace = _require_object(
@@ -416,14 +469,67 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
         for key, item_value in item.items():
             _require_string(item_value, f"output_classes[{index}].{key}")
 
-    profiles = _require_list(root["profiles"], "profiles")
+    identity = _require_object(
+        root["guest_identity"],
+        ("path", "size_bytes", "sha256"),
+        "guest_identity",
+    )
+    guest_identity = GuestIdentity(
+        path=_require_string(identity["path"], "guest_identity.path"),
+        size_bytes=_require_integer(identity["size_bytes"], "guest_identity.size_bytes"),
+        sha256=_require_sha256(identity["sha256"], "guest_identity.sha256"),
+    )
+    if guest_identity != GuestIdentity(
+        path="/etc/os-release",
+        size_bytes=400,
+        sha256="3e5851448bae5b36f351becde037a8b13b77307279f484eda808f8177d9a4293",
+    ):
+        raise ArtifactPolicyError("manifest", "checked guest identity drifted")
+
+    timeout_values = _require_object(
+        root["timeouts"],
+        (
+            "artifact_seconds",
+            "build_seconds",
+            "startup_seconds",
+            "request_seconds",
+            "guest_seconds",
+            "terminate_seconds",
+        ),
+        "timeouts",
+    )
+    timeouts = WorkflowTimeouts(
+        artifact_seconds=_require_integer(
+            timeout_values["artifact_seconds"], "timeouts.artifact_seconds"
+        ),
+        build_seconds=_require_integer(
+            timeout_values["build_seconds"], "timeouts.build_seconds"
+        ),
+        startup_seconds=_require_integer(
+            timeout_values["startup_seconds"], "timeouts.startup_seconds"
+        ),
+        request_seconds=_require_integer(
+            timeout_values["request_seconds"], "timeouts.request_seconds"
+        ),
+        guest_seconds=_require_integer(
+            timeout_values["guest_seconds"], "timeouts.guest_seconds"
+        ),
+        terminate_seconds=_require_integer(
+            timeout_values["terminate_seconds"], "timeouts.terminate_seconds"
+        ),
+    )
+    if timeouts != WorkflowTimeouts(600, 900, 30, 5, 60, 5):
+        raise ArtifactPolicyError("manifest", "checked workflow timeouts drifted")
+
+    profile_values = _require_list(root["profiles"], "profiles")
     expected_profiles = (
         ("macos-api-rootfs-smoke", "api"),
         ("macos-no-api-rootfs-smoke", "no-api"),
     )
-    if len(profiles) != 2:
-        raise ArtifactPolicyError("manifest", "planned profile set drifted")
-    for index, value in enumerate(profiles):
+    if len(profile_values) != 2:
+        raise ArtifactPolicyError("manifest", "workflow profile set drifted")
+    profiles: dict[str, GuestWorkflowProfile] = {}
+    for index, value in enumerate(profile_values):
         item = _require_object(
             value,
             (
@@ -436,6 +542,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
                 "boot_args",
                 "rootfs_read_only",
                 "success_marker",
+                "failure_marker",
                 "shutdown",
                 "networking",
                 "platform",
@@ -445,32 +552,65 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
             f"profiles[{index}]",
         )
         expected_id, expected_mode = expected_profiles[index]
+        implementation = tuple(
+            _require_reference(reference, f"profiles[{index}].implementation")
+            for reference in _require_list(
+                item["implementation"], f"profiles[{index}].implementation"
+            )
+        )
+        validation = tuple(
+            _require_reference(reference, f"profiles[{index}].validation")
+            for reference in _require_list(
+                item["validation"], f"profiles[{index}].validation"
+            )
+        )
         if (
             item["id"] != expected_id
-            or item["state"] != "planned"
+            or item["state"] != "implemented-and-verified"
             or item["mode"] != expected_mode
             or item["kernel_artifact"] != "kernel"
             or item["rootfs_artifact"] != "rootfs"
-            or item["initrd_artifact"] != "rootfs-poweroff-initrd"
-            or item["boot_args"] != "console=ttyS0 reboot=t panic=1 pci=off"
+            or item["initrd_artifact"] != "guest-boot-initrd"
+            or item["boot_args"]
+            != "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/rootfs-poweroff-init"
             or _require_bool(item["rootfs_read_only"], "rootfs_read_only") is not True
             or item["success_marker"] != "BANGBANG_ROOTFS_WORKFLOW_OK"
+            or item["failure_marker"] != "BANGBANG_ROOTFS_WORKFLOW_FAIL"
             or item["shutdown"] != "guest-poweroff"
             or item["networking"] != "none"
             or item["platform"] != "aarch64-apple-darwin-hvf"
-            or item["implementation"] != []
-            or item["validation"] != []
+            or len(implementation) != 1
+            or implementation[0]
+            != ManifestReference(
+                Path("scripts/run-macos-guest-workflow.py"),
+                "def run_workflow(",
+            )
+            or len(validation) != 1
+            or validation[0]
+            != ManifestReference(
+                Path("scripts/run-integration-tests.sh"),
+                f"scripts/run-macos-guest-workflow.py {expected_mode}",
+            )
         ):
-            raise ArtifactPolicyError("manifest", f"planned profile drifted: {expected_id}")
+            raise ArtifactPolicyError("manifest", f"workflow profile drifted: {expected_id}")
+        profiles[expected_mode] = GuestWorkflowProfile(
+            profile_id=expected_id,
+            mode=expected_mode,
+            kernel_artifact="kernel",
+            rootfs_artifact="rootfs",
+            initrd_artifact="guest-boot-initrd",
+            boot_args=item["boot_args"],
+            rootfs_read_only=True,
+            success_marker=item["success_marker"],
+            failure_marker=item["failure_marker"],
+            implementation=implementation,
+            validation=validation,
+        )
 
     evidence = _require_object(root["evidence"], ("implementation", "validation", "documentation"), "evidence")
     for key in evidence:
         for reference in _require_list(evidence[key], f"evidence.{key}"):
-            ref = _require_object(reference, ("kind", "path", "anchor"), f"evidence.{key}")
-            if ref["kind"] != "local":
-                raise ArtifactPolicyError("manifest", "guest workflow evidence must be local")
-            _require_relative_path(ref["path"], f"evidence.{key}.path")
-            _require_string(ref["anchor"], f"evidence.{key}.anchor")
+            _require_reference(reference, f"evidence.{key}")
 
     _require_exact_strings(
         root["nonclaims"],
@@ -486,7 +626,14 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
         ),
         "nonclaims",
     )
-    return GuestWorkflowManifest(downloads=downloads, generated=generated, recipes=recipes)
+    return GuestWorkflowManifest(
+        downloads=downloads,
+        generated=generated,
+        recipes=recipes,
+        profiles=profiles,
+        guest_identity=guest_identity,
+        timeouts=timeouts,
+    )
 
 
 def cache_root() -> Path:

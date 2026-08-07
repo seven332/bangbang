@@ -20,7 +20,8 @@ use bangbang_firecracker_capability_audit::{
     validate_cpu_template_fingerprint_dump_compatibility, validate_cpu_template_helper_audit,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
     validate_cpu_template_strip_compatibility, validate_guest_workflow_audit,
-    validate_logger_compatibility, validate_logger_producers, validate_metrics_compatibility,
+    validate_guest_workflow_compatibility, validate_logger_compatibility,
+    validate_logger_producers, validate_metrics_compatibility,
     validate_metrics_device_compatibility, validate_metrics_device_producers,
     validate_metrics_lifecycle, validate_metrics_process_compatibility,
     validate_metrics_process_producers, validate_metrics_schema,
@@ -74,6 +75,7 @@ enum ValidateMode {
     CpuTemplateFingerprintDumpFinal,
     CpuTemplateFingerprintCompareFinal,
     CpuTemplateFinal,
+    GuestWorkflowFinal,
 }
 
 fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
@@ -95,8 +97,9 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
             Ok(ValidateMode::CpuTemplateFingerprintCompareFinal)
         }
         [flag] if flag == "--cpu-template-final" => Ok(ValidateMode::CpuTemplateFinal),
+        [flag] if flag == "--guest-workflow-final" => Ok(ValidateMode::GuestWorkflowFinal),
         _ => Err(AuditError::new(
-            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, or --cpu-template-final flag",
+            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, or --guest-workflow-final flag",
         )),
     }
 }
@@ -680,6 +683,65 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
                     .to_string(),
             );
         }
+        ValidateMode::GuestWorkflowFinal => {
+            validate_guest_workflow_compatibility(
+                &manifest,
+                &inventory,
+                &guest_workflow_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "guest workflow compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_logger_producers(&logger_manifest, &logger_audit, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("logger producer validation errors:\n{errors}"))
+                })?;
+            validate_metrics_schema(&metrics_authority, &manifest, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("metrics schema validation errors:\n{errors}"))
+                })?;
+            validate_metrics_process_producers(
+                &metrics_process_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics process producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_device_producers(
+                &metrics_device_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics device producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_lifecycle(
+                &metrics_lifecycle_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
+            })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
+            return Ok(
+                "Firecracker capability inventory, canonical guest workflow audit, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid for the terminal macOS guest workflow compatibility scope"
+                    .to_string(),
+            );
+        }
     };
     let mut failures = Vec::new();
     if let Err(errors) = validate(&manifest, &inventory, &root, audit_mode) {
@@ -903,6 +965,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
     let metrics_lifecycle_audit_path = root.join(METRICS_LIFECYCLE_AUDIT_PATH);
     let tracing_audit_path = root.join(TRACING_AUDIT_PATH);
     let cpu_template_helper_audit_path = root.join(CPU_TEMPLATE_HELPER_AUDIT_PATH);
+    let guest_workflow_audit_path = root.join(GUEST_WORKFLOW_AUDIT_PATH);
     let normalized_output = normalize_lexically(&output_path);
     let checked_paths = [
         &source_path,
@@ -915,6 +978,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
         &metrics_lifecycle_audit_path,
         &tracing_audit_path,
         &cpu_template_helper_audit_path,
+        &guest_workflow_audit_path,
     ];
     if checked_paths
         .iter()
@@ -1036,7 +1100,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -1102,6 +1166,10 @@ mod tests {
         assert_eq!(
             parse_validate_mode(&["--cpu-template-final".to_string()]).unwrap(),
             ValidateMode::CpuTemplateFinal
+        );
+        assert_eq!(
+            parse_validate_mode(&["--guest-workflow-final".to_string()]).unwrap(),
+            ValidateMode::GuestWorkflowFinal
         );
 
         for invalid in [
@@ -1263,6 +1331,7 @@ mod tests {
             METRICS_LIFECYCLE_AUDIT_PATH,
             TRACING_AUDIT_PATH,
             CPU_TEMPLATE_HELPER_AUDIT_PATH,
+            GUEST_WORKFLOW_AUDIT_PATH,
         ] {
             let error = candidate_output_path(root, Path::new(path))
                 .expect_err("checked inventory path should be refused");
