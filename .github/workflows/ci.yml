@@ -59,6 +59,9 @@ jobs:
       - name: Validate Firecracker capability inventory
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 
+      - name: Certify macOS guest workflow scope
+        run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --guest-workflow-final
+
       - name: Certify CPU-template dump and verify scope
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-helper-final
 

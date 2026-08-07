@@ -2692,6 +2692,32 @@ does not expose new raw host-memory pointers. Direct `linux-loader`/`vm-memory`
 integration is deferred until the project decides whether to add a narrow
 adapter or adopt `vm-memory` more broadly.
 
+## macOS Guest Workflow
+
+Bangbang publishes two closed rootless development/demo commands for Apple
+Silicon: `scripts/run-macos-guest-workflow.py api` and
+`scripts/run-macos-guest-workflow.py no-api`. Both verify the same
+manifest-pinned arm64 kernel, deterministic initrd and read-only Ubuntu
+squashfs; locally build and sign the direct VMM for HVF; configure one vCPU and
+256 MiB; require exact guest-visible `/etc/os-release` content through the root
+virtio-block device; observe a fixed success marker plus guest-requested
+poweroff and exit zero; and clean only their captured private session. API mode
+requires four exact `204 No Content` transactions and owned socket removal.
+No-API mode writes an equivalent mode-0600 canonical config and continuously
+rejects any API socket publication.
+
+The workflow is the terminal applicable macOS/HVF mapping for the pinned
+Firecracker `getting-started` and `rootfs-and-kernel` corpora. Linux/KVM host
+instructions, root-mounted image construction, networking/SSH, jailer and
+FreeBSD flows are audited exclusions rather than macOS aliases. The exact
+artifact identities, operator prerequisites, cache/session policy and
+troubleshooting live in the [macOS Guest Workflow](macos-guest-workflow.md);
+the two-row evidence and nonclaim boundary live in the
+[checked contract](../compat/firecracker/v1.16.0/guest-workflow-contract.md).
+This does not broaden the supported API/device surface or claim arbitrary
+kernel/distribution boot, production containment, guest networking, artifact
+redistribution/authentication or byte-reproducible ext4.
+
 ## Internal Drive Configuration
 
 The API crate has strict Firecracker-shaped `PUT /drives/{drive_id}` and

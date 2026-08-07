@@ -12649,11 +12649,50 @@
     {
       "id": "corpus:getting-started",
       "family": "process",
-      "summary": "The Linux runtime isolation inputs referenced by getting-started now have explicit macOS platform exclusions; continue auditing setup, operator workflow, artifacts, deployment identity, and all other pinned getting-started claims.",
+      "summary": "Provide a checked rootless networkless Apple Silicon workflow that prepares pinned guest artifacts and proves signed API and no-api rootfs boot, exact guest identity, guest-requested poweroff, process exit, and session/socket cleanup; Linux/KVM, root, TAP/iptables, jailer, and production deployment instructions remain explicit nonclaims.",
       "source_refs": [
         "corpus:getting-started"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "scripts/build-guest-boot-initrd.py",
+          "anchor": "def build_rootfs_poweroff_init_code("
+        },
+        {
+          "kind": "local",
+          "path": "scripts/guest_artifact_policy.py",
+          "anchor": "class GuestWorkflowProfile"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-macos-guest-workflow.py",
+          "anchor": "def run_workflow("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "scripts/run-macos-guest-workflow.py api"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "scripts/run-macos-guest-workflow.py no-api"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_macos_guest_workflow.py",
+          "anchor": "class MacosGuestWorkflowTests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/guest_workflow_audit.rs",
+          "anchor": "guest_workflow_terminal_scope_is_exact"
+        }
+      ]
     },
     {
       "id": "corpus:hugepages",
@@ -13249,11 +13288,50 @@
     {
       "id": "corpus:rootfs-and-kernel",
       "family": "boot-and-lifecycle",
-      "summary": "Wave 7 owns the remaining pinned host-artifact and applicable specification audit for Linux kernel/rootfs construction recipes, other-architecture guidance, and the FreeBSD flow. Wave 2 supplies verified public arm64 kernel/initrd/rootfs loading and signed boot, not those construction workflows.",
+      "summary": "Prepare and verify the pinned Firecracker CI arm64 kernel and read-only squashfs plus Bangbang's deterministic initrd, then prove exact guest-visible os-release bytes and poweroff; upstream Linux/FreeBSD build recipes, arbitrary images, redistribution, and byte-reproducible ext4 remain outside the macOS workflow.",
       "source_refs": [
         "corpus:rootfs-and-kernel"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "scripts/build-guest-boot-initrd.py",
+          "anchor": "def build_rootfs_poweroff_init_code("
+        },
+        {
+          "kind": "local",
+          "path": "scripts/guest_artifact_policy.py",
+          "anchor": "class GuestWorkflowProfile"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-macos-guest-workflow.py",
+          "anchor": "def run_workflow("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "scripts/run-macos-guest-workflow.py api"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "scripts/run-macos-guest-workflow.py no-api"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_macos_guest_workflow.py",
+          "anchor": "class MacosGuestWorkflowTests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/guest_workflow_audit.rs",
+          "anchor": "guest_workflow_terminal_scope_is_exact"
+        }
+      ]
     },
     {
       "id": "corpus:seccomp",

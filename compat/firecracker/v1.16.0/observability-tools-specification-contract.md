@@ -302,8 +302,8 @@ remain in the CPU-template contract.
 | `corpus:cpu-template-helper` | #1795 | `implemented-and-verified` |
 | `corpus:cpu-templates` | #1795 | `implemented-and-verified` |
 | `semantic.cpu:configuration-templates-and-feature-state` | #1795 | `implemented-and-verified` |
-| `corpus:getting-started` | #1796 | `audit-required` |
-| `corpus:rootfs-and-kernel` | #1796 | `audit-required` |
+| `corpus:getting-started` | #1796 | `implemented-and-verified` |
+| `corpus:rootfs-and-kernel` | #1796 | `implemented-and-verified` |
 | `corpus:formal-verification` | #1797 | `audit-required` |
 | `corpus:network-performance` | #1798 | `audit-required` |
 | `corpus:specification` | #1798 | `audit-required` |
@@ -353,7 +353,11 @@ pass. #1795 finally promotes its exact three aggregate rows after the canonical
 producer ledger, exact runtime-foundation dispositions, signed five-command
 composition, lifecycle/guest-boot, native-v1 snapshot-boundary, documentation,
 and fail-closed transition gates pass. The current inventory is therefore
-exactly 365 implemented, 20 audit-required, three
+#1872 then certifies #1796's exact two getting-started and rootfs/kernel corpus
+rows through the pinned [macOS API and no-API guest
+workflow](../../../docs/macos-guest-workflow.md), signed HVF execution, and
+fail-closed terminal audit. The current inventory is therefore
+exactly 367 implemented, 18 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

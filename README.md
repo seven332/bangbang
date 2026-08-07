@@ -21,6 +21,9 @@ Each detailed subject has one primary document:
   rationale.
 - [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md) is the
   compact current-status and evidence index.
+- [macOS Guest Workflow](docs/macos-guest-workflow.md) owns the public,
+  rootless API and no-API guest boot commands, exact artifact identities,
+  cleanup policy, troubleshooting, and workflow nonclaims.
 - [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
   owns the pinned structural scope, reviewed dispositions, and evidence rules.
 - [Firecracker-shaped Developer Tracing](compat/firecracker/v1.16.0/tracing-contract.md)
@@ -69,37 +72,34 @@ compat/firecracker/v1.16.0
 
 ## Quick Start
 
-Use the latest stable Rust toolchain. Start the direct, uncontained VMM process
-and API server:
+On an Apple Silicon Mac, use the latest stable Rust toolchain and run either
+checked guest workflow from the repository root:
+
+```sh
+scripts/run-macos-guest-workflow.py api
+scripts/run-macos-guest-workflow.py no-api
+```
+
+Both modes prepare and verify the exact pinned arm64 kernel, deterministic
+initrd and read-only Ubuntu squashfs, build and sign Bangbang for HVF, validate
+the guest-visible rootfs identity, observe guest-requested poweroff, and clean
+their private session. The first configures the VM through HTTP over an
+owner-only Unix socket; the second starts the equivalent canonical config with
+`--no-api` and proves that no socket appears. See the
+[macOS Guest Workflow](docs/macos-guest-workflow.md) for prerequisites,
+artifact identities, cache behavior and troubleshooting.
+
+For control-plane exploration without booting a guest, start the direct,
+uncontained API process:
 
 ```sh
 cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 ```
 
-In another terminal, verify the local API:
+In another terminal, query its local version endpoint:
 
 ```sh
 curl --unix-socket /tmp/bangbang.socket http://localhost/version
-```
-
-Configure and start a minimal guest after replacing `/tmp/vmlinux` with a
-supported arm64 Linux kernel:
-
-```sh
-curl --unix-socket /tmp/bangbang.socket \
-  -X PUT http://localhost/machine-config \
-  -H 'Content-Type: application/json' \
-  -d '{"vcpu_count":1,"mem_size_mib":128}'
-
-curl --unix-socket /tmp/bangbang.socket \
-  -X PUT http://localhost/boot-source \
-  -H 'Content-Type: application/json' \
-  -d '{"kernel_image_path":"/tmp/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1"}'
-
-curl --unix-socket /tmp/bangbang.socket \
-  -X PUT http://localhost/actions \
-  -H 'Content-Type: application/json' \
-  -d '{"action_type":"InstanceStart"}'
 ```
 
 Run `cargo run -p bangbang -- --help` for the accepted process arguments. The

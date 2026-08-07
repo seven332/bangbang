@@ -20,6 +20,25 @@ BLOCK_READ_MARKER = b"BANGBANG_BLOCK_READ_OK"
 BLOCK_WRITE_MARKER = b"BANGBANG_BLOCK_WRITE_OK"
 BLOCK_WRITE_SECTOR_SIZE = 512
 ROOTFS_READ_MARKER = b"BANGBANG_ROOTFS_READ_OK"
+ROOTFS_WORKFLOW_SUCCESS_MARKER = b"BANGBANG_ROOTFS_WORKFLOW_OK\n"
+ROOTFS_WORKFLOW_FAILURE_MARKER = b"BANGBANG_ROOTFS_WORKFLOW_FAIL\n"
+ROOTFS_WORKFLOW_OS_RELEASE = (
+    b'PRETTY_NAME="Ubuntu 24.04.3 LTS"\n'
+    b'NAME="Ubuntu"\n'
+    b'VERSION_ID="24.04"\n'
+    b'VERSION="24.04.3 LTS (Noble Numbat)"\n'
+    b'VERSION_CODENAME=noble\n'
+    b'ID=ubuntu\n'
+    b'ID_LIKE=debian\n'
+    b'HOME_URL="https://www.ubuntu.com/"\n'
+    b'SUPPORT_URL="https://help.ubuntu.com/"\n'
+    b'BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"\n'
+    b'PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/'
+    b'privacy-policy"\n'
+    b'UBUNTU_CODENAME=noble\n'
+    b'LOGO=ubuntu-logo\n'
+)
+ROOTFS_WORKFLOW_READ_SIZE = len(ROOTFS_WORKFLOW_OS_RELEASE) + 1
 SMP_SECONDARY_MARKER = b"BANGBANG_SECONDARY_CPU_OK\n"
 SMP_PROGRESS_READY_MARKER = b"BBSMPREADY\n"
 SMP_PROGRESS_CPU0_TOKEN = b"\xa5"
@@ -616,6 +635,156 @@ def build_guest_init_elf() -> bytes:
         raise RuntimeError("guest init code size changed after address assignment")
 
     data = b"".join(data for _name, data in guest_init_data())
+    return build_guest_elf(code, data)
+
+
+def build_rootfs_poweroff_init_code(addresses: dict[str, int]) -> bytes:
+    code = Aarch64CodeBuilder()
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, addresses["devtmpfs"]),
+                mov_imm_64(1, addresses["dev"]),
+                mov_imm_64(2, addresses["devtmpfs"]),
+                movz_64(3, 0),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MOUNT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, addresses["vda"]),
+                mov_imm_64(1, addresses["mnt"]),
+                mov_imm_64(2, addresses["squashfs"]),
+                movz_64(3, LINUX_MOUNT_FLAG_RDONLY),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MOUNT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["rootfs_os_release"]),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_MI)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(1, addresses["rootfs_os_release_buffer"]),
+                movz_64(2, ROOTFS_WORKFLOW_READ_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, len(ROOTFS_WORKFLOW_OS_RELEASE)),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(20, addresses["rootfs_os_release_buffer"]),
+                mov_imm_64(21, addresses["expected_os_release"]),
+                movz_64(22, len(ROOTFS_WORKFLOW_OS_RELEASE)),
+            )
+        )
+    )
+    code.label("compare_os_release")
+    code.emit(
+        b"".join(
+            (
+                ldrb_u32(23, 20),
+                ldrb_u32(24, 21),
+                cmp_reg_32(23, 24),
+            )
+        )
+    )
+    code.branch_cond("failure", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                add_imm_64(20, 20, 1),
+                add_imm_64(21, 21, 1),
+                sub_imm_64(22, 22, 1),
+                cmp_imm_64(22, 0),
+            )
+        )
+    )
+    code.branch_cond("compare_os_release", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["success_marker"],
+            len(ROOTFS_WORKFLOW_SUCCESS_MARKER),
+        )
+    )
+    emit_snapshot_block_poweroff(code)
+
+    code.label("failure")
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["failure_marker"],
+            len(ROOTFS_WORKFLOW_FAILURE_MARKER),
+        )
+    )
+    emit_snapshot_block_poweroff(code)
+    return code.build()
+
+
+def rootfs_poweroff_init_data() -> list[tuple[str, bytes]]:
+    return [
+        ("devtmpfs", DEV_TMPFS_NAME),
+        ("dev", DEV_PATH),
+        ("mnt", MNT_PATH),
+        ("squashfs", SQUASHFS_NAME),
+        ("vda", VDA_PATH),
+        ("rootfs_os_release", ROOTFS_OS_RELEASE_PATH),
+        ("rootfs_os_release_buffer", bytes(ROOTFS_WORKFLOW_READ_SIZE)),
+        ("expected_os_release", ROOTFS_WORKFLOW_OS_RELEASE),
+        ("success_marker", ROOTFS_WORKFLOW_SUCCESS_MARKER),
+        ("failure_marker", ROOTFS_WORKFLOW_FAILURE_MARKER),
+    ]
+
+
+def rootfs_poweroff_init_addresses(code_size: int) -> dict[str, int]:
+    addresses: dict[str, int] = {}
+    data_offset = ELF_CODE_OFFSET + code_size
+    for name, data in rootfs_poweroff_init_data():
+        addresses[name] = ELF_BASE_VADDR + data_offset
+        data_offset += len(data)
+    return addresses
+
+
+def build_rootfs_poweroff_init_elf() -> bytes:
+    placeholder_addresses = {
+        name: ELF_BASE_VADDR for name, _data in rootfs_poweroff_init_data()
+    }
+    code_size = len(build_rootfs_poweroff_init_code(placeholder_addresses))
+    addresses = rootfs_poweroff_init_addresses(code_size)
+    code = build_rootfs_poweroff_init_code(addresses)
+    if len(code) != code_size:
+        raise RuntimeError(
+            "guest rootfs-poweroff init code size changed after address assignment"
+        )
+
+    data = b"".join(data for _name, data in rootfs_poweroff_init_data())
     return build_guest_elf(code, data)
 
 
@@ -2698,6 +2867,7 @@ def cpio_entry(
 
 def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
+    rootfs_poweroff_init = build_rootfs_poweroff_init_elf()
     snapshot_block_init = build_snapshot_block_init_elf()
     serial_rx_init = build_serial_rx_init_elf()
     pci_rng_init = build_pci_rng_init_elf()
@@ -2728,6 +2898,12 @@ def build_initrd() -> bytes:
                 rdevminor=64,
             ),
             cpio_entry(name="init", ino=6, mode=S_IFREG | 0o755, data=guest_init),
+            cpio_entry(
+                name="rootfs-poweroff-init",
+                ino=17,
+                mode=S_IFREG | 0o755,
+                data=rootfs_poweroff_init,
+            ),
             cpio_entry(
                 name="poweroff-init",
                 ino=7,
@@ -2782,7 +2958,7 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=snapshot_entropy_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=17, mode=0, nlink=1),
+            cpio_entry(name="TRAILER!!!", ino=18, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -2892,6 +3068,87 @@ def validate_reboot_init_entry(
         raise RuntimeError(f"guest initrd {name} payload does not load reboot syscall")
     if svc_0() not in payload:
         raise RuntimeError(f"guest initrd {name} payload does not contain SVC #0")
+
+
+def validate_rootfs_poweroff_init_entry(
+    entries: dict[str, dict[str, object]],
+) -> None:
+    entry = required_entry(entries, "rootfs-poweroff-init")
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd rootfs-poweroff-init entry is not a regular file")
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd rootfs-poweroff-init payload is not an ELF file")
+    for marker in (
+        ROOTFS_WORKFLOW_SUCCESS_MARKER,
+        ROOTFS_WORKFLOW_FAILURE_MARKER,
+    ):
+        if marker not in payload:
+            raise RuntimeError(
+                "guest initrd rootfs-poweroff-init payload does not contain "
+                f"{marker!r}"
+            )
+    if payload.count(ROOTFS_WORKFLOW_OS_RELEASE) != 1:
+        raise RuntimeError(
+            "guest initrd rootfs-poweroff-init payload does not contain exactly one "
+            "pinned os-release identity"
+        )
+    for guest_path in (
+        DEV_TMPFS_NAME,
+        DEV_PATH,
+        MNT_PATH,
+        SQUASHFS_NAME,
+        VDA_PATH,
+        ROOTFS_OS_RELEASE_PATH,
+    ):
+        if guest_path not in payload:
+            raise RuntimeError(
+                "guest initrd rootfs-poweroff-init payload does not contain "
+                f"{guest_path!r}"
+            )
+    for syscall, description in (
+        (LINUX_AARCH64_SYSCALL_MOUNT, "mount"),
+        (LINUX_AARCH64_SYSCALL_OPENAT, "openat"),
+        (LINUX_AARCH64_SYSCALL_READ, "read"),
+        (LINUX_AARCH64_SYSCALL_WRITE, "write"),
+        (LINUX_AARCH64_SYSCALL_REBOOT, "reboot"),
+    ):
+        if movz_64(8, syscall) not in payload:
+            raise RuntimeError(
+                "guest initrd rootfs-poweroff-init payload does not load "
+                f"{description}"
+            )
+    for instruction, description in (
+        (movz_64(3, LINUX_MOUNT_FLAG_RDONLY), "read-only mount flag"),
+        (movz_64(2, ROOTFS_WORKFLOW_READ_SIZE), "bounded read size"),
+        (
+            cmp_imm_64(0, len(ROOTFS_WORKFLOW_OS_RELEASE)),
+            "exact read count",
+        ),
+        (
+            movz_64(22, len(ROOTFS_WORKFLOW_OS_RELEASE)),
+            "comparison length",
+        ),
+        (ldrb_u32(23, 20), "observed-byte load"),
+        (ldrb_u32(24, 21), "expected-byte load"),
+        (cmp_reg_32(23, 24), "byte comparison"),
+        (add_imm_64(20, 20, 1), "observed-pointer increment"),
+        (add_imm_64(21, 21, 1), "expected-pointer increment"),
+        (sub_imm_64(22, 22, 1), "comparison decrement"),
+        (mov_imm_64(2, LINUX_REBOOT_CMD_POWER_OFF), "poweroff command"),
+    ):
+        if instruction not in payload:
+            raise RuntimeError(
+                "guest initrd rootfs-poweroff-init payload omits " f"{description}"
+            )
+    if payload.count(mov_imm_64(2, LINUX_REBOOT_CMD_POWER_OFF)) != 2:
+        raise RuntimeError(
+            "guest initrd rootfs-poweroff-init payload must power off after both outcomes"
+        )
+    if svc_0() not in payload:
+        raise RuntimeError(
+            "guest initrd rootfs-poweroff-init payload does not contain SVC #0"
+        )
 
 
 def validate_smp_init_entry(entries: dict[str, dict[str, object]]) -> None:
@@ -3224,6 +3481,7 @@ def validate_initrd(data: bytes) -> None:
         "dev/console",
         "dev/ttyS0",
         "init",
+        "rootfs-poweroff-init",
         "poweroff-init",
         "reboot-init",
         "smp-init",
@@ -3301,6 +3559,8 @@ def validate_initrd(data: bytes) -> None:
             raise RuntimeError(
                 f"guest initrd init payload does not contain {guest_path!r}"
             )
+
+    validate_rootfs_poweroff_init_entry(entries)
 
     pci_rng_init = required_entry(entries, "pci-rng-init")
     if file_type(pci_rng_init["mode"]) != S_IFREG:

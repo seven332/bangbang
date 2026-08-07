@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-supported_tests=(hvf_lifecycle guest_boot native_v2_process executable_hvf_e2e cpu_template_helper app_sandbox production_bundle)
+supported_tests=(hvf_lifecycle guest_boot native_v2_process executable_hvf_e2e cpu_template_helper app_sandbox production_bundle guest_workflow)
 
 usage() {
   cat <<'EOF'
@@ -16,7 +16,8 @@ Options:
   --test NAME          Run one integration test target. Can be repeated.
                        Supported values: hvf_lifecycle, guest_boot,
                        native_v2_process, executable_hvf_e2e,
-                       cpu_template_helper, app_sandbox, production_bundle.
+                       cpu_template_helper, app_sandbox, production_bundle,
+                       guest_workflow.
   -h, --help           Show this help.
 
 Arguments after -- are passed to each signed Rust test binary or executable
@@ -103,6 +104,10 @@ if [[ "${#selected_tests[@]}" -eq 0 ]]; then
 fi
 
 if [[ "${#test_args[@]}" -gt 0 ]]; then
+  if contains guest_workflow "${selected_tests[@]}"; then
+    echo "guest_workflow does not accept trailing Rust test arguments" >&2
+    exit 2
+  fi
   for test_arg in "${test_args[@]}"; do
     case "$test_arg" in
       --test-threads | --test-threads=*)
@@ -607,6 +612,8 @@ for test_name in "${selected_tests[@]}"; do
     cpu_template_helper)
       build_cpu_template_helper_e2e
       ;;
+    guest_workflow)
+      ;;
     guest_boot | hvf_lifecycle)
       build_and_sign_test "$test_name"
       ;;
@@ -673,6 +680,11 @@ for index in "${!signed_test_bins[@]}"; do
       ;;
   esac
 done
+
+if contains guest_workflow "${selected_tests[@]}"; then
+  scripts/run-macos-guest-workflow.py api
+  scripts/run-macos-guest-workflow.py no-api
+fi
 
 if contains cpu_template_helper "${selected_tests[@]}"; then
   if [[ "${#test_args[@]}" -eq 0 ]]; then

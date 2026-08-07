@@ -45,6 +45,11 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
   --metrics-final`: certify the terminal ten-scenario #1790 metrics lifecycle matrix
   and its exact aggregate capability and ownership handoff.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --guest-workflow-final`: certify the exact terminal macOS API/no-API guest
+  workflow and its two promoted Firecracker corpus identities.
+- `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`: run portable
+  guest artifact and macOS workflow policy/failure tests.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo check -p bangbang-launcher --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the launcher's explicit platform-error path.
 - `cargo check -p bangbang-cpu-template-helper --all-targets --all-features --locked --target aarch64-unknown-linux-musl`: verify unsupported targets compile to the helper's explicit platform-error path.
@@ -59,6 +64,8 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo clippy -p bangbang-cpu-template-helper --test hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed CPU-template helper target.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
 - `scripts/run-integration-tests.sh`: sign and run HVF-backed integration tests on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
+- `scripts/run-integration-tests.sh --test guest_workflow`: sign and run both
+  literal public macOS guest workflow profiles against real HVF.
 - `scripts/build-production-bundle.sh --output /path/to/Bangbang.app`: build,
   separately sign, inspect, and exclusively publish the production launcher and
   nested App Sandbox worker.

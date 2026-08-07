@@ -9,7 +9,7 @@
     "parent_issue": "#1796",
     "preparation_issue": "#1871",
     "completion_issue": "#1872",
-    "state": "preparation"
+    "state": "complete"
   },
   "source_namespace": {
     "release": "v1.15",
@@ -49,8 +49,8 @@
       "id": "guest-boot-initrd",
       "generator_path": "scripts/build-guest-boot-initrd.py",
       "cache_path": "bangbang/guest-boot/initrd.cpio",
-      "sha256": "f1cd1318caf1e7f1cbff1e095dce9a9958b84320746d763a01a3fd5048008050",
-      "size_bytes": 52224,
+      "sha256": "1057079b072452a762396113867ebc5afa699a0b5c3121e28970ecadd4ba11d0",
+      "size_bytes": 54272,
       "output_class": "deterministic-generated-cache",
       "determinism": "byte-identical"
     }
@@ -166,38 +166,77 @@
       "locking": "none"
     }
   ],
+  "guest_identity": {
+    "path": "/etc/os-release",
+    "size_bytes": 400,
+    "sha256": "3e5851448bae5b36f351becde037a8b13b77307279f484eda808f8177d9a4293"
+  },
+  "timeouts": {
+    "artifact_seconds": 600,
+    "build_seconds": 900,
+    "startup_seconds": 30,
+    "request_seconds": 5,
+    "guest_seconds": 60,
+    "terminate_seconds": 5
+  },
   "profiles": [
     {
       "id": "macos-api-rootfs-smoke",
-      "state": "planned",
+      "state": "implemented-and-verified",
       "mode": "api",
       "kernel_artifact": "kernel",
       "rootfs_artifact": "rootfs",
-      "initrd_artifact": "rootfs-poweroff-initrd",
-      "boot_args": "console=ttyS0 reboot=t panic=1 pci=off",
+      "initrd_artifact": "guest-boot-initrd",
+      "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/rootfs-poweroff-init",
       "rootfs_read_only": true,
       "success_marker": "BANGBANG_ROOTFS_WORKFLOW_OK",
+      "failure_marker": "BANGBANG_ROOTFS_WORKFLOW_FAIL",
       "shutdown": "guest-poweroff",
       "networking": "none",
       "platform": "aarch64-apple-darwin-hvf",
-      "implementation": [],
-      "validation": []
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-macos-guest-workflow.py",
+          "anchor": "def run_workflow("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "scripts/run-macos-guest-workflow.py api"
+        }
+      ]
     },
     {
       "id": "macos-no-api-rootfs-smoke",
-      "state": "planned",
+      "state": "implemented-and-verified",
       "mode": "no-api",
       "kernel_artifact": "kernel",
       "rootfs_artifact": "rootfs",
-      "initrd_artifact": "rootfs-poweroff-initrd",
-      "boot_args": "console=ttyS0 reboot=t panic=1 pci=off",
+      "initrd_artifact": "guest-boot-initrd",
+      "boot_args": "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/rootfs-poweroff-init",
       "rootfs_read_only": true,
       "success_marker": "BANGBANG_ROOTFS_WORKFLOW_OK",
+      "failure_marker": "BANGBANG_ROOTFS_WORKFLOW_FAIL",
       "shutdown": "guest-poweroff",
       "networking": "none",
       "platform": "aarch64-apple-darwin-hvf",
-      "implementation": [],
-      "validation": []
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-macos-guest-workflow.py",
+          "anchor": "def run_workflow("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-integration-tests.sh",
+          "anchor": "scripts/run-macos-guest-workflow.py no-api"
+        }
+      ]
     }
   ],
   "evidence": {
@@ -205,7 +244,7 @@
       {
         "kind": "local",
         "path": "scripts/build-guest-boot-initrd.py",
-        "anchor": "publish_generated_bytes("
+        "anchor": "def build_rootfs_poweroff_init_code("
       },
       {
         "kind": "local",
@@ -220,7 +259,12 @@
       {
         "kind": "local",
         "path": "scripts/guest_artifact_policy.py",
-        "anchor": "class ArtifactPolicyError"
+        "anchor": "class GuestWorkflowProfile"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/run-macos-guest-workflow.py",
+        "anchor": "def run_workflow("
       },
       {
         "kind": "local",
@@ -231,8 +275,18 @@
     "validation": [
       {
         "kind": "local",
+        "path": "scripts/run-integration-tests.sh",
+        "anchor": "scripts/run-macos-guest-workflow.py api"
+      },
+      {
+        "kind": "local",
         "path": "scripts/tests/test_guest_artifact_policy.py",
         "anchor": "class GuestArtifactPolicyTests"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/tests/test_macos_guest_workflow.py",
+        "anchor": "class MacosGuestWorkflowTests"
       },
       {
         "kind": "local",
@@ -243,13 +297,13 @@
     "documentation": [
       {
         "kind": "local",
-        "path": "compat/firecracker/v1.16.0/README.md",
-        "anchor": "Guest workflow artifact authority"
+        "path": "compat/firecracker/v1.16.0/guest-workflow-contract.md",
+        "anchor": "# macOS Guest Workflow Contract"
       },
       {
         "kind": "local",
-        "path": "docs/testing.md",
-        "anchor": "## Guest Boot Artifacts"
+        "path": "docs/macos-guest-workflow.md",
+        "anchor": "# macOS Guest Workflow"
       }
     ]
   },
