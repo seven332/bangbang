@@ -38,6 +38,9 @@ mod validate;
 mod wave7_aggregate_audit_model;
 mod wave7_aggregate_audit_validate;
 mod wave7_aggregate_certify;
+mod wave8_certification_audit_model;
+mod wave8_certification_audit_validate;
+mod wave8_certification_certify;
 
 pub use cpu_template_helper_audit_model::{
     CpuTemplateHelperArtifact, CpuTemplateHelperAudit, CpuTemplateHelperExecution,
@@ -174,6 +177,20 @@ pub use wave7_aggregate_audit_validate::{
 pub use wave7_aggregate_certify::{
     WAVE7_OWNED_CAPABILITY_IDS, WAVE7_PLATFORM_IMPOSSIBLE_CAPABILITY_IDS,
     validate_wave7_aggregate_compatibility,
+};
+pub use wave8_certification_audit_model::{
+    Wave8AuthorityEvidence, Wave8CertificationAudit, Wave8DeliveryHierarchy, Wave8DeliveryOutcome,
+    Wave8DeliveryParent, Wave8DispositionCounts, Wave8DocumentOwner, Wave8Domain, Wave8Handoff,
+    Wave8HandoffOwner, Wave8InteractionPair, Wave8Nonclaim, Wave8Outcome, Wave8PlatformMechanism,
+    Wave8PlatformObservation, Wave8PlatformReview, Wave8RejectedAlternative, Wave8Scenario,
+    Wave8ScenarioExecution,
+};
+pub use wave8_certification_audit_validate::{
+    WAVE8_CERTIFICATION_AUDIT_PATH, WAVE8_CERTIFICATION_AUDIT_SCHEMA_VERSION,
+    WAVE8_CERTIFICATION_CAPABILITY_ID, validate_wave8_certification_audit,
+};
+pub use wave8_certification_certify::{
+    WAVE8_OWNED_CAPABILITY_IDS, validate_wave8_certification_compatibility,
 };
 
 use std::fmt;
@@ -408,6 +425,20 @@ pub fn read_wave7_aggregate_audit(path: &Path) -> Result<Wave7AggregateAudit, Au
     })
 }
 
+/// Read and parse the checked Wave 8 certification authority.
+pub fn read_wave8_certification_audit(path: &Path) -> Result<Wave8CertificationAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read Wave 8 certification audit: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse Wave 8 certification audit: {error}"
+        ))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -508,6 +539,13 @@ pub fn specification_benchmark_audit_json(
 /// Serialize the checked Wave 7 aggregate authority using canonical pretty JSON.
 pub fn wave7_aggregate_audit_json(audit: &Wave7AggregateAudit) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "Wave 7 aggregate audit")
+}
+
+/// Serialize the checked Wave 8 certification authority using canonical pretty JSON.
+pub fn wave8_certification_audit_json(
+    audit: &Wave8CertificationAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "Wave 8 certification audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {

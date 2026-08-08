@@ -1,0 +1,151 @@
+# Firecracker v1.16 Wave 8 platform-feasible certification
+
+This contract is the final source-tree authority for #1348's platform-feasible
+Firecracker v1.16.0 delivery. It certifies one capability transition owned by
+#1881 on the native Apple Silicon/Hypervisor.framework target. It does not
+close or reclassify outcomes that still require external privilege or
+credentials.
+
+The checked machine-readable authority is
+[`wave8-certification-audit.json`](wave8-certification-audit.json). Its strict
+Rust model, validator, certifier, and adversarial tests reject partial
+transitions, representative-sample closure, stale or unrelated evidence, and
+unreviewed platform exclusions.
+
+| Capability | Delivery | Disposition |
+| --- | --- | --- |
+| `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | #1881 | `implemented-and-verified` |
+
+## Certified interaction matrix
+
+The matrix has seven domains:
+
+1. lifecycle state;
+2. API errors;
+3. logger and metrics observability;
+4. containment and resource authority;
+5. devices;
+6. networking and MMDS; and
+7. snapshots and restore.
+
+The validator derives every canonical combination from this fixed domain order
+and requires all 21 unordered pairs. A stored pair count cannot satisfy the
+gate. Each pair instead names every selected leaf scenario whose exact domain
+membership covers it, and each scenario resolves to a fixed tracked path and
+literal function anchor.
+
+Four existing product leaves provide the complete selected matrix:
+
+| Scenario | Boundary | Certified role |
+| --- | --- | --- |
+| `portable-snapshot-serialization` | Portable API-server unit boundary | Serializes lifecycle/API/MMDS/periodic work with synchronous snapshot creation, observes cancellation, and leaves no escaped artifact. |
+| `signed-direct-live-patch` | Signed direct VMM over real HVF | Combines lifecycle idempotency, strict failure-atomic errors, logger/metrics, device and network/MMDS live patch, capture-ready snapshot state, and terminal cleanup. |
+| `signed-production-snapshot-containment` | Signed launcher plus App Sandbox worker over real HVF | Combines grant/resource containment, lifecycle and telemetry, devices, network/MMDS, native-v2 continuation, failure handling, and cleanup. |
+| `signed-production-claim-rejection` | Signed production launch boundary | Binds wrong or missing typed boot claims to redacted public errors and proves the resource pair is not consumed. |
+
+The first, second, and third scenarios overlap intentionally. The portable
+scenario is the deterministic concurrency/cancellation oracle; the direct
+scenario proves the public VMM path; the production scenario proves the real
+grant and App Sandbox boundary. The fourth scenario supplies the otherwise
+missing API-error/resource-authority pair. A broad passing test from a
+different role cannot replace one of these anchors.
+
+This is completeness for the fixed reviewed interaction model, not a proof of
+all possible runtime interleavings. Existing focused logger, metrics,
+fatal-exit, cross-process snapshot, configuration-failure, and device tests
+remain supporting evidence and continue to run in the repository test matrix.
+
+## Platform exclusion re-challenge
+
+Wave 8 independently partitions every proven-platform-impossible record into
+four current public-mechanism reviews. Each record must also retain its own
+upstream contract, public platform evidence, credible alternatives, stable
+behavior, focused tests, compatibility and security text, and Challenge link
+in the capability inventory.
+
+| Mechanism | Records | Current result |
+| --- | ---: | --- |
+| X86 CPUID and MSR identities | 13 | Public arm64 Hypervisor.framework has no identity-preserving x86 CPUID leaf/subleaf/register or MSR selector API. Silent acceptance, cross-architecture translation, and a different emulator/backend change the request. |
+| Linux KVM feature and CPU-template identities | 7 | HVF feature and system registers do not preserve Linux KVM capability numbers, vCPU-init feature-word identity, or a Neoverse V1 source model. Private mappings, mask reinterpretation, and a different source CPU change the contract. |
+| Exact Linux hugetlbfs `2M` memory | 2 | Current public XNU accepts its superpage selector only for x86; arm and arm64 SPTM pmap state that superpages are unsupported, and the public arm64 allocation probe returns `KERN_INVALID_ARGUMENT`. Alignment, batching, and HVF's 4/16-KiB IPA granules do not supply Firecracker's hugetlbfs pool, backing, `MAP_NORESERVE`/`SIGBUS`, balloon, dirty, and restore semantics. |
+| Linux seccomp, cgroup, network-namespace, and PID-namespace mechanisms | 8 | Public macOS/XNU has no equivalent Linux syscall/action/controller/namespace identity. App Sandbox, rlimits, launchd/QoS, Network Extension, vmnet, Endpoint Security, private APIs, and a Linux sidecar have different security and process contracts. |
+
+The checked authority pins the current Firecracker sources, Apple developer
+interfaces, and public XNU `xnu-12377.121.6` sources used by these reviews.
+Future platform evidence that changes a mechanism conclusion requires a fresh
+ID-by-ID Challenge and inventory update; the family ledger alone cannot make a
+record impossible.
+
+## Exact retained external boundary
+
+After the Wave 8 transition, the inventory is exactly 377 implemented, eight
+audit-required, three missing-platform-feasible, and 30
+proven-platform-impossible records. The eleven nonterminal outcomes are an
+exact external-evidence partition:
+
+- six #1373 audit-required outcomes: `corpus:jailer`,
+  `corpus:production-host`, `jailer/chroot-base-dir`, `jailer/gid`,
+  `jailer/uid`, and `jailer/run`;
+- two #1378 audit-required outcomes: `corpus:network-setup` and
+  `semantic.network:virtio-net-vmnet-policy-and-connectivity`; and
+- three #1351 missing-platform-feasible isolation semantics covering host
+  resource authority, the jailer/containment result, and multiprocess
+  concurrency/redaction/failure atomicity.
+
+The #1373 set requires a same-host executor that has both root authority and
+real HVF execution. The #1378 set requires caller-owned Apple-approved signing
+and profile authority plus an isolated vmnet fixture. Hosted sudo without HVF,
+local HVF without noninteractive root, missing credentials, a skipped test, or
+an unexecuted harness does not satisfy either gate. These are feasible external
+handoffs and are not platform-impossible classifications.
+
+The direct #1348 delivery-parent policy retains #1351 open and requires the
+other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
+remain explicit open external branches. The offline validator checks this
+declarative identity policy but never claims a live GitHub query.
+
+## Certification commands and historical composition
+
+The scoped terminal command is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
+```
+
+It composes every Wave 7 component authority, the phase-aware Wave 7
+certifier, and the Wave 8 authority. The Wave 7 artifact remains historical at
+376/9/3/30 with one Wave 8 handoff. Its certifier accepts that exact historical
+phase or the exact one-row Wave 8 successor at 377/8/3/30; it rejects unrelated
+or partial drift.
+
+The global `--final` mode remains stronger and intentionally fails while the
+eight audit-required and three feasible external outcomes remain. Wave 8 does
+not weaken that completion gate.
+
+The checked command is reproducible and networkless. Live GitHub hierarchy,
+assignment, review threads, pull-request checks, remote branches, merge state,
+and default-branch identity are mutable delivery evidence. The PR workflow
+must verify them on the reviewed head and record the PR head, merge commit,
+merged-main OID, inventory totals, source comparison, signed execution, and CI
+result in #1881 and #1348 after merge.
+
+The full portable, Apple-target, signed Apple Silicon, source comparison, Kani,
+review, CI, and merged-main command sequence remains canonical in
+[`docs/testing.md`](../../../docs/testing.md). This contract does not duplicate
+its operator setup.
+
+## Nonclaims
+
+This certification does not claim:
+
+- completion of the retained root/HVF or approved-vmnet evidence;
+- Linux KVM or Firecracker binary identity;
+- arbitrary guest support or distinct-host snapshot portability;
+- portable performance parity or thresholds;
+- whole-system formal correctness or all possible runtime interleavings;
+- a private API, privileged fallback, entitlement, credential, or Linux
+  sidecar supplied by the repository; or
+- live GitHub state from the offline Rust validator.
+
+Any newly discovered product interaction gap must be delivered through a
+separate challenged producer issue before this authority can certify it.

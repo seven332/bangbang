@@ -103,6 +103,9 @@ jobs:
       - name: Certify terminal Wave 7 aggregate scope
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
 
+      - name: Certify terminal Wave 8 platform-feasible scope
+        run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 

@@ -1,0 +1,664 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1348",
+  "delivery_issue": "#1881",
+  "capability_id": "semantic.cross-capability:state-errors-metrics-security-and-snapshots",
+  "target_counts": {
+    "implemented_and_verified": 377,
+    "audit_required": 8,
+    "missing_platform_feasible": 3,
+    "proven_platform_impossible": 30
+  },
+  "domains": [
+    "lifecycle-state",
+    "api-errors",
+    "observability",
+    "security-resource-authority",
+    "devices",
+    "network-mmds",
+    "snapshots-restore"
+  ],
+  "scenarios": [
+    {
+      "id": "portable-snapshot-serialization",
+      "execution": "portable",
+      "domains": [
+        "lifecycle-state",
+        "api-errors",
+        "observability",
+        "network-mmds",
+        "snapshots-restore"
+      ],
+      "outcomes": [
+        "strict-errors-and-failure-atomicity",
+        "snapshot-serialization",
+        "cancellation-without-artifacts"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/api_server.rs",
+          "anchor": "fn synchronous_snapshot_serializes_api_mmds_and_periodic_work_but_observes_cancellation()"
+        }
+      ]
+    },
+    {
+      "id": "signed-direct-live-patch",
+      "execution": "signed-direct-hvf",
+      "domains": [
+        "lifecycle-state",
+        "api-errors",
+        "observability",
+        "devices",
+        "network-mmds",
+        "snapshots-restore"
+      ],
+      "outcomes": [
+        "lifecycle-idempotency",
+        "strict-errors-and-failure-atomicity",
+        "logger-metrics-lifecycle",
+        "device-network-live-patch",
+        "snapshot-capture-ready",
+        "terminal-cleanup"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn signed_executable_runs_async_block_over_mmio_with_live_patch()"
+        }
+      ]
+    },
+    {
+      "id": "signed-production-snapshot-containment",
+      "execution": "signed-production-bundle",
+      "domains": [
+        "lifecycle-state",
+        "observability",
+        "security-resource-authority",
+        "devices",
+        "network-mmds",
+        "snapshots-restore"
+      ],
+      "outcomes": [
+        "lifecycle-idempotency",
+        "logger-metrics-lifecycle",
+        "grant-containment-and-redaction",
+        "snapshot-restore-continuation",
+        "terminal-cleanup"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment()"
+        }
+      ]
+    },
+    {
+      "id": "signed-production-claim-rejection",
+      "execution": "signed-production-bundle",
+      "domains": [
+        "api-errors",
+        "security-resource-authority"
+      ],
+      "outcomes": [
+        "strict-errors-and-failure-atomicity",
+        "grant-containment-and-redaction",
+        "claim-failure-nonconsumption"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_rejects_wrong_and_missing_boot_claims_without_consuming_pair()"
+        }
+      ]
+    }
+  ],
+  "interactions": [
+    {
+      "left": "lifecycle-state",
+      "right": "api-errors",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch"
+      ]
+    },
+    {
+      "left": "lifecycle-state",
+      "right": "observability",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "lifecycle-state",
+      "right": "security-resource-authority",
+      "scenario_ids": [
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "lifecycle-state",
+      "right": "devices",
+      "scenario_ids": [
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "lifecycle-state",
+      "right": "network-mmds",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "lifecycle-state",
+      "right": "snapshots-restore",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "api-errors",
+      "right": "observability",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch"
+      ]
+    },
+    {
+      "left": "api-errors",
+      "right": "security-resource-authority",
+      "scenario_ids": [
+        "signed-production-claim-rejection"
+      ]
+    },
+    {
+      "left": "api-errors",
+      "right": "devices",
+      "scenario_ids": [
+        "signed-direct-live-patch"
+      ]
+    },
+    {
+      "left": "api-errors",
+      "right": "network-mmds",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch"
+      ]
+    },
+    {
+      "left": "api-errors",
+      "right": "snapshots-restore",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch"
+      ]
+    },
+    {
+      "left": "observability",
+      "right": "security-resource-authority",
+      "scenario_ids": [
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "observability",
+      "right": "devices",
+      "scenario_ids": [
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "observability",
+      "right": "network-mmds",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "observability",
+      "right": "snapshots-restore",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "security-resource-authority",
+      "right": "devices",
+      "scenario_ids": [
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "security-resource-authority",
+      "right": "network-mmds",
+      "scenario_ids": [
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "security-resource-authority",
+      "right": "snapshots-restore",
+      "scenario_ids": [
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "devices",
+      "right": "network-mmds",
+      "scenario_ids": [
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "devices",
+      "right": "snapshots-restore",
+      "scenario_ids": [
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    },
+    {
+      "left": "network-mmds",
+      "right": "snapshots-restore",
+      "scenario_ids": [
+        "portable-snapshot-serialization",
+        "signed-direct-live-patch",
+        "signed-production-snapshot-containment"
+      ]
+    }
+  ],
+  "platform_reviews": [
+    {
+      "mechanism": "x86-cpuid-msr",
+      "capability_ids": [
+        "api-property:CpuConfig.cpuid_modifiers",
+        "api-property:CpuConfig.msr_modifiers",
+        "api-property:CpuidLeafModifier.flags",
+        "api-property:CpuidLeafModifier.leaf",
+        "api-property:CpuidLeafModifier.modifiers",
+        "api-property:CpuidLeafModifier.subleaf",
+        "api-property:CpuidRegisterModifier.bitmap",
+        "api-property:CpuidRegisterModifier.register",
+        "api-property:MsrModifier.addr",
+        "api-property:MsrModifier.bitmap",
+        "api-schema:CpuidLeafModifier",
+        "api-schema:CpuidRegisterModifier",
+        "api-schema:MsrModifier"
+      ],
+      "observation": "arm64-sdk-lacks-x86-cpuid-msr",
+      "upstream_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1092-L1165"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs#L70-L159"
+        }
+      ],
+      "platform_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_sys_reg%28_%3A_%3A_%3A%29"
+        }
+      ],
+      "rejected_alternatives": [
+        "ignore-cpu-requests",
+        "cross-architecture-register-translation",
+        "emulation-or-different-backend"
+      ],
+      "challenge": {
+        "kind": "github",
+        "url": "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449"
+      }
+    },
+    {
+      "mechanism": "arm-kvm-feature-template",
+      "capability_ids": [
+        "api-property:CpuConfig.kvm_capabilities",
+        "api-property:CpuConfig.vcpu_features",
+        "api-property:MachineConfiguration.cpu_template",
+        "api-property:VcpuFeatures.bitmap",
+        "api-property:VcpuFeatures.index",
+        "api-schema:CpuTemplate",
+        "api-schema:VcpuFeatures"
+      ],
+      "observation": "hvf-registers-do-not-preserve-kvm-identity",
+      "upstream_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/vcpu.rs#L202-L216"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/cpu_config/aarch64/custom_cpu_template.rs#L34-L96"
+        }
+      ],
+      "platform_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_config_get_feature_reg%28_%3A_%3A_%3A%29"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_sys_reg%28_%3A_%3A_%3A%29"
+        }
+      ],
+      "rejected_alternatives": [
+        "private-kvm-capability-mapping",
+        "feature-word-register-reinterpretation",
+        "different-cpu-source-model"
+      ],
+      "challenge": {
+        "kind": "github",
+        "url": "https://github.com/seven332/bangbang/issues/1393#issuecomment-4993017798"
+      }
+    },
+    {
+      "mechanism": "linux-hugetlbfs2m",
+      "capability_ids": [
+        "api-property:MachineConfiguration.huge_pages",
+        "corpus:hugepages"
+      ],
+      "observation": "arm64-xnu-rejects-two-mib-superpages",
+      "upstream_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/hugepages.md"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/vmm_config/machine_config.rs#L36-L88"
+        }
+      ],
+      "platform_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/vm/vm_map.c#L2942-L2964"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/arm/pmap/pmap.h#L269-L270"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/arm64/sptm/pmap/pmap.h#L230-L231"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/hypervisor/hv_ipa_granule_t"
+        }
+      ],
+      "rejected_alternatives": [
+        "virtual-alignment-or-batching",
+        "hvf-ipa-granule",
+        "privileged-host-or-linux-sidecar"
+      ],
+      "challenge": {
+        "kind": "github",
+        "url": "https://github.com/seven332/bangbang/issues/1391#issuecomment-4989883731"
+      }
+    },
+    {
+      "mechanism": "linux-runtime-isolation",
+      "capability_ids": [
+        "corpus:seccomp",
+        "firecracker-argument:no-seccomp",
+        "firecracker-argument:seccomp-filter",
+        "tool-argument:jailer/cgroup",
+        "tool-argument:jailer/cgroup-version",
+        "tool-argument:jailer/netns",
+        "tool-argument:jailer/new-pid-ns",
+        "tool-argument:jailer/parent-cgroup"
+      ],
+      "observation": "macos-lacks-linux-isolation-primitives",
+      "upstream_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/main.rs"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs"
+        }
+      ],
+      "platform_sources": [
+        {
+          "kind": "authoritative",
+          "url": "https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/kern/syscalls.master"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/security/app-sandbox"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/networkextension/packet-tunnel-provider"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/vmnet"
+        },
+        {
+          "kind": "authoritative",
+          "url": "https://developer.apple.com/documentation/endpointsecurity"
+        }
+      ],
+      "rejected_alternatives": [
+        "app-sandbox-or-rlimits",
+        "network-extension-or-vmnet",
+        "launchd-endpoint-security-or-sidecar"
+      ],
+      "challenge": {
+        "kind": "github",
+        "url": "https://github.com/seven332/bangbang/issues/1384#issuecomment-4987589364"
+      }
+    }
+  ],
+  "handoffs": [
+    {
+      "capability_id": "corpus:jailer",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "corpus:production-host",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-argument:jailer/chroot-base-dir",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-argument:jailer/gid",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-argument:jailer/uid",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-operation:jailer/run",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "corpus:network-setup",
+      "owner": "issue1378",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "owner": "issue1378",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "semantic.isolation:host-resource-authority-and-brokerage",
+      "owner": "issue1351",
+      "disposition": "missing-platform-feasible"
+    },
+    {
+      "capability_id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
+      "owner": "issue1351",
+      "disposition": "missing-platform-feasible"
+    },
+    {
+      "capability_id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+      "owner": "issue1351",
+      "disposition": "missing-platform-feasible"
+    }
+  ],
+  "delivery_hierarchy": {
+    "preceding_parents": [
+      {
+        "issue": "#1349",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1351",
+        "outcome": "retained-external"
+      },
+      {
+        "issue": "#1388",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1410",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1439",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1440",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1490",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1491",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1493",
+        "outcome": "completed"
+      },
+      {
+        "issue": "#1494",
+        "outcome": "completed"
+      }
+    ],
+    "retained_external_issues": [
+      "#1371",
+      "#1373",
+      "#1374",
+      "#1375",
+      "#1378"
+    ],
+    "offline_validator_queries_github": false
+  },
+  "evidence": {
+    "implementation": [
+      {
+        "kind": "local",
+        "path": "compat/firecracker/v1.16.0/wave8-certification-audit.json",
+        "anchor": "\"domains\": ["
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/src/wave8_certification_audit_model.rs",
+        "anchor": "pub struct Wave8CertificationAudit"
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/src/wave8_certification_audit_validate.rs",
+        "anchor": "pub fn validate_wave8_certification_audit"
+      }
+    ],
+    "validation": [
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/tests/wave8_certification_audit.rs",
+        "anchor": "fn checked_wave8_certification_audit_is_canonical_and_fail_closed()"
+      }
+    ],
+    "documentation": [
+      {
+        "kind": "local",
+        "path": "compat/firecracker/v1.16.0/wave8-certification-contract.md",
+        "anchor": "## Certified interaction matrix"
+      },
+      {
+        "kind": "local",
+        "path": "docs/testing.md",
+        "anchor": "## Wave 8 final certification"
+      }
+    ]
+  },
+  "document_owners": [
+    {
+      "subject": "wave8-authority",
+      "path": "compat/firecracker/v1.16.0/wave8-certification-contract.md"
+    },
+    {
+      "subject": "compatibility-boundary",
+      "path": "docs/firecracker-compatibility.md"
+    },
+    {
+      "subject": "current-validation-matrix",
+      "path": "docs/firecracker-validation-matrix.md"
+    },
+    {
+      "subject": "operator-verification",
+      "path": "docs/testing.md"
+    },
+    {
+      "subject": "security-boundary",
+      "path": "docs/security.md"
+    }
+  ],
+  "nonclaims": [
+    "external-evidence-completion",
+    "linux-kvm-or-firecracker-binary-parity",
+    "arbitrary-guest-or-cross-host-portability",
+    "portable-performance-parity",
+    "whole-system-formal-correctness",
+    "all-possible-runtime-interleavings",
+    "private-or-privileged-fallback",
+    "live-github-state-from-offline-validator"
+  ]
+}

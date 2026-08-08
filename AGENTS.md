@@ -27,6 +27,9 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo fmt --all -- --check`: verify Rust formatting.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate`: validate the
   checked delivery-time Firecracker inventory without a sibling checkout.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --wave8-final`: certify the final seven-domain/21-pair platform-feasible
+  interaction scope while retaining the exact external evidence outcomes.
 - `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`: run the
   portable guest-artifact policy, cache, sidecar, publication, and wrapper tests.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate

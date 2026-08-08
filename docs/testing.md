@@ -2041,11 +2041,58 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-
 
 It derives the exact 93 parent-owned identities, 37 design semantics, 958
 device-table relations, 261 API identities, 21 release entries, 55 public-tool
-leaves, and every supported virtio-MMIO profile. It succeeds only at inventory
-totals `376/9/3/30` with the exact nine audit and three feasible handoffs. It
-does not execute Kani, sign binaries, run HVF, or collect an environment report
-inside the Rust process: run the targeted Kani job, the full signed integration
-wrapper, and the specification collector separately for a current PR head.
+leaves, and every supported virtio-MMIO profile. It accepts only its historical
+inventory phase `376/9/3/30` with the Wave 8 row audit-required or the exact
+one-row Wave 8 successor `377/8/3/30`. It does not execute Kani, sign binaries,
+run HVF, or collect an environment report inside the Rust process: run the
+targeted Kani job, the full signed integration wrapper, and the specification
+collector separately for a current PR head.
+
+## Wave 8 final certification
+
+The final platform-feasible gate consumes the checked
+[`wave8-certification-audit.json`](../compat/firecracker/v1.16.0/wave8-certification-audit.json)
+and composes all earlier terminal authorities:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
+```
+
+The strict ledger fixes seven domains and derives all 21 unordered pairs from
+four exact leaf scenarios. It requires literal path-and-function anchors and
+rejects a valid test from the wrong role, a stale anchor, altered domain
+membership, a missing pair, or a partial transition. Its portable oracle proves
+snapshot/API/MMDS/periodic-work serialization, cancellation, and no escaped
+artifact. Its signed direct and production leaves prove the real HVF, App
+Sandbox, grant/resource, device, network/MMDS, observability, lifecycle, and
+native-v2 continuation interactions. The separate signed wrong-claim leaf
+proves redacted failure atomicity without consuming the typed resource pair.
+
+Run the selected signed leaves through the normal wrapper when diagnosing the
+matrix:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e -- \
+  macos_arm64::signed_executable_runs_async_block_over_mmio_with_live_patch --exact
+scripts/run-integration-tests.sh --test production_bundle -- \
+  normal_bundle_certifies_native_v2_network_mmds_snapshot_continuation_and_containment --exact
+scripts/run-integration-tests.sh --test production_bundle -- \
+  normal_bundle_rejects_wrong_and_missing_boot_claims_without_consuming_pair --exact
+```
+
+The full signed wrapper remains the release gate because the Wave 8 authority
+also composes the supporting logger, metrics, fatal-exit, device, network, and
+snapshot suites. The authority independently groups all 30 impossible records
+into exact x86 CPUID/MSR (13), Linux KVM feature/template (7), Linux hugetlbfs
+`2M` (2), and Linux runtime-isolation (8) reviews. Per-ID exclusions remain
+mandatory.
+
+Exactly six #1373 audit rows, two #1378 audit rows, and three #1351 feasible
+rows remain; the checked authority owns the machine-derived current totals.
+The global `--final` command deliberately continues to fail until those
+external root/HVF and approved-vmnet evidence gates pass. The Rust command is
+offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
+merged-main OID are checked and recorded by the pull-request workflow.
 
 ## Running Tests
 
@@ -2063,6 +2110,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-te
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
