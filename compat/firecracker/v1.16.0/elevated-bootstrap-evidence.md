@@ -1,10 +1,10 @@
 # Elevated macOS Bootstrap Evidence
 
-This contract records the #1373 evidence result for the direct-root operator
-branch beneath #1371. It tests whether Firecracker's chroot-first credential
-transition can coexist with Bangbang's mandatory production worker boundary;
-it does not add a public root mode, accept jailer uid/gid/chroot options, or
-change a capability disposition by itself.
+This contract records the #1373 direct-worker result and the #1884
+inherited-root follow-up beneath #1371. Together they test two public orderings
+for combining Firecracker's chroot-first model with Bangbang's mandatory
+production worker boundary. They do not add a public root mode, accept jailer
+uid/gid/chroot options, or change a capability disposition by themselves.
 
 ## Exact test boundary
 
@@ -14,8 +14,8 @@ The evidence bundle keeps the production layout and identity split:
   Sandbox nor Hypervisor entitlement;
 - the separately signed nested worker has Hardened Runtime and exactly the App
   Sandbox plus Hypervisor entitlements;
-- the launcher performs the normal static bundle and suspended/live worker
-  identity checks before authorizing the probe; and
+- the launcher retains normal static bundle validation and performs the
+  suspended/live worker identity checks whenever the child reaches them; and
 - both launcher and worker probe entries are compiled only with the
   `elevated-bootstrap-probe` feature. A normal `--no-default-features` build is
   checked for absence of the launcher-owned worker activation, ready and status
@@ -35,19 +35,32 @@ new filesystem authority, at fixed worker fd 8. The existing fixed production
 session and dormant broker endpoints remain closed-role socket descriptors;
 the worker receives no host path and cannot reopen the root by name.
 
-The signed worker verifies initial root identity, the nonce-bound descriptor
-identity, and exact mode before `fchdir`, public `chroot(2)`, `chdir("/")`,
-`setgroups`, `setgid`, or `setuid`. The launcher reports only fixed mode, stage,
-and error categories. Target IDs, paths, nonce, device/inode values, descriptor
-numbers, signing values, account data, and environment values are never
-reported.
+For the inherited-root branch, the wrapper copies exactly the complete signed
+probe bundle plus the current host's Apple-signed `/usr/lib/dyld` into fixed
+`/Bangbang.app` and `/usr/lib/dyld` locations inside a separate private root.
+It admits exactly 20 manifest entries, normalizes and records each original
+device/inode/owner/group/type/mode tuple, proves the loader bytes match the
+host file, and revalidates the loader and complete nested code signatures. The
+launcher independently validates the host-visible staged layout/profile and
+loader through no-follow descriptors, prepares every spawn object, enters the
+root with public `fchdir`/`chroot`/`chdir`, reattests `/`, and only then calls
+public `posix_spawn` with the fixed in-root worker path.
+
+In direct modes, the signed worker verifies initial root identity, the
+nonce-bound descriptor identity, and exact mode before `fchdir`, public
+`chroot(2)`, or `chdir("/")`. If the inherited worker reaches application
+entry, it must additionally attest that `/` and cwd are the same exact root,
+observe the direct App Sandbox chroot retry denial, and create then destroy one
+real HVF VM. No mode executes `setgroups`, `setgid`, or `setuid`. The launcher
+reports only fixed mode, stage, and error categories. Target IDs, paths,
+nonces, device/inode values, descriptor numbers, signing values, account data,
+and environment values are never reported.
 
 ## Capable-host result
 
 The final evidence shape was executed on 2026-08-08 on Apple Silicon with
 macOS 26.5.2, macOS SDK 26.5, and `kern.hv_support=1`, under explicit operator
-root authority. The same private directory and public syscall produced these
-results:
+root authority. The complete matrix produced these results:
 
 | Process boundary | Mode | Result |
 | --- | --- | --- |
@@ -55,52 +68,71 @@ results:
 | signed nested App Sandbox + Hypervisor worker | explicit ordinary target, repeated three times | exact root fd and `fchdir` succeeded; `chroot` returned permission denied |
 | same worker | uid/gid zero no-drop | exact root fd and `fchdir` succeeded; `chroot` returned permission denied |
 | same worker | high unmapped numeric uid/gid syscall case | exact root fd and `fchdir` succeeded; `chroot` returned permission denied |
-| two concurrent launcher/worker pairs | distinct exact roots and the same explicit target class | both returned the same chroot-stage permission denial |
+| two concurrent direct launcher/worker pairs | distinct exact roots and the same explicit target class | both returned the same chroot-stage permission denial |
+| same signed App Sandbox + Hypervisor worker, unchrooted | HVF control | exact worker validation and real HVF create/destroy succeeded |
+| launcher enters staged root before spawn | inherited-root, repeated three times | static bundle/loader validation and launcher root entry succeeded; `posix_spawn` returned success, but the worker exited before the earliest Ready record (`worker-bootstrap` / `other`) |
+| two concurrent complete inherited roots | distinct staged bundle/loader trees | both returned the same `worker-bootstrap` / `other` blocker |
 
-Focused negative cases also reject a group-writable leaf and a symlink leaf
-before worker activation. Every successful, rejected, and concurrent case
-leaves the exact private roots empty; cleanup rechecks device, inode, owner,
-group, and mode before `rmdir`, and refuses to remove a replacement.
+Focused negative cases reject a group-writable root and a symlink root. The
+staged manifest also rejects a writable, missing, symlinked, or inode-replaced
+loader, a missing nested worker, and an unexpected entry before worker
+activation. Every successful, rejected, repeated, and concurrent case leaves
+no root or workspace residue. Nonempty-root cleanup preflights all 20 ledger
+entries before removing any, then uses only reverse exact `unlink`/`rmdir`;
+root cleanup rechecks device, inode, owner, group, and mode and refuses to
+remove a replacement.
 
-The host had real HVF support and the rejected worker carried the real
-Hypervisor entitlement, but no guest was started: mandatory App Sandbox denied
-the earlier public chroot syscall before credential transition, lifecycle/API,
-typed resource consumption, or HVF construction could begin. Treating later
-steps as passing through a mock or a separate invocation would not change that
-ordered combination result.
+The inherited result is not a missing-HVF or generally invalid-signature
+result: the same exact unchrooted signed worker completed real HVF
+create/destroy in the same wrapper run. The inherited branch nevertheless
+never reached application entry, root attestation, the direct-chroot sandbox
+control, or HVF. No guest, credential transition, lifecycle/API, or typed
+resource consumption was attempted.
 
-After that result was established, the checked harness was deliberately kept
-at the evidence boundary: it contains no dormant credential-changing product
-path. If a future platform permits the sandboxed `chroot`, the worker reports
-`unexpected-continuation` and exits before `setgroups`, `setgid`, `setuid`,
-lifecycle, API, or HVF work. That failure forces a fresh implementation and
-Challenge instead of silently treating an unproved continuation as success.
-Connected-socket credentials therefore never cross a credential change in the
-measured branch; the harness authenticates the initial root peer by exact PID
-and effective IDs plus the random nonce, leaves the normal peer verifier
-unchanged, and makes no dynamic-versus-snapshot credential claim for #1374.
+After those results were established, the checked harness remained at the
+evidence boundary: it contains no credential-changing product path. If a
+future platform permits the direct sandboxed `chroot`, that branch reports
+`unexpected-continuation` before later work. If an inherited worker reaches
+entry, it must pass exact root, sandbox-denial, and HVF checks before success.
+Either changed result forces fresh implementation research and Challenge.
+Connected-socket credentials never cross a credential change in these measured
+branches; the harness leaves the normal peer verifier unchanged and makes no
+dynamic-versus-snapshot credential claim for #1374.
 
 ## Supported conclusion and nonclaims
 
-On the measured public macOS/SDK boundary, a mandatory App Sandbox worker
-cannot enter a caller-selected chroot, even when it starts with exact root
-identity and receives an already-opened, validated directory descriptor. The
-successful unsandboxed control distinguishes this result from missing host
-root authority, an invalid root, or an unavailable `chroot(2)` primitive.
+On the measured public macOS/SDK boundary, a running mandatory App Sandbox
+worker cannot directly enter a caller-selected chroot, even with exact root
+identity and an already-opened validated directory descriptor. The successful
+unsandboxed control distinguishes that result from missing root authority, an
+invalid root, or an unavailable `chroot(2)` primitive.
 
-Moving `chroot` to an unsandboxed helper cannot change another process's root;
-performing it before loading the worker removes the production bundle and
-dynamic-loader path needed to spawn that worker; removing App Sandbox,
-installing a privileged daemon/setuid helper, or using private Seatbelt APIs
-changes the challenged product/security model. Therefore the exact
-Firecracker chroot-plus-mandatory-containment branch has a reproducible public
-platform blocker and should be dispositioned through #1371's fresh Challenge.
+Pre-spawn inheritance is materially different and #1884 measured it rather
+than dismissing it. Staging the complete signed bundle and current host dyld
+was sufficient for `posix_spawn` to return success after launcher chroot, so
+the former assumption that root entry necessarily removes all executable and
+loader lookup was too broad. It was not sufficient for the spawned image to
+reach the first application record. Because no authenticated worker code ran,
+the evidence cannot distinguish a dyld/shared-cache bootstrap dependency from
+another pre-entry platform launch dependency and cannot claim inherited App
+Sandbox or HVF execution.
+
+This is a reproducible blocker for the exact public staged-bundle/current-dyld
+shape, with successful direct-root and unchrooted-HVF controls. It is evidence
+for #1371's fresh Challenge, not an inventory disposition by this PR. Removing
+App Sandbox, installing a privileged daemon/setuid helper, using private
+Seatbelt APIs, or switching to a different VMM process changes the challenged
+product/security model; any credible public in-root dependency alternative
+must instead be evaluated explicitly by the parent.
 
 This does not prove that numeric `setgroups`/`setgid`/`setuid` alone are
-unavailable on macOS, does not claim Linux mount/PID/user namespace parity,
-does not certify notarized distribution, and does not generalize beyond the
-recorded OS/SDK behavior. A future public platform change requires rerunning
-the wrapper and a fresh ID-by-ID Challenge.
+unavailable on macOS, that no larger fixed in-root Darwin dependency set can
+bootstrap, or that inherited-root success would supply full resources,
+lifecycle, API, guest boot, daemon/crash, grant, or credential semantics. It
+does not claim Linux mount/PID/user namespace parity, certify notarized
+distribution, or generalize beyond the recorded OS/SDK behavior. A changed
+root content or future public platform requires rerunning the wrapper and a
+fresh ID-by-ID Challenge.
 
 ## Reproduction
 
@@ -126,5 +158,5 @@ sudo /usr/bin/env -i HOME=/var/root PATH=/usr/bin:/bin \
 The required terminal summary is value-free:
 
 ```text
-result: app-sandbox-chroot=permission-denied control=success cleanup=exact
+result: inherited-root-worker=blocked stage=worker-bootstrap error=other controls=success cleanup=exact
 ```

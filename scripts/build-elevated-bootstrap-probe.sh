@@ -73,9 +73,11 @@ cd "$repo_root"
 target_triple="aarch64-apple-darwin"
 launcher_bin="$repo_root/target/$target_triple/release/bangbang-launcher"
 worker_bin="$repo_root/target/$target_triple/release/bangbang"
-worker_activation="--bangbang-internal-elevated-bootstrap-worker-v1"
+worker_activation="--bangbang-internal-elevated-bootstrap-worker-v2"
 status_activation="status: elevated bootstrap blocked"
-ready_activation="BBEP-READY-V1"
+ready_activation="BBEP-READY-V2"
+inherited_mode="inherited-root"
+hvf_stage="hvf-create"
 
 cargo build \
   -p bangbang \
@@ -87,12 +89,21 @@ cargo build \
   --locked \
   --target "$target_triple"
 
-if LC_ALL=C /usr/bin/grep -a -F -q -- "$worker_activation" "$launcher_bin" \
-  || LC_ALL=C /usr/bin/grep -a -F -q -- "$status_activation" "$launcher_bin" \
-  || LC_ALL=C /usr/bin/grep -a -F -q -- "$ready_activation" "$worker_bin"; then
-  echo "normal artifact unexpectedly contains elevated probe code" >&2
-  exit 1
-fi
+probe_markers=(
+  "$worker_activation"
+  "$status_activation"
+  "$ready_activation"
+  "$inherited_mode"
+  "$hvf_stage"
+)
+for artifact in "$launcher_bin" "$worker_bin"; do
+  for marker_value in "${probe_markers[@]}"; do
+    if LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$artifact"; then
+      echo "normal artifact unexpectedly contains elevated probe code" >&2
+      exit 1
+    fi
+  done
+done
 
 cargo build \
   -p bangbang \
@@ -105,9 +116,17 @@ cargo build \
   --locked \
   --target "$target_triple"
 
-if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$worker_activation" "$launcher_bin" \
-  || ! LC_ALL=C /usr/bin/grep -a -F -q -- "$status_activation" "$launcher_bin" \
-  || ! LC_ALL=C /usr/bin/grep -a -F -q -- "$ready_activation" "$worker_bin"; then
+for marker_value in \
+  "$worker_activation" \
+  "$status_activation" \
+  "$inherited_mode" \
+  "$hvf_stage"; do
+  if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$launcher_bin"; then
+    echo "evidence artifact is missing the elevated probe boundary" >&2
+    exit 1
+  fi
+done
+if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$ready_activation" "$worker_bin"; then
   echo "evidence artifact is missing the elevated probe boundary" >&2
   exit 1
 fi

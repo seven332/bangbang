@@ -114,65 +114,260 @@ fn launch_elevated_prepared(
     launch: crate::launch_policy::PreparedLaunch,
     elevated_probe: crate::elevated_probe::Config,
 ) -> Result<LauncherExit, LauncherError> {
+    let bootstrap = elevated_probe.bootstrap()?;
+    if elevated_probe.mode() == bangbang_session::elevated_probe::ProbeMode::InheritedRoot {
+        return launch_inherited_prepared(launch, elevated_probe, bootstrap);
+    }
+    let spawned = crate::macos::spawn::prepare_suspended_elevated(
+        layout.worker_executable(),
+        launch.worker_args,
+        elevated_probe.root_fd(),
+    )?
+    .spawn()?;
+    finish_elevated_exchange(spawned, launch.worker_profile, bootstrap, false)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn launch_inherited_prepared(
+    launch: crate::launch_policy::PreparedLaunch,
+    elevated_probe: crate::elevated_probe::Config,
+    bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+) -> Result<LauncherExit, LauncherError> {
+    use bangbang_session::elevated_probe::{ProbeErrorCategory, ProbeStage};
+
+    let staged_layout = match elevated_probe.staged_layout() {
+        Ok(layout) => layout,
+        Err(_) => {
+            return Ok(elevated_blocked(
+                ProbeStage::ValidateStagedBundle,
+                ProbeErrorCategory::InvalidInput,
+            ));
+        }
+    };
+    let staged_profile = match crate::macos::code_sign::validate_bundle(&staged_layout) {
+        Ok(profile) => profile,
+        Err(_) => {
+            return Ok(elevated_blocked(
+                ProbeStage::ValidateStagedBundle,
+                ProbeErrorCategory::Other,
+            ));
+        }
+    };
+    if staged_profile != launch.worker_profile {
+        return Ok(elevated_blocked(
+            ProbeStage::ValidateStagedBundle,
+            ProbeErrorCategory::InvalidInput,
+        ));
+    }
+    if elevated_probe.validate_staged_loader().is_err() {
+        return Ok(elevated_blocked(
+            ProbeStage::ValidateStagedLoader,
+            ProbeErrorCategory::InvalidInput,
+        ));
+    }
+    let worker = match elevated_probe.in_root_worker() {
+        Ok(worker) => worker,
+        Err(_) => {
+            return Ok(elevated_blocked(
+                ProbeStage::SpawnWorker,
+                ProbeErrorCategory::InvalidInput,
+            ));
+        }
+    };
+    let prepared = match crate::macos::spawn::prepare_suspended_elevated(
+        worker,
+        launch.worker_args,
+        elevated_probe.root_fd(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Ok(elevated_blocked(
+                ProbeStage::SpawnWorker,
+                probe_error_category(&error),
+            ));
+        }
+    };
+    if let Err(failure) = elevated_probe.enter_inherited_root() {
+        return Ok(elevated_blocked(failure.stage, failure.category));
+    }
+    let spawned = match prepared.spawn() {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            return Ok(elevated_blocked(
+                ProbeStage::SpawnWorker,
+                probe_error_category(&error),
+            ));
+        }
+    };
+    finish_elevated_exchange(spawned, launch.worker_profile, bootstrap, true)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn finish_elevated_exchange(
+    mut spawned: crate::macos::spawn::SuspendedWorker,
+    expected_profile: crate::macos::code_sign::WorkerProfile,
+    bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+    inherited_root: bool,
+) -> Result<LauncherExit, LauncherError> {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
 
-    use bangbang_session::elevated_probe::{ProbeResult, READY_RECORD, RESULT_RECORD_BYTES};
+    use bangbang_session::elevated_probe::{
+        ProbeErrorCategory, ProbeResult, ProbeStage, READY_RECORD, RESULT_RECORD_BYTES,
+    };
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
-    let bootstrap = elevated_probe.bootstrap()?;
-    let mut spawned = crate::macos::spawn::spawn_suspended_elevated(
-        layout.worker_executable(),
-        launch.worker_args,
-        elevated_probe.root_fd(),
-    )?;
-    if crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?
-        != launch.worker_profile
-    {
-        return Err(LauncherError::InvalidWorkerIdentity);
+    match crate::macos::code_sign::validate_worker_process(spawned.worker.pid()) {
+        Ok(profile) if profile == expected_profile => {}
+        Ok(_) if inherited_root => {
+            return Ok(elevated_blocked(
+                ProbeStage::SuspendedIdentity,
+                ProbeErrorCategory::InvalidInput,
+            ));
+        }
+        Ok(_) => return Err(LauncherError::InvalidWorkerIdentity),
+        Err(_) if inherited_root => {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::Other,
+            ));
+        }
+        Err(error) => return Err(error),
     }
-    spawned
-        .session
-        .set_read_timeout(Some(TIMEOUT))
-        .map_err(|error| LauncherError::SessionSetup(error.kind()))?;
-    spawned
-        .session
-        .set_write_timeout(Some(TIMEOUT))
-        .map_err(|error| LauncherError::SessionSetup(error.kind()))?;
-    spawned.worker.resume()?;
+    if let Err(error) = spawned.session.set_read_timeout(Some(TIMEOUT)) {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::from_io_kind(error.kind()),
+            ));
+        }
+        return Err(LauncherError::SessionSetup(error.kind()));
+    }
+    if let Err(error) = spawned.session.set_write_timeout(Some(TIMEOUT)) {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::from_io_kind(error.kind()),
+            ));
+        }
+        return Err(LauncherError::SessionSetup(error.kind()));
+    }
+    if let Err(error) = spawned.worker.resume() {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                probe_error_category(&error),
+            ));
+        }
+        return Err(error);
+    }
     let mut ready = [0_u8; READY_RECORD.len()];
-    spawned
-        .session
-        .read_exact(&mut ready)
-        .map_err(|_| LauncherError::SessionProtocol)?;
-    if ready != READY_RECORD {
+    if let Err(error) = spawned.session.read_exact(&mut ready) {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::from_io_kind(error.kind()),
+            ));
+        }
         return Err(LauncherError::SessionProtocol);
     }
-    bangbang_session::macos::verify_peer(spawned.session.as_raw_fd(), spawned.worker.pid())
-        .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
-    if crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?
-        != launch.worker_profile
+    if ready != READY_RECORD {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::InvalidInput,
+            ));
+        }
+        return Err(LauncherError::SessionProtocol);
+    }
+    if bangbang_session::macos::verify_peer(spawned.session.as_raw_fd(), spawned.worker.pid())
+        .is_err()
     {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::LiveIdentity,
+                ProbeErrorCategory::Other,
+            ));
+        }
         return Err(LauncherError::InvalidWorkerIdentity);
     }
-    spawned
-        .session
-        .write_all(&bootstrap.encode())
-        .map_err(|_| LauncherError::SessionProtocol)?;
-    let mut encoded_result = [0_u8; RESULT_RECORD_BYTES];
-    spawned
-        .session
-        .read_exact(&mut encoded_result)
-        .map_err(|_| LauncherError::SessionProtocol)?;
-    let result =
-        ProbeResult::decode(&encoded_result).map_err(|_| LauncherError::SessionProtocol)?;
-    if result.mode() != bootstrap.mode() || result.nonce() != bootstrap.nonce() {
+    match crate::macos::code_sign::validate_worker_process(spawned.worker.pid()) {
+        Ok(profile) if profile == expected_profile => {}
+        Ok(_) if inherited_root => {
+            return Ok(elevated_blocked(
+                ProbeStage::LiveIdentity,
+                ProbeErrorCategory::InvalidInput,
+            ));
+        }
+        Ok(_) => return Err(LauncherError::InvalidWorkerIdentity),
+        Err(_) if inherited_root => {
+            return Ok(elevated_blocked(
+                ProbeStage::LiveIdentity,
+                ProbeErrorCategory::Other,
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    if spawned.session.write_all(&bootstrap.encode()).is_err() {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::Other,
+            ));
+        }
         return Err(LauncherError::SessionProtocol);
     }
-    let status = spawned.worker.wait()?;
-    let exit = map_exit_status(status)?;
+    let mut encoded_result = [0_u8; RESULT_RECORD_BYTES];
+    if spawned.session.read_exact(&mut encoded_result).is_err() {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::Other,
+            ));
+        }
+        return Err(LauncherError::SessionProtocol);
+    }
+    let result = match ProbeResult::decode(&encoded_result) {
+        Ok(result) => result,
+        Err(_) if inherited_root => {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::InvalidInput,
+            ));
+        }
+        Err(_) => return Err(LauncherError::SessionProtocol),
+    };
+    if result.mode() != bootstrap.mode() || result.nonce() != bootstrap.nonce() {
+        if inherited_root {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::InvalidInput,
+            ));
+        }
+        return Err(LauncherError::SessionProtocol);
+    }
+    let status = match spawned.worker.wait() {
+        Ok(status) => status,
+        Err(error) if inherited_root => {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                probe_error_category(&error),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let exit = match map_exit_status(status) {
+        Ok(exit) => exit,
+        Err(_) if inherited_root => {
+            return Ok(elevated_blocked(
+                ProbeStage::WorkerBootstrap,
+                ProbeErrorCategory::Other,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     match result.outcome() {
         Ok(()) if exit.code() == 0 => {
             println!(
@@ -189,7 +384,43 @@ fn launch_elevated_prepared(
             );
             Ok(LauncherExit(3))
         }
+        Ok(()) | Err(_) if inherited_root => Ok(elevated_blocked(
+            ProbeStage::WorkerBootstrap,
+            ProbeErrorCategory::InvalidInput,
+        )),
         Ok(()) | Err(_) => Err(LauncherError::SessionProtocol),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn elevated_blocked(
+    stage: bangbang_session::elevated_probe::ProbeStage,
+    category: bangbang_session::elevated_probe::ProbeErrorCategory,
+) -> LauncherExit {
+    println!(
+        "status: elevated bootstrap blocked stage={} error={}",
+        stage.name(),
+        category.name()
+    );
+    LauncherExit(3)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn probe_error_category(
+    error: &LauncherError,
+) -> bangbang_session::elevated_probe::ProbeErrorCategory {
+    use bangbang_session::elevated_probe::ProbeErrorCategory;
+
+    match error {
+        LauncherError::WorkerSpawn(kind)
+        | LauncherError::SessionSetup(kind)
+        | LauncherError::WorkerWait(kind)
+        | LauncherError::SignalForward(kind) => ProbeErrorCategory::from_io_kind(*kind),
+        LauncherError::InvalidBundleLayout
+        | LauncherError::InvalidBundleEntry
+        | LauncherError::InvalidWorkerIdentity
+        | LauncherError::InvalidLaunchPolicy => ProbeErrorCategory::InvalidInput,
+        _ => ProbeErrorCategory::Other,
     }
 }
 

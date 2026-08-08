@@ -82,10 +82,12 @@ const GRANT_PROBE_READY: &str = "status: grant integration probe ready";
 const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
 const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
 const GRANT_PROBE_MARKER: &str = "grant-integration-probe.enabled";
-const ELEVATED_PROBE_OPTION: &str = "--bangbang-internal-elevated-bootstrap-probe-v1";
-const ELEVATED_WORKER_OPTION: &[u8] = b"--bangbang-internal-elevated-bootstrap-worker-v1";
-const ELEVATED_READY_RECORD: &[u8] = b"BBEP-READY-V1";
+const ELEVATED_PROBE_OPTION: &str = "--bangbang-internal-elevated-bootstrap-probe-v2";
+const ELEVATED_WORKER_OPTION: &[u8] = b"--bangbang-internal-elevated-bootstrap-worker-v2";
+const ELEVATED_READY_RECORD: &[u8] = b"BBEP-READY-V2";
 const ELEVATED_BLOCKED_STATUS: &[u8] = b"status: elevated bootstrap blocked";
+const ELEVATED_INHERITED_MODE: &[u8] = b"inherited-root";
+const ELEVATED_HVF_STAGE: &[u8] = b"hvf-create";
 const ELEVATED_PROBE_MARKER: &str = "elevated-bootstrap-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
 const RESTORE_ROOT_ID: &str = "restore-root-1601";
@@ -13041,20 +13043,22 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
     );
     let launcher_bytes = fs::read(launcher(&bundle)).expect("normal launcher should read");
     let worker_bytes = fs::read(worker_executable(&bundle)).expect("normal worker should read");
-    for marker in [ELEVATED_WORKER_OPTION, ELEVATED_BLOCKED_STATUS] {
-        assert!(
-            !launcher_bytes
-                .windows(marker.len())
-                .any(|window| window == marker),
-            "normal launcher must statically exclude the elevated probe"
-        );
+    for artifact in [&launcher_bytes, &worker_bytes] {
+        for marker in [
+            ELEVATED_WORKER_OPTION,
+            ELEVATED_READY_RECORD,
+            ELEVATED_BLOCKED_STATUS,
+            ELEVATED_INHERITED_MODE,
+            ELEVATED_HVF_STAGE,
+        ] {
+            assert!(
+                !artifact
+                    .windows(marker.len())
+                    .any(|window| window == marker),
+                "normal artifact must statically exclude the elevated probe"
+            );
+        }
     }
-    assert!(
-        !worker_bytes
-            .windows(ELEVATED_READY_RECORD.len())
-            .any(|window| window == ELEVATED_READY_RECORD),
-        "normal worker must statically exclude the elevated bootstrap"
-    );
 
     let output = run_launcher(
         &bundle,
@@ -13073,7 +13077,12 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
     );
     assert_eq!(output.status.code(), Some(ARGUMENT_PARSING_EXIT_CODE));
     let diagnostics = [output.stdout, output.stderr].concat();
-    for marker in [ELEVATED_READY_RECORD, ELEVATED_BLOCKED_STATUS] {
+    for marker in [
+        ELEVATED_READY_RECORD,
+        ELEVATED_BLOCKED_STATUS,
+        ELEVATED_INHERITED_MODE,
+        ELEVATED_HVF_STAGE,
+    ] {
         assert!(
             !diagnostics
                 .windows(marker.len())

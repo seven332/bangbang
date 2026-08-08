@@ -147,23 +147,87 @@ pub(crate) fn spawn_suspended(
     executable: &Path,
     args: Vec<OsString>,
 ) -> Result<SuspendedWorker, LauncherError> {
-    spawn_suspended_inner(executable, args, None)
+    prepare_suspended_inner(executable, args, None)?.spawn()
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
-pub(crate) fn spawn_suspended_elevated(
+pub(crate) fn prepare_suspended_elevated(
     executable: &Path,
     args: Vec<OsString>,
     root: RawFd,
-) -> Result<SuspendedWorker, LauncherError> {
-    spawn_suspended_inner(executable, args, Some(root))
+) -> Result<PreparedSuspendedWorker, LauncherError> {
+    prepare_suspended_inner(executable, args, Some(root))
 }
 
-fn spawn_suspended_inner(
+pub(crate) struct PreparedSuspendedWorker {
+    executable: CString,
+    _argv: Vec<CString>,
+    _environment: Vec<CString>,
+    argv_pointers: Vec<*mut c_char>,
+    environment_pointers: Vec<*mut c_char>,
+    attributes: SpawnAttributes,
+    actions: SpawnFileActions,
+    parent: UnixStream,
+    child: UnixStream,
+    grant_parent: UnixDatagram,
+    grant_child: UnixDatagram,
+    broker_parent: UnixDatagram,
+    broker_child: UnixDatagram,
+    vhost_parent: UnixDatagram,
+    vhost_child: UnixDatagram,
+    block_parent: UnixDatagram,
+    block_child: UnixDatagram,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    _elevated_root: Option<OwnedFd>,
+}
+
+impl PreparedSuspendedWorker {
+    pub(crate) fn spawn(self) -> Result<SuspendedWorker, LauncherError> {
+        let mut pid = 0;
+        // SAFETY: Preparation owns every C string, pointer array, descriptor,
+        // attribute, and action through this synchronous call. Moving a
+        // `CString` does not move its allocation, so the precomputed pointers
+        // remain valid. `pid` is writable for exactly one result.
+        let result = unsafe {
+            libc::posix_spawn(
+                &raw mut pid,
+                self.executable.as_ptr(),
+                self.actions.as_ptr(),
+                self.attributes.as_ptr(),
+                self.argv_pointers.as_ptr(),
+                self.environment_pointers.as_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(LauncherError::WorkerSpawn(
+                io::Error::from_raw_os_error(result).kind(),
+            ));
+        }
+        drop(self.child);
+        drop(self.grant_child);
+        drop(self.broker_child);
+        drop(self.vhost_child);
+        drop(self.block_child);
+        Ok(SuspendedWorker {
+            worker: OwnedWorker {
+                pid,
+                status: None,
+                released: false,
+            },
+            session: self.parent,
+            grants: self.grant_parent,
+            socket_broker: self.broker_parent,
+            vhost_user_broker: self.vhost_parent,
+            block_control_broker: self.block_parent,
+        })
+    }
+}
+
+fn prepare_suspended_inner(
     executable: &Path,
     args: Vec<OsString>,
     elevated_root: Option<RawFd>,
-) -> Result<SuspendedWorker, LauncherError> {
+) -> Result<PreparedSuspendedWorker, LauncherError> {
     #[cfg(not(feature = "elevated-bootstrap-probe"))]
     let _ = elevated_root;
     #[cfg(feature = "elevated-bootstrap-probe")]
@@ -208,9 +272,9 @@ fn spawn_suspended_inner(
     let executable = cstring(executable.as_os_str())
         .map_err(|_| LauncherError::WorkerSpawn(io::ErrorKind::InvalidInput))?;
     let argv = argv(&executable, args)?;
-    let env = environment()?;
+    let environment = environment()?;
     let argv_pointers = pointer_array(&argv);
-    let env_pointers = pointer_array(&env);
+    let environment_pointers = pointer_array(&environment);
 
     let mut attributes = SpawnAttributes::new()?;
     attributes.configure(false)?;
@@ -249,41 +313,26 @@ fn spawn_suspended_inner(
         }
     }
 
-    let mut pid = 0;
-    // SAFETY: All C strings and null-terminated pointer arrays remain live for
-    // the synchronous spawn. Attribute/action wrappers own initialized Darwin
-    // objects and `pid` is writable for one result.
-    let result = unsafe {
-        libc::posix_spawn(
-            &raw mut pid,
-            executable.as_ptr(),
-            actions.as_ptr(),
-            attributes.as_ptr(),
-            argv_pointers.as_ptr(),
-            env_pointers.as_ptr(),
-        )
-    };
-    if result != 0 {
-        return Err(LauncherError::WorkerSpawn(
-            io::Error::from_raw_os_error(result).kind(),
-        ));
-    }
-    drop(child);
-    drop(grant_child);
-    drop(broker_child);
-    drop(vhost_child);
-    drop(block_child);
-    Ok(SuspendedWorker {
-        worker: OwnedWorker {
-            pid,
-            status: None,
-            released: false,
-        },
-        session: parent,
-        grants: grant_parent,
-        socket_broker: broker_parent,
-        vhost_user_broker: vhost_parent,
-        block_control_broker: block_parent,
+    Ok(PreparedSuspendedWorker {
+        executable,
+        _argv: argv,
+        _environment: environment,
+        argv_pointers,
+        environment_pointers,
+        attributes,
+        actions,
+        parent,
+        child,
+        grant_parent,
+        grant_child,
+        broker_parent,
+        broker_child,
+        vhost_parent,
+        vhost_child,
+        block_parent,
+        block_child,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        _elevated_root: elevated_root,
     })
 }
 

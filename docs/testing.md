@@ -2089,16 +2089,19 @@ mandatory.
 
 Exactly six #1373 audit rows, two #1378 audit rows, and three #1351 feasible
 rows remain; the checked authority owns the machine-derived current totals.
-The global `--final` command deliberately continues to fail until those
-external root/HVF and approved-vmnet evidence gates pass. The Rust command is
+The root/HVF gate has produced controlled #1373 and #1884 evidence, but it does
+not rewrite inventory by itself. The global `--final` command deliberately
+continues to fail until #1371 challenges and transitions those rows and the
+approved-vmnet and remaining feasible gates complete. The Rust command is
 offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
 merged-main OID are checked and recorded by the pull-request workflow.
 
 ## Explicit Elevated Bootstrap Evidence
 
-The #1373 root proof is deliberately separate from
-`scripts/run-integration-tests.sh`. Normal validation never invokes `sudo`,
-prompts for a password, or treats missing root/HVF support as a passing skip.
+The #1373 direct-worker and #1884 inherited-root proofs are deliberately
+separate from `scripts/run-integration-tests.sh`. Normal validation never
+invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
+passing skip.
 First build the test-only bundle as an ordinary user at an absent absolute
 destination:
 
@@ -2108,10 +2111,10 @@ scripts/build-elevated-bootstrap-probe.sh \
 ```
 
 The build compiles normal launcher and worker artifacts first and verifies that
-the probe status/worker activation/ready bytes are absent. It then builds both
-ends with the same disabled-by-default feature, adds a visible test-only
-resource marker, and uses the normal production packager, signature split,
-entitlements, Hardened Runtime, and inspections.
+the V2 probe status, worker activation, Ready, inherited-root, and HVF markers
+are absent. It then builds both ends with the same disabled-by-default feature,
+adds a visible test-only resource marker, and uses the normal production
+packager, signature split, entitlements, Hardened Runtime, and inspections.
 
 On a capable Apple Silicon host, calculate the explicit numeric target before
 elevation and invoke the wrapper yourself:
@@ -2131,9 +2134,24 @@ Silicon, HVF, bundle identity, or cleanup is failure. The wrapper never reads
 `SUDO_UID`, `SUDO_GID`, `HOME`, `PATH`, account names, or a password; the
 caller owns the elevation mechanism. On entry it replaces inherited standard
 input with `/dev/null`, so elevation input cannot flow into the launcher or
-signed worker. It reports OS/SDK/architecture and only the value-free terminal
-result. The measured result and its limits are in the [elevated bootstrap
-evidence contract](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
+signed worker.
+
+The inherited branch stages exactly the complete signed evidence bundle and
+current `/usr/lib/dyld` in a root-owned private root. A 20-entry private ledger
+binds every device/inode/owner/group/type/mode; preactivation negatives cover a
+writable, missing, symlinked, and inode-replaced loader, a missing nested
+worker, and an unexpected entry. The wrapper retains the #1373 direct denial,
+an unsandboxed launcher root control, and an unchrooted signed-worker real-HVF
+create/destroy control; it repeats the inherited result three times and runs
+two complete roots concurrently. Cleanup validates all entries before any
+removal and uses only exact reverse `unlink`/`rmdir`, then an independent scan
+must find no root or workspace residue.
+
+It reports OS/SDK/architecture and only the value-free terminal result. The
+measured result is `worker-bootstrap` / `other`: in-root `posix_spawn` returned
+success but the worker exited before its earliest application record. Its
+supported conclusion and nonclaims are in the [elevated bootstrap evidence
+contract](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 ## Running Tests
 

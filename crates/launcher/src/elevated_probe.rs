@@ -5,11 +5,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use bangbang_session::elevated_probe::{
-    LAUNCHER_ACTIVATION, ProbeBootstrap, ProbeMode, WORKER_ACTIVATION,
+    LAUNCHER_ACTIVATION, ProbeBootstrap, ProbeErrorCategory, ProbeMode, ProbeStage,
+    WORKER_ACTIVATION,
 };
 use bangbang_session::{ObjectIdentity, SessionId};
 
-use crate::LauncherError;
+use crate::{BundleLayout, LauncherError};
 
 const ROOT_OPTION: &str = "--root";
 const TARGET_UID_OPTION: &str = "--target-uid";
@@ -19,10 +20,22 @@ const DELIMITER: &str = "--";
 const MAX_ROOT_PATH_BYTES: usize = 1024;
 const ROOT_CHILD_PREFIX: &str = "bangbang-elevated-probe.";
 const ROOT_CHILD_SUFFIX_BYTES: usize = 8;
+const STAGED_LAUNCHER_PATH: &str = "Bangbang.app/Contents/MacOS/bangbang";
+const IN_ROOT_WORKER_PATH: &str =
+    "/Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/MacOS/bangbang-worker";
+const MAX_STAGED_DYLD_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProbeFailure {
+    pub(crate) stage: ProbeStage,
+    pub(crate) category: ProbeErrorCategory,
+}
 
 pub(crate) struct Config {
     root: OwnedFd,
+    root_path: PathBuf,
     root_identity: ObjectIdentity,
+    staged_loader_identity: Option<ObjectIdentity>,
     target_uid: u32,
     target_gid: u32,
     mode: ProbeMode,
@@ -73,10 +86,17 @@ impl Config {
             .ok_or(LauncherError::InvalidLaunchPolicy)?;
         validate_initial_root()?;
         let (root, root_identity) = open_private_root(&root_path)?;
+        let staged_loader_identity = if mode == ProbeMode::InheritedRoot {
+            Some(validate_staged_loader(root.as_raw_fd(), None)?)
+        } else {
+            None
+        };
         Ok((
             Some(Self {
                 root,
+                root_path,
                 root_identity,
+                staged_loader_identity,
                 target_uid,
                 target_gid,
                 mode,
@@ -102,6 +122,28 @@ impl Config {
 
     pub(crate) const fn mode(&self) -> ProbeMode {
         self.mode
+    }
+
+    pub(crate) fn staged_layout(&self) -> Result<BundleLayout, LauncherError> {
+        if self.mode != ProbeMode::InheritedRoot {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        BundleLayout::from_launcher_executable(&self.root_path.join(STAGED_LAUNCHER_PATH))
+    }
+
+    pub(crate) fn validate_staged_loader(&self) -> Result<(), LauncherError> {
+        let expected = self
+            .staged_loader_identity
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        validate_staged_loader(self.root.as_raw_fd(), Some(expected)).map(|_| ())
+    }
+
+    pub(crate) fn in_root_worker(&self) -> Result<&'static Path, LauncherError> {
+        if self.mode == ProbeMode::InheritedRoot {
+            Ok(Path::new(IN_ROOT_WORKER_PATH))
+        } else {
+            Err(LauncherError::InvalidLaunchPolicy)
+        }
     }
 
     pub(crate) fn bootstrap(&self) -> Result<ProbeBootstrap, LauncherError> {
@@ -137,6 +179,127 @@ impl Config {
         }
         Ok(())
     }
+
+    pub(crate) fn enter_inherited_root(&self) -> Result<(), ProbeFailure> {
+        if self.mode != ProbeMode::InheritedRoot {
+            return Err(ProbeFailure {
+                stage: ProbeStage::EnterRoot,
+                category: ProbeErrorCategory::InvalidInput,
+            });
+        }
+        self.validate_staged_loader().map_err(|_| ProbeFailure {
+            stage: ProbeStage::ValidateStagedLoader,
+            category: ProbeErrorCategory::InvalidInput,
+        })?;
+        ordered_root_transition(
+            || {
+                // SAFETY: `root` is the exact retained private directory
+                // validated by descriptor and this feature-gated launcher has
+                // not started workers.
+                cvt_root_syscall(unsafe { libc::fchdir(self.root.as_raw_fd()) })
+            },
+            || {
+                // SAFETY: Cwd is the retained exact root and the fixed relative
+                // string is NUL-terminated. The process intentionally never
+                // escapes this root.
+                cvt_root_syscall(unsafe { libc::chroot(c".".as_ptr()) })
+            },
+            || {
+                // SAFETY: The process is inside the private root and the fixed
+                // path is NUL-terminated.
+                cvt_root_syscall(unsafe { libc::chdir(c"/".as_ptr()) })
+            },
+            || {
+                let slash = open_directory(c"/").map_err(|_| ProbeErrorCategory::Other)?;
+                let stat =
+                    descriptor_stat(slash.as_raw_fd()).map_err(|_| ProbeErrorCategory::Other)?;
+                if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+                    || stat.st_mode & 0o7777 != 0o700
+                    || stat.st_uid != 0
+                    || stat.st_gid != 0
+                    || stat_identity(&stat) != self.root_identity
+                {
+                    return Err(ProbeErrorCategory::InvalidInput);
+                }
+                Ok(())
+            },
+        )
+    }
+}
+
+fn cvt_root_syscall(result: libc::c_int) -> Result<(), ProbeErrorCategory> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ProbeErrorCategory::from_io_kind(
+            std::io::Error::last_os_error().kind(),
+        ))
+    }
+}
+
+fn ordered_root_transition<F, C, D, V>(
+    fchdir: F,
+    chroot: C,
+    chdir: D,
+    validate: V,
+) -> Result<(), ProbeFailure>
+where
+    F: FnOnce() -> Result<(), ProbeErrorCategory>,
+    C: FnOnce() -> Result<(), ProbeErrorCategory>,
+    D: FnOnce() -> Result<(), ProbeErrorCategory>,
+    V: FnOnce() -> Result<(), ProbeErrorCategory>,
+{
+    fchdir().map_err(|category| ProbeFailure {
+        stage: ProbeStage::EnterRoot,
+        category,
+    })?;
+    chroot().map_err(|category| ProbeFailure {
+        stage: ProbeStage::Chroot,
+        category,
+    })?;
+    chdir().map_err(|category| ProbeFailure {
+        stage: ProbeStage::ChangeDirectory,
+        category,
+    })?;
+    validate().map_err(|category| ProbeFailure {
+        stage: ProbeStage::InheritedRoot,
+        category,
+    })?;
+    Ok(())
+}
+
+fn validate_staged_loader(
+    root: RawFd,
+    expected: Option<ObjectIdentity>,
+) -> Result<ObjectIdentity, LauncherError> {
+    let usr = openat_directory(root, c"usr")?;
+    let lib = openat_directory(usr.as_raw_fd(), c"lib")?;
+    let loader = openat_plain_file(lib.as_raw_fd(), c"dyld")?;
+    let stat = descriptor_stat(loader.as_raw_fd())?;
+    validate_staged_loader_stat(&stat, expected)
+}
+
+fn validate_staged_loader_stat(
+    stat: &libc::stat,
+    expected: Option<ObjectIdentity>,
+) -> Result<ObjectIdentity, LauncherError> {
+    let identity = stat_identity(stat);
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_mode & 0o022 != 0
+        || stat.st_mode & 0o111 == 0
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_size <= 0
+        || u64::try_from(stat.st_size)
+            .ok()
+            .is_none_or(|size| size > MAX_STAGED_DYLD_BYTES)
+        || identity.device == 0
+        || identity.inode == 0
+        || expected.is_some_and(|expected| expected != identity)
+    {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    Ok(identity)
 }
 
 fn parse_u32(value: Option<&OsString>) -> Result<u32, LauncherError> {
@@ -242,6 +405,19 @@ fn openat_directory(parent: RawFd, child: &CStr) -> Result<OwnedFd, LauncherErro
     owned_descriptor(descriptor)
 }
 
+fn openat_plain_file(parent: RawFd, child: &CStr) -> Result<OwnedFd, LauncherError> {
+    // SAFETY: `parent` is a retained directory, `child` is NUL-terminated, and
+    // no pointer is retained.
+    let descriptor = unsafe {
+        libc::openat(
+            parent,
+            child.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    owned_descriptor(descriptor)
+}
+
 fn owned_descriptor(descriptor: RawFd) -> Result<OwnedFd, LauncherError> {
     if descriptor < 0 {
         Err(LauncherError::InvalidLaunchPolicy)
@@ -285,6 +461,8 @@ fn stat_identity(stat: &libc::stat) -> ObjectIdentity {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     #[test]
@@ -310,10 +488,12 @@ mod tests {
         let root = std::fs::File::open("/").expect("test root descriptor should open");
         let config = Config {
             root: root.into(),
+            root_path: PathBuf::from("/private/var/root/bangbang-elevated-probe.A1b2C3d4"),
             root_identity: ObjectIdentity {
                 device: 123,
                 inode: 456,
             },
+            staged_loader_identity: None,
             target_uid: 1_234_567_891,
             target_gid: 1_234_567_893,
             mode: ProbeMode::Drop,
@@ -334,6 +514,20 @@ mod tests {
     }
 
     #[test]
+    fn in_root_worker_path_is_fixed_to_the_nested_bundle() {
+        assert_eq!(
+            Path::new(STAGED_LAUNCHER_PATH),
+            Path::new("Bangbang.app/Contents/MacOS/bangbang")
+        );
+        assert_eq!(
+            Path::new(IN_ROOT_WORKER_PATH),
+            Path::new(
+                "/Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/MacOS/bangbang-worker"
+            )
+        );
+    }
+
+    #[test]
     fn numeric_parser_is_decimal_and_bounded() {
         assert_eq!(parse_u32(Some(&OsString::from("0"))), Ok(0));
         assert_eq!(
@@ -346,5 +540,109 @@ mod tests {
                 Err(LauncherError::InvalidLaunchPolicy)
             );
         }
+    }
+
+    #[test]
+    fn inherited_root_transition_is_ordered_and_stops_on_first_failure() {
+        let stages = [
+            ProbeStage::EnterRoot,
+            ProbeStage::Chroot,
+            ProbeStage::ChangeDirectory,
+            ProbeStage::InheritedRoot,
+        ];
+        for (fail_at, expected_stage) in stages.into_iter().enumerate() {
+            let calls = RefCell::new(Vec::new());
+            let operation = |index| {
+                calls.borrow_mut().push(index);
+                if index == fail_at {
+                    Err(ProbeErrorCategory::PermissionDenied)
+                } else {
+                    Ok(())
+                }
+            };
+            let failure = ordered_root_transition(
+                || operation(0),
+                || operation(1),
+                || operation(2),
+                || operation(3),
+            )
+            .expect_err("the selected transition operation should fail");
+            assert_eq!(
+                failure,
+                ProbeFailure {
+                    stage: expected_stage,
+                    category: ProbeErrorCategory::PermissionDenied,
+                }
+            );
+            assert_eq!(*calls.borrow(), (0..=fail_at).collect::<Vec<_>>());
+        }
+
+        let calls = RefCell::new(Vec::new());
+        let operation = |index| {
+            calls.borrow_mut().push(index);
+            Ok(())
+        };
+        ordered_root_transition(
+            || operation(0),
+            || operation(1),
+            || operation(2),
+            || operation(3),
+        )
+        .expect("all transition operations should succeed");
+        assert_eq!(*calls.borrow(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn staged_loader_metadata_and_identity_are_closed() {
+        let loader = std::fs::File::open("/usr/lib/dyld")
+            .expect("the macOS dynamic loader should be present");
+        let stat = descriptor_stat(loader.as_raw_fd()).expect("loader should stat");
+        let identity = validate_staged_loader_stat(&stat, None)
+            .expect("the system loader should satisfy the closed metadata shape");
+        validate_staged_loader_stat(&stat, Some(identity))
+            .expect("the recorded loader identity should match");
+
+        let mut wrong_type = stat;
+        wrong_type.st_mode = (wrong_type.st_mode & !libc::S_IFMT) | libc::S_IFDIR;
+        let mut writable = stat;
+        writable.st_mode |= 0o022;
+        let mut wrong_uid = stat;
+        wrong_uid.st_uid = 1;
+        let mut wrong_gid = stat;
+        wrong_gid.st_gid = 1;
+        let mut empty = stat;
+        empty.st_size = 0;
+        let mut oversized = stat;
+        oversized.st_size =
+            i64::try_from(MAX_STAGED_DYLD_BYTES + 1).expect("loader bound should fit off_t");
+        let mut zero_device = stat;
+        zero_device.st_dev = 0;
+        let mut zero_inode = stat;
+        zero_inode.st_ino = 0;
+        for invalid in [
+            wrong_type,
+            writable,
+            wrong_uid,
+            wrong_gid,
+            empty,
+            oversized,
+            zero_device,
+            zero_inode,
+        ] {
+            assert_eq!(
+                validate_staged_loader_stat(&invalid, None),
+                Err(LauncherError::InvalidLaunchPolicy)
+            );
+        }
+        assert_eq!(
+            validate_staged_loader_stat(
+                &stat,
+                Some(ObjectIdentity {
+                    device: identity.device,
+                    inode: identity.inode ^ 1,
+                })
+            ),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
     }
 }

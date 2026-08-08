@@ -3434,24 +3434,36 @@ platform-feasible. Missing authority or credentials is not an impossibility
 proof. Global `--final` stays blocked until evidence is translated into an
 ID-specific disposition and the other external outcomes complete.
 
-The #1373 same-host gate has now been executed rather than inferred from split
-environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root and
-`kern.hv_support=1`, the unsandboxed signed launcher successfully entered the
-private chroot. The separately signed worker—with mandatory App Sandbox and
-Hypervisor entitlements—accepted the same nonce-bound root descriptor and
-completed `fchdir`, but public `chroot(2)` returned permission denied for the
-ordinary-target, uid/gid-zero, high-unmapped, repeated, and concurrent shapes.
-No credential transition, API, resource, or HVF operation can occur after that
-ordered blocker. This proves the exact chroot-plus-mandatory-containment branch,
-not that public numeric credential syscalls alone are absent. The complete
-boundary, alternatives, cleanup rules, reproduction command, and future-OS
-nonclaim are in the checked
+The elevated same-host gates have now been executed rather than inferred from
+split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root
+and `kern.hv_support=1`, #1373's unsandboxed signed launcher entered the private
+chroot. The separately signed worker—with mandatory App Sandbox and Hypervisor
+entitlements—accepted the nonce-bound root descriptor and completed `fchdir`,
+but public `chroot(2)` returned permission denied for the ordinary-target,
+uid/gid-zero, high-unmapped, repeated, and concurrent shapes. This proves the
+direct-worker ordering, not that public numeric credential syscalls alone are
+absent.
+
+#1884 then measured the credible pre-spawn ordering. The root launcher staged
+and validated the complete signed bundle and current host dyld, prepared the
+closed suspended spawn, entered and reattested the root, and addressed only the
+fixed in-root worker. `posix_spawn` returned success, but the child exited
+before its earliest application Ready record in three repeated and two
+concurrent complete roots. The same unchrooted signed worker completed real HVF
+create/destroy, so the inherited failure is not a general signing or HVF
+failure. It occurs too early to prove inherited App Sandbox activation, root
+attestation, or HVF, and it does not rule out a separately challenged larger
+fixed Darwin dependency set. No credential transition, API, resource, or guest
+operation occurs in either blocked ordering. The complete boundary,
+alternatives, exact staged-entry cleanup rules, reproduction command, and
+future-OS nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
-The six rows remain audit outcomes until #1371 completes its fresh per-ID
-Challenge and an inventory transition lands. The evidence harness is test-only
-and statically absent from normal launcher and worker builds; it is not a root
-service, public jailer mode, daemon, setuid helper, or ambient path authority.
+The six rows remain audit outcomes until #1371 challenges the controlled result
+and remaining credible alternatives per ID and an inventory transition lands.
+The evidence harness is test-only and statically absent from normal launcher
+and worker builds; it is not a root service, public jailer mode, daemon, setuid
+helper, or ambient path authority.
 
 ## Current Non-Goals
 
