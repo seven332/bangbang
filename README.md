@@ -33,6 +33,9 @@ Each detailed subject has one primary document:
   nonclaims.
 - [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
   owns the pinned structural scope, reviewed dispositions, and evidence rules.
+- [Wave 7 Aggregate Authority](compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
+  machine-checks the terminal design, device API, release, public-tool, and
+  virtio-MMIO closure while retaining every external handoff.
 - [Firecracker-shaped Developer Tracing](compat/firecracker/v1.16.0/tracing-contract.md)
   owns the opt-in feature, exact production scope set, record/privacy envelope,
   delivery policy, and explicit nonclaims.
@@ -54,6 +57,12 @@ Each detailed subject has one primary document:
 Versioned files under `compat/firecracker/v1.16.0/` are audit ledgers. They
 record pinned upstream identities, dispositions, exclusions, and evidence; the
 human-readable documents above explain current behavior.
+
+The scoped Wave 7 terminal gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
+```
 
 ## Workspace Layout
 

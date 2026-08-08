@@ -581,6 +581,13 @@ machine/CPU topology, and x86 KVM MSR coverage
 non-applicable to arm64 HVF. Linux host-kernel support is likewise a platform
 boundary rather than a macOS device claim.
 
+The complete 21-entry Added/Fixed sequence, including separate PCI and MMIO
+#5818 claims, is machine-checked by the
+[Wave 7 aggregate authority](../compat/firecracker/v1.16.0/wave7-aggregate-audit.json).
+That authority also binds this release interpretation to the exact design,
+device API, public-tool, and virtio-MMIO producer populations; it retains Linux
+6.18 host support under #1373 rather than presenting it as macOS behavior.
+
 Bangbang completion evidence is equally exact. The merged implementation PRs
 are [#1334 virtio-mem](https://github.com/seven332/bangbang/pull/1334),
 [#1335 targeted pmem flush](https://github.com/seven332/bangbang/pull/1335),

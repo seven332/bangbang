@@ -1,0 +1,940 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1491",
+  "delivery_issue": "#1799",
+  "upstream_sources": [
+    {
+      "capability_id": "corpus:design",
+      "path": "docs/design.md",
+      "anchor": "entire-file",
+      "git_blob": "143fef76410e4f7e45b32d3986e0d78eedf5175a"
+    },
+    {
+      "capability_id": "corpus:device-api",
+      "path": "docs/device-api.md",
+      "anchor": "entire-file",
+      "git_blob": "f638cc889f32e0be32fd750a79e65f88cb5c65a1"
+    },
+    {
+      "capability_id": "corpus:release-changelog",
+      "path": "CHANGELOG.md",
+      "anchor": "v1.16.0",
+      "git_blob": "d76cfc8a4601638f45fea032982faef8b9e30742"
+    }
+  ],
+  "capability_ids": [
+    "corpus:design",
+    "corpus:device-api",
+    "corpus:release-changelog",
+    "semantic.tools:packaging-help-errors-and-applicable-operations",
+    "semantic.transport:virtio-mmio-activation"
+  ],
+  "target_counts": {
+    "implemented_and_verified": 376,
+    "audit_required": 9,
+    "missing_platform_feasible": 3,
+    "proven_platform_impossible": 30
+  },
+  "design": [
+    {
+      "section": "scope-and-features",
+      "capability_id": "semantic.specification:api-availability-stability-and-failure-information",
+      "outcome": "implemented"
+    },
+    {
+      "section": "scope-and-features",
+      "capability_id": "semantic.specification:performance-resource-and-telemetry-outcomes",
+      "outcome": "implemented"
+    },
+    {
+      "section": "host-integration",
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "outcome": "handoff1378"
+    },
+    {
+      "section": "host-integration",
+      "capability_id": "semantic.process:cli-config-readiness-and-api-socket",
+      "outcome": "implemented"
+    },
+    {
+      "section": "host-integration",
+      "capability_id": "semantic.process:instance-identity-and-version-output",
+      "outcome": "implemented"
+    },
+    {
+      "section": "host-integration",
+      "capability_id": "semantic.process:signals-exits-fd-and-cleanup",
+      "outcome": "implemented"
+    },
+    {
+      "section": "host-integration",
+      "capability_id": "semantic.storage:block-sync-async-vhost-and-limits",
+      "outcome": "implemented"
+    },
+    {
+      "section": "host-integration",
+      "capability_id": "semantic.storage:pmem-root-mapping-flush-and-state",
+      "outcome": "implemented"
+    },
+    {
+      "section": "internal-architecture",
+      "capability_id": "semantic.hotplug:runtime-device-manager",
+      "outcome": "implemented"
+    },
+    {
+      "section": "internal-architecture",
+      "capability_id": "semantic.lifecycle:pause-resume-quiescence-and-failure",
+      "outcome": "implemented"
+    },
+    {
+      "section": "internal-architecture",
+      "capability_id": "semantic.lifecycle:smp-psci-and-vcpu-ownership",
+      "outcome": "implemented"
+    },
+    {
+      "section": "internal-architecture",
+      "capability_id": "semantic.transport:pci-msi-and-coexistence",
+      "outcome": "implemented"
+    },
+    {
+      "section": "internal-architecture",
+      "capability_id": "semantic.transport:virtio-mmio-activation",
+      "outcome": "implemented"
+    },
+    {
+      "section": "threat-containment",
+      "capability_id": "semantic.cross-capability:state-errors-metrics-security-and-snapshots",
+      "outcome": "handoff-wave8"
+    },
+    {
+      "section": "threat-containment",
+      "capability_id": "semantic.isolation:host-resource-authority-and-brokerage",
+      "outcome": "handoff1351"
+    },
+    {
+      "section": "threat-containment",
+      "capability_id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
+      "outcome": "handoff1351"
+    },
+    {
+      "section": "threat-containment",
+      "capability_id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+      "outcome": "handoff1351"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.boot:arm64-cache-fdt",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.boot:kernel-rootfs-fdt-and-cache",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.cpu:configuration-templates-and-feature-state",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.device:entropy-queues-limits-metrics-and-state",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.device:serial-stdin-stdout-rx-and-restore",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
+      "outcome": "implemented"
+    },
+    {
+      "section": "machine-model",
+      "capability_id": "semantic.memory:machine-sizing-hugepages-and-dirty-tracking",
+      "outcome": "implemented"
+    },
+    {
+      "section": "storage-networking-and-rate-limiting",
+      "capability_id": "semantic.mmds:tcp-token-session-and-isolation",
+      "outcome": "implemented"
+    },
+    {
+      "section": "storage-networking-and-rate-limiting",
+      "capability_id": "semantic.vsock:live-routing-credit-events-and-cleanup",
+      "outcome": "implemented"
+    },
+    {
+      "section": "storage-networking-and-rate-limiting",
+      "capability_id": "semantic.vsock:snapshot-override-reset-and-rx-gating",
+      "outcome": "implemented"
+    },
+    {
+      "section": "metadata-and-sandboxing",
+      "capability_id": "semantic.snapshot:diff-dirty-tracking-and-memory-backends",
+      "outcome": "implemented"
+    },
+    {
+      "section": "metadata-and-sandboxing",
+      "capability_id": "semantic.snapshot:editor-rebase-and-inspection",
+      "outcome": "implemented"
+    },
+    {
+      "section": "metadata-and-sandboxing",
+      "capability_id": "semantic.snapshot:full-create-load-and-public-lifecycle",
+      "outcome": "implemented"
+    },
+    {
+      "section": "metadata-and-sandboxing",
+      "capability_id": "semantic.snapshot:multi-vcpu-drives-devices-and-mmds",
+      "outcome": "implemented"
+    },
+    {
+      "section": "metadata-and-sandboxing",
+      "capability_id": "semantic.snapshot:network-vsock-overrides-portability-and-clones",
+      "outcome": "implemented"
+    },
+    {
+      "section": "monitoring-and-tooling",
+      "capability_id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",
+      "outcome": "implemented"
+    },
+    {
+      "section": "monitoring-and-tooling",
+      "capability_id": "semantic.observability:metrics-schema-producers-flush-and-lifecycle",
+      "outcome": "implemented"
+    },
+    {
+      "section": "monitoring-and-tooling",
+      "capability_id": "semantic.tools:packaging-help-errors-and-applicable-operations",
+      "outcome": "implemented"
+    }
+  ],
+  "device_api": {
+    "dimensions": [
+      {
+        "section": "endpoints",
+        "rows": 17,
+        "device_columns": [
+          "keyboard",
+          "serial console",
+          "virtio-block",
+          "vhost-user-block",
+          "virtio-net",
+          "virtio-vsock",
+          "virtio-rng",
+          "virtio-pmem",
+          "virtio-mem"
+        ],
+        "required_relations": 9
+      },
+      {
+        "section": "input-schema",
+        "rows": 75,
+        "device_columns": [
+          "keyboard",
+          "serial console",
+          "virtio-block",
+          "vhost-user-block",
+          "virtio-net",
+          "virtio-vsock",
+          "virtio-rng",
+          "virtio-pmem",
+          "virtio-mem"
+        ],
+        "required_relations": 47
+      },
+      {
+        "section": "output-schema",
+        "rows": 16,
+        "device_columns": [
+          "keyboard",
+          "serial console",
+          "virtio-block",
+          "vhost-user-block",
+          "virtio-net",
+          "virtio-vsock",
+          "virtio-mem"
+        ],
+        "required_relations": 5
+      },
+      {
+        "section": "instance-actions",
+        "rows": 3,
+        "device_columns": [
+          "keyboard",
+          "serial console",
+          "virtio-block",
+          "vhost-user-block",
+          "virtio-net",
+          "virtio-vsock"
+        ],
+        "required_relations": 1
+      }
+    ],
+    "normalizations": [
+      {
+        "source": "CreateSnapshotParams",
+        "current": "SnapshotCreateParams"
+      },
+      {
+        "source": "LoadSnapshotParams",
+        "current": "SnapshotLoadParams"
+      },
+      {
+        "source": "SerialConfig",
+        "current": "SerialDevice"
+      },
+      {
+        "source": "MemoryHotplugConfig.block_size_mi",
+        "current": "MemoryHotplugConfig.block_size_mib"
+      }
+    ],
+    "required_relations": [
+      "endpoints|drives/{id}|virtio-block|api-path:/drives/{drive_id}|implemented",
+      "endpoints|drives/{id}|vhost-user-block|api-path:/drives/{drive_id}|implemented",
+      "endpoints|hotplug/memory|virtio-mem|api-path:/hotplug/memory|implemented",
+      "endpoints|mmds|virtio-net|api-path:/mmds|implemented",
+      "endpoints|mmds/config|virtio-net|api-path:/mmds/config|implemented",
+      "endpoints|network-interfaces/{id}|virtio-net|api-path:/network-interfaces/{iface_id}|implemented",
+      "endpoints|entropy|virtio-rng|api-path:/entropy|implemented",
+      "endpoints|pmem/{id}|virtio-pmem|api-path:/pmem/{id}|implemented",
+      "endpoints|serial|serial console|api-path:/serial|implemented",
+      "input-schema|Drive.drive_id|virtio-block|api-property:Drive.drive_id|implemented",
+      "input-schema|Drive.drive_id|vhost-user-block|api-property:Drive.drive_id|implemented",
+      "input-schema|Drive.is_read_only|virtio-block|api-property:Drive.is_read_only|implemented",
+      "input-schema|Drive.is_root_device|virtio-block|api-property:Drive.is_root_device|implemented",
+      "input-schema|Drive.is_root_device|vhost-user-block|api-property:Drive.is_root_device|implemented",
+      "input-schema|Drive.partuuid|virtio-block|api-property:Drive.partuuid|implemented",
+      "input-schema|Drive.partuuid|vhost-user-block|api-property:Drive.partuuid|implemented",
+      "input-schema|Drive.path_on_host|virtio-block|api-property:Drive.path_on_host|implemented",
+      "input-schema|Drive.rate_limiter|virtio-block|api-property:Drive.rate_limiter|implemented",
+      "input-schema|Drive.socket|vhost-user-block|api-property:Drive.socket|implemented",
+      "input-schema|MmdsConfig.network_interfaces|virtio-net|api-property:MmdsConfig.network_interfaces|implemented",
+      "input-schema|MmdsConfig.version|virtio-net|api-property:MmdsConfig.version|implemented",
+      "input-schema|MmdsConfig.ipv4_address|virtio-net|api-property:MmdsConfig.ipv4_address|implemented",
+      "input-schema|NetworkInterface.guest_mac|virtio-net|api-property:NetworkInterface.guest_mac|implemented",
+      "input-schema|NetworkInterface.host_dev_name|virtio-net|api-property:NetworkInterface.host_dev_name|implemented",
+      "input-schema|NetworkInterface.iface_id|virtio-net|api-property:NetworkInterface.iface_id|implemented",
+      "input-schema|NetworkInterface.mtu|virtio-net|api-property:NetworkInterface.mtu|implemented",
+      "input-schema|NetworkInterface.rx_rate_limiter|virtio-net|api-property:NetworkInterface.rx_rate_limiter|implemented",
+      "input-schema|NetworkInterface.tx_rate_limiter|virtio-net|api-property:NetworkInterface.tx_rate_limiter|implemented",
+      "input-schema|PartialDrive.drive_id|virtio-block|api-property:PartialDrive.drive_id|implemented",
+      "input-schema|PartialDrive.path_on_host|virtio-block|api-property:PartialDrive.path_on_host|implemented",
+      "input-schema|PartialNetworkInterface.iface_id|virtio-net|api-property:PartialNetworkInterface.iface_id|implemented",
+      "input-schema|PartialNetworkInterface.rx_rate_limiter|virtio-net|api-property:PartialNetworkInterface.rx_rate_limiter|implemented",
+      "input-schema|PartialNetworkInterface.tx_rate_limiter|virtio-net|api-property:PartialNetworkInterface.tx_rate_limiter|implemented",
+      "input-schema|RateLimiter.bandwidth|virtio-net|api-property:RateLimiter.bandwidth|implemented",
+      "input-schema|RateLimiter.ops|virtio-block|api-property:RateLimiter.ops|implemented",
+      "input-schema|TokenBucket.one_time_burst|virtio-block|api-property:TokenBucket.one_time_burst|implemented",
+      "input-schema|TokenBucket.refill_time|virtio-block|api-property:TokenBucket.refill_time|implemented",
+      "input-schema|TokenBucket.size|virtio-block|api-property:TokenBucket.size|implemented",
+      "input-schema|TokenBucket.one_time_burst|virtio-net|api-property:TokenBucket.one_time_burst|implemented",
+      "input-schema|TokenBucket.refill_time|virtio-net|api-property:TokenBucket.refill_time|implemented",
+      "input-schema|TokenBucket.size|virtio-net|api-property:TokenBucket.size|implemented",
+      "input-schema|Vsock.guest_cid|virtio-vsock|api-property:Vsock.guest_cid|implemented",
+      "input-schema|Vsock.uds_path|virtio-vsock|api-property:Vsock.uds_path|implemented",
+      "input-schema|Vsock.vsock_id|virtio-vsock|api-property:Vsock.vsock_id|implemented",
+      "input-schema|EntropyDevice.rate_limiter|virtio-rng|api-property:EntropyDevice.rate_limiter|implemented",
+      "input-schema|Pmem.id|virtio-pmem|api-property:Pmem.id|implemented",
+      "input-schema|Pmem.path_on_host|virtio-pmem|api-property:Pmem.path_on_host|implemented",
+      "input-schema|Pmem.root_device|virtio-pmem|api-property:Pmem.root_device|implemented",
+      "input-schema|Pmem.read_only|virtio-pmem|api-property:Pmem.read_only|implemented",
+      "input-schema|Pmem.rate_limiter|virtio-pmem|api-property:Pmem.rate_limiter|implemented",
+      "input-schema|PartialPmem.id|virtio-pmem|api-property:PartialPmem.id|implemented",
+      "input-schema|PartialPmem.rate_limiter|virtio-pmem|api-property:PartialPmem.rate_limiter|implemented",
+      "input-schema|MemoryHotplugConfig.total_size_mib|virtio-mem|api-property:MemoryHotplugConfig.total_size_mib|implemented",
+      "input-schema|MemoryHotplugConfig.slot_size_mib|virtio-mem|api-property:MemoryHotplugConfig.slot_size_mib|implemented",
+      "input-schema|MemoryHotplugConfig.block_size_mi|virtio-mem|api-property:MemoryHotplugConfig.block_size_mib|implemented",
+      "input-schema|MemoryHotplugSizeUpdate.requested_size_mib|virtio-mem|api-property:MemoryHotplugSizeUpdate.requested_size_mib|implemented",
+      "output-schema|MemoryHotplugStatus.total_size_mib|virtio-mem|api-property:MemoryHotplugStatus.total_size_mib|implemented",
+      "output-schema|MemoryHotplugStatus.slot_size_mib|virtio-mem|api-property:MemoryHotplugStatus.slot_size_mib|implemented",
+      "output-schema|MemoryHotplugStatus.block_size_mib|virtio-mem|api-property:MemoryHotplugStatus.block_size_mib|implemented",
+      "output-schema|MemoryHotplugStatus.plugged_size_mib|virtio-mem|api-property:MemoryHotplugStatus.plugged_size_mib|implemented",
+      "output-schema|MemoryHotplugStatus.requested_size_mib|virtio-mem|api-property:MemoryHotplugStatus.requested_size_mib|implemented",
+      "instance-actions|SendCtrlAltDel|keyboard|corpus:actions-api|arm64-rejected"
+    ],
+    "optional_relations": 896,
+    "api_population": {
+      "operations": 38,
+      "paths": 26,
+      "schemas": 44,
+      "properties": 152,
+      "actions_corpus": 1,
+      "implemented": 240,
+      "proven_platform_impossible": 21
+    }
+  },
+  "release_entries": [
+    {
+      "id": "added-5786-pci-hotplug",
+      "section": "added",
+      "producer_capability_id": "semantic.hotplug:runtime-device-manager",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-5323-vsock-restore-override",
+      "section": "added",
+      "producer_capability_id": "semantic.vsock:snapshot-override-reset-and-rx-gating",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-5824-serial-rate-limiter",
+      "section": "added",
+      "producer_capability_id": "semantic.device:serial-stdin-stdout-rx-and-restore",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-5799-log-callsite-rate-limiter",
+      "section": "added",
+      "producer_capability_id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-5789-pmem-rate-limiter",
+      "section": "added",
+      "producer_capability_id": "semantic.storage:pmem-root-mapping-flush-and-state",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-5872-vsock-event-idx",
+      "section": "added",
+      "producer_capability_id": "semantic.vsock:live-routing-credit-events-and-cleanup",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-5828-network-mtu",
+      "section": "added",
+      "producer_capability_id": "api-property:NetworkInterface.mtu",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-5906-arm64-rng-seed",
+      "section": "added",
+      "producer_capability_id": "semantic.boot:arm64-cache-fdt",
+      "outcome": "implemented"
+    },
+    {
+      "id": "added-linux-6.18-host-kernels",
+      "section": "added",
+      "producer_capability_id": "corpus:production-host",
+      "outcome": "linux-host-handoff1373"
+    },
+    {
+      "id": "fixed-5762-entropy-request-cap",
+      "section": "fixed",
+      "producer_capability_id": "semantic.device:entropy-queues-limits-metrics-and-state",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5760-vmgenid-hid",
+      "section": "fixed",
+      "producer_capability_id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5764-uart-snapshot-restore",
+      "section": "fixed",
+      "producer_capability_id": "semantic.device:serial-stdin-stdout-rx-and-restore",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5780-arm64-cache-fdt",
+      "section": "fixed",
+      "producer_capability_id": "semantic.boot:arm64-cache-fdt",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5793-virtio-mem-slot-accounting",
+      "section": "fixed",
+      "producer_capability_id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5794-balloon-stat-length",
+      "section": "fixed",
+      "producer_capability_id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5809-clock-realtime",
+      "section": "fixed",
+      "producer_capability_id": "api-property:SnapshotLoadParams.clock_realtime",
+      "outcome": "arm64-rejected"
+    },
+    {
+      "id": "fixed-5738-x86-kvm-msr-range",
+      "section": "fixed",
+      "producer_capability_id": "api-schema:MsrModifier",
+      "outcome": "proven-platform-impossible"
+    },
+    {
+      "id": "fixed-5818-pci-status-sequencing",
+      "section": "fixed",
+      "producer_capability_id": "semantic.transport:pci-msi-and-coexistence",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5818-mmio-clear-status-bits",
+      "section": "fixed",
+      "producer_capability_id": "semantic.transport:virtio-mmio-activation",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5884-balloon-hinting-204",
+      "section": "fixed",
+      "producer_capability_id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
+      "outcome": "implemented"
+    },
+    {
+      "id": "fixed-5882-vsock-rx-reset-gate",
+      "section": "fixed",
+      "producer_capability_id": "semantic.vsock:snapshot-override-reset-and-rx-gating",
+      "outcome": "implemented"
+    }
+  ],
+  "tools": [
+    {
+      "tool": "cpu-template-helper",
+      "source_prefix": "cpu-template-helper/",
+      "package": "bangbang-cpu-template-helper",
+      "binaries": [
+        "cpu-template-helper"
+      ],
+      "execution": "native-signed",
+      "counts": {
+        "total": 18,
+        "implemented": 18,
+        "proven_platform_impossible": 0,
+        "audit_handoff_1373": 0
+      },
+      "scenarios": [
+        "help-and-version",
+        "strict-arguments",
+        "canonical-input-output",
+        "collision-and-nonmutation",
+        "signed-effective-hvf"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "tools/cpu-template-helper/tests/cli.rs",
+          "anchor": "fn help_and_version_are_the_only_portable_stdout_successes()"
+        }
+      ]
+    },
+    {
+      "tool": "firecracker",
+      "source_prefix": "firecracker/",
+      "package": "bangbang",
+      "binaries": [
+        "bangbang"
+      ],
+      "execution": "product-alternative",
+      "counts": {
+        "total": 1,
+        "implemented": 1,
+        "proven_platform_impossible": 0,
+        "audit_handoff_1373": 0
+      },
+      "scenarios": [
+        "help-version-and-errors",
+        "strict-config-and-api-socket",
+        "signed-process-lifecycle"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "fn executable_prints_help_and_exits_before_socket_publication()"
+        }
+      ]
+    },
+    {
+      "tool": "jailer",
+      "source_prefix": "jailer/",
+      "package": "bangbang-launcher",
+      "binaries": [
+        "bangbang-bundle",
+        "bangbang-launcher"
+      ],
+      "execution": "product-alternative",
+      "counts": {
+        "total": 14,
+        "implemented": 5,
+        "proven_platform_impossible": 5,
+        "audit_handoff_1373": 4
+      },
+      "scenarios": [
+        "help-and-version",
+        "strict-arguments",
+        "production-bundle-alternative",
+        "explicit-linux-exclusions",
+        "retained-identity-handoffs"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn launcher_exposes_exact_jailer_help_version_and_policy_validation()"
+        }
+      ]
+    },
+    {
+      "tool": "rebase-snap",
+      "source_prefix": "rebase-snap/",
+      "package": "bangbang-snapshot-tools",
+      "binaries": [
+        "rebase-snap"
+      ],
+      "execution": "deprecated-portable",
+      "counts": {
+        "total": 3,
+        "implemented": 3,
+        "proven_platform_impossible": 0,
+        "audit_handoff_1373": 0
+      },
+      "scenarios": [
+        "help-and-errors",
+        "deprecated-operation",
+        "canonical-no-clobber-rebase",
+        "signed-restore"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "fn help_and_version_expose_the_selected_firecracker_surfaces()"
+        }
+      ]
+    },
+    {
+      "tool": "seccompiler",
+      "source_prefix": "seccompiler/",
+      "package": "bangbang-seccompiler",
+      "binaries": [
+        "seccompiler-bin"
+      ],
+      "execution": "portable-offline",
+      "counts": {
+        "total": 6,
+        "implemented": 6,
+        "proven_platform_impossible": 0,
+        "audit_handoff_1373": 0
+      },
+      "scenarios": [
+        "help-and-version",
+        "strict-arguments",
+        "canonical-artifact",
+        "linux-oracle-semantics"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "fn help_and_version_identify_the_offline_compatibility_tool()"
+        }
+      ]
+    },
+    {
+      "tool": "snapshot-editor",
+      "source_prefix": "snapshot-editor/",
+      "package": "bangbang-snapshot-tools",
+      "binaries": [
+        "snapshot-editor"
+      ],
+      "execution": "portable-offline",
+      "counts": {
+        "total": 13,
+        "implemented": 13,
+        "proven_platform_impossible": 0,
+        "audit_handoff_1373": 0
+      },
+      "scenarios": [
+        "help-and-errors",
+        "nested-operations",
+        "canonical-no-clobber-output",
+        "signed-full-and-diff-restore"
+      ],
+      "evidence": [
+        {
+          "kind": "local",
+          "path": "tools/snapshot-tools/tests/cli.rs",
+          "anchor": "fn invalid_invocations_are_deterministic_and_do_not_echo_values()"
+        }
+      ]
+    }
+  ],
+  "virtio_mmio": {
+    "claims": [
+      "identity",
+      "feature-negotiation",
+      "queue-selection-and-configuration",
+      "queue-notification",
+      "interrupt-delivery-and-acknowledgement",
+      "ordered-status-transitions",
+      "reset",
+      "activation-failure",
+      "device-configuration-access",
+      "transport-state-restore",
+      "typed-logging",
+      "redacted-tracing"
+    ],
+    "devices": [
+      {
+        "id": "block-file",
+        "producer_capability_id": "semantic.storage:block-sync-async-vhost-and-limits",
+        "implementation_path": "crates/runtime/src/block.rs"
+      },
+      {
+        "id": "block-vhost-user",
+        "producer_capability_id": "semantic.storage:block-sync-async-vhost-and-limits",
+        "implementation_path": "crates/bangbang/src/direct_vhost_user.rs"
+      },
+      {
+        "id": "pmem",
+        "producer_capability_id": "semantic.storage:pmem-root-mapping-flush-and-state",
+        "implementation_path": "crates/runtime/src/pmem.rs"
+      },
+      {
+        "id": "network",
+        "producer_capability_id": "api-schema:NetworkInterface",
+        "implementation_path": "crates/runtime/src/network.rs"
+      },
+      {
+        "id": "vsock",
+        "producer_capability_id": "semantic.vsock:live-routing-credit-events-and-cleanup",
+        "implementation_path": "crates/runtime/src/vsock.rs"
+      },
+      {
+        "id": "entropy",
+        "producer_capability_id": "semantic.device:entropy-queues-limits-metrics-and-state",
+        "implementation_path": "crates/runtime/src/entropy.rs"
+      },
+      {
+        "id": "balloon",
+        "producer_capability_id": "semantic.memory-device:balloon-oom-stats-hinting-and-reporting",
+        "implementation_path": "crates/runtime/src/balloon.rs"
+      },
+      {
+        "id": "virtio-mem",
+        "producer_capability_id": "semantic.memory-device:virtio-mem-lifecycle-accounting-and-state",
+        "implementation_path": "crates/runtime/src/memory_hotplug.rs"
+      }
+    ],
+    "evidence": {
+      "production": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "pub struct VirtioMmioRegisterHandler"
+        }
+      ],
+      "focused": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "fn register_handler_implements_mmio_handler_for_dispatcher()"
+        }
+      ],
+      "formal": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/formal-verification-audit.json",
+          "anchor": "\"id\": \"virtio-mmio-status-transitions\""
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "fn verify_virtio_mmio_status_transitions()"
+        }
+      ],
+      "signed": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "fn signed_executable_runs_async_block_over_mmio_with_live_patch()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/hvf/tests/guest_boot.rs",
+          "anchor": "fn boots_signed_mmio_guest_with_complete_virtio_network_semantics()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_certifies_native_v2_storage_epochs_over_mmio_and_pci()"
+        }
+      ]
+    },
+    "pci_evidence_may_substitute": false
+  },
+  "handoffs": [
+    {
+      "capability_id": "semantic.isolation:host-resource-authority-and-brokerage",
+      "owner": "issue1351",
+      "disposition": "missing-platform-feasible"
+    },
+    {
+      "capability_id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
+      "owner": "issue1351",
+      "disposition": "missing-platform-feasible"
+    },
+    {
+      "capability_id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+      "owner": "issue1351",
+      "disposition": "missing-platform-feasible"
+    },
+    {
+      "capability_id": "corpus:jailer",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "corpus:production-host",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-argument:jailer/chroot-base-dir",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-argument:jailer/gid",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-argument:jailer/uid",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "tool-operation:jailer/run",
+      "owner": "issue1373",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "corpus:network-setup",
+      "owner": "issue1378",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "owner": "issue1378",
+      "disposition": "audit-required"
+    },
+    {
+      "capability_id": "semantic.cross-capability:state-errors-metrics-security-and-snapshots",
+      "owner": "wave8",
+      "disposition": "audit-required"
+    }
+  ],
+  "evidence": {
+    "implementation": [
+      {
+        "kind": "local",
+        "path": "compat/firecracker/v1.16.0/wave7-aggregate-audit.json",
+        "anchor": "\"schema_version\": 1"
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/src/wave7_aggregate_audit_validate.rs",
+        "anchor": "pub fn validate_wave7_aggregate_audit("
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/src/wave7_aggregate_certify.rs",
+        "anchor": "pub fn validate_wave7_aggregate_compatibility("
+      }
+    ],
+    "validation": [
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/tests/checked_inventory.rs",
+        "anchor": "fn wave_7_ownership_and_core_api_policy_is_stable()"
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/tests/wave7_aggregate_audit.rs",
+        "anchor": "fn checked_wave7_aggregate_audit_is_canonical_and_fail_closed()"
+      }
+    ],
+    "signed": [
+      {
+        "kind": "local",
+        "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+        "anchor": "fn signed_executable_runs_async_block_over_mmio_with_live_patch()"
+      },
+      {
+        "kind": "local",
+        "path": "crates/launcher/tests/production_bundle_e2e.rs",
+        "anchor": "fn production_bundle_has_exact_nested_signing_contract()"
+      }
+    ],
+    "documentation": [
+      {
+        "kind": "local",
+        "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md",
+        "anchor": "## Wave 7 aggregate certification"
+      },
+      {
+        "kind": "local",
+        "path": "docs/testing.md",
+        "anchor": "## Wave 7 aggregate certification"
+      }
+    ]
+  },
+  "document_owners": [
+    {
+      "subject": "landing-page",
+      "path": "README.md"
+    },
+    {
+      "subject": "human-compatibility",
+      "path": "docs/firecracker-compatibility.md"
+    },
+    {
+      "subject": "validation-index",
+      "path": "docs/firecracker-validation-matrix.md"
+    },
+    {
+      "subject": "commands",
+      "path": "docs/testing.md"
+    },
+    {
+      "subject": "trust-boundaries",
+      "path": "docs/security.md"
+    },
+    {
+      "subject": "checked-wave7-contract",
+      "path": "compat/firecracker/v1.16.0/observability-tools-specification-contract.md"
+    }
+  ],
+  "nonclaims": [
+    "firecracker-binary-or-linux-kvm-parity",
+    "retained-handoff-completion",
+    "pci-evidence-for-mmio",
+    "portable-performance-threshold",
+    "tracked-environment-report",
+    "wave8-interaction-completion"
+  ]
+}

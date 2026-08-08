@@ -68,6 +68,11 @@ For commands and test-layer selection, see the
   and network-performance blobs, exact reference environments/statuses,
   Bangbang measurement methods/units, report and fixture policy, evidence,
   nonclaims, and the exact three promoted rows.
+- [`wave7-aggregate-audit.json`](wave7-aggregate-audit.json) is the human-owned
+  terminal #1799 and #1491 authority. It partitions all design semantics,
+  derives all device-API cells and identities, enumerates all release entries
+  and public-tool leaves, certifies the complete virtio-MMIO composition, and
+  retains the exact nine audit plus three feasible handoffs.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -117,6 +122,7 @@ reviewed delta.
 | [macOS guest workflow](guest-workflow-contract.md) | Terminal two-corpus mapping, exact pinned guest identity, public API/no-API lifecycle, process/cache ownership, signed execution and platform/nonclaim boundary |
 | [Targeted formal verification](formal-verification-contract.md) | Terminal one-corpus mapping, exact Kani/toolchain pins, five source/compiled-bijective bounded proofs, retained tests, and explicit whole-system/mechanism nonclaims |
 | [Specification benchmark](specification-benchmark-contract.md) | Terminal three-row reference interpretation, strict signed collector/report/comparison, real FIFO loss/replay evidence, optional fixture boundary, and exact performance nonclaims |
+| [Wave 7 aggregate](observability-tools-specification-contract.md#wave-7-aggregate-certification) | Terminal 93-row parent distribution, exact design/device API/release/tool/MMIO ledgers, and explicit #1351/#1373/#1378/Wave 8 handoffs |
 
 ## Dispositions
 
@@ -137,6 +143,12 @@ Only [`capabilities.json`](capabilities.json) and the validator are
 authoritative for current global totals. Contract-local selected-record counts
 may be retained where they are part of a mechanically checked closure.
 Historical delivery arithmetic belongs in Git and GitHub.
+
+The scoped terminal aggregate gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
+```
 
 ## Guest workflow artifact authority
 

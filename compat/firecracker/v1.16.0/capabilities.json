@@ -12506,20 +12506,58 @@
     {
       "id": "corpus:design",
       "family": "process",
-      "summary": "The runtime seccomp, cgroup, network-namespace, and PID-namespace limits now have terminal macOS platform conclusions; continue auditing the pinned design corpus for independent lifecycle, resource brokerage, deployment, and broader architecture claims.",
+      "summary": "Certify every pinned design claim through an exact 37-record semantic partition: 32 implemented native outcomes, three explicit #1351 feasible isolation handoffs, one #1378 network handoff, and one Wave 8 interaction handoff.",
       "source_refs": [
         "corpus:design"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/wave7-aggregate-audit.json",
+          "anchor": "\"design\": ["
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/wave7_aggregate_audit_validate.rs",
+          "anchor": "fn validate_design("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/wave7_aggregate_audit.rs",
+          "anchor": "fn checked_wave7_aggregate_audit_is_canonical_and_fail_closed()"
+        }
+      ]
     },
     {
       "id": "corpus:device-api",
       "family": "device-transport",
-      "summary": "Audit all applicable capability claims owned by the pinned device-api source corpus.",
+      "summary": "Certify all four pinned device-API tables as 958 exact relations, including every one of 62 required producer mappings, 896 explicit optional cells, historical-name normalization, the arm64 keyboard-action rejection, and the complete terminal 261-record API population.",
       "source_refs": [
         "corpus:device-api"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/wave7-aggregate-audit.json",
+          "anchor": "\"device_api\": {"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/wave7_aggregate_audit_validate.rs",
+          "anchor": "fn validate_device_api("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/wave7_aggregate_audit.rs",
+          "anchor": "fn checked_wave7_aggregate_audit_is_canonical_and_fail_closed()"
+        }
+      ]
     },
     {
       "id": "corpus:device-hotplug",
@@ -13342,11 +13380,30 @@
     {
       "id": "corpus:release-changelog",
       "family": "specifications",
-      "summary": "Audit all applicable capability claims owned by the pinned release-changelog source corpus.",
+      "summary": "Certify all 21 ordered v1.16.0 Added and Fixed entries against terminal local producers or an explicit platform result, preserving both independent #5818 transport claims and the #1373 Linux-host handoff.",
       "source_refs": [
         "corpus:release-changelog"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/wave7-aggregate-audit.json",
+          "anchor": "\"release_entries\": ["
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/wave7_aggregate_audit_validate.rs",
+          "anchor": "fn validate_release("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/wave7_aggregate_audit.rs",
+          "anchor": "fn checked_wave7_aggregate_audit_is_canonical_and_fail_closed()"
+        }
+      ]
     },
     {
       "id": "corpus:rootfs-and-kernel",
@@ -16650,14 +16707,33 @@
     {
       "id": "semantic.tools:packaging-help-errors-and-applicable-operations",
       "family": "public-tools",
-      "summary": "Audit packaging, help/version, input/output authority, errors, cleanup, and architecture applicability for all pinned public tools.",
+      "summary": "Certify the exact six-tool, 55-leaf public surface as 46 implemented operations/arguments, five proven Linux-only jailer exclusions, and four retained #1373 jailer identity handoffs, with actual-binary help, strict-input, failure, publication, redaction, and applicable signed-product evidence.",
       "source_refs": [
         "corpus:cpu-template-helper",
         "corpus:jailer",
         "corpus:seccompiler",
         "corpus:snapshot-editor"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/wave7-aggregate-audit.json",
+          "anchor": "\"tools\": ["
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/wave7_aggregate_audit_validate.rs",
+          "anchor": "fn validate_tools("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/wave7_aggregate_audit.rs",
+          "anchor": "fn checked_wave7_aggregate_audit_is_canonical_and_fail_closed()"
+        }
+      ]
     },
     {
       "id": "semantic.transport:pci-msi-and-coexistence",
@@ -16746,11 +16822,40 @@
     {
       "id": "semantic.transport:virtio-mmio-activation",
       "family": "device-transport",
-      "summary": "Audit virtio-MMIO discovery, feature negotiation, queues, interrupts, reset, limits, and device activation.",
+      "summary": "Certify the shared virtio-MMIO v2 transport across identity, two-page feature negotiation, queues, notifications, interrupts, ordered status/reset/activation, configuration, restore, typed observability, file and vhost-user block, pmem, network, vsock, entropy, balloon, and virtio-mem without substituting PCI-only evidence.",
       "source_refs": [
         "corpus:device-api"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/wave7-aggregate-audit.json",
+          "anchor": "\"virtio_mmio\": {"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "pub struct VirtioMmioRegisterHandler"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/wave7_aggregate_audit_validate.rs",
+          "anchor": "fn validate_mmio("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/virtio_mmio.rs",
+          "anchor": "fn register_handler_implements_mmio_handler_for_dispatcher()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/wave7_aggregate_audit.rs",
+          "anchor": "fn checked_wave7_aggregate_audit_is_canonical_and_fail_closed()"
+        }
+      ]
     },
     {
       "id": "semantic.vsock:live-routing-credit-events-and-cleanup",

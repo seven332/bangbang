@@ -15,13 +15,13 @@ use bangbang_firecracker_capability_audit::{
     MetricsDeviceProducerDisposition, MetricsProcessProducerDisposition,
     MetricsProducerDisposition, MetricsProducerOwner, Reference, SOURCE_MANIFEST_PATH,
     SPECIFICATION_BENCHMARK_CAPABILITY_IDS, TERMINAL_DEVICE_POLICY_PROFILE_IDS, TRACING_AUDIT_PATH,
-    TRACING_CALL_SITE_IDS, TRACING_COMPATIBILITY_CAPABILITY_IDS, logger_producer_audit_json,
-    logger_producer_manifest_json, read_capability_inventory, read_cpu_template_helper_audit,
-    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
-    read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
-    read_metrics_schema_authority, read_source_manifest, read_tracing_audit, source_manifest_json,
-    tracing_audit_json, validate, validate_cpu_template_compatibility,
-    validate_cpu_template_fingerprint_compare_compatibility,
+    TRACING_CALL_SITE_IDS, TRACING_COMPATIBILITY_CAPABILITY_IDS, WAVE7_AGGREGATE_CAPABILITY_IDS,
+    logger_producer_audit_json, logger_producer_manifest_json, read_capability_inventory,
+    read_cpu_template_helper_audit, read_logger_producer_audit, read_logger_producer_manifest,
+    read_metrics_device_producer_audit, read_metrics_lifecycle_audit,
+    read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
+    read_tracing_audit, source_manifest_json, tracing_audit_json, validate,
+    validate_cpu_template_compatibility, validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
     validate_cpu_template_strip_compatibility, validate_logger_compatibility,
@@ -759,7 +759,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        371
+        376
     );
     assert_eq!(
         inventory
@@ -767,7 +767,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        14
+        9
     );
     assert_eq!(
         inventory
@@ -1907,6 +1907,9 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let specification_benchmark_implemented = SPECIFICATION_BENCHMARK_IMPLEMENTED
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let wave7_aggregate_implemented = WAVE7_AGGREGATE_CAPABILITY_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let impossible = X86_IMPOSSIBLE.into_iter().collect::<BTreeSet<_>>();
 
     assert_eq!(owned.len(), 93, "Wave 7 owner identities must be unique");
@@ -1925,6 +1928,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert_eq!(guest_workflow_implemented.len(), 2);
     assert_eq!(formal_verification_implemented.len(), 1);
     assert_eq!(specification_benchmark_implemented.len(), 3);
+    assert_eq!(wave7_aggregate_implemented.len(), 5);
     assert_eq!(impossible.len(), 13);
     assert!(implemented.is_disjoint(&impossible));
     assert!(logger_implemented.is_disjoint(&implemented));
@@ -2038,6 +2042,11 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     );
     assert!(
         specification_benchmark_implemented
+            .iter()
+            .all(|id| owned.contains(id))
+    );
+    assert!(
+        wave7_aggregate_implemented
             .iter()
             .all(|id| owned.contains(id))
     );
@@ -2281,6 +2290,22 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         );
     }
 
+    for id in &wave7_aggregate_implemented {
+        let capability = by_id.get(id).expect("Wave 7 aggregate identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ImplementedAndVerified,
+            "Wave 7 aggregate identity must be terminal: {id}"
+        );
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+        assert!(capability.exclusion.is_none());
+        assert!(
+            contract.contains(&format!("| `{id}` | #1799 | `implemented-and-verified` |")),
+            "contract must record implemented Wave 7 aggregate result: {id}"
+        );
+    }
+
     for id in &impossible {
         let capability = by_id.get(id).expect("x86 identity must exist");
         assert_eq!(capability.source_refs, [*id]);
@@ -2357,6 +2382,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .chain(cpu_template_fingerprint_compare_implemented.iter())
         .chain(cpu_template_aggregate_implemented.iter())
         .chain(specification_benchmark_implemented.iter())
+        .chain(wave7_aggregate_implemented.iter())
         .chain(impossible.iter())
         .copied()
         .collect::<BTreeSet<_>>();
@@ -2371,6 +2397,9 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert!(formal_verification_implemented.is_disjoint(&guest_workflow_implemented));
     assert!(specification_benchmark_implemented.is_disjoint(&guest_workflow_implemented));
     assert!(specification_benchmark_implemented.is_disjoint(&formal_verification_implemented));
+    assert!(wave7_aggregate_implemented.is_disjoint(&guest_workflow_implemented));
+    assert!(wave7_aggregate_implemented.is_disjoint(&formal_verification_implemented));
+    assert!(wave7_aggregate_implemented.is_disjoint(&specification_benchmark_implemented));
     let selected_without_formal_verification =
         selected_without_guest_workflow_or_formal_verification
             .union(&guest_workflow_implemented)
@@ -2410,8 +2439,8 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     assert!(normalized_contract.contains("../../../docs/macos-guest-workflow.md"));
     assert!(normalized_contract.contains("../../../docs/formal-verification.md"));
     assert!(normalized_contract.contains("../../../docs/specification-benchmarks.md"));
-    assert!(normalized_contract.contains("371 implemented, 14 audit-required"));
-    assert!(normalized_contract.contains("376/9/3/30"));
+    assert!(normalized_contract.contains("376 implemented, nine audit-required"));
+    assert!(normalized_contract.contains("80 implemented and 13 proven-platform-impossible"));
 }
 
 #[test]
@@ -3515,8 +3544,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 371);
-    assert_eq!(count(Disposition::AuditRequired), 14);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
+    assert_eq!(count(Disposition::AuditRequired), 9);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4245,8 +4274,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 371);
-    assert_eq!(count(Disposition::AuditRequired), 14);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
+    assert_eq!(count(Disposition::AuditRequired), 9);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4542,8 +4571,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 371);
-    assert_eq!(count(Disposition::AuditRequired), 14);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
+    assert_eq!(count(Disposition::AuditRequired), 9);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4691,8 +4720,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 371);
-    assert_eq!(count(Disposition::AuditRequired), 14);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
+    assert_eq!(count(Disposition::AuditRequired), 9);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4939,8 +4968,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 371);
-    assert_eq!(count(Disposition::AuditRequired), 14);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
+    assert_eq!(count(Disposition::AuditRequired), 9);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 
