@@ -4,6 +4,8 @@
 #[doc(hidden)]
 pub const VMNET_AUTHORIZATION_PROBE_ARG: &str = "--private-vmnet-authorization-probe";
 
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+mod elevated_probe;
 mod error;
 #[cfg(target_os = "macos")]
 mod grant_manifest;

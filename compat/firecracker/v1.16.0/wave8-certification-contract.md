@@ -99,6 +99,14 @@ local HVF without noninteractive root, missing credentials, a skipped test, or
 an unexecuted harness does not satisfy either gate. These are feasible external
 handoffs and are not platform-impossible classifications.
 
+That #1373 execution gate has since run on the controlled Apple Silicon host.
+The [elevated bootstrap evidence](elevated-bootstrap-evidence.md) records a
+successful unsandboxed root control and a repeated chroot-stage permission
+denial in the exact App Sandbox + Hypervisor worker. The six rows remain
+`audit-required` in this Wave 8 snapshot until #1371 performs its fresh
+ID-specific Challenge and an authoritative inventory transition; the evidence
+result itself does not silently rewrite this checked historical boundary.
+
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
 remain explicit open external branches. The offline validator checks this

@@ -5,6 +5,7 @@ edition.workspace = true
 repository.workspace = true
 
 [features]
+elevated-bootstrap-probe = []
 test-support = []
 
 [dependencies]

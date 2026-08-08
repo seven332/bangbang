@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+elevated-bootstrap-probe = ["bangbang-session/elevated-bootstrap-probe"]
+
 [dependencies]
 bangbang-session = { path = "../session" }
 libc = "0.2"
