@@ -147,6 +147,9 @@ fn launch_elevated_prepared(
         elevated_probe.root_fd(),
     )?
     .spawn()?;
+    // The completed spawn copied the fixed root descriptor into the worker.
+    // Close the launcher-owned copy before any credential transition begins.
+    drop(elevated_probe);
     finish_elevated_exchange(spawned, launch.worker_profile, bootstrap, false)
 }
 
