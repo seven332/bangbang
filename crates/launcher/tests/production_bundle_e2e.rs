@@ -88,11 +88,18 @@ const ELEVATED_READY_RECORD: &[u8] = b"BBEP-READY-V2";
 const ELEVATED_BLOCKED_STATUS: &[u8] = b"status: elevated bootstrap blocked";
 const ELEVATED_INHERITED_MODE: &[u8] = b"inherited-root";
 const ELEVATED_HVF_STAGE: &[u8] = b"hvf-create";
-const ELEVATED_CREDENTIAL_MODE: &[u8] = b"credential-drop";
+const ELEVATED_CREDENTIAL_DROP_MODE: &[u8] = b"credential-drop";
+const ELEVATED_CREDENTIAL_RETAIN_MODE: &[u8] = b"credential-retain-root";
+const ELEVATED_CREDENTIAL_UNMAPPED_MODE: &[u8] = b"credential-unmapped";
+const ELEVATED_CREDENTIAL_CONTROL_MODE: &[u8] = b"credential-control";
 const ELEVATED_CREDENTIAL_STATUS: &[u8] = b"status: elevated credential";
 const ELEVATED_CREDENTIAL_RECORD: &[u8] = b"BBC1";
 const ELEVATED_CREDENTIAL_DATAGRAM: &[u8] = b"BBG1";
 const ELEVATED_CREDENTIAL_STEP: &[u8] = b"restore-groups";
+const ELEVATED_CREDENTIAL_LAUNCHER_ARTIFACT: &[u8] =
+    b"bangbang-elevated-credential-launcher-v1-credential-drop-BBC1-BBG1-restore-groups";
+const ELEVATED_CREDENTIAL_WORKER_ARTIFACT: &[u8] =
+    b"bangbang-elevated-credential-worker-v1-credential-drop-BBC1-BBG1-restore-groups";
 const ELEVATED_PROBE_MARKER: &str = "elevated-bootstrap-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
 const RESTORE_ROOT_ID: &str = "restore-root-1601";
@@ -13055,11 +13062,16 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_BLOCKED_STATUS,
             ELEVATED_INHERITED_MODE,
             ELEVATED_HVF_STAGE,
-            ELEVATED_CREDENTIAL_MODE,
+            ELEVATED_CREDENTIAL_DROP_MODE,
+            ELEVATED_CREDENTIAL_RETAIN_MODE,
+            ELEVATED_CREDENTIAL_UNMAPPED_MODE,
+            ELEVATED_CREDENTIAL_CONTROL_MODE,
             ELEVATED_CREDENTIAL_STATUS,
             ELEVATED_CREDENTIAL_RECORD,
             ELEVATED_CREDENTIAL_DATAGRAM,
             ELEVATED_CREDENTIAL_STEP,
+            ELEVATED_CREDENTIAL_LAUNCHER_ARTIFACT,
+            ELEVATED_CREDENTIAL_WORKER_ARTIFACT,
         ] {
             assert!(
                 !artifact
@@ -13097,6 +13109,8 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_CREDENTIAL_RECORD,
             ELEVATED_CREDENTIAL_DATAGRAM,
             ELEVATED_CREDENTIAL_STEP,
+            ELEVATED_CREDENTIAL_LAUNCHER_ARTIFACT,
+            ELEVATED_CREDENTIAL_WORKER_ARTIFACT,
         ] {
             assert!(
                 !diagnostics
