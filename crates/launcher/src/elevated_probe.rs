@@ -180,6 +180,35 @@ impl Config {
         Ok(())
     }
 
+    pub(crate) fn run_credential_control(
+        &self,
+    ) -> Result<
+        bangbang_session::elevated_credential::CredentialTransition,
+        bangbang_session::elevated_probe::CredentialFailureValue,
+    > {
+        use bangbang_session::elevated_probe::{
+            CredentialFailureValue, CredentialGroupClass, CredentialIdentityClass,
+            CredentialPrefix, CredentialSelfState, CredentialStep,
+        };
+
+        if self.mode != ProbeMode::CredentialControl {
+            return Err(CredentialFailureValue::new(
+                CredentialStep::InitialIdentity,
+                ProbeErrorCategory::InvalidInput,
+                CredentialPrefix::None,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::Other,
+                    CredentialGroupClass::Other,
+                ),
+            ));
+        }
+        bangbang_session::elevated_credential::transition_process(
+            self.mode,
+            self.target_uid,
+            self.target_gid,
+        )
+    }
+
     pub(crate) fn enter_inherited_root(&self) -> Result<(), ProbeFailure> {
         if self.mode != ProbeMode::InheritedRoot {
             return Err(ProbeFailure {

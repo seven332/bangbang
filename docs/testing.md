@@ -2098,7 +2098,8 @@ merged-main OID are checked and recorded by the pull-request workflow.
 
 ## Explicit Elevated Bootstrap Evidence
 
-The #1373 direct-worker and #1884 inherited-root proofs are deliberately
+The #1373 direct-worker, #1884 inherited-root, and #1885 no-chroot credential
+proofs are deliberately
 separate from `scripts/run-integration-tests.sh`. Normal validation never
 invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
 passing skip.
@@ -2111,10 +2112,12 @@ scripts/build-elevated-bootstrap-probe.sh \
 ```
 
 The build compiles normal launcher and worker artifacts first and verifies that
-the V2 probe status, worker activation, Ready, inherited-root, and HVF markers
-are absent. It then builds both ends with the same disabled-by-default feature,
-adds a visible test-only resource marker, and uses the normal production
-packager, signature split, entitlements, Hardened Runtime, and inspections.
+the V2 probe status, worker activation, Ready, inherited-root, HVF, credential
+mode, credential phase, and restoration-step markers are absent. It then builds
+both ends with the same disabled-by-default feature, checks role-specific
+credential markers, adds a visible test-only resource marker, and uses the
+normal production packager, signature split, entitlements, Hardened Runtime,
+and inspections.
 
 On a capable Apple Silicon host, calculate the explicit numeric target before
 elevation and invoke the wrapper yourself:
@@ -2144,13 +2147,27 @@ worker, and an unexpected entry. The wrapper retains the #1373 direct denial,
 an unsandboxed launcher root control, and an unchrooted signed-worker real-HVF
 create/destroy control; it repeats the inherited result three times and runs
 two complete roots concurrently. Cleanup validates all entries before any
-removal and uses only exact reverse `unlink`/`rmdir`, then an independent scan
-must find no root or workspace residue.
+removal and uses only exact reverse `unlink`/`rmdir`.
 
-It reports OS/SDK/architecture and only the value-free terminal result. The
-measured result is `worker-bootstrap` / `other`: in-root `posix_spawn` returned
-success but the worker exited before its earliest application record. Its
-supported conclusion and nonclaims are in the [elevated bootstrap evidence
+The credential branch never calls chroot. It first runs mapped ordinary,
+retained-root, and SDK-maximum unmapped controls in the unsandboxed signed
+launcher. It then transitions the mandatory signed worker first and the fixed
+launcher second over nonce-bound stream and datagram phases. Nonzero cases
+require `setgroups` → `setgid` → `setuid`, exact real/effective target identity,
+Darwin's `effective-only` group-access-list postcondition, and denied uid/gid/
+group restoration. Ordinary and retained-root cases repeat, and two ordinary
+pairs run concurrently against distinct private roots. Final independent scans
+must find no launcher, worker, root, workspace, or named-socket residue.
+
+It reports OS/SDK/architecture and only value-free terminal classes. The
+inherited result remains `worker-bootstrap` / `other`: in-root `posix_spawn`
+returned success but the worker exited before its earliest application record.
+The no-chroot credential result completed mapped ordinary, retained-root
+no-drop, and SDK-maximum unmapped transitions. Stream credentials remained
+connection-time snapshots, datagram credentials were unsupported, opaque
+datagram tokens changed only for credential transitions, and live peer PIDs
+remained exact. Its supported conclusion and nonclaims are in the
+[elevated bootstrap evidence
 contract](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 ## Running Tests

@@ -205,6 +205,7 @@ replacement_root=""
 replacement_root_identity=""
 replacement_candidate=""
 replacement_candidate_identity=""
+cleanup_return=false
 
 bundle_directories=(
   "Contents"
@@ -583,6 +584,9 @@ cleanup() {
     echo "bangbang elevated bootstrap proof: exact cleanup failed" >&2
     exit 5
   fi
+  if [[ "$cleanup_return" == true ]]; then
+    return "$prior_status"
+  fi
   exit "$prior_status"
 }
 trap cleanup EXIT
@@ -674,6 +678,29 @@ assert_case "$probe_root" 2147483647 2147483647 unmapped-syscall 3 \
   "status: elevated bootstrap blocked stage=chroot error=permission-denied"
 assert_case "$probe_root" 0 0 hvf-control 0 \
   "status: elevated bootstrap hvf-control complete"
+
+expected_credential_control="status: elevated credential credential-control complete prefix=irreversible identity=target groups=effective-only"
+expected_credential_retain_control="status: elevated credential credential-control complete prefix=retained-root identity=initial-and-target groups=initial"
+expected_credential_drop="status: elevated credential credential-drop complete stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed datagram-pid=exact"
+expected_credential_retain="status: elevated credential credential-retain-root complete stream-eid=stable-root stream-cred=stable-root stream-pid=exact datagram-cred=unsupported datagram-token=unchanged datagram-pid=exact"
+expected_credential_unmapped="status: elevated credential credential-unmapped complete stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed datagram-pid=exact"
+
+assert_case "$probe_root" "$target_uid" "$target_gid" credential-control 0 \
+  "$expected_credential_control"
+assert_case "$probe_root" 0 0 credential-control 0 \
+  "$expected_credential_retain_control"
+assert_case "$probe_root" 2147483647 2147483647 credential-control 0 \
+  "$expected_credential_control"
+for _ in 1 2 3; do
+  assert_case "$probe_root" "$target_uid" "$target_gid" credential-drop 0 \
+    "$expected_credential_drop"
+done
+for _ in 1 2 3; do
+  assert_case "$probe_root" 0 0 credential-retain-root 0 \
+    "$expected_credential_retain"
+done
+assert_case "$probe_root" 2147483647 2147483647 credential-unmapped 0 \
+  "$expected_credential_unmapped"
 
 create_private_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
   inherited_root inherited_root_identity
@@ -868,6 +895,29 @@ fi
 /bin/unlink "$workspace/case-a"
 /bin/unlink "$workspace/case-b"
 
+set +e
+invoke "$concurrent_root_a" "$target_uid" "$target_gid" credential-drop \
+  > "$workspace/case-a" 2>&1 &
+pid_a=$!
+invoke "$concurrent_root_b" "$target_uid" "$target_gid" credential-drop \
+  > "$workspace/case-b" 2>&1 &
+pid_b=$!
+wait "$pid_a"
+status_a=$?
+wait "$pid_b"
+status_b=$?
+set -e
+output_a="$(<"$workspace/case-a")"
+output_b="$(<"$workspace/case-b")"
+if [[ "$status_a" -ne 0 || "$status_b" -ne 0 \
+  || "$output_a" != "$expected_credential_drop" \
+  || "$output_b" != "$expected_credential_drop" ]]; then
+  echo "bangbang elevated bootstrap proof: credential concurrency case failed" >&2
+  exit 1
+fi
+/bin/unlink "$workspace/case-a"
+/bin/unlink "$workspace/case-b"
+
 create_private_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
   inherited_root_a inherited_root_a_identity
 create_private_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
@@ -914,4 +964,38 @@ fi
 /bin/unlink "$workspace/inherited-case-a"
 /bin/unlink "$workspace/inherited-case-b"
 
-echo "result: inherited-root-worker=blocked stage=worker-bootstrap error=other controls=success cleanup=exact"
+socket_residue=0
+for path in \
+  "$probe_root" \
+  "$inherited_root" \
+  "$inherited_root_a" \
+  "$inherited_root_b" \
+  "$concurrent_root_a" \
+  "$concurrent_root_b" \
+  "$replacement_root" \
+  "$workspace"; do
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    count="$(/usr/bin/find -x "$path" -type s -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+    socket_residue="$((socket_residue + count))"
+  fi
+done
+cleanup_return=true
+cleanup
+
+root_residue="$(/usr/bin/find /private/var/root -maxdepth 1 \
+  \( -name 'bangbang-elevated-probe.*' -o -name 'bangbang-elevated-work.*' \) \
+  -print 2>/dev/null | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+launcher_residue="$({ /usr/bin/pgrep -x bangbang-launcher 2>/dev/null || true; } \
+  | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+worker_residue="$({ /usr/bin/pgrep -x bangbang 2>/dev/null || true; } \
+  | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+if [[ "$socket_residue" -ne 0 || "$root_residue" -ne 0 \
+  || "$launcher_residue" -ne 0 || "$worker_residue" -ne 0 ]]; then
+  echo "bangbang elevated bootstrap proof: final residue scan failed" >&2
+  exit 1
+fi
+
+echo "result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete controls=complete cleanup=exact"
+echo "observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact"
+echo "residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero"
+echo "nonclaims: target-runtime=unmeasured target-resources=unmeasured grants=unmeasured lifecycle-api=unmeasured daemon-crash=unmeasured guest-hvf=unmeasured public-policy=unchanged uid-gid=nonterminal chroot=unresolved aggregate-jailer=nonterminal"

@@ -102,13 +102,17 @@ handoffs and are not platform-impossible classifications.
 That same-host execution gate has since run on the controlled Apple Silicon
 host. The [elevated bootstrap evidence](elevated-bootstrap-evidence.md) records
 #1373's successful unsandboxed root control and repeated direct-worker chroot
-denial, plus #1884's follow-up. In the follow-up, the same unchrooted signed
+denial, plus #1884 and #1885 follow-ups. In #1884, the same unchrooted signed
 worker completed real HVF create/destroy; after the launcher entered an exact
 root containing the complete signed bundle and current dyld, `posix_spawn`
 returned success but the worker exited before the first application record.
+#1885 separately completed worker-first and launcher-second public credential
+transitions without chroot for mapped ordinary and SDK-maximum unmapped classes;
+zero remained retained-root/no-drop. Target runtime/resources, lifecycle/API,
+guest/HVF continuation, and final uid/gid disposition remain unmeasured.
 The six rows remain `audit-required` in this Wave 8 snapshot until #1371
 challenges the result and any remaining credible public alternative per ID and
-an authoritative inventory transition lands. Neither evidence PR silently
+an authoritative inventory transition lands. No evidence PR silently
 rewrites this checked historical boundary.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the

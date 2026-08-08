@@ -57,8 +57,10 @@ handoff, and socket-broker channels. Contained startup config, startup metadata,
 adopt exact read-only grants; block and pmem devices adopt exact repeatable
 read-only/read-write backing grants; logger, metrics, and serial adopt exact
 singleton write-only sink grants; vhost-user endpoints require repeatable
-connect-only directory grants and launcher-returned streams. Arbitrary uid/gid transition, configurable
-chroot ownership, and complete distribution-signing policy remain absent. The
+connect-only directory grants and launcher-returned streams. Public product
+uid/gid transition, configurable chroot ownership, and complete
+distribution-signing policy remain absent; a disabled evidence bundle has
+measured credential bootstrap only. The
 exact seccomp, cgroup, network-namespace, and PID-namespace mechanisms are now
 certified public-macOS exclusions rather than unresolved or silently accepted
 inputs.
@@ -237,7 +239,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 
 | Area | Current status | Review expectation |
 | --- | --- | --- |
-| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate current-user checks with arbitrary uid/gid transition or a private cwd with chroot. |
+| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; no-chroot credential bootstrap measured only in a disabled evidence bundle | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate measured bootstrap with target-owned runtime/resource continuation or a private cwd with chroot. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
@@ -498,7 +500,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
-| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope. | Keep arbitrary uid/gid, configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
+| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; public credential syscalls measured only in the disabled bootstrap harness. | Keep product uid/gid pending target-owned runtime/resource/lifecycle continuation, and keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
@@ -3454,9 +3456,28 @@ create/destroy, so the inherited failure is not a general signing or HVF
 failure. It occurs too early to prove inherited App Sandbox activation, root
 attestation, or HVF, and it does not rule out a separately challenged larger
 fixed Darwin dependency set. No credential transition, API, resource, or guest
-operation occurs in either blocked ordering. The complete boundary,
-alternatives, exact staged-entry cleanup rules, reproduction command, and
-future-OS nonclaim are in the checked
+operation occurs in either blocked chroot ordering.
+
+#1885 separately measured public numeric credential transition without chroot.
+Both fixed signed endpoints completed the ordered supplementary-group clear,
+gid transition, uid transition, exact real/effective postcondition, and denied
+root-restoration checks for mapped ordinary and SDK-maximum unmapped classes.
+Darwin reports the cleared group access list as the current effective gid only;
+the harness therefore requires the value-free `effective-only` class rather
+than misreporting a literal empty list. Zero/zero retained exact root without
+calling a mutating credential primitive and is explicitly no-drop.
+
+The worker transitions first and the launcher second after a nonce-bound
+datagram-possession barrier. Stream `getpeereid` and `LOCAL_PEERCRED` retained
+their documented connection-time root snapshot; connected-datagram
+`LOCAL_PEERCRED` was unsupported; opaque `LOCAL_PEERTOKEN` changed for a real
+transition and remained unchanged for retained-root; live stream/datagram PIDs
+remained exact. Repeated and concurrent runs left no exact process, private
+root, workspace, or named-socket residue. This proves bootstrap syscalls and
+observation classes only, not target-owned runtime/resources, typed grants,
+lifecycle/API, daemon/crash behavior, guest/HVF after transition, public policy,
+or an implemented uid/gid disposition. The complete boundary, alternatives,
+exact cleanup rules, reproduction command, and future-OS nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 The six rows remain audit outcomes until #1371 challenges the controlled result

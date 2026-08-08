@@ -64,6 +64,29 @@ where
             println!("status: elevated bootstrap control complete");
             return Ok(LauncherExit(0));
         }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        if elevated_probe.as_ref().is_some_and(|probe| {
+            probe.mode() == bangbang_session::elevated_probe::ProbeMode::CredentialControl
+        }) {
+            let probe = elevated_probe
+                .as_ref()
+                .ok_or(LauncherError::InvalidLaunchPolicy)?;
+            return match probe.run_credential_control() {
+                Ok(transition) => {
+                    println!(
+                        "status: elevated credential credential-control complete prefix={} identity={} groups={}",
+                        transition.prefix().name(),
+                        transition.state().identity().name(),
+                        transition.state().groups().name()
+                    );
+                    Ok(LauncherExit(0))
+                }
+                Err(failure) => Ok(credential_blocked_value(
+                    bangbang_session::elevated_probe::CredentialRole::Launcher,
+                    failure,
+                )),
+            };
+        }
         if let Some(mut bootstrap) = child_bootstrap {
             let result = (|| {
                 if !request.requests_daemonize()
@@ -124,6 +147,9 @@ fn launch_elevated_prepared(
         elevated_probe.root_fd(),
     )?
     .spawn()?;
+    // The completed spawn copied the fixed root descriptor into the worker.
+    // Close the launcher-owned copy before any credential transition begins.
+    drop(elevated_probe);
     finish_elevated_exchange(spawned, launch.worker_profile, bootstrap, false)
 }
 
@@ -319,6 +345,18 @@ fn finish_elevated_exchange(
         }
         return Err(LauncherError::SessionProtocol);
     }
+    if bootstrap.mode().is_credential_pair() {
+        let (initial, baseline) = match begin_credential_exchange(&mut spawned, bootstrap) {
+            Ok(initial) => initial,
+            Err(failure) => {
+                return Ok(credential_blocked_value(
+                    bangbang_session::elevated_probe::CredentialRole::Launcher,
+                    failure,
+                ));
+            }
+        };
+        return finish_credential_exchange(spawned, bootstrap, initial, baseline);
+    }
     let mut encoded_result = [0_u8; RESULT_RECORD_BYTES];
     if spawned.session.read_exact(&mut encoded_result).is_err() {
         if inherited_root {
@@ -390,6 +428,642 @@ fn finish_elevated_exchange(
         )),
         Ok(()) | Err(_) => Err(LauncherError::SessionProtocol),
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+const fn credential_initial_state(
+    bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+) -> bangbang_session::elevated_probe::CredentialSelfState {
+    use bangbang_session::elevated_probe::{
+        CredentialGroupClass, CredentialIdentityClass, CredentialSelfState,
+    };
+
+    CredentialSelfState::new(
+        if bootstrap.mode().retains_root() {
+            CredentialIdentityClass::InitialAndTarget
+        } else {
+            CredentialIdentityClass::InitialRoot
+        },
+        CredentialGroupClass::Other,
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+const fn credential_protocol_failure(
+    prefix: bangbang_session::elevated_probe::CredentialPrefix,
+    state: bangbang_session::elevated_probe::CredentialSelfState,
+) -> bangbang_session::elevated_probe::CredentialFailureValue {
+    use bangbang_session::elevated_probe::{
+        CredentialFailureValue, CredentialStep, ProbeErrorCategory,
+    };
+
+    CredentialFailureValue::new(
+        CredentialStep::Protocol,
+        ProbeErrorCategory::InvalidInput,
+        prefix,
+        state,
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn begin_credential_exchange(
+    spawned: &mut crate::macos::spawn::SuspendedWorker,
+    bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+) -> Result<
+    (
+        bangbang_session::elevated_probe::PeerObservation,
+        bangbang_session::elevated_credential::PeerBaseline,
+    ),
+    bangbang_session::elevated_probe::CredentialFailureValue,
+> {
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
+
+    use bangbang_session::elevated_probe::{
+        CredentialDatagramPhase, CredentialDatagramProof, CredentialFailureValue, CredentialPrefix,
+        CredentialRole, CredentialStep, ProbeErrorCategory,
+    };
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const CREDENTIAL_LAUNCHER_ARTIFACT: &str =
+        "bangbang-elevated-credential-launcher-v1-credential-drop-BBC1-BBG1-restore-groups";
+
+    std::hint::black_box(CREDENTIAL_LAUNCHER_ARTIFACT);
+
+    let protocol_failure = |category| {
+        CredentialFailureValue::new(
+            CredentialStep::Protocol,
+            category,
+            CredentialPrefix::None,
+            credential_initial_state(bootstrap),
+        )
+    };
+    spawned
+        .grants
+        .set_read_timeout(Some(TIMEOUT))
+        .map_err(|error| protocol_failure(ProbeErrorCategory::from_io_kind(error.kind())))?;
+    spawned
+        .grants
+        .set_write_timeout(Some(TIMEOUT))
+        .map_err(|error| protocol_failure(ProbeErrorCategory::from_io_kind(error.kind())))?;
+    let challenge = CredentialDatagramProof::challenge(bootstrap.mode(), bootstrap.nonce())
+        .map_err(|_| protocol_failure(ProbeErrorCategory::InvalidInput))?;
+    send_credential_datagram(&spawned.grants, challenge).map_err(protocol_failure)?;
+    let worker_ready = receive_credential_datagram(&spawned.grants).map_err(protocol_failure)?;
+    if !worker_ready.matches_expected(
+        bootstrap.mode(),
+        CredentialDatagramPhase::WorkerReady,
+        CredentialRole::Worker,
+        bootstrap.nonce(),
+    ) {
+        return Err(protocol_failure(ProbeErrorCategory::InvalidInput));
+    }
+    // SAFETY: `getpid` has no pointer or ownership contract.
+    let socket_creator = unsafe { libc::getpid() };
+    let (initial, baseline) = bangbang_session::elevated_credential::observe_initial_peer(
+        spawned.session.as_raw_fd(),
+        spawned.grants.as_raw_fd(),
+        spawned.worker.pid(),
+        socket_creator,
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+    )
+    .map_err(|category| {
+        CredentialFailureValue::new(
+            CredentialStep::PeerObservation,
+            category,
+            CredentialPrefix::None,
+            credential_initial_state(bootstrap),
+        )
+    })?;
+    let release = CredentialDatagramProof::launcher_release(bootstrap.mode(), bootstrap.nonce())
+        .map_err(|_| protocol_failure(ProbeErrorCategory::InvalidInput))?;
+    send_credential_datagram(&spawned.grants, release).map_err(protocol_failure)?;
+    Ok((initial, baseline))
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn receive_credential_datagram(
+    grants: &std::os::unix::net::UnixDatagram,
+) -> Result<
+    bangbang_session::elevated_probe::CredentialDatagramProof,
+    bangbang_session::elevated_probe::ProbeErrorCategory,
+> {
+    use bangbang_session::elevated_probe::{
+        CREDENTIAL_DATAGRAM_BYTES, CredentialDatagramProof, ProbeErrorCategory,
+    };
+
+    let mut encoded = [0_u8; CREDENTIAL_DATAGRAM_BYTES + 1];
+    let length = grants
+        .recv(&mut encoded)
+        .map_err(|error| ProbeErrorCategory::from_io_kind(error.kind()))?;
+    if length != CREDENTIAL_DATAGRAM_BYTES {
+        return Err(ProbeErrorCategory::InvalidInput);
+    }
+    let exact = encoded[..CREDENTIAL_DATAGRAM_BYTES]
+        .try_into()
+        .map_err(|_| ProbeErrorCategory::InvalidInput)?;
+    CredentialDatagramProof::decode(exact).map_err(|_| ProbeErrorCategory::InvalidInput)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn send_credential_datagram(
+    grants: &std::os::unix::net::UnixDatagram,
+    proof: bangbang_session::elevated_probe::CredentialDatagramProof,
+) -> Result<(), bangbang_session::elevated_probe::ProbeErrorCategory> {
+    use bangbang_session::elevated_probe::ProbeErrorCategory;
+
+    let encoded = proof.encode();
+    let length = grants
+        .send(&encoded)
+        .map_err(|error| ProbeErrorCategory::from_io_kind(error.kind()))?;
+    if length == encoded.len() {
+        Ok(())
+    } else {
+        Err(ProbeErrorCategory::InvalidInput)
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn finish_credential_exchange(
+    mut spawned: crate::macos::spawn::SuspendedWorker,
+    bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+    initial: bangbang_session::elevated_probe::PeerObservation,
+    baseline: bangbang_session::elevated_credential::PeerBaseline,
+) -> Result<LauncherExit, LauncherError> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    use bangbang_session::elevated_probe::{
+        CREDENTIAL_RECORD_BYTES, CredentialFailureValue, CredentialPrefix, CredentialRecord,
+        CredentialRecordKind, CredentialRole, CredentialStep, PeerObservation,
+    };
+
+    // SAFETY: `getpid` has no pointer or ownership contract and remains stable
+    // across this process's credential transition.
+    let socket_creator = unsafe { libc::getpid() };
+
+    let worker_transitioned = match read_credential_record(&mut spawned.session) {
+        Ok(record)
+            if record.matches_exchange(
+                bootstrap.mode(),
+                CredentialRole::Worker,
+                bootstrap.nonce(),
+            ) =>
+        {
+            match record.kind() {
+                CredentialRecordKind::WorkerTransitioned => record,
+                CredentialRecordKind::Failure => {
+                    let _ = credential_wait_for_exit(&mut spawned, 1);
+                    return credential_blocked_record(record);
+                }
+                CredentialRecordKind::LauncherTransitioned | CredentialRecordKind::WorkerFinal => {
+                    return send_launcher_failure_and_wait(
+                        &mut spawned,
+                        bootstrap,
+                        credential_protocol_failure(
+                            CredentialPrefix::None,
+                            credential_initial_state(bootstrap),
+                        ),
+                        initial,
+                    );
+                }
+            }
+        }
+        Ok(_) | Err(_) => {
+            return send_launcher_failure_and_wait(
+                &mut spawned,
+                bootstrap,
+                credential_protocol_failure(
+                    CredentialPrefix::None,
+                    credential_initial_state(bootstrap),
+                ),
+                initial,
+            );
+        }
+    };
+
+    let after_worker = match bangbang_session::elevated_credential::observe_later_peer(
+        spawned.session.as_raw_fd(),
+        spawned.grants.as_raw_fd(),
+        spawned.worker.pid(),
+        socket_creator,
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+        &baseline,
+    ) {
+        Ok(observation) => observation,
+        Err(category) => {
+            return send_launcher_failure_and_wait(
+                &mut spawned,
+                bootstrap,
+                CredentialFailureValue::new(
+                    CredentialStep::PeerObservation,
+                    category,
+                    CredentialPrefix::None,
+                    credential_initial_state(bootstrap),
+                ),
+                initial,
+            );
+        }
+    };
+    let transition = match bangbang_session::elevated_credential::transition_process(
+        bootstrap.mode(),
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+    ) {
+        Ok(transition) => transition,
+        Err(failure) => {
+            return send_launcher_failure_and_wait(&mut spawned, bootstrap, failure, initial);
+        }
+    };
+    let after_both = match bangbang_session::elevated_credential::observe_later_peer(
+        spawned.session.as_raw_fd(),
+        spawned.grants.as_raw_fd(),
+        spawned.worker.pid(),
+        socket_creator,
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+        &baseline,
+    ) {
+        Ok(observation) => observation,
+        Err(category) => {
+            return send_launcher_failure_and_wait(
+                &mut spawned,
+                bootstrap,
+                CredentialFailureValue::new(
+                    CredentialStep::PeerObservation,
+                    category,
+                    transition.prefix(),
+                    transition.state(),
+                ),
+                initial,
+            );
+        }
+    };
+    let launcher_observations = [initial, after_worker, after_both];
+    let launcher_record = match CredentialRecord::launcher_transitioned(
+        bootstrap.mode(),
+        transition.state(),
+        launcher_observations,
+        bootstrap.nonce(),
+    ) {
+        Ok(record) => record,
+        Err(_) => {
+            return Ok(credential_protocol_blocked_after_reap(
+                &mut spawned,
+                transition.prefix(),
+                transition.state(),
+            ));
+        }
+    };
+    if spawned
+        .session
+        .write_all(&launcher_record.encode())
+        .is_err()
+    {
+        return Ok(credential_protocol_blocked_after_reap(
+            &mut spawned,
+            transition.prefix(),
+            transition.state(),
+        ));
+    }
+
+    let worker_final = match read_credential_record(&mut spawned.session) {
+        Ok(record)
+            if record.matches_exchange(
+                bootstrap.mode(),
+                CredentialRole::Worker,
+                bootstrap.nonce(),
+            ) =>
+        {
+            match record.kind() {
+                CredentialRecordKind::WorkerFinal => record,
+                CredentialRecordKind::Failure => {
+                    let _ = credential_wait_for_exit(&mut spawned, 1);
+                    return credential_blocked_record(record);
+                }
+                CredentialRecordKind::WorkerTransitioned
+                | CredentialRecordKind::LauncherTransitioned => {
+                    return Ok(credential_protocol_blocked_after_reap(
+                        &mut spawned,
+                        transition.prefix(),
+                        transition.state(),
+                    ));
+                }
+            }
+        }
+        Ok(_) | Err(_) => {
+            return Ok(credential_protocol_blocked_after_reap(
+                &mut spawned,
+                transition.prefix(),
+                transition.state(),
+            ));
+        }
+    };
+    if credential_wait_for_exit(&mut spawned, 0).is_err() {
+        return Ok(credential_protocol_blocked_after_reap(
+            &mut spawned,
+            transition.prefix(),
+            transition.state(),
+        ));
+    }
+
+    let worker_initial = worker_transitioned.observations();
+    let worker_observations = worker_final.observations();
+    if worker_initial[0] != worker_observations[0]
+        || worker_initial[1] != worker_observations[1]
+        || !worker_initial[2].is_none()
+    {
+        return Ok(credential_blocked_value(
+            CredentialRole::Launcher,
+            credential_protocol_failure(transition.prefix(), transition.state()),
+        ));
+    }
+    let Some(semantics) =
+        credential_semantics(bootstrap.mode(), launcher_observations, worker_observations)
+    else {
+        return Ok(credential_blocked_value(
+            CredentialRole::Launcher,
+            credential_protocol_failure(transition.prefix(), transition.state()),
+        ));
+    };
+    println!(
+        "status: elevated credential {} complete stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={}",
+        bootstrap.mode().name(),
+        semantics.stream_eid,
+        semantics.stream_cred,
+        semantics.datagram_cred,
+        semantics.datagram_token,
+        semantics.datagram_pid
+    );
+    return Ok(LauncherExit(0));
+
+    fn read_credential_record(
+        stream: &mut std::os::unix::net::UnixStream,
+    ) -> Result<CredentialRecord, ()> {
+        let mut encoded = [0_u8; CREDENTIAL_RECORD_BYTES];
+        stream.read_exact(&mut encoded).map_err(|_| ())?;
+        CredentialRecord::decode(&encoded).map_err(|_| ())
+    }
+
+    fn send_launcher_failure_and_wait(
+        spawned: &mut crate::macos::spawn::SuspendedWorker,
+        bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+        failure: CredentialFailureValue,
+        initial: PeerObservation,
+    ) -> Result<LauncherExit, LauncherError> {
+        let record = match CredentialRecord::failure(
+            bootstrap.mode(),
+            CredentialRole::Launcher,
+            failure,
+            initial,
+            bootstrap.nonce(),
+        ) {
+            Ok(record) => record,
+            Err(_) => {
+                spawned.worker.terminate_and_reap();
+                return Ok(credential_blocked_value(CredentialRole::Launcher, failure));
+            }
+        };
+        let _ = spawned.session.write_all(&record.encode());
+        let _ = credential_wait_for_exit(spawned, 1);
+        Ok(credential_blocked_value(CredentialRole::Launcher, failure))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn credential_protocol_blocked_after_reap(
+    spawned: &mut crate::macos::spawn::SuspendedWorker,
+    prefix: bangbang_session::elevated_probe::CredentialPrefix,
+    state: bangbang_session::elevated_probe::CredentialSelfState,
+) -> LauncherExit {
+    use bangbang_session::elevated_probe::CredentialRole;
+
+    spawned.worker.terminate_and_reap();
+    credential_blocked_value(
+        CredentialRole::Launcher,
+        credential_protocol_failure(prefix, state),
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn credential_wait_for_exit(
+    spawned: &mut crate::macos::spawn::SuspendedWorker,
+    expected: u8,
+) -> Result<(), LauncherError> {
+    use std::time::{Duration, Instant};
+
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    let result = (|| {
+        let deadline = Instant::now()
+            .checked_add(WAIT_TIMEOUT)
+            .ok_or(LauncherError::SessionProtocol)?;
+        loop {
+            if let Some(status) = spawned.worker.try_wait()? {
+                let exit = map_exit_status(status)?;
+                return if exit.code() == expected {
+                    Ok(())
+                } else {
+                    Err(LauncherError::SessionProtocol)
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(LauncherError::SessionProtocol);
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    })();
+    if result.is_err() {
+        spawned.worker.terminate_and_reap();
+    }
+    result
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn credential_blocked_record(
+    record: bangbang_session::elevated_probe::CredentialRecord,
+) -> Result<LauncherExit, LauncherError> {
+    use bangbang_session::elevated_probe::{CredentialFailureValue, CredentialSelfState};
+
+    let (step, category, prefix) = record
+        .failure_value()
+        .ok_or(LauncherError::SessionProtocol)?;
+    Ok(credential_blocked_value(
+        record.role(),
+        CredentialFailureValue::new(
+            step,
+            category,
+            prefix,
+            CredentialSelfState::new(record.identity(), record.groups()),
+        ),
+    ))
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn credential_blocked_value(
+    role: bangbang_session::elevated_probe::CredentialRole,
+    failure: bangbang_session::elevated_probe::CredentialFailureValue,
+) -> LauncherExit {
+    println!(
+        "status: elevated credential blocked role={} step={} error={} prefix={} identity={} groups={}",
+        role.name(),
+        failure.step().name(),
+        failure.category().name(),
+        failure.prefix().name(),
+        failure.state().identity().name(),
+        failure.state().groups().name()
+    );
+    LauncherExit(3)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+struct CredentialSemantics {
+    stream_eid: &'static str,
+    stream_cred: &'static str,
+    datagram_cred: &'static str,
+    datagram_token: &'static str,
+    datagram_pid: &'static str,
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn credential_semantics(
+    mode: bangbang_session::elevated_probe::ProbeMode,
+    launcher: [bangbang_session::elevated_probe::PeerObservation; 3],
+    worker: [bangbang_session::elevated_probe::PeerObservation; 3],
+) -> Option<CredentialSemantics> {
+    use bangbang_session::elevated_probe::{PeerPidClass, PeerTokenClass};
+
+    if launcher
+        .iter()
+        .chain(worker.iter())
+        .any(|observation| observation.stream_pid() != PeerPidClass::Exact)
+    {
+        return None;
+    }
+    let datagram_pid = if launcher
+        .iter()
+        .chain(worker.iter())
+        .all(|observation| observation.datagram_pid() == PeerPidClass::Unsupported)
+    {
+        "unsupported"
+    } else if launcher
+        .iter()
+        .all(|observation| observation.datagram_pid() == PeerPidClass::Exact)
+        && worker
+            .iter()
+            .all(|observation| observation.datagram_pid() == PeerPidClass::Exact)
+    {
+        "exact"
+    } else if launcher
+        .iter()
+        .all(|observation| observation.datagram_pid() == PeerPidClass::SocketCreator)
+        && worker
+            .iter()
+            .all(|observation| observation.datagram_pid() == PeerPidClass::Exact)
+    {
+        "creator-snapshot"
+    } else {
+        return None;
+    };
+    let stream_eid = identity_semantic(mode, launcher, worker, |value| value.stream_eid())?;
+    let stream_cred = identity_semantic(mode, launcher, worker, |value| value.stream_cred())?;
+    let datagram_cred = identity_semantic(mode, launcher, worker, |value| value.datagram_cred())?;
+    let tokens = [
+        launcher[0].datagram_token(),
+        launcher[1].datagram_token(),
+        launcher[2].datagram_token(),
+        worker[0].datagram_token(),
+        worker[1].datagram_token(),
+        worker[2].datagram_token(),
+    ];
+    let datagram_token = if tokens
+        .iter()
+        .all(|value| *value == PeerTokenClass::Unsupported)
+    {
+        "unsupported"
+    } else if tokens[0] == PeerTokenClass::Baseline
+        && tokens[3] == PeerTokenClass::Baseline
+        && tokens[1..3]
+            .iter()
+            .chain(tokens[4..6].iter())
+            .all(|value| *value == PeerTokenClass::Unchanged)
+    {
+        "unchanged"
+    } else if tokens[0] == PeerTokenClass::Baseline
+        && tokens[3] == PeerTokenClass::Baseline
+        && tokens[1..3]
+            .iter()
+            .chain(tokens[4..6].iter())
+            .all(|value| matches!(value, PeerTokenClass::Unchanged | PeerTokenClass::Changed))
+        && tokens.contains(&PeerTokenClass::Changed)
+    {
+        "changed"
+    } else {
+        return None;
+    };
+    Some(CredentialSemantics {
+        stream_eid,
+        stream_cred,
+        datagram_cred,
+        datagram_token,
+        datagram_pid,
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn identity_semantic<F>(
+    mode: bangbang_session::elevated_probe::ProbeMode,
+    launcher: [bangbang_session::elevated_probe::PeerObservation; 3],
+    worker: [bangbang_session::elevated_probe::PeerObservation; 3],
+    select: F,
+) -> Option<&'static str>
+where
+    F: Fn(
+        bangbang_session::elevated_probe::PeerObservation,
+    ) -> bangbang_session::elevated_probe::CredentialIdentityClass,
+{
+    use bangbang_session::elevated_probe::CredentialIdentityClass::{
+        InitialAndTarget, InitialRoot, Other, Target, Unsupported,
+    };
+
+    let launcher = launcher.map(&select);
+    let worker = worker.map(&select);
+    let values = [
+        launcher[0],
+        launcher[1],
+        launcher[2],
+        worker[0],
+        worker[1],
+        worker[2],
+    ];
+    if values.iter().all(|value| *value == Unsupported) {
+        return Some("unsupported");
+    }
+    if values
+        .iter()
+        .any(|value| matches!(value, Other | Unsupported))
+    {
+        return None;
+    }
+    if mode.retains_root() {
+        return values
+            .iter()
+            .all(|value| *value == InitialAndTarget)
+            .then_some("stable-root");
+    }
+    if values.iter().all(|value| *value == InitialRoot) {
+        return Some("snapshot");
+    }
+    if launcher == [InitialRoot, Target, Target] && worker == [InitialRoot, InitialRoot, Target] {
+        return Some("dynamic");
+    }
+    values
+        .iter()
+        .all(|value| matches!(value, InitialRoot | Target))
+        .then_some("mixed")
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -514,5 +1188,201 @@ mod tests {
             map_exit_status(status).expect("signal status should map"),
             LauncherExit(128 + u8::try_from(libc::SIGTERM).expect("signal should fit"))
         );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    fn peer_observation(
+        identity: bangbang_session::elevated_probe::CredentialIdentityClass,
+        datagram_pid: bangbang_session::elevated_probe::PeerPidClass,
+        token: bangbang_session::elevated_probe::PeerTokenClass,
+    ) -> bangbang_session::elevated_probe::PeerObservation {
+        use bangbang_session::elevated_probe::{
+            CredentialIdentityClass, PeerObservation, PeerPidClass,
+        };
+
+        PeerObservation::new(
+            identity,
+            identity,
+            PeerPidClass::Exact,
+            CredentialIdentityClass::Unsupported,
+            datagram_pid,
+            token,
+        )
+        .expect("complete peer observation")
+    }
+
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    #[test]
+    fn credential_protocol_failure_preserves_each_completed_transition_prefix() {
+        use bangbang_session::elevated_probe::{
+            CredentialGroupClass, CredentialIdentityClass, CredentialPrefix, CredentialSelfState,
+        };
+
+        for (prefix, state) in [
+            (
+                CredentialPrefix::Irreversible,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::Target,
+                    CredentialGroupClass::EffectiveOnly,
+                ),
+            ),
+            (
+                CredentialPrefix::RetainedRoot,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::InitialAndTarget,
+                    CredentialGroupClass::Initial,
+                ),
+            ),
+        ] {
+            let failure = credential_protocol_failure(prefix, state);
+
+            assert_eq!(failure.prefix(), prefix);
+            assert_eq!(failure.state(), state);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    #[test]
+    fn credential_semantics_distinguish_snapshot_dynamic_and_retained_root() {
+        use bangbang_session::elevated_probe::{
+            CredentialIdentityClass::{InitialAndTarget, InitialRoot, Other, Target},
+            PeerPidClass, PeerTokenClass, ProbeMode,
+        };
+
+        let snapshot = [
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Baseline),
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Unchanged),
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Unchanged),
+        ];
+        assert_eq!(
+            identity_semantic(ProbeMode::CredentialDrop, snapshot, snapshot, |value| value
+                .stream_eid()),
+            Some("snapshot")
+        );
+
+        let launcher = [
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Baseline),
+            peer_observation(Target, PeerPidClass::Exact, PeerTokenClass::Changed),
+            peer_observation(Target, PeerPidClass::Exact, PeerTokenClass::Changed),
+        ];
+        let worker = [
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Baseline),
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Unchanged),
+            peer_observation(Target, PeerPidClass::Exact, PeerTokenClass::Changed),
+        ];
+        assert_eq!(
+            identity_semantic(ProbeMode::CredentialDrop, launcher, worker, |value| value
+                .stream_eid()),
+            Some("dynamic")
+        );
+
+        let retained = [
+            peer_observation(
+                InitialAndTarget,
+                PeerPidClass::Exact,
+                PeerTokenClass::Baseline,
+            ),
+            peer_observation(
+                InitialAndTarget,
+                PeerPidClass::Exact,
+                PeerTokenClass::Unchanged,
+            ),
+            peer_observation(
+                InitialAndTarget,
+                PeerPidClass::Exact,
+                PeerTokenClass::Unchanged,
+            ),
+        ];
+        assert_eq!(
+            identity_semantic(
+                ProbeMode::CredentialRetainRoot,
+                retained,
+                retained,
+                |value| value.stream_eid(),
+            ),
+            Some("stable-root")
+        );
+
+        let invalid = [
+            peer_observation(Other, PeerPidClass::Exact, PeerTokenClass::Baseline),
+            peer_observation(Other, PeerPidClass::Exact, PeerTokenClass::Unchanged),
+            peer_observation(Other, PeerPidClass::Exact, PeerTokenClass::Unchanged),
+        ];
+        assert_eq!(
+            identity_semantic(ProbeMode::CredentialDrop, invalid, snapshot, |value| value
+                .stream_eid()),
+            None
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    #[test]
+    fn credential_summary_requires_exact_stream_pid_and_bounded_datagram_creator_shape() {
+        use bangbang_session::elevated_probe::{
+            CredentialIdentityClass::InitialRoot, PeerPidClass, PeerTokenClass, ProbeMode,
+        };
+
+        let launcher = [
+            peer_observation(
+                InitialRoot,
+                PeerPidClass::SocketCreator,
+                PeerTokenClass::Baseline,
+            ),
+            peer_observation(
+                InitialRoot,
+                PeerPidClass::SocketCreator,
+                PeerTokenClass::Changed,
+            ),
+            peer_observation(
+                InitialRoot,
+                PeerPidClass::SocketCreator,
+                PeerTokenClass::Changed,
+            ),
+        ];
+        let worker = [
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Baseline),
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Unchanged),
+            peer_observation(InitialRoot, PeerPidClass::Exact, PeerTokenClass::Changed),
+        ];
+        let summary = credential_semantics(ProbeMode::CredentialDrop, launcher, worker)
+            .expect("bounded creator snapshot should summarize");
+        assert_eq!(summary.stream_eid, "snapshot");
+        assert_eq!(summary.datagram_cred, "unsupported");
+        assert_eq!(summary.datagram_token, "changed");
+        assert_eq!(summary.datagram_pid, "creator-snapshot");
+
+        let unsupported_pid = launcher.map(|value| {
+            peer_observation(
+                value.stream_eid(),
+                PeerPidClass::Unsupported,
+                value.datagram_token(),
+            )
+        });
+        let unsupported_worker_pid = worker.map(|value| {
+            peer_observation(
+                value.stream_eid(),
+                PeerPidClass::Unsupported,
+                value.datagram_token(),
+            )
+        });
+        assert_eq!(
+            credential_semantics(
+                ProbeMode::CredentialDrop,
+                unsupported_pid,
+                unsupported_worker_pid,
+            )
+            .expect("uniform unsupported datagram PID should summarize")
+            .datagram_pid,
+            "unsupported"
+        );
+
+        let mismatched = launcher.map(|value| {
+            peer_observation(
+                value.stream_eid(),
+                PeerPidClass::Mismatch,
+                value.datagram_token(),
+            )
+        });
+        assert!(credential_semantics(ProbeMode::CredentialDrop, mismatched, worker).is_none());
     }
 }

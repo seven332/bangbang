@@ -16,10 +16,17 @@ pub const READY_RECORD: [u8; 16] = *b"BBEP-READY-V2\0\0\0";
 pub const BOOTSTRAP_RECORD_BYTES: usize = 64;
 /// Encoded terminal result record length.
 pub const RESULT_RECORD_BYTES: usize = 48;
+/// Encoded credential phase record length.
+pub const CREDENTIAL_RECORD_BYTES: usize = 80;
+/// Encoded credential datagram-possession record length.
+pub const CREDENTIAL_DATAGRAM_BYTES: usize = 48;
 
 const VERSION: u16 = 2;
 const BOOTSTRAP_MAGIC: [u8; 4] = *b"BBE2";
 const RESULT_MAGIC: [u8; 4] = *b"BBR2";
+const CREDENTIAL_VERSION: u16 = 1;
+const CREDENTIAL_MAGIC: [u8; 4] = *b"BBC1";
+const CREDENTIAL_DATAGRAM_MAGIC: [u8; 4] = *b"BBG1";
 
 /// Exact evidence mode selected by the explicit root wrapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +44,14 @@ pub enum ProbeMode {
     HvfControl = 5,
     /// Inherit a launcher-entered root and run the sandbox/HVF evidence sequence.
     InheritedRoot = 6,
+    /// Drop both signed endpoints to one mapped nonzero numeric identity without chroot.
+    CredentialDrop = 7,
+    /// Retain exact root on both signed endpoints without calling credential mutators.
+    CredentialRetainRoot = 8,
+    /// Exercise the SDK-maximum unmapped numeric identity without chroot.
+    CredentialUnmapped = 9,
+    /// Run the same no-chroot credential primitive in the unsandboxed launcher.
+    CredentialControl = 10,
 }
 
 impl ProbeMode {
@@ -49,6 +64,10 @@ impl ProbeMode {
             "control" => Self::Control,
             "hvf-control" => Self::HvfControl,
             "inherited-root" => Self::InheritedRoot,
+            "credential-drop" => Self::CredentialDrop,
+            "credential-retain-root" => Self::CredentialRetainRoot,
+            "credential-unmapped" => Self::CredentialUnmapped,
+            "credential-control" => Self::CredentialControl,
             _ => return None,
         };
         mode.accepts_target(uid, gid).then_some(mode)
@@ -64,6 +83,10 @@ impl ProbeMode {
             Self::Control => "control",
             Self::HvfControl => "hvf-control",
             Self::InheritedRoot => "inherited-root",
+            Self::CredentialDrop => "credential-drop",
+            Self::CredentialRetainRoot => "credential-retain-root",
+            Self::CredentialUnmapped => "credential-unmapped",
+            Self::CredentialControl => "credential-control",
         }
     }
 
@@ -71,11 +94,29 @@ impl ProbeMode {
     #[must_use]
     pub const fn accepts_target(self, uid: u32, gid: u32) -> bool {
         match self {
-            Self::Drop | Self::UnmappedSyscall => uid != 0 && gid != 0,
+            Self::Drop | Self::UnmappedSyscall | Self::CredentialDrop => uid != 0 && gid != 0,
+            Self::CredentialUnmapped => uid == 2_147_483_647 && gid == 2_147_483_647,
             Self::RetainRoot | Self::Control | Self::HvfControl | Self::InheritedRoot => {
                 uid == 0 && gid == 0
             }
+            Self::CredentialRetainRoot => uid == 0 && gid == 0,
+            Self::CredentialControl => (uid == 0) == (gid == 0),
         }
+    }
+
+    /// Returns whether this mode runs the paired no-chroot credential protocol.
+    #[must_use]
+    pub const fn is_credential_pair(self) -> bool {
+        matches!(
+            self,
+            Self::CredentialDrop | Self::CredentialRetainRoot | Self::CredentialUnmapped
+        )
+    }
+
+    /// Returns whether this mode retains exact root without credential mutation.
+    #[must_use]
+    pub const fn retains_root(self) -> bool {
+        matches!(self, Self::CredentialRetainRoot)
     }
 
     fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
@@ -86,6 +127,10 @@ impl ProbeMode {
             4 => Ok(Self::Control),
             5 => Ok(Self::HvfControl),
             6 => Ok(Self::InheritedRoot),
+            7 => Ok(Self::CredentialDrop),
+            8 => Ok(Self::CredentialRetainRoot),
+            9 => Ok(Self::CredentialUnmapped),
+            10 => Ok(Self::CredentialControl),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -225,6 +270,1022 @@ impl ProbeErrorCategory {
     }
 }
 
+/// Fixed process role in the credential evidence exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CredentialRole {
+    /// The unsandboxed outer launcher endpoint.
+    Launcher = 1,
+    /// The mandatory App Sandbox and Hypervisor worker endpoint.
+    Worker = 2,
+}
+
+impl CredentialRole {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            1 => Ok(Self::Launcher),
+            2 => Ok(Self::Worker),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+
+    /// Returns the stable value-free role spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Launcher => "launcher",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+/// Exact phase in the credential datagram possession barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CredentialDatagramPhase {
+    /// Launcher proves possession after sending the stream bootstrap.
+    Challenge = 1,
+    /// Worker proves possession while both endpoints remain root.
+    WorkerReady = 2,
+    /// Launcher releases the worker only after its own initial observation.
+    LauncherRelease = 3,
+}
+
+impl CredentialDatagramPhase {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            1 => Ok(Self::Challenge),
+            2 => Ok(Self::WorkerReady),
+            3 => Ok(Self::LauncherRelease),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// Nonce-bound proof that the expected process owns the inherited datagram endpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CredentialDatagramProof {
+    mode: ProbeMode,
+    phase: CredentialDatagramPhase,
+    role: CredentialRole,
+    nonce: SessionId,
+}
+
+impl CredentialDatagramProof {
+    /// Constructs the launcher challenge.
+    pub fn challenge(mode: ProbeMode, nonce: SessionId) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            CredentialDatagramPhase::Challenge,
+            CredentialRole::Launcher,
+            nonce,
+        )
+    }
+
+    /// Constructs the worker possession response.
+    pub fn worker_ready(mode: ProbeMode, nonce: SessionId) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            CredentialDatagramPhase::WorkerReady,
+            CredentialRole::Worker,
+            nonce,
+        )
+    }
+
+    /// Constructs the launcher release barrier.
+    pub fn launcher_release(mode: ProbeMode, nonce: SessionId) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            CredentialDatagramPhase::LauncherRelease,
+            CredentialRole::Launcher,
+            nonce,
+        )
+    }
+
+    fn new(
+        mode: ProbeMode,
+        phase: CredentialDatagramPhase,
+        role: CredentialRole,
+        nonce: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        let expected_role = match phase {
+            CredentialDatagramPhase::Challenge | CredentialDatagramPhase::LauncherRelease => {
+                CredentialRole::Launcher
+            }
+            CredentialDatagramPhase::WorkerReady => CredentialRole::Worker,
+        };
+        if !mode.is_credential_pair() || nonce.is_pre_session() || role != expected_role {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            mode,
+            phase,
+            role,
+            nonce,
+        })
+    }
+
+    /// Returns the selected credential mode.
+    #[must_use]
+    pub const fn mode(self) -> ProbeMode {
+        self.mode
+    }
+
+    /// Returns the exact barrier phase.
+    #[must_use]
+    pub const fn phase(self) -> CredentialDatagramPhase {
+        self.phase
+    }
+
+    /// Returns the sending process role.
+    #[must_use]
+    pub const fn role(self) -> CredentialRole {
+        self.role
+    }
+
+    /// Returns the command nonce.
+    #[must_use]
+    pub const fn nonce(self) -> SessionId {
+        self.nonce
+    }
+
+    /// Returns whether this proof is the exact next barrier frame.
+    #[must_use]
+    pub fn matches_expected(
+        self,
+        mode: ProbeMode,
+        phase: CredentialDatagramPhase,
+        role: CredentialRole,
+        nonce: SessionId,
+    ) -> bool {
+        self.mode == mode && self.phase == phase && self.role == role && self.nonce == nonce
+    }
+
+    /// Encodes the exact datagram record.
+    #[must_use]
+    pub fn encode(self) -> [u8; CREDENTIAL_DATAGRAM_BYTES] {
+        let mut bytes = [0_u8; CREDENTIAL_DATAGRAM_BYTES];
+        bytes[0..4].copy_from_slice(&CREDENTIAL_DATAGRAM_MAGIC);
+        bytes[4..6].copy_from_slice(&CREDENTIAL_VERSION.to_be_bytes());
+        bytes[6] = self.mode as u8;
+        bytes[7] = self.phase as u8;
+        bytes[8] = self.role as u8;
+        bytes[16..48].copy_from_slice(self.nonce.as_bytes());
+        bytes
+    }
+
+    /// Decodes and validates one exact datagram record.
+    pub fn decode(bytes: &[u8; CREDENTIAL_DATAGRAM_BYTES]) -> Result<Self, ProbeProtocolError> {
+        if bytes[0..4] != CREDENTIAL_DATAGRAM_MAGIC
+            || bytes[4..6] != CREDENTIAL_VERSION.to_be_bytes()
+            || bytes[9..16] != [0; 7]
+        {
+            return Err(ProbeProtocolError);
+        }
+        Self::new(
+            ProbeMode::from_byte(bytes[6])?,
+            CredentialDatagramPhase::from_byte(bytes[7])?,
+            CredentialRole::from_byte(bytes[8])?,
+            SessionId::from_bytes(array(bytes, 16)?),
+        )
+    }
+}
+
+impl fmt::Debug for CredentialDatagramProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialDatagramProof(<redacted>)")
+    }
+}
+
+/// Stable credential operation or validation step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CredentialStep {
+    /// Validate initial real/effective root and capture supplementary groups.
+    InitialIdentity = 1,
+    /// Clear the supplementary group list.
+    ClearGroups = 2,
+    /// Validate the cleared supplementary group list.
+    ValidateClearedGroups = 3,
+    /// Set the target real/effective/saved group identity.
+    SetGid = 4,
+    /// Set the target real/effective/saved user identity.
+    SetUid = 5,
+    /// Validate final real/effective identity and supplementary groups.
+    ValidateFinalIdentity = 6,
+    /// Prove user identity zero cannot be restored.
+    RestoreUid = 7,
+    /// Prove group identity zero cannot be restored.
+    RestoreGid = 8,
+    /// Prove root supplementary groups cannot be restored.
+    RestoreGroups = 9,
+    /// Observe connected stream and datagram peer surfaces.
+    PeerObservation = 10,
+    /// Validate the closed multi-phase credential exchange.
+    Protocol = 11,
+}
+
+impl CredentialStep {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            1 => Ok(Self::InitialIdentity),
+            2 => Ok(Self::ClearGroups),
+            3 => Ok(Self::ValidateClearedGroups),
+            4 => Ok(Self::SetGid),
+            5 => Ok(Self::SetUid),
+            6 => Ok(Self::ValidateFinalIdentity),
+            7 => Ok(Self::RestoreUid),
+            8 => Ok(Self::RestoreGid),
+            9 => Ok(Self::RestoreGroups),
+            10 => Ok(Self::PeerObservation),
+            11 => Ok(Self::Protocol),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+
+    /// Returns the stable value-free step spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::InitialIdentity => "initial-identity",
+            Self::ClearGroups => "clear-groups",
+            Self::ValidateClearedGroups => "validate-cleared-groups",
+            Self::SetGid => "set-gid",
+            Self::SetUid => "set-uid",
+            Self::ValidateFinalIdentity => "validate-final-identity",
+            Self::RestoreUid => "restore-uid",
+            Self::RestoreGid => "restore-gid",
+            Self::RestoreGroups => "restore-groups",
+            Self::PeerObservation => "peer-observation",
+            Self::Protocol => "protocol",
+        }
+    }
+}
+
+/// Last complete prefix of the ordered credential transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CredentialPrefix {
+    /// No credential transition step completed.
+    None = 0,
+    /// Initial root identity and groups were validated.
+    Initial = 1,
+    /// Supplementary groups were cleared and revalidated.
+    GroupsCleared = 2,
+    /// Target gid was installed.
+    GidSet = 3,
+    /// Target uid was installed.
+    UidSet = 4,
+    /// Final target identity and effective-group-only access list were validated.
+    FinalIdentity = 5,
+    /// Root restoration attempts all failed and final state remained exact.
+    Irreversible = 6,
+    /// Retained-root state remained identical without credential mutation.
+    RetainedRoot = 7,
+}
+
+impl CredentialPrefix {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Initial),
+            2 => Ok(Self::GroupsCleared),
+            3 => Ok(Self::GidSet),
+            4 => Ok(Self::UidSet),
+            5 => Ok(Self::FinalIdentity),
+            6 => Ok(Self::Irreversible),
+            7 => Ok(Self::RetainedRoot),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+
+    /// Returns the stable value-free prefix spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Initial => "initial",
+            Self::GroupsCleared => "groups-cleared",
+            Self::GidSet => "gid-set",
+            Self::UidSet => "uid-set",
+            Self::FinalIdentity => "final-identity",
+            Self::Irreversible => "irreversible",
+            Self::RetainedRoot => "retained-root",
+        }
+    }
+}
+
+/// Value-free classification of one process or peer identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CredentialIdentityClass {
+    /// No identity was observed in this record slot.
+    NotObserved = 0,
+    /// Exact initial root identity.
+    InitialRoot = 1,
+    /// Exact requested nonzero target identity.
+    Target = 2,
+    /// Root is both the initial and requested retained identity.
+    InitialAndTarget = 3,
+    /// A supported query returned another identity class.
+    Other = 4,
+    /// The public query is unsupported for this socket surface.
+    Unsupported = 5,
+}
+
+impl CredentialIdentityClass {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            0 => Ok(Self::NotObserved),
+            1 => Ok(Self::InitialRoot),
+            2 => Ok(Self::Target),
+            3 => Ok(Self::InitialAndTarget),
+            4 => Ok(Self::Other),
+            5 => Ok(Self::Unsupported),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+
+    /// Returns the stable value-free identity spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not-observed",
+            Self::InitialRoot => "initial-root",
+            Self::Target => "target",
+            Self::InitialAndTarget => "initial-and-target",
+            Self::Other => "other",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Value-free classification of one process supplementary-group state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CredentialGroupClass {
+    /// No group state was observed in this record slot.
+    NotObserved = 0,
+    /// Exact initial supplementary groups were retained.
+    Initial = 1,
+    /// Darwin reports only the current effective gid after supplementary groups are cleared.
+    EffectiveOnly = 2,
+    /// Another group state was observed.
+    Other = 3,
+}
+
+impl CredentialGroupClass {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            0 => Ok(Self::NotObserved),
+            1 => Ok(Self::Initial),
+            2 => Ok(Self::EffectiveOnly),
+            3 => Ok(Self::Other),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+
+    /// Returns the stable value-free supplementary-group spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not-observed",
+            Self::Initial => "initial",
+            Self::EffectiveOnly => "effective-only",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Value-free final self state reported by one credential endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CredentialSelfState {
+    identity: CredentialIdentityClass,
+    groups: CredentialGroupClass,
+}
+
+impl CredentialSelfState {
+    /// Constructs one final self-state classification.
+    #[must_use]
+    pub const fn new(identity: CredentialIdentityClass, groups: CredentialGroupClass) -> Self {
+        Self { identity, groups }
+    }
+
+    /// Returns the identity class.
+    #[must_use]
+    pub const fn identity(self) -> CredentialIdentityClass {
+        self.identity
+    }
+
+    /// Returns the supplementary-group class.
+    #[must_use]
+    pub const fn groups(self) -> CredentialGroupClass {
+        self.groups
+    }
+}
+
+/// Value-free failure details carried by a credential phase record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CredentialFailureValue {
+    step: CredentialStep,
+    category: ProbeErrorCategory,
+    prefix: CredentialPrefix,
+    state: CredentialSelfState,
+}
+
+impl CredentialFailureValue {
+    /// Constructs one exact failure value.
+    #[must_use]
+    pub const fn new(
+        step: CredentialStep,
+        category: ProbeErrorCategory,
+        prefix: CredentialPrefix,
+        state: CredentialSelfState,
+    ) -> Self {
+        Self {
+            step,
+            category,
+            prefix,
+            state,
+        }
+    }
+
+    /// Returns the failed operation or validation step.
+    #[must_use]
+    pub const fn step(self) -> CredentialStep {
+        self.step
+    }
+
+    /// Returns the redacted operating-system category.
+    #[must_use]
+    pub const fn category(self) -> ProbeErrorCategory {
+        self.category
+    }
+
+    /// Returns the last complete ordered prefix.
+    #[must_use]
+    pub const fn prefix(self) -> CredentialPrefix {
+        self.prefix
+    }
+
+    /// Returns the value-free self state at failure.
+    #[must_use]
+    pub const fn state(self) -> CredentialSelfState {
+        self.state
+    }
+}
+
+/// Live PID observation for one connected local socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PeerPidClass {
+    /// No PID query was made in this record slot.
+    NotObserved = 0,
+    /// The public query returned the exact expected live PID.
+    Exact = 1,
+    /// The public query retained the fixed socketpair creator PID.
+    SocketCreator = 2,
+    /// The public query returned another positive PID.
+    Mismatch = 3,
+    /// The public query is unsupported for this socket surface.
+    Unsupported = 4,
+}
+
+impl PeerPidClass {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            0 => Ok(Self::NotObserved),
+            1 => Ok(Self::Exact),
+            2 => Ok(Self::SocketCreator),
+            3 => Ok(Self::Mismatch),
+            4 => Ok(Self::Unsupported),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// Opaque audit-token observation relative to the initial connected peer token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PeerTokenClass {
+    /// No token query was made in this record slot.
+    NotObserved = 0,
+    /// The initial opaque peer token was captured.
+    Baseline = 1,
+    /// The later opaque peer token is byte-for-byte unchanged.
+    Unchanged = 2,
+    /// The later opaque peer token changed without decoding its fields.
+    Changed = 3,
+    /// The public query is unsupported for this socket surface.
+    Unsupported = 4,
+}
+
+impl PeerTokenClass {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            0 => Ok(Self::NotObserved),
+            1 => Ok(Self::Baseline),
+            2 => Ok(Self::Unchanged),
+            3 => Ok(Self::Changed),
+            4 => Ok(Self::Unsupported),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// Bounded semantic observations for one stream/datagram peer boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerObservation {
+    stream_eid: CredentialIdentityClass,
+    stream_cred: CredentialIdentityClass,
+    stream_pid: PeerPidClass,
+    datagram_cred: CredentialIdentityClass,
+    datagram_pid: PeerPidClass,
+    datagram_token: PeerTokenClass,
+}
+
+impl PeerObservation {
+    /// The exact empty observation used for a phase that has not run.
+    pub const NONE: Self = Self {
+        stream_eid: CredentialIdentityClass::NotObserved,
+        stream_cred: CredentialIdentityClass::NotObserved,
+        stream_pid: PeerPidClass::NotObserved,
+        datagram_cred: CredentialIdentityClass::NotObserved,
+        datagram_pid: PeerPidClass::NotObserved,
+        datagram_token: PeerTokenClass::NotObserved,
+    };
+
+    /// Constructs one complete value-free observation.
+    pub fn new(
+        stream_eid: CredentialIdentityClass,
+        stream_cred: CredentialIdentityClass,
+        stream_pid: PeerPidClass,
+        datagram_cred: CredentialIdentityClass,
+        datagram_pid: PeerPidClass,
+        datagram_token: PeerTokenClass,
+    ) -> Result<Self, ProbeProtocolError> {
+        if matches!(stream_eid, CredentialIdentityClass::NotObserved)
+            || matches!(stream_cred, CredentialIdentityClass::NotObserved)
+            || matches!(stream_pid, PeerPidClass::NotObserved)
+            || matches!(datagram_cred, CredentialIdentityClass::NotObserved)
+            || matches!(datagram_pid, PeerPidClass::NotObserved)
+            || matches!(datagram_token, PeerTokenClass::NotObserved)
+        {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            stream_eid,
+            stream_cred,
+            stream_pid,
+            datagram_cred,
+            datagram_pid,
+            datagram_token,
+        })
+    }
+
+    /// Returns whether no observation was recorded.
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        matches!(self.stream_eid, CredentialIdentityClass::NotObserved)
+            && matches!(self.stream_cred, CredentialIdentityClass::NotObserved)
+            && matches!(self.stream_pid, PeerPidClass::NotObserved)
+            && matches!(self.datagram_cred, CredentialIdentityClass::NotObserved)
+            && matches!(self.datagram_pid, PeerPidClass::NotObserved)
+            && matches!(self.datagram_token, PeerTokenClass::NotObserved)
+    }
+
+    /// Returns the stream `getpeereid` class.
+    #[must_use]
+    pub const fn stream_eid(self) -> CredentialIdentityClass {
+        self.stream_eid
+    }
+
+    /// Returns the stream `LOCAL_PEERCRED` class.
+    #[must_use]
+    pub const fn stream_cred(self) -> CredentialIdentityClass {
+        self.stream_cred
+    }
+
+    /// Returns the stream live-PID class.
+    #[must_use]
+    pub const fn stream_pid(self) -> PeerPidClass {
+        self.stream_pid
+    }
+
+    /// Returns the datagram `LOCAL_PEERCRED` class.
+    #[must_use]
+    pub const fn datagram_cred(self) -> CredentialIdentityClass {
+        self.datagram_cred
+    }
+
+    /// Returns the datagram live-PID class.
+    #[must_use]
+    pub const fn datagram_pid(self) -> PeerPidClass {
+        self.datagram_pid
+    }
+
+    /// Returns the opaque datagram token class.
+    #[must_use]
+    pub const fn datagram_token(self) -> PeerTokenClass {
+        self.datagram_token
+    }
+
+    fn encode(self) -> [u8; 6] {
+        [
+            self.stream_eid as u8,
+            self.stream_cred as u8,
+            self.stream_pid as u8,
+            self.datagram_cred as u8,
+            self.datagram_pid as u8,
+            self.datagram_token as u8,
+        ]
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, ProbeProtocolError> {
+        let [
+            stream_eid,
+            stream_cred,
+            stream_pid,
+            datagram_cred,
+            datagram_pid,
+            datagram_token,
+        ] = array::<6>(bytes, 0)?;
+        let observation = Self {
+            stream_eid: CredentialIdentityClass::from_byte(stream_eid)?,
+            stream_cred: CredentialIdentityClass::from_byte(stream_cred)?,
+            stream_pid: PeerPidClass::from_byte(stream_pid)?,
+            datagram_cred: CredentialIdentityClass::from_byte(datagram_cred)?,
+            datagram_pid: PeerPidClass::from_byte(datagram_pid)?,
+            datagram_token: PeerTokenClass::from_byte(datagram_token)?,
+        };
+        if observation.is_none()
+            || (!matches!(observation.stream_eid, CredentialIdentityClass::NotObserved)
+                && !matches!(
+                    observation.stream_cred,
+                    CredentialIdentityClass::NotObserved
+                )
+                && !matches!(observation.stream_pid, PeerPidClass::NotObserved)
+                && !matches!(
+                    observation.datagram_cred,
+                    CredentialIdentityClass::NotObserved
+                )
+                && !matches!(observation.datagram_pid, PeerPidClass::NotObserved)
+                && !matches!(observation.datagram_token, PeerTokenClass::NotObserved))
+        {
+            Ok(observation)
+        } else {
+            Err(ProbeProtocolError)
+        }
+    }
+}
+
+/// Fixed state carried by one credential phase record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CredentialRecordKind {
+    /// Worker completed its transition and first two observations.
+    WorkerTransitioned = 1,
+    /// Launcher completed its transition and all three local observations.
+    LauncherTransitioned = 2,
+    /// Worker completed its final after-both observation.
+    WorkerFinal = 3,
+    /// One role stopped at an exact credential or protocol step.
+    Failure = 4,
+}
+
+impl CredentialRecordKind {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            1 => Ok(Self::WorkerTransitioned),
+            2 => Ok(Self::LauncherTransitioned),
+            3 => Ok(Self::WorkerFinal),
+            4 => Ok(Self::Failure),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// One authenticated, value-free credential phase or failure record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CredentialRecord {
+    mode: ProbeMode,
+    kind: CredentialRecordKind,
+    role: CredentialRole,
+    failure: Option<(CredentialStep, ProbeErrorCategory, CredentialPrefix)>,
+    identity: CredentialIdentityClass,
+    groups: CredentialGroupClass,
+    observations: [PeerObservation; 3],
+    nonce: SessionId,
+}
+
+impl CredentialRecord {
+    /// Constructs a successful worker-transition record.
+    pub fn worker_transitioned(
+        mode: ProbeMode,
+        state: CredentialSelfState,
+        initial: PeerObservation,
+        after_worker: PeerObservation,
+        nonce: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::success(
+            mode,
+            CredentialRecordKind::WorkerTransitioned,
+            CredentialRole::Worker,
+            state,
+            [initial, after_worker, PeerObservation::NONE],
+            nonce,
+        )
+    }
+
+    /// Constructs a successful launcher-transition record.
+    pub fn launcher_transitioned(
+        mode: ProbeMode,
+        state: CredentialSelfState,
+        observations: [PeerObservation; 3],
+        nonce: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::success(
+            mode,
+            CredentialRecordKind::LauncherTransitioned,
+            CredentialRole::Launcher,
+            state,
+            observations,
+            nonce,
+        )
+    }
+
+    /// Constructs a successful worker-final record.
+    pub fn worker_final(
+        mode: ProbeMode,
+        state: CredentialSelfState,
+        observations: [PeerObservation; 3],
+        nonce: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::success(
+            mode,
+            CredentialRecordKind::WorkerFinal,
+            CredentialRole::Worker,
+            state,
+            observations,
+            nonce,
+        )
+    }
+
+    /// Constructs a value-free failure record.
+    pub fn failure(
+        mode: ProbeMode,
+        role: CredentialRole,
+        failure: CredentialFailureValue,
+        initial: PeerObservation,
+        nonce: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        if !mode.is_credential_pair()
+            || nonce.is_pre_session()
+            || matches!(
+                failure.state().identity(),
+                CredentialIdentityClass::NotObserved | CredentialIdentityClass::Unsupported
+            )
+            || matches!(failure.state().groups(), CredentialGroupClass::NotObserved)
+            || (failure.prefix() != CredentialPrefix::None && initial.is_none())
+        {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            mode,
+            kind: CredentialRecordKind::Failure,
+            role,
+            failure: Some((failure.step(), failure.category(), failure.prefix())),
+            identity: failure.state().identity(),
+            groups: failure.state().groups(),
+            observations: [initial, PeerObservation::NONE, PeerObservation::NONE],
+            nonce,
+        })
+    }
+
+    fn success(
+        mode: ProbeMode,
+        kind: CredentialRecordKind,
+        role: CredentialRole,
+        state: CredentialSelfState,
+        observations: [PeerObservation; 3],
+        nonce: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        let expected = if mode.retains_root() {
+            (
+                CredentialIdentityClass::InitialAndTarget,
+                CredentialGroupClass::Initial,
+            )
+        } else {
+            (
+                CredentialIdentityClass::Target,
+                CredentialGroupClass::EffectiveOnly,
+            )
+        };
+        let observation_shape = match kind {
+            CredentialRecordKind::WorkerTransitioned => {
+                !observations[0].is_none()
+                    && !observations[1].is_none()
+                    && observations[2].is_none()
+                    && role == CredentialRole::Worker
+            }
+            CredentialRecordKind::LauncherTransitioned => {
+                observations
+                    .iter()
+                    .all(|observation| !observation.is_none())
+                    && role == CredentialRole::Launcher
+            }
+            CredentialRecordKind::WorkerFinal => {
+                observations
+                    .iter()
+                    .all(|observation| !observation.is_none())
+                    && role == CredentialRole::Worker
+            }
+            CredentialRecordKind::Failure => false,
+        };
+        if !mode.is_credential_pair()
+            || nonce.is_pre_session()
+            || (state.identity(), state.groups()) != expected
+            || !observation_shape
+        {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            mode,
+            kind,
+            role,
+            failure: None,
+            identity: state.identity(),
+            groups: state.groups(),
+            observations,
+            nonce,
+        })
+    }
+
+    /// Returns the selected probe mode.
+    #[must_use]
+    pub const fn mode(self) -> ProbeMode {
+        self.mode
+    }
+
+    /// Returns the exact phase kind.
+    #[must_use]
+    pub const fn kind(self) -> CredentialRecordKind {
+        self.kind
+    }
+
+    /// Returns the sender or failing process role.
+    #[must_use]
+    pub const fn role(self) -> CredentialRole {
+        self.role
+    }
+
+    /// Returns the fixed failure triple, if this is a failure record.
+    #[must_use]
+    pub const fn failure_value(
+        self,
+    ) -> Option<(CredentialStep, ProbeErrorCategory, CredentialPrefix)> {
+        self.failure
+    }
+
+    /// Returns the sender's final identity class.
+    #[must_use]
+    pub const fn identity(self) -> CredentialIdentityClass {
+        self.identity
+    }
+
+    /// Returns the sender's final supplementary-group class.
+    #[must_use]
+    pub const fn groups(self) -> CredentialGroupClass {
+        self.groups
+    }
+
+    /// Returns the phase-ordered peer observations.
+    #[must_use]
+    pub const fn observations(self) -> [PeerObservation; 3] {
+        self.observations
+    }
+
+    /// Returns the command nonce.
+    #[must_use]
+    pub const fn nonce(self) -> SessionId {
+        self.nonce
+    }
+
+    /// Returns whether this record belongs to the exact exchange and sender.
+    #[must_use]
+    pub fn matches_exchange(self, mode: ProbeMode, role: CredentialRole, nonce: SessionId) -> bool {
+        self.mode == mode && self.role == role && self.nonce == nonce
+    }
+
+    /// Returns whether this record is the exact next successful phase.
+    #[must_use]
+    pub fn matches_expected(
+        self,
+        mode: ProbeMode,
+        kind: CredentialRecordKind,
+        role: CredentialRole,
+        nonce: SessionId,
+    ) -> bool {
+        self.matches_exchange(mode, role, nonce) && self.kind == kind
+    }
+
+    /// Encodes the exact credential phase record.
+    #[must_use]
+    pub fn encode(self) -> [u8; CREDENTIAL_RECORD_BYTES] {
+        let mut bytes = [0_u8; CREDENTIAL_RECORD_BYTES];
+        bytes[0..4].copy_from_slice(&CREDENTIAL_MAGIC);
+        bytes[4..6].copy_from_slice(&CREDENTIAL_VERSION.to_be_bytes());
+        bytes[6] = self.mode as u8;
+        bytes[7] = self.kind as u8;
+        bytes[8] = self.role as u8;
+        bytes[9] = u8::from(self.failure.is_none());
+        if let Some((step, category, prefix)) = self.failure {
+            bytes[10] = step as u8;
+            bytes[11] = category as u8;
+            bytes[12] = prefix as u8;
+        }
+        bytes[13] = self.identity as u8;
+        bytes[14] = self.groups as u8;
+        for (index, observation) in self.observations.into_iter().enumerate() {
+            let start = 16 + index * 6;
+            if let Some(slot) = bytes.get_mut(start..start + 6) {
+                slot.copy_from_slice(&observation.encode());
+            }
+        }
+        bytes[48..80].copy_from_slice(self.nonce.as_bytes());
+        bytes
+    }
+
+    /// Decodes and validates one exact credential phase record.
+    pub fn decode(bytes: &[u8; CREDENTIAL_RECORD_BYTES]) -> Result<Self, ProbeProtocolError> {
+        if bytes[0..4] != CREDENTIAL_MAGIC
+            || bytes[4..6] != CREDENTIAL_VERSION.to_be_bytes()
+            || bytes[15] != 0
+            || bytes[34..48] != [0; 14]
+        {
+            return Err(ProbeProtocolError);
+        }
+        let mode = ProbeMode::from_byte(bytes[6])?;
+        let kind = CredentialRecordKind::from_byte(bytes[7])?;
+        let role = CredentialRole::from_byte(bytes[8])?;
+        let identity = CredentialIdentityClass::from_byte(bytes[13])?;
+        let groups = CredentialGroupClass::from_byte(bytes[14])?;
+        let observations = [
+            PeerObservation::decode(&bytes[16..22])?,
+            PeerObservation::decode(&bytes[22..28])?,
+            PeerObservation::decode(&bytes[28..34])?,
+        ];
+        let nonce = SessionId::from_bytes(array(bytes, 48)?);
+        let record = match (kind, bytes[9], bytes[10], bytes[11], bytes[12]) {
+            (CredentialRecordKind::Failure, 0, step, category, prefix) => Self::failure(
+                mode,
+                role,
+                CredentialFailureValue::new(
+                    CredentialStep::from_byte(step)?,
+                    ProbeErrorCategory::from_byte(category)?,
+                    CredentialPrefix::from_byte(prefix)?,
+                    CredentialSelfState::new(identity, groups),
+                ),
+                observations[0],
+                nonce,
+            ),
+            (CredentialRecordKind::WorkerTransitioned, 1, 0, 0, 0) => Self::worker_transitioned(
+                mode,
+                CredentialSelfState::new(identity, groups),
+                observations[0],
+                observations[1],
+                nonce,
+            ),
+            (CredentialRecordKind::LauncherTransitioned, 1, 0, 0, 0) => {
+                Self::launcher_transitioned(
+                    mode,
+                    CredentialSelfState::new(identity, groups),
+                    observations,
+                    nonce,
+                )
+            }
+            (CredentialRecordKind::WorkerFinal, 1, 0, 0, 0) => Self::worker_final(
+                mode,
+                CredentialSelfState::new(identity, groups),
+                observations,
+                nonce,
+            ),
+            _ => Err(ProbeProtocolError),
+        }?;
+        if record.encode() == *bytes {
+            Ok(record)
+        } else {
+            Err(ProbeProtocolError)
+        }
+    }
+}
+
+impl fmt::Debug for CredentialRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialRecord(<redacted>)")
+    }
+}
+
 /// One nonce-bound exact-root bootstrap command.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ProbeBootstrap {
@@ -244,7 +1305,7 @@ impl ProbeBootstrap {
         root: ObjectIdentity,
         nonce: SessionId,
     ) -> Result<Self, ProbeProtocolError> {
-        if mode == ProbeMode::Control
+        if matches!(mode, ProbeMode::Control | ProbeMode::CredentialControl)
             || !mode.accepts_target(target_uid, target_gid)
             || root.device == 0
             || root.inode == 0
@@ -340,7 +1401,9 @@ pub struct ProbeResult {
 impl ProbeResult {
     /// Constructs a successful terminal result.
     pub fn success(mode: ProbeMode, nonce: SessionId) -> Result<Self, ProbeProtocolError> {
-        if mode == ProbeMode::Control || nonce.is_pre_session() {
+        if matches!(mode, ProbeMode::Control | ProbeMode::CredentialControl)
+            || nonce.is_pre_session()
+        {
             return Err(ProbeProtocolError);
         }
         Ok(Self {
@@ -357,7 +1420,9 @@ impl ProbeResult {
         stage: ProbeStage,
         category: ProbeErrorCategory,
     ) -> Result<Self, ProbeProtocolError> {
-        if mode == ProbeMode::Control || nonce.is_pre_session() {
+        if matches!(mode, ProbeMode::Control | ProbeMode::CredentialControl)
+            || nonce.is_pre_session()
+        {
             return Err(ProbeProtocolError);
         }
         Ok(Self {
@@ -411,7 +1476,7 @@ impl ProbeResult {
             return Err(ProbeProtocolError);
         }
         let mode = ProbeMode::from_byte(bytes[6])?;
-        if mode == ProbeMode::Control {
+        if matches!(mode, ProbeMode::Control | ProbeMode::CredentialControl) {
             return Err(ProbeProtocolError);
         }
         let nonce = SessionId::from_bytes(array(bytes, 16)?);
@@ -607,6 +1672,32 @@ mod tests {
         );
         assert_eq!(ProbeMode::parse("hvf-control", 501, 20), None);
         assert_eq!(ProbeMode::parse("inherited-root", 501, 20), None);
+        assert_eq!(
+            ProbeMode::parse("credential-drop", 501, 20),
+            Some(ProbeMode::CredentialDrop)
+        );
+        assert_eq!(ProbeMode::parse("credential-drop", 0, 0), None);
+        assert_eq!(
+            ProbeMode::parse("credential-retain-root", 0, 0),
+            Some(ProbeMode::CredentialRetainRoot)
+        );
+        assert_eq!(
+            ProbeMode::parse("credential-unmapped", 2_147_483_647, 2_147_483_647),
+            Some(ProbeMode::CredentialUnmapped)
+        );
+        assert_eq!(
+            ProbeMode::parse("credential-unmapped", u32::MAX, u32::MAX),
+            None
+        );
+        assert_eq!(
+            ProbeMode::parse("credential-control", 501, 20),
+            Some(ProbeMode::CredentialControl)
+        );
+        assert_eq!(
+            ProbeMode::parse("credential-control", 0, 0),
+            Some(ProbeMode::CredentialControl)
+        );
+        assert_eq!(ProbeMode::parse("credential-control", 501, 0), None);
         assert_eq!(ProbeMode::parse("unknown", 501, 20), None);
     }
 
@@ -652,6 +1743,9 @@ mod tests {
             (ProbeMode::UnmappedSyscall, u32::MAX, u32::MAX),
             (ProbeMode::HvfControl, 0, 0),
             (ProbeMode::InheritedRoot, 0, 0),
+            (ProbeMode::CredentialDrop, 501, 20),
+            (ProbeMode::CredentialRetainRoot, 0, 0),
+            (ProbeMode::CredentialUnmapped, 2_147_483_647, 2_147_483_647),
         ] {
             let bootstrap = ProbeBootstrap::new(
                 mode,
@@ -676,5 +1770,331 @@ mod tests {
                 assert_eq!(ProbeResult::decode(&result.encode()), Ok(result));
             }
         }
+    }
+
+    fn observation(identity: CredentialIdentityClass, token: PeerTokenClass) -> PeerObservation {
+        PeerObservation::new(
+            identity,
+            identity,
+            PeerPidClass::Exact,
+            CredentialIdentityClass::Unsupported,
+            PeerPidClass::Exact,
+            token,
+        )
+        .expect("complete observation")
+    }
+
+    #[test]
+    fn credential_datagram_proofs_are_closed_nonce_bound_and_redacted() {
+        let nonce = SessionId::from_bytes([0x31; 32]);
+        for proof in [
+            CredentialDatagramProof::challenge(ProbeMode::CredentialDrop, nonce)
+                .expect("valid challenge"),
+            CredentialDatagramProof::worker_ready(ProbeMode::CredentialDrop, nonce)
+                .expect("valid worker response"),
+            CredentialDatagramProof::launcher_release(ProbeMode::CredentialDrop, nonce)
+                .expect("valid release"),
+        ] {
+            let encoded = proof.encode();
+            assert_eq!(encoded.len(), CREDENTIAL_DATAGRAM_BYTES);
+            assert_eq!(CredentialDatagramProof::decode(&encoded), Ok(proof));
+            assert_eq!(format!("{proof:?}"), "CredentialDatagramProof(<redacted>)");
+            for index in [0, 4, 9, 15] {
+                let mut malformed = encoded;
+                malformed[index] ^= 0xff;
+                assert_eq!(
+                    CredentialDatagramProof::decode(&malformed),
+                    Err(ProbeProtocolError)
+                );
+            }
+        }
+        assert!(
+            CredentialDatagramProof::challenge(ProbeMode::Drop, nonce).is_err(),
+            "historical modes must not enter the credential barrier"
+        );
+        assert!(
+            CredentialDatagramProof::challenge(ProbeMode::CredentialDrop, SessionId::pre_session())
+                .is_err()
+        );
+        let mut wrong_role = CredentialDatagramProof::challenge(ProbeMode::CredentialDrop, nonce)
+            .expect("valid challenge")
+            .encode();
+        wrong_role[8] = CredentialRole::Worker as u8;
+        assert_eq!(
+            CredentialDatagramProof::decode(&wrong_role),
+            Err(ProbeProtocolError)
+        );
+
+        let challenge = CredentialDatagramProof::challenge(ProbeMode::CredentialDrop, nonce)
+            .expect("valid challenge");
+        let worker_ready = CredentialDatagramProof::worker_ready(ProbeMode::CredentialDrop, nonce)
+            .expect("valid worker response");
+        let release = CredentialDatagramProof::launcher_release(ProbeMode::CredentialDrop, nonce)
+            .expect("valid release");
+        assert!(challenge.matches_expected(
+            ProbeMode::CredentialDrop,
+            CredentialDatagramPhase::Challenge,
+            CredentialRole::Launcher,
+            nonce,
+        ));
+        assert!(worker_ready.matches_expected(
+            ProbeMode::CredentialDrop,
+            CredentialDatagramPhase::WorkerReady,
+            CredentialRole::Worker,
+            nonce,
+        ));
+        assert!(release.matches_expected(
+            ProbeMode::CredentialDrop,
+            CredentialDatagramPhase::LauncherRelease,
+            CredentialRole::Launcher,
+            nonce,
+        ));
+        assert!(
+            !challenge.matches_expected(
+                ProbeMode::CredentialDrop,
+                CredentialDatagramPhase::WorkerReady,
+                CredentialRole::Worker,
+                nonce,
+            ),
+            "a replayed challenge must not advance the barrier"
+        );
+        assert!(
+            !release.matches_expected(
+                ProbeMode::CredentialDrop,
+                CredentialDatagramPhase::Challenge,
+                CredentialRole::Launcher,
+                nonce,
+            ),
+            "an out-of-order release must not start a barrier"
+        );
+        assert!(!worker_ready.matches_expected(
+            ProbeMode::CredentialDrop,
+            CredentialDatagramPhase::WorkerReady,
+            CredentialRole::Worker,
+            SessionId::from_bytes([0x32; 32]),
+        ));
+        assert!(!worker_ready.matches_expected(
+            ProbeMode::CredentialRetainRoot,
+            CredentialDatagramPhase::WorkerReady,
+            CredentialRole::Worker,
+            nonce,
+        ));
+    }
+
+    #[test]
+    fn credential_phase_records_round_trip_and_reject_contradictory_shapes() {
+        let nonce = SessionId::from_bytes([0x42; 32]);
+        let initial = observation(
+            CredentialIdentityClass::InitialRoot,
+            PeerTokenClass::Baseline,
+        );
+        let snapshot = observation(
+            CredentialIdentityClass::InitialRoot,
+            PeerTokenClass::Unchanged,
+        );
+        let target = observation(CredentialIdentityClass::Target, PeerTokenClass::Changed);
+        let state = CredentialSelfState::new(
+            CredentialIdentityClass::Target,
+            CredentialGroupClass::EffectiveOnly,
+        );
+        for record in [
+            CredentialRecord::worker_transitioned(
+                ProbeMode::CredentialDrop,
+                state,
+                initial,
+                snapshot,
+                nonce,
+            )
+            .expect("valid worker transition"),
+            CredentialRecord::launcher_transitioned(
+                ProbeMode::CredentialDrop,
+                state,
+                [initial, target, target],
+                nonce,
+            )
+            .expect("valid launcher transition"),
+            CredentialRecord::worker_final(
+                ProbeMode::CredentialDrop,
+                state,
+                [initial, snapshot, target],
+                nonce,
+            )
+            .expect("valid worker final"),
+            CredentialRecord::failure(
+                ProbeMode::CredentialDrop,
+                CredentialRole::Worker,
+                CredentialFailureValue::new(
+                    CredentialStep::SetUid,
+                    ProbeErrorCategory::PermissionDenied,
+                    CredentialPrefix::GidSet,
+                    CredentialSelfState::new(
+                        CredentialIdentityClass::Other,
+                        CredentialGroupClass::EffectiveOnly,
+                    ),
+                ),
+                initial,
+                nonce,
+            )
+            .expect("valid partial failure"),
+        ] {
+            let encoded = record.encode();
+            assert_eq!(encoded.len(), CREDENTIAL_RECORD_BYTES);
+            assert_eq!(CredentialRecord::decode(&encoded), Ok(record));
+            assert_eq!(format!("{record:?}"), "CredentialRecord(<redacted>)");
+            for index in [0, 4, 15, 34, 47] {
+                let mut malformed = encoded;
+                malformed[index] ^= 0xff;
+                assert_eq!(
+                    CredentialRecord::decode(&malformed),
+                    Err(ProbeProtocolError)
+                );
+            }
+        }
+
+        assert!(
+            CredentialRecord::worker_transitioned(
+                ProbeMode::CredentialDrop,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::InitialRoot,
+                    CredentialGroupClass::Initial,
+                ),
+                initial,
+                snapshot,
+                nonce,
+            )
+            .is_err(),
+            "success self-attestation must match the selected mode"
+        );
+        assert!(
+            CredentialRecord::failure(
+                ProbeMode::CredentialDrop,
+                CredentialRole::Worker,
+                CredentialFailureValue::new(
+                    CredentialStep::SetUid,
+                    ProbeErrorCategory::PermissionDenied,
+                    CredentialPrefix::GidSet,
+                    state,
+                ),
+                PeerObservation::NONE,
+                nonce,
+            )
+            .is_err(),
+            "partial transition failures require the initial observation"
+        );
+        assert!(
+            CredentialRecord::failure(
+                ProbeMode::CredentialDrop,
+                CredentialRole::Worker,
+                CredentialFailureValue::new(
+                    CredentialStep::Protocol,
+                    ProbeErrorCategory::InvalidInput,
+                    CredentialPrefix::None,
+                    CredentialSelfState::new(
+                        CredentialIdentityClass::NotObserved,
+                        CredentialGroupClass::NotObserved,
+                    ),
+                ),
+                PeerObservation::NONE,
+                nonce,
+            )
+            .is_err(),
+            "failure self-attestation must remain meaningful"
+        );
+
+        let worker_transitioned = CredentialRecord::worker_transitioned(
+            ProbeMode::CredentialDrop,
+            state,
+            initial,
+            snapshot,
+            nonce,
+        )
+        .expect("valid worker transition");
+        let worker_final = CredentialRecord::worker_final(
+            ProbeMode::CredentialDrop,
+            state,
+            [initial, snapshot, target],
+            nonce,
+        )
+        .expect("valid worker final");
+        let mut worker_with_unexpected_final_observation = worker_transitioned.encode();
+        let unexpected_observation: [u8; 6] = worker_with_unexpected_final_observation[16..22]
+            .try_into()
+            .expect("fixed observation slot");
+        worker_with_unexpected_final_observation[28..34].copy_from_slice(&unexpected_observation);
+        assert_eq!(
+            CredentialRecord::decode(&worker_with_unexpected_final_observation),
+            Err(ProbeProtocolError),
+            "ignored observation slots must remain canonical zeroes"
+        );
+        let failure = CredentialRecord::failure(
+            ProbeMode::CredentialDrop,
+            CredentialRole::Worker,
+            CredentialFailureValue::new(
+                CredentialStep::SetUid,
+                ProbeErrorCategory::PermissionDenied,
+                CredentialPrefix::GidSet,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::Other,
+                    CredentialGroupClass::EffectiveOnly,
+                ),
+            ),
+            initial,
+            nonce,
+        )
+        .expect("valid partial failure");
+        let mut failure_with_unexpected_later_observation = failure.encode();
+        failure_with_unexpected_later_observation[22..28].copy_from_slice(&unexpected_observation);
+        assert_eq!(
+            CredentialRecord::decode(&failure_with_unexpected_later_observation),
+            Err(ProbeProtocolError),
+            "failure records must reject ignored later observations"
+        );
+        assert!(worker_transitioned.matches_expected(
+            ProbeMode::CredentialDrop,
+            CredentialRecordKind::WorkerTransitioned,
+            CredentialRole::Worker,
+            nonce,
+        ));
+        assert!(
+            !worker_transitioned.matches_expected(
+                ProbeMode::CredentialDrop,
+                CredentialRecordKind::WorkerFinal,
+                CredentialRole::Worker,
+                nonce,
+            ),
+            "a replayed transition record must not satisfy the final phase"
+        );
+        assert!(
+            !worker_final.matches_exchange(
+                ProbeMode::CredentialDrop,
+                CredentialRole::Worker,
+                SessionId::from_bytes([0x43; 32]),
+            ),
+            "a record from another session must not bind to this exchange"
+        );
+        assert!(!worker_final.matches_exchange(
+            ProbeMode::CredentialDrop,
+            CredentialRole::Launcher,
+            nonce,
+        ));
+
+        let datagram = CredentialDatagramProof::challenge(ProbeMode::CredentialDrop, nonce)
+            .expect("valid challenge")
+            .encode();
+        let mut wrong_stream_family = [0_u8; CREDENTIAL_RECORD_BYTES];
+        wrong_stream_family[..CREDENTIAL_DATAGRAM_BYTES].copy_from_slice(&datagram);
+        assert_eq!(
+            CredentialRecord::decode(&wrong_stream_family),
+            Err(ProbeProtocolError)
+        );
+        let record = worker_transitioned.encode();
+        let wrong_datagram_family: &[u8; CREDENTIAL_DATAGRAM_BYTES] = record
+            .get(..CREDENTIAL_DATAGRAM_BYTES)
+            .and_then(|bytes| bytes.try_into().ok())
+            .expect("fixed record prefix");
+        assert_eq!(
+            CredentialDatagramProof::decode(wrong_datagram_family),
+            Err(ProbeProtocolError)
+        );
     }
 }
