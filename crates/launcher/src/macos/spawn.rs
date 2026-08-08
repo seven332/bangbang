@@ -147,6 +147,43 @@ pub(crate) fn spawn_suspended(
     executable: &Path,
     args: Vec<OsString>,
 ) -> Result<SuspendedWorker, LauncherError> {
+    spawn_suspended_inner(executable, args, None)
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn spawn_suspended_elevated(
+    executable: &Path,
+    args: Vec<OsString>,
+    root: RawFd,
+) -> Result<SuspendedWorker, LauncherError> {
+    spawn_suspended_inner(executable, args, Some(root))
+}
+
+fn spawn_suspended_inner(
+    executable: &Path,
+    args: Vec<OsString>,
+    elevated_root: Option<RawFd>,
+) -> Result<SuspendedWorker, LauncherError> {
+    #[cfg(not(feature = "elevated-bootstrap-probe"))]
+    let _ = elevated_root;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    let elevated_root = elevated_root
+        .map(|root| {
+            if root < 0 {
+                return Err(LauncherError::SessionSetup(io::ErrorKind::InvalidInput));
+            }
+            // SAFETY: `root` remains owned by the caller; success returns an
+            // independent close-on-exec descriptor reserved above fixed fds.
+            let duplicate = unsafe { libc::fcntl(root, libc::F_DUPFD_CLOEXEC, MIN_TRANSPORT_FD) };
+            if duplicate < 0 {
+                return Err(LauncherError::SessionSetup(
+                    io::Error::last_os_error().kind(),
+                ));
+            }
+            // SAFETY: `duplicate` is a fresh descriptor owned by this scope.
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+        })
+        .transpose()?;
     let (parent, child) =
         UnixStream::pair().map_err(|error| LauncherError::SessionSetup(error.kind()))?;
     let parent = duplicate_stream_at_or_above(parent, MIN_TRANSPORT_FD)?;
@@ -202,6 +239,14 @@ pub(crate) fn spawn_suspended(
     actions.duplicate(block_child.as_raw_fd(), BLOCK_CONTROL_BROKER_FD)?;
     if block_child.as_raw_fd() != BLOCK_CONTROL_BROKER_FD {
         actions.close(block_child.as_raw_fd())?;
+    }
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    if let Some(root) = elevated_root.as_ref() {
+        let fixed = bangbang_session::elevated_probe::ROOT_FD;
+        actions.duplicate(root.as_raw_fd(), fixed)?;
+        if root.as_raw_fd() != fixed {
+            actions.close(root.as_raw_fd())?;
+        }
     }
 
     let mut pid = 0;

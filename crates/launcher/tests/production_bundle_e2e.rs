@@ -82,6 +82,11 @@ const GRANT_PROBE_READY: &str = "status: grant integration probe ready";
 const GRANT_DELAY_OPTION: &str = "--bangbang-internal-grant-delay-v1";
 const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
 const GRANT_PROBE_MARKER: &str = "grant-integration-probe.enabled";
+const ELEVATED_PROBE_OPTION: &str = "--bangbang-internal-elevated-bootstrap-probe-v1";
+const ELEVATED_WORKER_OPTION: &[u8] = b"--bangbang-internal-elevated-bootstrap-worker-v1";
+const ELEVATED_READY_RECORD: &[u8] = b"BBEP-READY-V1";
+const ELEVATED_BLOCKED_STATUS: &[u8] = b"status: elevated bootstrap blocked";
+const ELEVATED_PROBE_MARKER: &str = "elevated-bootstrap-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
 const RESTORE_ROOT_ID: &str = "restore-root-1601";
 const RESTORE_VSOCK_ID: &str = "restore-vsock-1601";
@@ -13022,6 +13027,60 @@ fn normal_production_bundle_excludes_grant_probe_behavior() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains(RESTORE_ACTIVE_READY));
     assert_restore_output_redacted(&output, &restore);
     restore.assert_pristine();
+}
+
+#[test]
+fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe() {
+    let bundle = production_bundle();
+    assert!(
+        !worker_bundle(&bundle)
+            .join("Contents/Resources")
+            .join(ELEVATED_PROBE_MARKER)
+            .exists(),
+        "normal production bundle must not carry the elevated probe marker"
+    );
+    let launcher_bytes = fs::read(launcher(&bundle)).expect("normal launcher should read");
+    let worker_bytes = fs::read(worker_executable(&bundle)).expect("normal worker should read");
+    for marker in [ELEVATED_WORKER_OPTION, ELEVATED_BLOCKED_STATUS] {
+        assert!(
+            !launcher_bytes
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "normal launcher must statically exclude the elevated probe"
+        );
+    }
+    assert!(
+        !worker_bytes
+            .windows(ELEVATED_READY_RECORD.len())
+            .any(|window| window == ELEVATED_READY_RECORD),
+        "normal worker must statically exclude the elevated bootstrap"
+    );
+
+    let output = run_launcher(
+        &bundle,
+        &[
+            OsStr::new(ELEVATED_PROBE_OPTION),
+            OsStr::new("--root"),
+            OsStr::new("/private/var/root/bangbang-elevated-probe.Disabled"),
+            OsStr::new("--target-uid"),
+            OsStr::new("501"),
+            OsStr::new("--target-gid"),
+            OsStr::new("20"),
+            OsStr::new("--mode"),
+            OsStr::new("drop"),
+            OsStr::new("--"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(ARGUMENT_PARSING_EXIT_CODE));
+    let diagnostics = [output.stdout, output.stderr].concat();
+    for marker in [ELEVATED_READY_RECORD, ELEVATED_BLOCKED_STATUS] {
+        assert!(
+            !diagnostics
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "normal bundle must not activate elevated probe behavior"
+        );
+    }
 }
 
 #[test]

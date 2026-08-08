@@ -18,6 +18,8 @@ mod api_server;
 mod contained_session;
 mod direct_snapshot_pager;
 mod direct_vhost_user;
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+mod elevated_bootstrap_probe;
 #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
 mod grant_integration_probe;
 #[doc(hidden)]
@@ -113,6 +115,10 @@ fn write_process_stdout_line(
 }
 
 fn main() -> ExitCode {
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    if elevated_bootstrap_probe::is_requested() {
+        return elevated_bootstrap_probe::run();
+    }
     #[cfg(target_os = "macos")]
     if anchored_socket::is_binder_invocation() {
         return if anchored_socket::run_binder() {

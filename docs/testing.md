@@ -2094,6 +2094,47 @@ external root/HVF and approved-vmnet evidence gates pass. The Rust command is
 offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
 merged-main OID are checked and recorded by the pull-request workflow.
 
+## Explicit Elevated Bootstrap Evidence
+
+The #1373 root proof is deliberately separate from
+`scripts/run-integration-tests.sh`. Normal validation never invokes `sudo`,
+prompts for a password, or treats missing root/HVF support as a passing skip.
+First build the test-only bundle as an ordinary user at an absent absolute
+destination:
+
+```sh
+scripts/build-elevated-bootstrap-probe.sh \
+  --output /absolute/absent/path/Bangbang.app
+```
+
+The build compiles normal launcher and worker artifacts first and verifies that
+the probe status/worker activation/ready bytes are absent. It then builds both
+ends with the same disabled-by-default feature, adds a visible test-only
+resource marker, and uses the normal production packager, signature split,
+entitlements, Hardened Runtime, and inspections.
+
+On a capable Apple Silicon host, calculate the explicit numeric target before
+elevation and invoke the wrapper yourself:
+
+```sh
+target_uid="$(id -u)"
+target_gid="$(id -g)"
+sudo /usr/bin/env -i HOME=/var/root PATH=/usr/bin:/bin \
+  /bin/bash "$PWD/scripts/run-elevated-bootstrap-probe.sh" \
+  --bundle /absolute/absent/path/Bangbang.app \
+  --target-uid "$target_uid" \
+  --target-gid "$target_gid"
+```
+
+Do not use `--allow-unsupported` for this proof. Missing exact root, Apple
+Silicon, HVF, bundle identity, or cleanup is failure. The wrapper never reads
+`SUDO_UID`, `SUDO_GID`, `HOME`, `PATH`, account names, or a password; the
+caller owns the elevation mechanism. On entry it replaces inherited standard
+input with `/dev/null`, so elevation input cannot flow into the launcher or
+signed worker. It reports OS/SDK/architecture and only the value-free terminal
+result. The measured result and its limits are in the [elevated bootstrap
+evidence contract](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
+
 ## Running Tests
 
 Run the standard workspace checks before opening or updating a PR:

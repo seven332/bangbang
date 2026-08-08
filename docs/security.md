@@ -3427,12 +3427,31 @@ and seccomp/cgroup/network/PID namespace mechanisms are not aliases for public
 HVF registers/granules, XNU allocation, App Sandbox, rlimits, launchd,
 Network Extension, vmnet, or Endpoint Security.
 
-Six #1373 audit outcomes still require root and real HVF on the same host; two
+Six #1373 outcomes remain audit entries pending their parent Challenge; two
 #1378 outcomes still require caller-owned Apple-approved signing/profile
 authority and an isolated vmnet fixture; three #1351 isolation semantics remain
 platform-feasible. Missing authority or credentials is not an impossibility
-proof. The repository does not inspect, fabricate, or claim those external
-inputs, and global `--final` stays blocked by all eleven outcomes.
+proof. Global `--final` stays blocked until evidence is translated into an
+ID-specific disposition and the other external outcomes complete.
+
+The #1373 same-host gate has now been executed rather than inferred from split
+environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root and
+`kern.hv_support=1`, the unsandboxed signed launcher successfully entered the
+private chroot. The separately signed worker—with mandatory App Sandbox and
+Hypervisor entitlements—accepted the same nonce-bound root descriptor and
+completed `fchdir`, but public `chroot(2)` returned permission denied for the
+ordinary-target, uid/gid-zero, high-unmapped, repeated, and concurrent shapes.
+No credential transition, API, resource, or HVF operation can occur after that
+ordered blocker. This proves the exact chroot-plus-mandatory-containment branch,
+not that public numeric credential syscalls alone are absent. The complete
+boundary, alternatives, cleanup rules, reproduction command, and future-OS
+nonclaim are in the checked
+[elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
+
+The six rows remain audit outcomes until #1371 completes its fresh per-ID
+Challenge and an inventory transition lands. The evidence harness is test-only
+and statically absent from normal launcher and worker builds; it is not a root
+service, public jailer mode, daemon, setuid helper, or ambient path authority.
 
 ## Current Non-Goals
 

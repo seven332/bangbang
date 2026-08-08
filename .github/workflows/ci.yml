@@ -76,6 +76,41 @@ jobs:
       - name: Check unsupported CPU-template helper target
         run: cargo check -p bangbang-cpu-template-helper --all-targets --all-features --locked --target aarch64-unknown-linux-musl
 
+      - name: Build statically isolated elevated-bootstrap evidence bundle
+        run: |
+          mkdir -p "$RUNNER_TEMP/elevated-bootstrap"
+          scripts/build-elevated-bootstrap-probe.sh \
+            --output "$RUNNER_TEMP/elevated-bootstrap/Bangbang.app"
+
+      - name: Verify elevated proof requires explicit root
+        run: |
+          for invalid_uid in 0 0501 4294967296 '1:2'; do
+            set +e
+            invalid_output="$(scripts/run-elevated-bootstrap-probe.sh \
+              --bundle "$RUNNER_TEMP/elevated-bootstrap/Bangbang.app" \
+              --target-uid "$invalid_uid" \
+              --target-gid 20 2>&1)"
+            invalid_status=$?
+            set -e
+            if [[ "$invalid_status" -ne 2 \
+              || "$invalid_output" != "target uid and gid must be explicit nonzero decimal values" ]]; then
+              echo "elevated proof accepted a malformed target identity" >&2
+              exit 1
+            fi
+          done
+          set +e
+          proof_output="$(scripts/run-elevated-bootstrap-probe.sh \
+            --bundle "$RUNNER_TEMP/elevated-bootstrap/Bangbang.app" \
+            --target-uid 501 \
+            --target-gid 20 2>&1)"
+          proof_status=$?
+          set -e
+          if [[ "$proof_status" -ne 4 \
+            || "$proof_output" != "bangbang elevated bootstrap proof: explicit root required" ]]; then
+            echo "elevated proof did not preserve its explicit-root boundary" >&2
+            exit 1
+          fi
+
       - name: Validate Firecracker capability inventory
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 
