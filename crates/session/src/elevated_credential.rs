@@ -593,10 +593,21 @@ fn exact_peer_pid(
     expected: libc::pid_t,
     socket_creator: Option<libc::pid_t>,
 ) -> Result<PeerPidClass, ProbeErrorCategory> {
-    match crate::macos::peer_pid(fd) {
+    classify_peer_pid(crate::macos::peer_pid(fd), expected, socket_creator)
+}
+
+fn classify_peer_pid(
+    result: io::Result<libc::pid_t>,
+    expected: libc::pid_t,
+    socket_creator: Option<libc::pid_t>,
+) -> Result<PeerPidClass, ProbeErrorCategory> {
+    match result {
         Ok(pid) if pid == expected => Ok(PeerPidClass::Exact),
         Ok(pid) if Some(pid) == socket_creator => Ok(PeerPidClass::SocketCreator),
         Ok(_) => Err(ProbeErrorCategory::PermissionDenied),
+        Err(error) if socket_creator.is_some() && unsupported_errno(error.raw_os_error()) => {
+            Ok(PeerPidClass::Unsupported)
+        }
         Err(error) => Err(ProbeErrorCategory::from_io_kind(error.kind())),
     }
 }
@@ -1030,6 +1041,23 @@ mod tests {
             Ok(PeerPidClass::SocketCreator)
         );
         assert!(exact_peer_pid(datagram.as_raw_fd(), pid.wrapping_add(1), None).is_err());
+        assert_eq!(
+            classify_peer_pid(
+                Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT)),
+                pid,
+                Some(pid),
+            ),
+            Ok(PeerPidClass::Unsupported)
+        );
+        assert!(
+            classify_peer_pid(
+                Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT)),
+                pid,
+                None,
+            )
+            .is_err(),
+            "stream LOCAL_PEERPID remains a required surface"
+        );
         assert!(stream_eid(datagram.as_raw_fd(), uid, gid).is_err());
         assert!(
             matches!(

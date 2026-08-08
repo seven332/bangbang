@@ -899,6 +899,12 @@ fn credential_semantics(
     }
     let datagram_pid = if launcher
         .iter()
+        .chain(worker.iter())
+        .all(|observation| observation.datagram_pid() == PeerPidClass::Unsupported)
+    {
+        "unsupported"
+    } else if launcher
+        .iter()
         .all(|observation| observation.datagram_pid() == PeerPidClass::Exact)
         && worker
             .iter()
@@ -1291,6 +1297,31 @@ mod tests {
         assert_eq!(summary.datagram_cred, "unsupported");
         assert_eq!(summary.datagram_token, "changed");
         assert_eq!(summary.datagram_pid, "creator-snapshot");
+
+        let unsupported_pid = launcher.map(|value| {
+            peer_observation(
+                value.stream_eid(),
+                PeerPidClass::Unsupported,
+                value.datagram_token(),
+            )
+        });
+        let unsupported_worker_pid = worker.map(|value| {
+            peer_observation(
+                value.stream_eid(),
+                PeerPidClass::Unsupported,
+                value.datagram_token(),
+            )
+        });
+        assert_eq!(
+            credential_semantics(
+                ProbeMode::CredentialDrop,
+                unsupported_pid,
+                unsupported_worker_pid,
+            )
+            .expect("uniform unsupported datagram PID should summarize")
+            .datagram_pid,
+            "unsupported"
+        );
 
         let mismatched = launcher.map(|value| {
             peer_observation(
