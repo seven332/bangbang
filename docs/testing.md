@@ -1499,6 +1499,35 @@ documents may retain selected-family counts only when a focused test uses them
 as a closure invariant; do not copy global totals or delivery chronology into
 prose.
 
+### Specification benchmark evidence
+
+The public signed collector, strict report and comparison contract, real FIFO
+loss sequence, optional network-fixture boundary, and interpretation rules live
+in the [specification benchmark guide](specification-benchmarks.md). Normal CI
+runs only its portable schemas, fake transactions, portable FIFO, cleanup and
+static audit:
+
+```sh
+python3 -m unittest scripts.tests.test_specification_benchmark
+cargo test -p bangbang-firecracker-capability-audit --test specification_benchmark_audit --locked
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --specification-benchmark-final
+```
+
+A delivery completion gate must additionally use a clean synchronized Apple
+Silicon `main` and an absent ignored or external report path:
+
+```sh
+scripts/specification-benchmark.py collect \
+  --config scripts/specification-benchmark-config.example.json \
+  --output .tmp/bangbang-specification-report.json
+scripts/specification-benchmark.py validate \
+  --report .tmp/bangbang-specification-report.json
+```
+
+Do not add `--allow-unsupported`, a numeric threshold, or a tracked machine
+report. Whole-process RSS, fixed guest compute/storage clocks, and optional
+fixture output retain the nonclaims in the public guide.
+
 ### Wave 7 core API and ownership evidence
 
 The checked

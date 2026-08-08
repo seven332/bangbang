@@ -1,0 +1,16 @@
+{
+  "host_label": "apple-silicon-lab",
+  "iterations": 3,
+  "schema_version": 1,
+  "timeouts": {
+    "artifact_seconds": 600,
+    "build_seconds": 900,
+    "guest_seconds": 60,
+    "network_seconds": 60,
+    "request_seconds": 5,
+    "startup_seconds": 30,
+    "terminate_seconds": 5
+  },
+  "tracing": "disabled",
+  "warmups": 1
+}

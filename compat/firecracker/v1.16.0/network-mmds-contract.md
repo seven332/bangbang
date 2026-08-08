@@ -73,8 +73,9 @@ the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
   Apple-approved start, packet-connectivity, service-error, teardown, crash,
   retry, and concurrent-session results; a non-success local gate is never a
   passing skip.
-- **W7** — #1491 owns the excluded `corpus:network-performance` row and final
-  repository-wide metrics/schema/timing/performance reconciliation.
+- **W7** — #1798 closes the separate `corpus:network-performance` reference
+  interpretation and strict optional-fixture boundary without claiming a
+  positive network sample; #1378 retains production connectivity.
 
 ## Exact 35-record ledger
 
@@ -219,10 +220,11 @@ before session creation.
   2.12 composes them unchanged with optional vsock and 2.13 with Diff.
   Peer-owned vmnet packets and active MMDS TCP sessions are intentionally not
   persisted; #1491 owns any explicit future host/fleet portability pair.
-- #1491 owns the separate network-performance corpus, global metric schema and
-  timing reconciliation, and performance validation. Correctness-critical
-  network/MMDS producers already exist; this ledger does not claim throughput
-  parity or Linux TAP/epoll/timerfd mechanism identity.
+- The [specification benchmark contract](specification-benchmark-contract.md)
+  owns the terminal network-performance reference interpretation and optional
+  fixture boundary. Correctness-critical network/MMDS producers already exist;
+  this ledger does not claim throughput parity or Linux TAP/epoll/timerfd
+  mechanism identity, and #1378 retains positive production connectivity.
 - macOS vmnet modes replace Linux TAP/NAT/bridge mechanisms. Operators remain
   responsible for mode selection and host firewall policy; the MMDS classifier
   is not an egress firewall.

@@ -305,9 +305,9 @@ remain in the CPU-template contract.
 | `corpus:getting-started` | #1796 | `implemented-and-verified` |
 | `corpus:rootfs-and-kernel` | #1796 | `implemented-and-verified` |
 | `corpus:formal-verification` | #1797 | `implemented-and-verified` |
-| `corpus:network-performance` | #1798 | `audit-required` |
-| `corpus:specification` | #1798 | `audit-required` |
-| `semantic.specification:performance-resource-and-telemetry-outcomes` | #1798 | `audit-required` |
+| `corpus:network-performance` | #1798 | `implemented-and-verified` |
+| `corpus:specification` | #1798 | `implemented-and-verified` |
+| `semantic.specification:performance-resource-and-telemetry-outcomes` | #1798 | `implemented-and-verified` |
 | `corpus:design` | #1799 | `audit-required` |
 | `corpus:device-api` | #1799 | `audit-required` |
 | `corpus:release-changelog` | #1799 | `audit-required` |
@@ -360,7 +360,11 @@ formal-verification corpus after the exact five bounded Kani harnesses, pinned
 toolchain, source-manifest bijection, Linux proof runner, documented [proof
 scope](../../../docs/formal-verification.md), and [versioned
 contract](formal-verification-contract.md) all pass their fail-closed gates.
-The current inventory is therefore exactly 368 implemented, 17 audit-required, three
+#1798 then promotes its exact three reference and measured-outcome rows after
+the strict signed [specification benchmark](../../../docs/specification-benchmarks.md),
+real FIFO loss/replay, canonical comparison, optional-fixture, documentation,
+and terminal-audit gates pass. The current inventory is therefore exactly 371
+implemented, 14 audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. If every other
 #1491-owned row later becomes implemented while the nine handoffs remain, the
 prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the

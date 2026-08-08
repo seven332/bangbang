@@ -13142,11 +13142,40 @@
     {
       "id": "corpus:network-performance",
       "family": "specifications",
-      "summary": "Audit all applicable capability claims owned by the pinned network-performance source corpus.",
+      "summary": "The pinned M5d.metal, Amazon Linux 2, VPC, ping, background-traffic, and multi-client iperf3 figures are recorded as environment-conditioned Firecracker references rather than Apple/HVF thresholds. Bangbang provides a strict optional credential-free no-shell fixture boundary whose executable/document identities, labels, raw integer observations, summaries, and asserted cleanup are retained without argv or environment. Network is absent by default, no parity verdict is emitted, and positive vmnet availability, credentials, recovery, concurrency, and external cleanup remain #1378-owned nonclaims.",
       "source_refs": [
         "corpus:network-performance"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/specification-benchmark-audit.json",
+          "anchor": "network-performance"
+        },
+        {
+          "kind": "local",
+          "path": "docs/specification-benchmarks.md",
+          "anchor": "## Optional network fixture"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/specification-benchmark.py",
+          "anchor": "def collect_network_sample("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_specification_benchmark.py",
+          "anchor": "test_network_fixture_runs_without_inherited_environment_and_requires_cleanup"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/specification_benchmark_audit.rs",
+          "anchor": "fn specification_benchmark_terminal_scope_and_totals_are_exact"
+        }
+      ]
     },
     {
       "id": "corpus:network-setup",
@@ -13912,11 +13941,50 @@
     {
       "id": "corpus:specification",
       "family": "specifications",
-      "summary": "Audit all applicable capability claims owned by the pinned specification source corpus.",
+      "summary": "The pinned Firecracker startup, memory, boot, compute, network, storage, and nonblocking-metrics claims are recorded with their AWS/Linux/KVM environments and pending statuses. Bangbang supplies a strict signed Apple/HVF observation path for applicable production startup/boot/telemetry mechanisms and a checked guest workload, while explicitly rejecting cross-environment thresholds, guest-map-excluding overhead equivalence, CoreMark/fio/iperf parity, controlled-cache claims, and tracked hardware fixtures.",
       "source_refs": [
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/specification-benchmark-audit.json",
+          "anchor": "specification"
+        },
+        {
+          "kind": "local",
+          "path": "docs/specification-benchmarks.md",
+          "anchor": "## Firecracker reference figures"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/specification-benchmark.py",
+          "anchor": "def collect_report("
+        },
+        {
+          "kind": "local",
+          "path": "scripts/specification_workload.py",
+          "anchor": "def parse_transcript("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_released_guest_specification_workload"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_specification_benchmark.py",
+          "anchor": "class ReportContractTests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/specification_benchmark_audit.rs",
+          "anchor": "fn checked_specification_benchmark_audit_is_canonical_and_fail_closed"
+        }
+      ]
     },
     {
       "id": "corpus:tracing",
@@ -16413,13 +16481,62 @@
     {
       "id": "semantic.specification:performance-resource-and-telemetry-outcomes",
       "family": "specifications",
-      "summary": "Audit portable boot/overhead/CPU/network/storage/latency, resource-density, and telemetry-loss outcomes separately from AWS/Linux host promises.",
+      "summary": "A strict signed Apple/HVF collector transactionally records production startup wall/CPU metrics, whole-process RSS at the guest release barrier, production boot-timer wall/CPU, fixed guest-monotonic compute/storage durations, and a real metrics-FIFO fill/EAGAIN/typed-failure/drain/retry replay count. Canonical reports retain all raw integers and exact count/min/median/max, compare only under a complete recomputed environment/build/binary/backend/guest/policy/method/unit/fixture identity, publish absent-only after cleanup, omit network by default, and emit no numeric verdict. Whole-process RSS, fixed workloads, uncontrolled page cache, optional fixtures, and AWS/Linux/KVM figures retain explicit nonclaims.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:production-host",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/specification-benchmark-audit.json",
+          "anchor": "process_startup_wall_us"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/boot_timer.rs",
+          "anchor": "Guest-boot-time"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/metrics.rs",
+          "anchor": "missed_metrics_count"
+        },
+        {
+          "kind": "local",
+          "path": "docs/specification-benchmarks.md",
+          "anchor": "## What one retained iteration measures"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/specification-benchmark.py",
+          "anchor": "def collect_telemetry_sample("
+        },
+        {
+          "kind": "local",
+          "path": "scripts/specification_workload.py",
+          "anchor": "class SpecificationWorkloadResult"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/executable_hvf_e2e.rs",
+          "anchor": "signed_executable_runs_released_guest_specification_workload"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_specification_benchmark.py",
+          "anchor": "class RuntimeBoundaryTests"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/specification_benchmark_audit.rs",
+          "anchor": "fn specification_benchmark_terminal_scope_and_totals_are_exact"
+        }
+      ]
     },
     {
       "id": "semantic.storage:block-sync-async-vhost-and-limits",

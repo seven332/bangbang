@@ -27,6 +27,10 @@ Each detailed subject has one primary document:
 - [Targeted Formal Verification](docs/formal-verification.md) owns the pinned
   Linux Kani setup, exact checked runner, five bounded proof records,
   assumptions, evidence interpretation, and nonclaims.
+- [Specification Benchmark Observations](docs/specification-benchmarks.md) owns
+  the strict signed Apple/HVF collector, report/comparison contract, real
+  metrics-FIFO loss observation, optional network fixture, and interpretation
+  nonclaims.
 - [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
   owns the pinned structural scope, reviewed dispositions, and evidence rules.
 - [Firecracker-shaped Developer Tracing](compat/firecracker/v1.16.0/tracing-contract.md)
