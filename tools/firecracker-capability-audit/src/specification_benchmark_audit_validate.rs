@@ -131,6 +131,7 @@ pub fn validate_specification_benchmark_audit(
     let tracked = tracked_repository_files(repository_root, &mut errors);
     validate_evidence(audit, repository_root, &tracked, &mut errors);
     validate_source_contracts(repository_root, &mut errors);
+    validate_runner_measurement_bindings(repository_root, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -420,5 +421,70 @@ fn validate_source_contracts(repository_root: &Path, errors: &mut Vec<String>) {
                 "specification benchmark source is unreadable: {path}"
             )),
         }
+    }
+}
+
+fn validate_runner_measurement_bindings(repository_root: &Path, errors: &mut Vec<String>) {
+    let Ok(runner) = std::fs::read_to_string(repository_root.join(RUNNER_PATH)) else {
+        return;
+    };
+    validate_runner_measurement_text(&runner, errors);
+}
+
+fn validate_runner_measurement_text(runner: &str, errors: &mut Vec<String>) {
+    for measurement in MEASUREMENTS {
+        for (field, token) in [
+            ("name", measurement.name),
+            ("method", measurement.method),
+            ("unit", measurement.unit),
+        ] {
+            if !runner.contains(token) {
+                errors.push(format!(
+                    "specification benchmark runner omits measurement {field}: {token}"
+                ));
+            }
+        }
+    }
+    for token in ["--start-time-us", "--start-time-cpu-us", "CLOCK_MONOTONIC"] {
+        if !runner.contains(token) {
+            errors.push(format!(
+                "specification benchmark runner omits startup baseline token: {token}"
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_measurement_bindings_are_exact_and_fail_closed() {
+        let mut exact = MEASUREMENTS
+            .iter()
+            .map(|measurement| {
+                format!(
+                    "{} {} {}",
+                    measurement.name, measurement.method, measurement.unit
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        exact.push_str("\n--start-time-us --start-time-cpu-us CLOCK_MONOTONIC");
+        let mut errors = Vec::new();
+        validate_runner_measurement_text(&exact, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let drifted = exact.replace(
+            "bangbang-pre-spawn-monotonic-initial-metrics-v1",
+            "drifted-method",
+        );
+        let mut errors = Vec::new();
+        validate_runner_measurement_text(&drifted, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("measurement method"))
+        );
     }
 }
