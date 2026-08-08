@@ -3,6 +3,9 @@
 mod codec;
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 #[doc(hidden)]
+pub mod elevated_credential;
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+#[doc(hidden)]
 pub mod elevated_probe;
 mod grant;
 #[cfg(target_os = "macos")]

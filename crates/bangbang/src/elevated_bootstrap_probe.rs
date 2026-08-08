@@ -3,16 +3,25 @@ use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use bangbang_hvf::HvfBackend;
 use bangbang_runtime::VmBackend;
 use bangbang_session::elevated_probe::{
-    BOOTSTRAP_RECORD_BYTES, ProbeBootstrap, ProbeErrorCategory, ProbeResult, ProbeStage,
-    READY_RECORD, RESULT_RECORD_BYTES, ROOT_FD, WORKER_ACTIVATION,
+    BOOTSTRAP_RECORD_BYTES, CREDENTIAL_DATAGRAM_BYTES, CREDENTIAL_RECORD_BYTES,
+    CredentialDatagramPhase, CredentialDatagramProof, CredentialFailureValue, CredentialGroupClass,
+    CredentialIdentityClass, CredentialPrefix, CredentialRecord, CredentialRecordKind,
+    CredentialRole, CredentialSelfState, CredentialStep, PeerObservation, ProbeBootstrap,
+    ProbeErrorCategory, ProbeResult, ProbeStage, READY_RECORD, RESULT_RECORD_BYTES, ROOT_FD,
+    WORKER_ACTIVATION,
 };
-use bangbang_session::{ObjectIdentity, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD};
+use bangbang_session::{GRANT_FD, ObjectIdentity, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD};
+
+const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(5);
+const CREDENTIAL_WORKER_ARTIFACT: &str =
+    "bangbang-elevated-credential-worker-v1-credential-drop-BBC1-BBG1-restore-groups";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProbeError {
@@ -27,10 +36,13 @@ pub(crate) fn is_requested() -> bool {
 }
 
 pub(crate) fn run() -> ExitCode {
-    let (mut stream, bootstrap) = match probe_session() {
+    let (mut stream, bootstrap, parent) = match probe_session() {
         Ok(session) => session,
         Err(_) => return ExitCode::FAILURE,
     };
+    if bootstrap.mode().is_credential_pair() {
+        return run_credential_pair(stream, bootstrap, parent);
+    }
     let outcome = execute(bootstrap);
     let result = match outcome {
         Ok(()) => ProbeResult::success(bootstrap.mode(), bootstrap.nonce()),
@@ -56,7 +68,7 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
-fn probe_session() -> Result<(UnixStream, ProbeBootstrap), ProbeError> {
+fn probe_session() -> Result<(UnixStream, ProbeBootstrap, libc::pid_t), ProbeError> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.as_slice() != [OsStr::new(WORKER_ACTIVATION)] {
         return Err(invalid(ProbeStage::InitialIdentity));
@@ -87,17 +99,379 @@ fn probe_session() -> Result<(UnixStream, ProbeBootstrap), ProbeError> {
         .map_err(|error| with_kind(ProbeStage::InitialIdentity, error.kind()))?;
     let bootstrap =
         ProbeBootstrap::decode(&encoded).map_err(|_| invalid(ProbeStage::InitialIdentity))?;
-    Ok((stream, bootstrap))
+    Ok((stream, bootstrap, parent))
 }
 
-fn execute(config: ProbeBootstrap) -> Result<(), ProbeError> {
-    validate_initial_identity()?;
+fn run_credential_pair(
+    mut stream: UnixStream,
+    bootstrap: ProbeBootstrap,
+    parent: libc::pid_t,
+) -> ExitCode {
+    std::hint::black_box(CREDENTIAL_WORKER_ARTIFACT);
+    if stream.set_read_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = validate_initial_identity() {
+        return write_credential_failure(
+            &mut stream,
+            bootstrap,
+            CredentialFailureValue::new(
+                CredentialStep::InitialIdentity,
+                ProbeErrorCategory::from_io_kind(error.kind),
+                CredentialPrefix::None,
+                initial_credential_state(bootstrap),
+            ),
+            PeerObservation::NONE,
+        );
+    }
+    let root = match take_root(bootstrap) {
+        Ok(root) => root,
+        Err(error) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                CredentialFailureValue::new(
+                    CredentialStep::InitialIdentity,
+                    ProbeErrorCategory::from_io_kind(error.kind),
+                    CredentialPrefix::None,
+                    initial_credential_state(bootstrap),
+                ),
+                PeerObservation::NONE,
+            );
+        }
+    };
+    drop(root);
+    let grants = match take_grants() {
+        Ok(grants) => grants,
+        Err(category) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::Protocol,
+                    category,
+                    CredentialPrefix::None,
+                    initial_credential_state(bootstrap),
+                ),
+                PeerObservation::NONE,
+            );
+        }
+    };
+    if grants.set_read_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
+        || grants.set_write_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
+    {
+        return write_credential_failure(
+            &mut stream,
+            bootstrap,
+            credential_failure(
+                CredentialStep::Protocol,
+                ProbeErrorCategory::Other,
+                CredentialPrefix::None,
+                initial_credential_state(bootstrap),
+            ),
+            PeerObservation::NONE,
+        );
+    }
+    match receive_credential_datagram(&grants) {
+        Ok(proof)
+            if proof.matches_expected(
+                bootstrap.mode(),
+                CredentialDatagramPhase::Challenge,
+                CredentialRole::Launcher,
+                bootstrap.nonce(),
+            ) => {}
+        Ok(_) | Err(_) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::Protocol,
+                    ProbeErrorCategory::InvalidInput,
+                    CredentialPrefix::None,
+                    initial_credential_state(bootstrap),
+                ),
+                PeerObservation::NONE,
+            );
+        }
+    }
+    let Ok(worker_ready) =
+        CredentialDatagramProof::worker_ready(bootstrap.mode(), bootstrap.nonce())
+    else {
+        return ExitCode::FAILURE;
+    };
+    if send_credential_datagram(&grants, worker_ready).is_err() {
+        return ExitCode::FAILURE;
+    }
+    match receive_credential_datagram(&grants) {
+        Ok(proof)
+            if proof.matches_expected(
+                bootstrap.mode(),
+                CredentialDatagramPhase::LauncherRelease,
+                CredentialRole::Launcher,
+                bootstrap.nonce(),
+            ) => {}
+        Ok(_) | Err(_) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::Protocol,
+                    ProbeErrorCategory::InvalidInput,
+                    CredentialPrefix::None,
+                    initial_credential_state(bootstrap),
+                ),
+                PeerObservation::NONE,
+            );
+        }
+    }
+    let (initial, baseline) = match bangbang_session::elevated_credential::observe_initial_peer(
+        stream.as_raw_fd(),
+        grants.as_raw_fd(),
+        parent,
+        parent,
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+    ) {
+        Ok(observation) => observation,
+        Err(category) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::PeerObservation,
+                    category,
+                    CredentialPrefix::None,
+                    initial_credential_state(bootstrap),
+                ),
+                PeerObservation::NONE,
+            );
+        }
+    };
+    let transition = match bangbang_session::elevated_credential::transition_process(
+        bootstrap.mode(),
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+    ) {
+        Ok(transition) => transition,
+        Err(failure) => {
+            return write_credential_failure(&mut stream, bootstrap, failure, initial);
+        }
+    };
+    let after_worker = match bangbang_session::elevated_credential::observe_later_peer(
+        stream.as_raw_fd(),
+        grants.as_raw_fd(),
+        parent,
+        parent,
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+        &baseline,
+    ) {
+        Ok(observation) => observation,
+        Err(category) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::PeerObservation,
+                    category,
+                    transition.prefix(),
+                    transition.state(),
+                ),
+                initial,
+            );
+        }
+    };
+    let Ok(record) = CredentialRecord::worker_transitioned(
+        bootstrap.mode(),
+        transition.state(),
+        initial,
+        after_worker,
+        bootstrap.nonce(),
+    ) else {
+        return ExitCode::FAILURE;
+    };
+    if stream.write_all(&record.encode()).is_err() {
+        return ExitCode::FAILURE;
+    }
+
+    let launcher = match read_credential_record(&mut stream) {
+        Ok(record)
+            if record.matches_exchange(
+                bootstrap.mode(),
+                CredentialRole::Launcher,
+                bootstrap.nonce(),
+            ) =>
+        {
+            record
+        }
+        Ok(_) | Err(_) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::Protocol,
+                    ProbeErrorCategory::InvalidInput,
+                    transition.prefix(),
+                    transition.state(),
+                ),
+                initial,
+            );
+        }
+    };
+    match launcher.kind() {
+        CredentialRecordKind::Failure => return ExitCode::FAILURE,
+        CredentialRecordKind::LauncherTransitioned => {}
+        CredentialRecordKind::WorkerTransitioned | CredentialRecordKind::WorkerFinal => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::Protocol,
+                    ProbeErrorCategory::InvalidInput,
+                    transition.prefix(),
+                    transition.state(),
+                ),
+                initial,
+            );
+        }
+    }
+    let after_both = match bangbang_session::elevated_credential::observe_later_peer(
+        stream.as_raw_fd(),
+        grants.as_raw_fd(),
+        parent,
+        parent,
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+        &baseline,
+    ) {
+        Ok(observation) => observation,
+        Err(category) => {
+            return write_credential_failure(
+                &mut stream,
+                bootstrap,
+                credential_failure(
+                    CredentialStep::PeerObservation,
+                    category,
+                    transition.prefix(),
+                    transition.state(),
+                ),
+                initial,
+            );
+        }
+    };
+    let Ok(final_record) = CredentialRecord::worker_final(
+        bootstrap.mode(),
+        transition.state(),
+        [initial, after_worker, after_both],
+        bootstrap.nonce(),
+    ) else {
+        return ExitCode::FAILURE;
+    };
+    if stream.write_all(&final_record.encode()).is_err() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn take_root(bootstrap: ProbeBootstrap) -> Result<OwnedFd, ProbeError> {
     bangbang_session::macos::set_cloexec(ROOT_FD)
         .map_err(|error| with_kind(ProbeStage::TakeRoot, error.kind()))?;
     // SAFETY: The feature-gated production spawn contract transfers fixed fd 8
     // exactly once to this process.
     let root = unsafe { OwnedFd::from_raw_fd(ROOT_FD) };
-    validate_root(root.as_raw_fd(), config.root())?;
+    validate_root(root.as_raw_fd(), bootstrap.root())?;
+    Ok(root)
+}
+
+fn take_grants() -> Result<UnixDatagram, ProbeErrorCategory> {
+    bangbang_session::macos::set_cloexec(GRANT_FD)
+        .map_err(|error| ProbeErrorCategory::from_io_kind(error.kind()))?;
+    // SAFETY: The production spawn contract transfers fixed fd 4 exactly once
+    // to this process, and credential mode consumes it instead of normal grants.
+    let owned = unsafe { OwnedFd::from_raw_fd(GRANT_FD) };
+    Ok(UnixDatagram::from(owned))
+}
+
+fn receive_credential_datagram(
+    grants: &UnixDatagram,
+) -> Result<CredentialDatagramProof, ProbeErrorCategory> {
+    let mut encoded = [0_u8; CREDENTIAL_DATAGRAM_BYTES + 1];
+    let length = grants
+        .recv(&mut encoded)
+        .map_err(|error| ProbeErrorCategory::from_io_kind(error.kind()))?;
+    if length != CREDENTIAL_DATAGRAM_BYTES {
+        return Err(ProbeErrorCategory::InvalidInput);
+    }
+    let exact = encoded[..CREDENTIAL_DATAGRAM_BYTES]
+        .try_into()
+        .map_err(|_| ProbeErrorCategory::InvalidInput)?;
+    CredentialDatagramProof::decode(exact).map_err(|_| ProbeErrorCategory::InvalidInput)
+}
+
+fn send_credential_datagram(
+    grants: &UnixDatagram,
+    proof: CredentialDatagramProof,
+) -> Result<(), ProbeErrorCategory> {
+    let encoded = proof.encode();
+    let length = grants
+        .send(&encoded)
+        .map_err(|error| ProbeErrorCategory::from_io_kind(error.kind()))?;
+    if length == encoded.len() {
+        Ok(())
+    } else {
+        Err(ProbeErrorCategory::InvalidInput)
+    }
+}
+
+fn read_credential_record(stream: &mut UnixStream) -> Result<CredentialRecord, ()> {
+    let mut encoded = [0_u8; CREDENTIAL_RECORD_BYTES];
+    stream.read_exact(&mut encoded).map_err(|_| ())?;
+    CredentialRecord::decode(&encoded).map_err(|_| ())
+}
+
+fn write_credential_failure(
+    stream: &mut UnixStream,
+    bootstrap: ProbeBootstrap,
+    failure: CredentialFailureValue,
+    initial: PeerObservation,
+) -> ExitCode {
+    let Ok(record) = CredentialRecord::failure(
+        bootstrap.mode(),
+        CredentialRole::Worker,
+        failure,
+        initial,
+        bootstrap.nonce(),
+    ) else {
+        return ExitCode::FAILURE;
+    };
+    let _ = stream.write_all(&record.encode());
+    ExitCode::FAILURE
+}
+
+const fn credential_failure(
+    step: CredentialStep,
+    category: ProbeErrorCategory,
+    prefix: CredentialPrefix,
+    state: CredentialSelfState,
+) -> CredentialFailureValue {
+    CredentialFailureValue::new(step, category, prefix, state)
+}
+
+const fn initial_credential_state(bootstrap: ProbeBootstrap) -> CredentialSelfState {
+    let identity = if bootstrap.mode().retains_root() {
+        CredentialIdentityClass::InitialAndTarget
+    } else {
+        CredentialIdentityClass::InitialRoot
+    };
+    CredentialSelfState::new(identity, CredentialGroupClass::Other)
+}
+
+fn execute(config: ProbeBootstrap) -> Result<(), ProbeError> {
+    validate_initial_identity()?;
+    let root = take_root(config)?;
     match config.mode() {
         bangbang_session::elevated_probe::ProbeMode::HvfControl => {
             drop(root);
@@ -112,7 +486,11 @@ fn execute(config: ProbeBootstrap) -> Result<(), ProbeError> {
         bangbang_session::elevated_probe::ProbeMode::Drop
         | bangbang_session::elevated_probe::ProbeMode::RetainRoot
         | bangbang_session::elevated_probe::ProbeMode::UnmappedSyscall => {}
-        bangbang_session::elevated_probe::ProbeMode::Control => {
+        bangbang_session::elevated_probe::ProbeMode::Control
+        | bangbang_session::elevated_probe::ProbeMode::CredentialDrop
+        | bangbang_session::elevated_probe::ProbeMode::CredentialRetainRoot
+        | bangbang_session::elevated_probe::ProbeMode::CredentialUnmapped
+        | bangbang_session::elevated_probe::ProbeMode::CredentialControl => {
             return Err(invalid(ProbeStage::InitialIdentity));
         }
     }
@@ -430,5 +808,33 @@ mod tests {
             .expect_err("destroy failure should be reported");
         assert_eq!(failure.stage, ProbeStage::HvfDestroy);
         assert_eq!(destroy_failure.calls, ["create", "destroy"]);
+    }
+
+    #[test]
+    fn credential_transport_rejects_disconnect_timeout_and_wrong_length() {
+        let (mut stream, peer) = UnixStream::pair().expect("stream pair should construct");
+        drop(peer);
+        assert!(
+            read_credential_record(&mut stream).is_err(),
+            "stream endpoint death must not produce a phase record"
+        );
+
+        let (datagram, peer) = UnixDatagram::pair().expect("datagram pair should construct");
+        peer.send(&[0; CREDENTIAL_DATAGRAM_BYTES - 1])
+            .expect("short datagram should send");
+        assert_eq!(
+            receive_credential_datagram(&datagram),
+            Err(ProbeErrorCategory::InvalidInput)
+        );
+
+        let (datagram, peer) = UnixDatagram::pair().expect("datagram pair should construct");
+        datagram
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("datagram timeout should configure");
+        drop(peer);
+        assert!(
+            receive_credential_datagram(&datagram).is_err(),
+            "a dead datagram endpoint must fail or time out without advancing"
+        );
     }
 }

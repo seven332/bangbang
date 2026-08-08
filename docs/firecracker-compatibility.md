@@ -1230,6 +1230,20 @@ parent loss before acknowledgment cancels the unpublished session, while later
 SIGINT/SIGTERM to that PID follows normal reap and cleanup. Signed evidence also
 covers two simultaneous daemon supervisors and peer survival after one stops.
 
+The disabled-by-default elevated evidence bundle additionally proves a
+no-chroot credential bootstrap boundary on Apple Silicon macOS 26.5.2 / SDK
+26.5. With explicit operator root, both fixed signed endpoints complete
+worker-first then launcher-second mapped ordinary and SDK-maximum unmapped
+credential transitions. Public `setgroups`/`setgid`/`setuid` order, the Darwin
+`effective-only` access-group postcondition, exact real/effective target ids,
+and failed root restoration are checked; zero is retained-root/no-drop. Stream
+credentials remain connection-time snapshots, datagram peer credentials are
+unsupported, opaque datagram tokens distinguish changed from retained-root,
+and live PIDs remain exact. This is evidence for #1371, not a public launch
+policy or capability disposition: target-owned runtime/resources, typed grants,
+lifecycle/API, daemon/crash, guest/HVF continuation, and final uid/gid semantics
+remain unmeasured.
+
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
 provides external descriptor authority, and contained config, metadata, kernel,
@@ -1245,9 +1259,10 @@ describe/state/memory consumers adopt exact files, and frozen native-v1 load
 may additionally adopt its persisted root; create retains
 repeatable output anchors with bounded children and strict crash-cleanup
 records. General dynamic post-Ready delivery, hard revocation, cross-filesystem
-socket publication, vmnet provisioning and policy, arbitrary uid/gid transition,
-configurable chroot, launch constraints, Developer ID possession, automatic
-restart, and notarization remain later work. The exact Linux seccomp, cgroup,
+socket publication, vmnet provisioning and policy, productized arbitrary
+uid/gid transition beyond the measured bootstrap boundary, configurable chroot,
+launch constraints, Developer ID possession, automatic restart, and
+notarization remain later work. The exact Linux seccomp, cgroup,
 network-namespace, and PID-namespace mechanisms now have terminal macOS
 platform exclusions; this does not make the surrounding aggregate jailer or
 production-host records complete.

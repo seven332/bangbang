@@ -1,10 +1,11 @@
 # Elevated macOS Bootstrap Evidence
 
-This contract records the #1373 direct-worker result and the #1884
-inherited-root follow-up beneath #1371. Together they test two public orderings
-for combining Firecracker's chroot-first model with Bangbang's mandatory
-production worker boundary. They do not add a public root mode, accept jailer
-uid/gid/chroot options, or change a capability disposition by themselves.
+This contract records the #1373 direct-worker result, the #1884 inherited-root
+follow-up, and the #1885 no-chroot credential-transition result beneath #1371.
+Together they test public chroot orderings and numeric credential bootstrap
+against Bangbang's mandatory production worker boundary. They do not add a
+public root mode, accept jailer uid/gid/chroot options, or change a capability
+disposition by themselves.
 
 ## Exact test boundary
 
@@ -18,9 +19,9 @@ The evidence bundle keeps the production layout and identity split:
   suspended/live worker identity checks whenever the child reaches them; and
 - both launcher and worker probe entries are compiled only with the
   `elevated-bootstrap-probe` feature. A normal `--no-default-features` build is
-  checked for absence of the launcher-owned worker activation, ready and status
-  records, and the marker resource, and the normal signed bundle rejects the
-  internal launcher argv.
+  checked for absence of the launcher-owned worker activation, ready/status
+  records, credential modes/phases/steps, and marker resource. The normal signed
+  bundle dynamically rejects both historical and credential internal argv.
 
 The root wrapper never invokes `sudo`. It requires exact real/effective
 uid/gid zero, accepts explicit numeric target uid/gid values, runs with a
@@ -46,15 +47,38 @@ loader through no-follow descriptors, prepares every spawn object, enters the
 root with public `fchdir`/`chroot`/`chdir`, reattests `/`, and only then calls
 public `posix_spawn` with the fixed in-root worker path.
 
-In direct modes, the signed worker verifies initial root identity, the
+In direct chroot modes, the signed worker verifies initial root identity, the
 nonce-bound descriptor identity, and exact mode before `fchdir`, public
 `chroot(2)`, or `chdir("/")`. If the inherited worker reaches application
 entry, it must additionally attest that `/` and cwd are the same exact root,
 observe the direct App Sandbox chroot retry denial, and create then destroy one
-real HVF VM. No mode executes `setgroups`, `setgid`, or `setuid`. The launcher
-reports only fixed mode, stage, and error categories. Target IDs, paths,
-nonces, device/inode values, descriptor numbers, signing values, account data,
-and environment values are never reported.
+real HVF VM. Those historical modes never execute `setgroups`, `setgid`, or
+`setuid`, and their output remains unchanged.
+
+The separate no-chroot credential modes reuse the same static, suspended, and
+live code validation, root descriptor, closed environment, fixed lifecycle
+stream, and fixed grant datagram. A nonce-bound three-message datagram barrier
+proves endpoint possession before the first transition. The worker transitions
+first, reports its self-state and initial/worker-only observations, then the
+launcher transitions and responds; the worker sends the final after-both
+observation before both processes exit. The external root wrapper retains only
+bounded supervision and exact cleanup.
+
+For a nonzero target, each endpoint executes public `setgroups(0, null)`,
+`setgid`, and `setuid` in that order. Darwin's legacy `getgroups` surface reports
+the current effective gid as the sole access-list entry after supplementary
+groups are cleared, so the checked postcondition is `effective-only`, not a
+literal zero-length list. Real/effective ids must equal the target, and attempts
+to restore uid zero, gid zero, or a root group must all return permission denied
+before any later work. Retained-root performs no credential mutation and is
+reported as no-drop. The SDK-maximum unmapped numeric class is measured only at
+the syscall/postcondition boundary.
+
+Stream `getpeereid` and `LOCAL_PEERCRED`, live `LOCAL_PEERPID`, datagram
+`LOCAL_PEERCRED`, and opaque `LOCAL_PEERTOKEN` comparison remain separate
+fields. Raw IDs, paths, PIDs, tokens, nonces, descriptor numbers, signatures,
+account data, and environment values never enter records, diagnostics, or the
+checked result.
 
 ## Capable-host result
 
@@ -72,32 +96,47 @@ root authority. The complete matrix produced these results:
 | same signed App Sandbox + Hypervisor worker, unchrooted | HVF control | exact worker validation and real HVF create/destroy succeeded |
 | launcher enters staged root before spawn | inherited-root, repeated three times | static bundle/loader validation and launcher root entry succeeded; `posix_spawn` returned success, but the worker exited before the earliest Ready record (`worker-bootstrap` / `other`) |
 | two concurrent complete inherited roots | distinct staged bundle/loader trees | both returned the same `worker-bootstrap` / `other` blocker |
+| unsandboxed signed launcher credential control | mapped ordinary target and SDK-maximum unmapped target | ordered transition, `effective-only` postcondition, and all three restoration denials completed |
+| same launcher control | uid/gid-zero retained-root | initial credentials/groups remained exact with no mutating credential call |
+| fixed signed launcher + App Sandbox/Hypervisor worker, no chroot | mapped ordinary target, repeated three times | worker-first and launcher-second transitions both completed irreversibly |
+| same fixed pair | uid/gid-zero retained-root, repeated three times | both endpoints retained exact root without claiming privilege separation |
+| same fixed pair | SDK-maximum unmapped numeric target | both endpoint syscalls, postconditions, and restoration denials completed independently of account-backed runtime feasibility |
+| two concurrent fixed credential pairs | distinct exact roots/workspaces | both ordinary-target transitions completed with byte-identical bounded results |
 
 Focused negative cases reject a group-writable root and a symlink root. The
 staged manifest also rejects a writable, missing, symlinked, or inode-replaced
 loader, a missing nested worker, and an unexpected entry before worker
-activation. Every successful, rejected, repeated, and concurrent case leaves
-no root or workspace residue. Nonempty-root cleanup preflights all 20 ledger
+activation. Every successful, rejected, repeated, and concurrent case leaves no
+process, root, workspace, or named-socket residue. Nonempty-root cleanup
+preflights all 20 ledger
 entries before removing any, then uses only reverse exact `unlink`/`rmdir`;
 root cleanup rechecks device, inode, owner, group, and mode and refuses to
 remove a replacement.
+
+Across the completed nonzero transitions, both stream credential surfaces kept
+their documented connection-time root snapshot while live stream PID remained
+exact. Connected-datagram `LOCAL_PEERCRED` returned the bounded unsupported
+class; `LOCAL_PEERTOKEN` changed after a credential transition and remained
+unchanged for retained-root; datagram `LOCAL_PEERPID` remained exact after the
+nonce-bound possession barrier. No datagram `getpeereid` claim is made.
 
 The inherited result is not a missing-HVF or generally invalid-signature
 result: the same exact unchrooted signed worker completed real HVF
 create/destroy in the same wrapper run. The inherited branch nevertheless
 never reached application entry, root attestation, the direct-chroot sandbox
-control, or HVF. No guest, credential transition, lifecycle/API, or typed
-resource consumption was attempted.
+control, or HVF. The no-chroot credential branch separately reached both signed
+application endpoints, but no target-owned runtime/resource tree, typed grant,
+public lifecycle/API, guest, or post-transition HVF operation was attempted.
 
 After those results were established, the checked harness remained at the
 evidence boundary: it contains no credential-changing product path. If a
 future platform permits the direct sandboxed `chroot`, that branch reports
 `unexpected-continuation` before later work. If an inherited worker reaches
 entry, it must pass exact root, sandbox-denial, and HVF checks before success.
-Either changed result forces fresh implementation research and Challenge.
-Connected-socket credentials never cross a credential change in these measured
-branches; the harness leaves the normal peer verifier unchanged and makes no
-dynamic-versus-snapshot credential claim for #1374.
+Either changed result forces fresh implementation research and Challenge. The
+harness leaves the normal peer verifier and public launch policy unchanged.
+#1885 records bootstrap semantics only; #1374 cannot reuse its stale assumptions
+without the target-runtime/resource/lifecycle continuation selected by #1371.
 
 ## Supported conclusion and nonclaims
 
@@ -125,13 +164,16 @@ Seatbelt APIs, or switching to a different VMM process changes the challenged
 product/security model; any credible public in-root dependency alternative
 must instead be evaluated explicitly by the parent.
 
-This does not prove that numeric `setgroups`/`setgid`/`setuid` alone are
-unavailable on macOS, that no larger fixed in-root Darwin dependency set can
-bootstrap, or that inherited-root success would supply full resources,
-lifecycle, API, guest boot, daemon/crash, grant, or credential semantics. It
-does not claim Linux mount/PID/user namespace parity, certify notarized
-distribution, or generalize beyond the recorded OS/SDK behavior. A changed
-root content or future public platform requires rerunning the wrapper and a
+The measured public credential primitives are available in the exact signed
+no-chroot process shape: mapped ordinary and SDK-maximum unmapped transitions
+both completed, while zero remained an explicit no-drop class. This is not yet
+a Firecracker uid/gid implementation. It does not establish target-owned
+runtime namespace and resource ownership, typed grants, lifecycle/API,
+daemon/crash cleanup, real guest/HVF work after transition, public policy, or
+aggregate jailer behavior. It also does not prove that a larger fixed in-root
+Darwin dependency set cannot bootstrap, claim Linux mount/PID/user namespace
+parity, certify notarized distribution, or generalize beyond the recorded
+OS/SDK behavior. A future public platform requires rerunning the wrapper and a
 fresh ID-by-ID Challenge.
 
 ## Reproduction
@@ -155,8 +197,12 @@ sudo /usr/bin/env -i HOME=/var/root PATH=/usr/bin:/bin \
   --target-gid "$target_gid"
 ```
 
-The required terminal summary is value-free:
+The required terminal summary remains value-free and includes the credential,
+observation, residue, and nonclaim classes:
 
 ```text
-result: inherited-root-worker=blocked stage=worker-bootstrap error=other controls=success cleanup=exact
+result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete controls=complete cleanup=exact
+observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact
+residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero
+nonclaims: target-runtime=unmeasured target-resources=unmeasured grants=unmeasured lifecycle-api=unmeasured daemon-crash=unmeasured guest-hvf=unmeasured public-policy=unchanged uid-gid=nonterminal chroot=unresolved aggregate-jailer=nonterminal
 ```

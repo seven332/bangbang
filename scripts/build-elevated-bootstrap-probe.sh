@@ -78,6 +78,11 @@ status_activation="status: elevated bootstrap blocked"
 ready_activation="BBEP-READY-V2"
 inherited_mode="inherited-root"
 hvf_stage="hvf-create"
+credential_mode="credential-drop"
+credential_status="status: elevated credential"
+credential_record="BBC1"
+credential_datagram="BBG1"
+credential_step="restore-groups"
 
 cargo build \
   -p bangbang \
@@ -95,6 +100,11 @@ probe_markers=(
   "$ready_activation"
   "$inherited_mode"
   "$hvf_stage"
+  "$credential_mode"
+  "$credential_status"
+  "$credential_record"
+  "$credential_datagram"
+  "$credential_step"
 )
 for artifact in "$launcher_bin" "$worker_bin"; do
   for marker_value in "${probe_markers[@]}"; do
@@ -120,16 +130,28 @@ for marker_value in \
   "$worker_activation" \
   "$status_activation" \
   "$inherited_mode" \
-  "$hvf_stage"; do
+  "$hvf_stage" \
+  "$credential_mode" \
+  "$credential_status" \
+  "$credential_record" \
+  "$credential_datagram" \
+  "$credential_step"; do
   if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$launcher_bin"; then
     echo "evidence artifact is missing the elevated probe boundary" >&2
     exit 1
   fi
 done
-if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$ready_activation" "$worker_bin"; then
-  echo "evidence artifact is missing the elevated probe boundary" >&2
-  exit 1
-fi
+for marker_value in \
+  "$ready_activation" \
+  "$credential_mode" \
+  "$credential_record" \
+  "$credential_datagram" \
+  "$credential_step"; do
+  if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$worker_bin"; then
+    echo "evidence artifact is missing the elevated probe boundary" >&2
+    exit 1
+  fi
+done
 
 cargo build \
   -p bangbang-launcher \
