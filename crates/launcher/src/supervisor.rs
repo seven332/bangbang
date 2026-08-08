@@ -446,6 +446,23 @@ const fn credential_initial_state(
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+const fn credential_protocol_failure(
+    prefix: bangbang_session::elevated_probe::CredentialPrefix,
+    state: bangbang_session::elevated_probe::CredentialSelfState,
+) -> bangbang_session::elevated_probe::CredentialFailureValue {
+    use bangbang_session::elevated_probe::{
+        CredentialFailureValue, CredentialStep, ProbeErrorCategory,
+    };
+
+    CredentialFailureValue::new(
+        CredentialStep::Protocol,
+        ProbeErrorCategory::InvalidInput,
+        prefix,
+        state,
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 fn begin_credential_exchange(
     spawned: &mut crate::macos::spawn::SuspendedWorker,
     bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
@@ -576,8 +593,7 @@ fn finish_credential_exchange(
 
     use bangbang_session::elevated_probe::{
         CREDENTIAL_RECORD_BYTES, CredentialFailureValue, CredentialPrefix, CredentialRecord,
-        CredentialRecordKind, CredentialRole, CredentialSelfState, CredentialStep, PeerObservation,
-        ProbeErrorCategory,
+        CredentialRecordKind, CredentialRole, CredentialStep, PeerObservation,
     };
 
     // SAFETY: `getpid` has no pointer or ownership contract and remains stable
@@ -602,7 +618,10 @@ fn finish_credential_exchange(
                     return send_launcher_failure_and_wait(
                         &mut spawned,
                         bootstrap,
-                        protocol_failure(credential_initial_state(bootstrap)),
+                        credential_protocol_failure(
+                            CredentialPrefix::None,
+                            credential_initial_state(bootstrap),
+                        ),
                         initial,
                     );
                 }
@@ -612,7 +631,10 @@ fn finish_credential_exchange(
             return send_launcher_failure_and_wait(
                 &mut spawned,
                 bootstrap,
-                protocol_failure(credential_initial_state(bootstrap)),
+                credential_protocol_failure(
+                    CredentialPrefix::None,
+                    credential_initial_state(bootstrap),
+                ),
                 initial,
             );
         }
@@ -711,7 +733,7 @@ fn finish_credential_exchange(
                     credential_wait_for_exit(&mut spawned, 1)?;
                     return Ok(credential_blocked_value(
                         CredentialRole::Launcher,
-                        protocol_failure(transition.state()),
+                        credential_protocol_failure(transition.prefix(), transition.state()),
                     ));
                 }
             }
@@ -720,7 +742,7 @@ fn finish_credential_exchange(
             credential_wait_for_exit(&mut spawned, 1)?;
             return Ok(credential_blocked_value(
                 CredentialRole::Launcher,
-                protocol_failure(transition.state()),
+                credential_protocol_failure(transition.prefix(), transition.state()),
             ));
         }
     };
@@ -734,12 +756,17 @@ fn finish_credential_exchange(
     {
         return Ok(credential_blocked_value(
             CredentialRole::Launcher,
-            protocol_failure(transition.state()),
+            credential_protocol_failure(transition.prefix(), transition.state()),
         ));
     }
-    let semantics =
+    let Some(semantics) =
         credential_semantics(bootstrap.mode(), launcher_observations, worker_observations)
-            .ok_or(LauncherError::SessionProtocol)?;
+    else {
+        return Ok(credential_blocked_value(
+            CredentialRole::Launcher,
+            credential_protocol_failure(transition.prefix(), transition.state()),
+        ));
+    };
     println!(
         "status: elevated credential {} complete stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={}",
         bootstrap.mode().name(),
@@ -757,15 +784,6 @@ fn finish_credential_exchange(
         let mut encoded = [0_u8; CREDENTIAL_RECORD_BYTES];
         stream.read_exact(&mut encoded).map_err(|_| ())?;
         CredentialRecord::decode(&encoded).map_err(|_| ())
-    }
-
-    const fn protocol_failure(state: CredentialSelfState) -> CredentialFailureValue {
-        CredentialFailureValue::new(
-            CredentialStep::Protocol,
-            ProbeErrorCategory::InvalidInput,
-            CredentialPrefix::None,
-            state,
-        )
     }
 
     fn send_launcher_failure_and_wait(
@@ -1139,6 +1157,29 @@ mod tests {
             token,
         )
         .expect("complete peer observation")
+    }
+
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    #[test]
+    fn credential_protocol_failure_preserves_the_completed_transition_prefix() {
+        use bangbang_session::elevated_probe::{
+            CredentialGroupClass, CredentialIdentityClass, CredentialPrefix, CredentialSelfState,
+        };
+
+        let failure = credential_protocol_failure(
+            CredentialPrefix::Irreversible,
+            CredentialSelfState::new(
+                CredentialIdentityClass::Target,
+                CredentialGroupClass::EffectiveOnly,
+            ),
+        );
+
+        assert_eq!(failure.prefix(), CredentialPrefix::Irreversible);
+        assert_eq!(failure.state().identity(), CredentialIdentityClass::Target);
+        assert_eq!(
+            failure.state().groups(),
+            CredentialGroupClass::EffectiveOnly
+        );
     }
 
     #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]

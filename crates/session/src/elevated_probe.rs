@@ -1236,7 +1236,7 @@ impl CredentialRecord {
             PeerObservation::decode(&bytes[28..34])?,
         ];
         let nonce = SessionId::from_bytes(array(bytes, 48)?);
-        match (kind, bytes[9], bytes[10], bytes[11], bytes[12]) {
+        let record = match (kind, bytes[9], bytes[10], bytes[11], bytes[12]) {
             (CredentialRecordKind::Failure, 0, step, category, prefix) => Self::failure(
                 mode,
                 role,
@@ -1271,6 +1271,11 @@ impl CredentialRecord {
                 nonce,
             ),
             _ => Err(ProbeProtocolError),
+        }?;
+        if record.encode() == *bytes {
+            Ok(record)
+        } else {
+            Err(ProbeProtocolError)
         }
     }
 }
@@ -2011,6 +2016,39 @@ mod tests {
             nonce,
         )
         .expect("valid worker final");
+        let mut worker_with_unexpected_final_observation = worker_transitioned.encode();
+        let unexpected_observation: [u8; 6] = worker_with_unexpected_final_observation[16..22]
+            .try_into()
+            .expect("fixed observation slot");
+        worker_with_unexpected_final_observation[28..34].copy_from_slice(&unexpected_observation);
+        assert_eq!(
+            CredentialRecord::decode(&worker_with_unexpected_final_observation),
+            Err(ProbeProtocolError),
+            "ignored observation slots must remain canonical zeroes"
+        );
+        let failure = CredentialRecord::failure(
+            ProbeMode::CredentialDrop,
+            CredentialRole::Worker,
+            CredentialFailureValue::new(
+                CredentialStep::SetUid,
+                ProbeErrorCategory::PermissionDenied,
+                CredentialPrefix::GidSet,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::Other,
+                    CredentialGroupClass::EffectiveOnly,
+                ),
+            ),
+            initial,
+            nonce,
+        )
+        .expect("valid partial failure");
+        let mut failure_with_unexpected_later_observation = failure.encode();
+        failure_with_unexpected_later_observation[22..28].copy_from_slice(&unexpected_observation);
+        assert_eq!(
+            CredentialRecord::decode(&failure_with_unexpected_later_observation),
+            Err(ProbeProtocolError),
+            "failure records must reject ignored later observations"
+        );
         assert!(worker_transitioned.matches_expected(
             ProbeMode::CredentialDrop,
             CredentialRecordKind::WorkerTransitioned,
