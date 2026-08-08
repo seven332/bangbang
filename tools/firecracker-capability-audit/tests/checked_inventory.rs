@@ -759,7 +759,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        376
+        377
     );
     assert_eq!(
         inventory
@@ -767,7 +767,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        9
+        8
     );
     assert_eq!(
         inventory
@@ -1608,6 +1608,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         "compat/firecracker/v1.16.0/observability-tools-specification-contract.md";
     const CHALLENGE_URL: &str =
         "https://github.com/seven332/bangbang/issues/1784#issuecomment-5161129449";
+    const WAVE8_ID: &str = "semantic.cross-capability:state-errors-metrics-security-and-snapshots";
     const WAVE_7_OWNED: [(&str, &str); 93] = [
         ("api-operation:GET /", "#1784"),
         ("api-operation:GET /version", "#1784"),
@@ -1869,6 +1870,11 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let handoffs = RETAINED_HANDOFFS
         .iter()
         .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let current_handoffs = handoffs
+        .iter()
+        .copied()
+        .filter(|id| *id != WAVE8_ID)
         .collect::<BTreeSet<_>>();
     let implemented = CORE_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
     let logger_implemented = LOGGER_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
@@ -2412,7 +2418,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let expected_audit = owned
         .difference(&selected)
         .copied()
-        .chain(handoffs.iter().copied())
+        .chain(current_handoffs.iter().copied())
         .collect::<BTreeSet<_>>();
     let actual_audit = inventory
         .capabilities
@@ -2421,13 +2427,17 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .map(|capability| capability.id.as_str())
         .collect::<BTreeSet<_>>();
     assert_eq!(actual_audit, expected_audit);
-    for id in &handoffs {
+    for id in &current_handoffs {
         assert_eq!(
             by_id.get(id).expect("handoff must exist").disposition,
             Disposition::AuditRequired,
-            "external or Wave 8 handoff must not move: {id}"
+            "external handoff must not move: {id}"
         );
     }
+    let wave8 = by_id.get(WAVE8_ID).expect("Wave 8 successor must exist");
+    assert_eq!(wave8.disposition, Disposition::ImplementedAndVerified);
+    assert!(!wave8.implementation.is_empty());
+    assert!(!wave8.validation.is_empty());
 
     assert!(normalized_contract.contains("Producer-only children #1785, #1788, and #1789"));
     assert!(normalized_contract.contains("does not claim comprehensive failure logging (#1786)"));
@@ -3544,8 +3554,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
-    assert_eq!(count(Disposition::AuditRequired), 9);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 377);
+    assert_eq!(count(Disposition::AuditRequired), 8);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4274,8 +4284,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
-    assert_eq!(count(Disposition::AuditRequired), 9);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 377);
+    assert_eq!(count(Disposition::AuditRequired), 8);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4571,8 +4581,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
-    assert_eq!(count(Disposition::AuditRequired), 9);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 377);
+    assert_eq!(count(Disposition::AuditRequired), 8);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4720,8 +4730,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
-    assert_eq!(count(Disposition::AuditRequired), 9);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 377);
+    assert_eq!(count(Disposition::AuditRequired), 8);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 }
@@ -4968,8 +4978,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 376);
-    assert_eq!(count(Disposition::AuditRequired), 9);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 377);
+    assert_eq!(count(Disposition::AuditRequired), 8);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
 

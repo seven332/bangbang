@@ -1281,7 +1281,9 @@ matrix status, and product/profile limits do not become
 validation evidence.
 
 Delivery validation permits explicit `audit-required` and
-`missing-platform-feasible` handoffs. Final validation rejects both.
+`missing-platform-feasible` handoffs. Global `--final` validation rejects both;
+scoped terminal authorities may certify their exact completed slice while
+retaining named external handoffs.
 A `proven-platform-impossible` record requires the exact upstream contract,
 authoritative platform evidence, reviewed alternatives, stable public behavior,
 focused tests, compatibility and security documentation, and a current
@@ -1301,6 +1303,18 @@ availability, stability, state, survival, and value-safe failure semantic. It
 also preserves the independent logger, metrics, tools, corpus, performance,
 formal-verification, and final cross-capability owners rather than promoting
 them through that aggregate result.
+
+The final
+[Wave 8 platform-feasible contract](../compat/firecracker/v1.16.0/wave8-certification-contract.md)
+now closes only
+`semantic.cross-capability:state-errors-metrics-security-and-snapshots`. Its
+strict authority derives all 21 unordered pairs across seven fixed lifecycle,
+error, observability, resource, device, network/MMDS, and snapshot domains from
+four exact portable and signed product leaves. It also rechecks the current
+30-record platform-exclusion partition and retains the exact eleven
+#1351/#1373/#1378 external outcomes. It does not turn missing credentials,
+root/HVF authority, skipped execution, or a weaker macOS mechanism into
+success or impossibility.
 
 The independent `corpus:formal-verification` owner is now terminal through the
 [Targeted Formal Verification](formal-verification.md) boundary and checked

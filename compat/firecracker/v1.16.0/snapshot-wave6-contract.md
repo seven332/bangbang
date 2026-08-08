@@ -229,8 +229,10 @@ destination rejection, not unconstrained cross-host success. Issue
 CPU/host/fleet pair selection and any future cross-host success evidence.
 Issue [#1378](https://github.com/seven332/bangbang/issues/1378) owns the first
 credentialed production vmnet connectivity, service/crash failure, concurrent
-session, and cleanup evidence. Wave 8 owns only the later cross-capability
-aggregate; it does not reopen these 68 terminal snapshot identities.
+session, and cleanup evidence. The later
+[Wave 8 cross-capability aggregate](wave8-certification-contract.md) is now
+terminal and does not reopen these 68 terminal snapshot identities or close
+the external #1378 evidence.
 
 No row claims Firecracker artifact bytes, Linux UFFD wire identity, an
 invented per-drive load override, live socket/TCP/packet/backend migration,

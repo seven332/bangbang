@@ -78,7 +78,7 @@ The directly reviewed identities and their current downstream boundaries are:
 
 | Boundary | Exact identities | Final disposition or owner |
 | --- | --- | --- |
-| Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `implemented-and-verified`; strict bodyless routing and deterministic serialization of the supported optional configuration are terminal under the [Wave 7 contract](observability-tools-specification-contract.md). The optional `.logger` and `.metrics` properties retain their #1786/#1787 owners, and Wave 8 retains only the final cross-capability interaction semantic. |
+| Exported configuration | `api-operation:GET /vm/config`; `api-path:/vm/config`; `api-schema:FullVmConfiguration` | `implemented-and-verified`; strict bodyless routing and deterministic serialization of the supported optional configuration are terminal under the [Wave 7 contract](observability-tools-specification-contract.md). The optional `.logger` and `.metrics` properties retain their #1786/#1787 component authorities, and their selected cross-capability interactions are terminal under the [Wave 8 contract](wave8-certification-contract.md). |
 | Snapshot create API leaves | `api-operation:PUT /snapshot/create`; `api-path:/snapshot/create`; `api-schema:SnapshotCreateParams`; `api-property:SnapshotCreateParams.snapshot_type`; `api-property:SnapshotCreateParams.snapshot_path`; `api-property:SnapshotCreateParams.mem_file_path` | `implemented-and-verified`; strict paused-only Full/Diff parsing and the two-output public transaction have portable, signed real-HVF, ordinary-production, and App Sandbox evidence. |
 | Snapshot load aggregates | `api-operation:PUT /snapshot/load`; `api-path:/snapshot/load`; `api-schema:SnapshotLoadParams` | `implemented-and-verified`; the strict schema, frozen native-v1 File/Uffd and native-v2 2.3–2.13 File/COW dispatch, Paused-first lifecycle, authority, failure, and mechanism boundaries are closed by the [Wave 6 snapshot contract](snapshot-wave6-contract.md). |
 | Snapshot semantics | `semantic.snapshot:full-create-load-and-public-lifecycle` | `implemented-and-verified`; the public lineage advances from device-free native-v2 2.3 through exact 2.12 Full with all 64 optional-device products, while exact 2.13 Diff adds mandatory base/selection/result kind 14 and retains all earlier readers. Zero-root and matching rebased results load through direct, contained, ordinary-production, and App Sandbox boundaries. |
@@ -88,10 +88,10 @@ The directly reviewed identities and their current downstream boundaries are:
 | Mixed snapshot aggregates | `semantic.snapshot:diff-dirty-tracking-and-memory-backends`; `corpus:snapshot-versioning` | `implemented-and-verified`; the exact Diff/rebase, frozen external-pager, version ladder, mechanism exclusions, and bounded portability evidence compose in the Wave 6 ledger. |
 | Snapshot composition | `semantic.snapshot:multi-vcpu-drives-devices-and-mmds` | `implemented-and-verified`; Full 2.12 and Diff 2.13 close all 64 optional-device MMIO/PCI products, exact complete-set external drive restoration, tools, recapture, and direct/contained production evidence. Firecracker v1.16 has no per-drive load-override field. |
 | Snapshot tracking leaves | `api-property:SnapshotLoadParams.enable_diff_snapshots`; `api-property:SnapshotLoadParams.track_dirty_pages` | Already `implemented-and-verified`; they select complete destination dirty tracking and compose with the separately certified exact-2.13 create/rebase boundary. |
-| Core API specification | `semantic.specification:api-availability-stability-and-failure-information` | `implemented-and-verified`; socket/control-loop availability, strict request/response/state behavior, process survival, value-safe failures, and the signed lifecycle are terminal under the [Wave 7 contract](observability-tools-specification-contract.md). Comprehensive failure logging, numeric performance/telemetry outcomes, and final cross-capability interactions remain explicitly separate. |
+| Core API specification | `semantic.specification:api-availability-stability-and-failure-information` | `implemented-and-verified`; socket/control-loop availability, strict request/response/state behavior, process survival, value-safe failures, and the signed lifecycle are terminal under the [Wave 7 contract](observability-tools-specification-contract.md). Logger, metrics, formal, and performance claims retain their component authorities; selected final cross-capability interactions are composed by Wave 8. |
 | Targeted formal verification | `corpus:formal-verification` | `implemented-and-verified`; five source/compiled-bijective Kani 0.67.0 harnesses prove bounded pager input, virtqueue scalar, token-refill, artifact-range, and virtio-status invariants under the [formal-verification contract](formal-verification-contract.md). This does not widen the core API, machine lifecycle, FFI/HVF, time, concurrency, I/O, performance, or whole-system claims. |
 | Broad specifications | `corpus:specification`; `semantic.specification:performance-resource-and-telemetry-outcomes` | `implemented-and-verified`; #1798 closes the applicable reference interpretation and threshold-free startup, whole-process RSS, boot, fixed-workload, and telemetry-loss observation contract under the [specification benchmark ledger](specification-benchmark-contract.md). |
-| Cross-capability certification | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `audit-required`; Wave 8 owns the final interaction audit after the individual lifecycle, error, telemetry, security, device, network, and snapshot producers stabilize. |
+| Cross-capability certification | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | `implemented-and-verified`; the checked [Wave 8 authority](wave8-certification-contract.md) derives all 21 unordered pairs across seven fixed domains from four exact portable and signed leaf scenarios, while retaining eleven external outcomes. |
 | External isolation gates | `semantic.isolation:host-resource-authority-and-brokerage`; `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`; `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity` | Unchanged `missing-platform-feasible`; #1351 retains its independent external root, vmnet, credential, and deployment evidence gates. |
 
 Those exact identities establish the following non-overlapping handoffs:
@@ -110,11 +110,12 @@ Those exact identities establish the following non-overlapping handoffs:
   repository-wide performance, resource, telemetry, and corpus outcomes after
   producers stabilize. The core API and architecture-specific x86 boundary
   are closed by the checked Wave 7 contract.
-- Wave 8 owns only
-  `semantic.cross-capability:state-errors-metrics-security-and-snapshots`, the
-  final interaction audit. Terminal `GET /vm/config`, path, and schema claims
-  remain bounded to deterministic export of supported optional fields and do
-  not certify unrelated logger, metrics, device, or cross-capability behavior.
+- Wave 8 closes only
+  `semantic.cross-capability:state-errors-metrics-security-and-snapshots`.
+  Terminal `GET /vm/config`, path, and schema claims remain bounded to
+  deterministic export of supported optional fields; the Wave 8 matrix certifies
+  only its fixed selected logger, metrics, device, network, resource, lifecycle,
+  error, and snapshot interactions.
 - #1351 retains only its independent external root/vmnet evidence gates. This
   audit does not change those records or their public behavior.
 
@@ -128,6 +129,7 @@ evidence references, and disposition rules remain owned by the validator and
 
 Delivery validation must pass, and the generated manifest must still compare
 byte-for-byte with a clean Firecracker checkout at
-`d83d72b710361a10294480131377b1b00b163af8`. Final #1348 validation continues
-to reject intentionally nonterminal external, Wave 7, and Wave 8 records until
-their owners complete them.
+`d83d72b710361a10294480131377b1b00b163af8`. The scoped Wave 7 and Wave 8 gates
+pass their exact historical/successor phases. Global final validation continues
+to reject the eight audit and three feasible external records until their
+owners supply the required root/HVF or approved-vmnet evidence.

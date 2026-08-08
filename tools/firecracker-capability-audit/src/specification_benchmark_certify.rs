@@ -15,6 +15,8 @@ const WAVE7_AGGREGATE_SUCCESSOR_IDS: [&str; 5] = [
     "semantic.tools:packaging-help-errors-and-applicable-operations",
     "semantic.transport:virtio-mmio-activation",
 ];
+const WAVE8_SUCCESSOR_ID: &str =
+    "semantic.cross-capability:state-errors-metrics-security-and-snapshots";
 
 /// Certify exactly the terminal #1798 capability transition and totals.
 pub fn validate_specification_benchmark_compatibility(
@@ -123,9 +125,16 @@ fn validate_totals(inventory: &CapabilityInventory, errors: &mut Vec<String>) {
         }
     }
     let totals = (implemented, audit_required, missing, impossible);
-    let expected_successor_disposition = match totals {
-        (371, 14, 3, 30) => Some(Disposition::AuditRequired),
-        (376, 9, 3, 30) => Some(Disposition::ImplementedAndVerified),
+    let expected_successor_dispositions = match totals {
+        (371, 14, 3, 30) => Some((Disposition::AuditRequired, Disposition::AuditRequired)),
+        (376, 9, 3, 30) => Some((
+            Disposition::ImplementedAndVerified,
+            Disposition::AuditRequired,
+        )),
+        (377, 8, 3, 30) => Some((
+            Disposition::ImplementedAndVerified,
+            Disposition::ImplementedAndVerified,
+        )),
         _ => None,
     };
     let capabilities = inventory
@@ -133,20 +142,28 @@ fn validate_totals(inventory: &CapabilityInventory, errors: &mut Vec<String>) {
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
-    if let Some(expected) = expected_successor_disposition {
+    if let Some((wave7_expected, wave8_expected)) = expected_successor_dispositions {
         for id in WAVE7_AGGREGATE_SUCCESSOR_IDS {
             if capabilities
                 .get(id)
-                .is_none_or(|capability| capability.disposition != expected)
+                .is_none_or(|capability| capability.disposition != wave7_expected)
             {
                 errors.push(format!(
                     "specification benchmark successor phase drifted: {id}"
                 ));
             }
         }
+        if capabilities
+            .get(WAVE8_SUCCESSOR_ID)
+            .is_none_or(|capability| capability.disposition != wave8_expected)
+        {
+            errors.push(format!(
+                "specification benchmark Wave 8 successor phase drifted: {WAVE8_SUCCESSOR_ID}"
+            ));
+        }
     } else {
         errors.push(format!(
-            "specification benchmark terminal totals must be its exact 371/14/3/30 phase or the exact five-row Wave 7 successor 376/9/3/30 phase, found {implemented}/{audit_required}/{missing}/{impossible}"
+            "specification benchmark terminal totals must be its exact 371/14/3/30 phase, the exact five-row Wave 7 successor 376/9/3/30 phase, or the exact one-row Wave 8 successor 377/8/3/30 phase, found {implemented}/{audit_required}/{missing}/{impossible}"
         ));
     }
 }

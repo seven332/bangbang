@@ -158,7 +158,8 @@ snapshot support for optional devices other than pmem and the independently
 certified serial component, generalized migration or portable Firecracker
 artifacts, bundled/managed vhost backend, physical-disk certification, Darwin
 memfd seals, Linux cgroup or io_uring mechanism identity, automatic guest PCI
-notification, or new entitlement. Wave 7 retains
+notification, or new entitlement. Wave 7 owns the historical
 repository-wide metrics/schema/timing closure, #1351 retains credentialed
-production and vmnet gates, and Wave 8 retains the final cross-capability
-export audit.
+production and vmnet gates, and the completed
+[Wave 8 authority](wave8-certification-contract.md) certifies only the fixed
+selected cross-capability interactions without widening this storage contract.

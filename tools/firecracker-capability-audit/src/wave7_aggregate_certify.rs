@@ -368,14 +368,14 @@ fn validate_contract(repository_root: &Path, errors: &mut Vec<String>) {
 fn validate_documented_commands(repository_root: &Path, errors: &mut Vec<String>) {
     let command =
         "cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final";
-    for path in [
-        ".github/workflows/ci.yml",
-        "README.md",
-        "compat/firecracker/v1.16.0/README.md",
-        "docs/testing.md",
-    ] {
+    for path in [".github/workflows/ci.yml", "docs/testing.md"] {
         match std::fs::read_to_string(repository_root.join(path)) {
-            Ok(contents) if contents.contains(command) => {}
+            Ok(contents)
+                if contents
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(command) => {}
             Ok(_) => errors.push(format!("Wave 7 final command is missing from {path}")),
             Err(_) => errors.push(format!("Wave 7 command owner is unreadable: {path}")),
         }

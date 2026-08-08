@@ -185,6 +185,20 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
     validate_wave7_aggregate_compatibility(&manifest, &inventory, &audit, &root)
         .expect("terminal Wave 7 aggregate must certify");
 
+    let mut historical = inventory.clone();
+    let wave8 = historical
+        .capabilities
+        .iter_mut()
+        .find(|capability| {
+            capability.id == "semantic.cross-capability:state-errors-metrics-security-and-snapshots"
+        })
+        .expect("Wave 8 successor capability must exist");
+    wave8.disposition = Disposition::AuditRequired;
+    wave8.implementation.clear();
+    wave8.validation.clear();
+    validate_wave7_aggregate_compatibility(&manifest, &historical, &audit, &root)
+        .expect("historical 376/9/3/30 Wave 7 phase must remain valid");
+
     for id in WAVE7_AGGREGATE_CAPABILITY_IDS {
         let mut downgraded = inventory.clone();
         let capability = downgraded

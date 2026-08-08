@@ -12506,7 +12506,7 @@
     {
       "id": "corpus:design",
       "family": "process",
-      "summary": "Certify every pinned design claim through an exact 37-record semantic partition: 32 implemented native outcomes, three explicit #1351 feasible isolation handoffs, one #1378 network handoff, and one Wave 8 interaction handoff.",
+      "summary": "Certify every pinned design claim through the historical Wave 7 exact 37-record semantic partition: 32 implemented native outcomes, three explicit #1351 feasible isolation handoffs, one #1378 network handoff, and one interaction handoff now closed by the exact Wave 8 successor authority.",
       "source_refs": [
         "corpus:design"
       ],
@@ -15226,13 +15226,32 @@
     {
       "id": "semantic.cross-capability:state-errors-metrics-security-and-snapshots",
       "family": "cross-capability",
-      "summary": "Audit interactions among lifecycle state, API errors, metrics/logging, security/resource ownership, devices, networking, and snapshots.",
+      "summary": "Certify the final platform-feasible interaction matrix across lifecycle state, API errors, metrics/logging, security/resource ownership, devices, networking/MMDS, and snapshots/restore through four exact leaf scenarios, all 21 unordered domain pairs, deterministic failure/concurrency outcomes, the current 30-record platform-exclusion review, and 11 explicit external handoffs.",
       "source_refs": [
         "corpus:design",
         "corpus:snapshot-support",
         "corpus:specification"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/wave8-certification-audit.json",
+          "anchor": "\"scenarios\": ["
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/wave8_certification_audit_validate.rs",
+          "anchor": "fn validate_interactions("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/wave8_certification_audit.rs",
+          "anchor": "fn wave8_terminal_transition_is_exact()"
+        }
+      ]
     },
     {
       "id": "semantic.device:entropy-queues-limits-metrics-and-state",
@@ -16484,7 +16503,7 @@
     {
       "id": "semantic.specification:api-availability-stability-and-failure-information",
       "family": "specifications",
-      "summary": "Keep the owner-only API socket available while the control loop lives; provide strict request, response, state, survival, and value-safe failure behavior with signed lifecycle evidence, while logger, formal, performance, telemetry, and Wave 8 interaction claims retain their exact downstream owners.",
+      "summary": "Keep the owner-only API socket available while the control loop lives; provide strict request, response, state, survival, and value-safe failure behavior with signed lifecycle evidence, while logger, formal, performance, and telemetry claims retain their exact component authorities and the completed Wave 8 matrix certifies their selected cross-capability interactions.",
       "source_refs": [
         "corpus:formal-verification",
         "corpus:specification"

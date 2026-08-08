@@ -36,6 +36,10 @@ Each detailed subject has one primary document:
 - [Wave 7 Aggregate Authority](compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
   machine-checks the terminal design, device API, release, public-tool, and
   virtio-MMIO closure while retaining every external handoff.
+- [Wave 8 Platform-Feasible Authority](compat/firecracker/v1.16.0/wave8-certification-contract.md)
+  certifies the final seven-domain interaction matrix, all 21 unordered pairs,
+  the current 30-record platform-exclusion review, and the exact retained
+  external evidence boundary.
 - [Firecracker-shaped Developer Tracing](compat/firecracker/v1.16.0/tracing-contract.md)
   owns the opt-in feature, exact production scope set, record/privacy envelope,
   delivery policy, and explicit nonclaims.
@@ -43,8 +47,9 @@ Each detailed subject has one primary document:
   snapshot formats, version behavior, capture/restore semantics, and nonclaims.
 - [Wave 6 Snapshot Certification](compat/firecracker/v1.16.0/snapshot-wave6-contract.md)
   owns the exact 70-record load, artifact, device, tool, time/identity, and
-  bounded-portability evidence ledger; only its two external network
-  aggregates remain nonterminal for #1378/#1491.
+  bounded-portability evidence ledger. Later #1491/Wave 8 composition is
+  terminal; caller-owned credentialed vmnet evidence remains external under
+  #1378.
 - [`bangbang-pager-v1` Protocol](docs/snapshot-pager-protocol.md) owns the pager
   wire and lifecycle contract.
 - [macOS Host Security Model](docs/security.md) owns authority, containment,
@@ -58,11 +63,10 @@ Versioned files under `compat/firecracker/v1.16.0/` are audit ledgers. They
 record pinned upstream identities, dispositions, exclusions, and evidence; the
 human-readable documents above explain current behavior.
 
-The scoped Wave 7 terminal gate is:
-
-```sh
-cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
-```
+The Wave 8 contract explains the scoped gate and retained external boundary.
+See the [Testing Guide](docs/testing.md#wave-8-final-certification) for the
+canonical commands and the checked authority for the machine-derived counts
+and exact nonterminal identities.
 
 ## Workspace Layout
 

@@ -244,6 +244,20 @@ jailer/production-host outcomes, two #1378 network outcomes, and one Wave 8
 interaction outcome. Aggregate completion does not infer completion of any of
 those handoffs.
 
+That 376/9/3/30 paragraph is the immutable #1799 phase recorded by this Wave 7
+authority. The phase-aware certifier also accepts exactly one successor:
+
+```console
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
+```
+
+The successor promotes only
+`semantic.cross-capability:state-errors-metrics-security-and-snapshots` under
+the checked [Wave 8 contract](wave8-certification-contract.md), producing
+377/8/3/30. The remaining six #1373, two #1378, and three #1351 external
+outcomes stay nonterminal. Any other identity or count transition fails the
+Wave 7 gate.
+
 The public-tool ledger derives 46 implemented leaves, five terminal Linux-only
 jailer exclusions, and four #1373 jailer handoffs. The virtio-MMIO ledger
 requires common identity/features/queue/notification/interrupt/status/reset/
@@ -406,9 +420,9 @@ real FIFO loss/replay, canonical comparison, optional-fixture, documentation,
 and terminal-audit gates pass. #1799 finally promotes its five aggregate rows
 after the checked source-complete authority derives every design semantic,
 device relation and API identity, release entry, public-tool leaf, and
-virtio-MMIO device profile while retaining all external handoffs. The current
-inventory is therefore exactly 376 implemented, nine audit-required, three
-missing-platform-feasible, and 30 proven-platform-impossible. These are exact
-consequences of the current row set, not quotas; the authoritative totals
-remain derived from `capabilities.json` and are rechecked by
-`validate --wave7-final`.
+virtio-MMIO device profile while retaining all external handoffs. The #1799
+inventory was therefore exactly 376 implemented, nine audit-required, three
+missing-platform-feasible, and 30 proven-platform-impossible. The current Wave
+8 successor is exactly 377/eight/three/30. These are exact consequences of the
+corresponding row sets, not quotas; authoritative current totals remain
+derived from `capabilities.json` and are rechecked by `validate --wave8-final`.

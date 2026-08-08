@@ -3406,6 +3406,34 @@ and locked private namespace, and signed tests prove that one crashed session
 does not terminate or clean a concurrent peer. This does not allocate unique
 external resources or coordinate caller-supplied paths across launchers.
 
+## Wave 8 Cross-Capability Security Composition
+
+The checked
+[Wave 8 authority](../compat/firecracker/v1.16.0/wave8-certification-contract.md)
+binds security/resource authority to the selected lifecycle, API-error,
+observability, device, network/MMDS, and snapshot interactions. Real signed
+production evidence proves grant containment and cleanup through native-v2
+network/MMDS continuation. A separate wrong/missing-claim scenario proves
+value-redacted failure atomicity without consuming the typed resource pair.
+The portable snapshot oracle separately proves cancellation and no escaped
+artifact, so the containment claim does not depend only on one end-to-end
+trace.
+
+The same authority re-challenges all 30 platform-impossible identities as four
+exact public-mechanism families. It does not broaden them: every identity still
+requires its own stable behavior, tests, compatibility/security evidence, and
+Challenge. Linux CPUID/MSR and KVM feature identities, exact hugetlbfs `2M`,
+and seccomp/cgroup/network/PID namespace mechanisms are not aliases for public
+HVF registers/granules, XNU allocation, App Sandbox, rlimits, launchd,
+Network Extension, vmnet, or Endpoint Security.
+
+Six #1373 audit outcomes still require root and real HVF on the same host; two
+#1378 outcomes still require caller-owned Apple-approved signing/profile
+authority and an isolated vmnet fixture; three #1351 isolation semantics remain
+platform-feasible. Missing authority or credentials is not an impossibility
+proof. The repository does not inspect, fabricate, or claim those external
+inputs, and global `--final` stays blocked by all eleven outcomes.
+
 ## Current Non-Goals
 
 The current scaffold does not implement:
