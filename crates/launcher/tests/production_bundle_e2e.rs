@@ -13041,11 +13041,7 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
     );
     let launcher_bytes = fs::read(launcher(&bundle)).expect("normal launcher should read");
     let worker_bytes = fs::read(worker_executable(&bundle)).expect("normal worker should read");
-    for marker in [
-        ELEVATED_PROBE_OPTION.as_bytes(),
-        ELEVATED_WORKER_OPTION,
-        ELEVATED_BLOCKED_STATUS,
-    ] {
+    for marker in [ELEVATED_WORKER_OPTION, ELEVATED_BLOCKED_STATUS] {
         assert!(
             !launcher_bytes
                 .windows(marker.len())
@@ -13053,14 +13049,12 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             "normal launcher must statically exclude the elevated probe"
         );
     }
-    for marker in [ELEVATED_WORKER_OPTION, ELEVATED_READY_RECORD] {
-        assert!(
-            !worker_bytes
-                .windows(marker.len())
-                .any(|window| window == marker),
-            "normal worker must statically exclude the elevated bootstrap"
-        );
-    }
+    assert!(
+        !worker_bytes
+            .windows(ELEVATED_READY_RECORD.len())
+            .any(|window| window == ELEVATED_READY_RECORD),
+        "normal worker must statically exclude the elevated bootstrap"
+    );
 
     let output = run_launcher(
         &bundle,

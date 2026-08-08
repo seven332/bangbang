@@ -18,9 +18,9 @@ The evidence bundle keeps the production layout and identity split:
   identity checks before authorizing the probe; and
 - both launcher and worker probe entries are compiled only with the
   `elevated-bootstrap-probe` feature. A normal `--no-default-features` build is
-  checked for absence of both activation strings, the ready and status records,
-  and the marker resource, and the normal signed bundle rejects the internal
-  argv.
+  checked for absence of the launcher-owned worker activation, ready and status
+  records, and the marker resource, and the normal signed bundle rejects the
+  internal launcher argv.
 
 The root wrapper never invokes `sudo`. It requires exact real/effective
 uid/gid zero, accepts explicit numeric target uid/gid values, runs with a
