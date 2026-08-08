@@ -2129,9 +2129,11 @@ sudo /usr/bin/env -i HOME=/var/root PATH=/usr/bin:/bin \
 Do not use `--allow-unsupported` for this proof. Missing exact root, Apple
 Silicon, HVF, bundle identity, or cleanup is failure. The wrapper never reads
 `SUDO_UID`, `SUDO_GID`, `HOME`, `PATH`, account names, or a password; the
-caller owns the elevation mechanism. It reports OS/SDK/architecture and only
-the value-free terminal result. The measured result and its limits are in the
-[elevated bootstrap evidence contract](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
+caller owns the elevation mechanism. On entry it replaces inherited standard
+input with `/dev/null`, so elevation input cannot flow into the launcher or
+signed worker. It reports OS/SDK/architecture and only the value-free terminal
+result. The measured result and its limits are in the [elevated bootstrap
+evidence contract](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 ## Running Tests
 

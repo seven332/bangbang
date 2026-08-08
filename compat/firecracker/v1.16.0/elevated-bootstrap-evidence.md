@@ -24,15 +24,16 @@ The evidence bundle keeps the production layout and identity split:
 
 The root wrapper never invokes `sudo`. It requires exact real/effective
 uid/gid zero, accepts explicit numeric target uid/gid values, runs with a
-closed environment and fixed absolute tools, and refuses missing root or HVF
-support rather than skipping. It creates only root-owned mode-0700 children
-beneath the fixed non-writable `/private/var/root` ancestry. The launcher walks
-that ancestry with no-follow directory descriptors, binds the leaf device and
-inode into a random nonce record, and transfers only the retained root
-descriptor as new filesystem authority, at fixed worker fd 8. The existing
-fixed production session and dormant broker endpoints remain closed-role
-socket descriptors; the worker receives no host path and cannot reopen the
-root by name.
+closed environment and fixed absolute tools, replaces inherited standard input
+with `/dev/null`, and refuses missing root or HVF support rather than skipping.
+Caller-provided elevation input therefore cannot be inherited by the launcher
+or worker. The wrapper creates only root-owned mode-0700 children beneath the
+fixed non-writable `/private/var/root` ancestry. The launcher walks that
+ancestry with no-follow directory descriptors, binds the leaf device and inode
+into a random nonce record, and transfers only the retained root descriptor as
+new filesystem authority, at fixed worker fd 8. The existing fixed production
+session and dormant broker endpoints remain closed-role socket descriptors;
+the worker receives no host path and cannot reopen the root by name.
 
 The signed worker verifies initial root identity, the nonce-bound descriptor
 identity, and exact mode before `fchdir`, public `chroot(2)`, `chdir("/")`,
