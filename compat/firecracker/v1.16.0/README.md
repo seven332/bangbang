@@ -63,6 +63,11 @@ For commands and test-layer selection, see the
   generated and recipe cache policy, output ownership classes, the implemented
   API/no-API profiles, guest identity and timeouts, evidence, and nonclaims for
   the exact two promoted corpus rows.
+- [`specification-benchmark-audit.json`](specification-benchmark-audit.json) is
+  the human-owned terminal #1798 authority. It pins the upstream specification
+  and network-performance blobs, exact reference environments/statuses,
+  Bangbang measurement methods/units, report and fixture policy, evidence,
+  nonclaims, and the exact three promoted rows.
 - Contract Markdown files are human-owned evidence ledgers. They define a
   selected capability family, its exact supported or excluded boundary, and
   the implementation and validation evidence for its dispositions.
@@ -111,6 +116,7 @@ reviewed delta.
 | [Developer tracing](tracing-contract.md) | Terminal opt-in feature contract, exact eight-call AST closure, fixed nesting/record/tool-delivery bounds, privacy, loss/result preservation, runtime tool admission, release diagnostics, and explicit mechanism/timing nonclaims |
 | [macOS guest workflow](guest-workflow-contract.md) | Terminal two-corpus mapping, exact pinned guest identity, public API/no-API lifecycle, process/cache ownership, signed execution and platform/nonclaim boundary |
 | [Targeted formal verification](formal-verification-contract.md) | Terminal one-corpus mapping, exact Kani/toolchain pins, five source/compiled-bijective bounded proofs, retained tests, and explicit whole-system/mechanism nonclaims |
+| [Specification benchmark](specification-benchmark-contract.md) | Terminal three-row reference interpretation, strict signed collector/report/comparison, real FIFO loss/replay evidence, optional fixture boundary, and exact performance nonclaims |
 
 ## Dispositions
 

@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1798",
+  "delivery_issue": "#1877",
+  "upstream_sources": [
+    {
+      "id": "specification",
+      "path": "SPECIFICATION.md",
+      "git_blob": "67ede9964f8a2d314b9cad69fe8d5b773e01b1d8",
+      "environment": [
+        "AWS M5d.metal and M6g.metal bare-metal hosts",
+        "Linux/KVM with sufficient CPU and memory",
+        "minimal guest and source-specific workload controls"
+      ],
+      "claims": [
+        "API startup CPU time <= 8 ms",
+        "API startup wall time 6-60 ms, typically 12 ms",
+        "VMM overhead <= 5 MiB for 1 vCPU and 128 MiB after excluding guest mappings",
+        "guest boot <= 125 ms from InstanceStart to /sbin/init",
+        "full nonblocking metrics FIFO may lose output and increments missed_metrics_count"
+      ],
+      "pending": [
+        "guest compute > 95% of bare metal",
+        "network throughput and latency integration coverage",
+        "storage throughput integration coverage"
+      ]
+    },
+    {
+      "id": "network-performance",
+      "path": "docs/network-performance.md",
+      "git_blob": "0be0d8cdd8dec6041286f36d3b33b7d7f8f4f437",
+      "environment": [
+        "AWS M5d.metal host in a VPC",
+        "Amazon Linux 2 host and guest with Linux kernel 4.14",
+        "ping, 10 Mbps background traffic, and multiple iperf3 clients"
+      ],
+      "claims": [
+        "TCP throughput 14.5 Gbps at <= 80% CPU",
+        "TCP throughput 25 Gbps at 100% CPU",
+        "round-trip latency 0.06 ms"
+      ],
+      "pending": [
+        "SPECIFICATION.md retains network performance integration coverage as pending"
+      ]
+    }
+  ],
+  "measurements": [
+    {
+      "name": "process_startup_wall_us",
+      "method": "bangbang-pre-spawn-monotonic-initial-metrics-v1",
+      "unit": "microseconds",
+      "producer": "api_server.process_startup_time_us from a pre-spawn CLOCK_MONOTONIC baseline",
+      "interpretation": "signed process startup wall clock before retained guest work"
+    },
+    {
+      "name": "process_startup_cpu_us",
+      "method": "bangbang-zero-process-cpu-initial-metrics-v1",
+      "unit": "microseconds",
+      "producer": "api_server.process_startup_time_cpu_us from the zero child-process CPU baseline",
+      "interpretation": "signed process startup CPU clock before retained guest work"
+    },
+    {
+      "name": "whole_process_rss_kib",
+      "method": "ps-rss-kib-v1",
+      "unit": "kibibytes",
+      "producer": "/bin/ps -o rss= -p PID at the guest ready barrier",
+      "interpretation": "whole Bangbang process including guest mappings"
+    },
+    {
+      "name": "guest_init_wall_us",
+      "method": "bangbang-boot-timer-v1",
+      "unit": "microseconds",
+      "producer": "production Guest-boot-time wall clock",
+      "interpretation": "InstanceStart to checked guest boot-timer write"
+    },
+    {
+      "name": "guest_init_cpu_us",
+      "method": "bangbang-boot-timer-v1",
+      "unit": "microseconds",
+      "producer": "production Guest-boot-time CPU clock",
+      "interpretation": "process CPU consumed through the checked guest boot-timer write"
+    },
+    {
+      "name": "guest_compute_duration_ns",
+      "method": "guest-clock-monotonic-fixed-loop-v1",
+      "unit": "nanoseconds",
+      "producer": "/bangbang-specification-benchmark",
+      "interpretation": "fixed data-dependent loop guest clock, not CoreMark or bare-metal ratio"
+    },
+    {
+      "name": "guest_storage_duration_ns",
+      "method": "guest-clock-monotonic-sequential-root-read-v1",
+      "unit": "nanoseconds",
+      "producer": "/bangbang-specification-benchmark",
+      "interpretation": "fixed sequential read guest clock, not fio or uncached throughput"
+    },
+    {
+      "name": "metrics_fifo_filled_bytes",
+      "method": "nonblocking-sentinel-until-eagain-v1",
+      "unit": "bytes",
+      "producer": "collector-owned real metrics FIFO filler",
+      "interpretation": "host pipe capacity observation, not loss evidence alone"
+    },
+    {
+      "name": "metrics_fifo_drained_bytes",
+      "method": "drain-after-failed-flush-v1",
+      "unit": "bytes",
+      "producer": "collector-owned real metrics FIFO reader",
+      "interpretation": "sentinel and possible partial failed-publication bytes"
+    },
+    {
+      "name": "metrics_missed_count",
+      "method": "failed-flush-replay-counter-v1",
+      "unit": "count",
+      "producer": "logger.missed_metrics_count after one typed failure and retry",
+      "interpretation": "exact production lost-output replay accounting"
+    }
+  ],
+  "policy": {
+    "runner": "scripts/specification-benchmark.py",
+    "config_example": "scripts/specification-benchmark-config.example.json",
+    "public_commands": [
+      [
+        "scripts/specification-benchmark.py",
+        "collect",
+        "--config",
+        "scripts/specification-benchmark-config.example.json",
+        "--output",
+        ".tmp/bangbang-specification-report.json"
+      ],
+      [
+        "scripts/specification-benchmark.py",
+        "validate",
+        "--report",
+        ".tmp/bangbang-specification-report.json"
+      ],
+      [
+        "scripts/specification-benchmark.py",
+        "compare",
+        "--previous",
+        "/path/to/previous.json",
+        "--current",
+        "/path/to/current.json"
+      ]
+    ],
+    "build_command": [
+      "cargo",
+      "build",
+      "--package",
+      "bangbang",
+      "--release",
+      "--locked",
+      "--no-default-features",
+      "--target",
+      "aarch64-apple-darwin"
+    ],
+    "platform": "Apple Silicon macOS with executable Hypervisor.framework; no unsupported bypass",
+    "sessions": [
+      "independent signed workload session per warmup and iteration",
+      "independent signed real metrics FIFO session per warmup and iteration"
+    ],
+    "summary_fields": [
+      "count",
+      "min",
+      "median",
+      "max"
+    ],
+    "comparison_key": "SHA-256 of environment, policy, ordered metric definitions, and optional fixture identity; raw values and summaries excluded",
+    "publication": "canonical mode-0600 absent-only report after complete root-session cleanup",
+    "network_default": "network member absent",
+    "network_fixture": "explicit credential-free no-shell bounded fixture with digest-pinned executable, matching labels, integer output, cleanup=complete, and no argv/environment in report",
+    "ci": "portable schema, parser, fake transaction, real portable FIFO, fixture, cleanup, publication, and static audit only; no hardware threshold",
+    "merged_main_gate": "fresh ignored networkless report from clean synchronized merged main with matching commit/tree/binary identity"
+  },
+  "capability_ids": [
+    "corpus:network-performance",
+    "corpus:specification",
+    "semantic.specification:performance-resource-and-telemetry-outcomes"
+  ],
+  "evidence": {
+    "implementation": [
+      {
+        "kind": "local",
+        "path": "scripts/specification-benchmark.py",
+        "anchor": "def assemble_report("
+      },
+      {
+        "kind": "local",
+        "path": "scripts/specification-benchmark.py",
+        "anchor": "def collect_report("
+      },
+      {
+        "kind": "local",
+        "path": "scripts/specification-benchmark.py",
+        "anchor": "def collect_telemetry_sample("
+      },
+      {
+        "kind": "local",
+        "path": "scripts/specification_workload.py",
+        "anchor": "def parse_transcript("
+      }
+    ],
+    "validation": [
+      {
+        "kind": "local",
+        "path": "scripts/tests/test_specification_benchmark.py",
+        "anchor": "class ReportContractTests"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/tests/test_specification_benchmark.py",
+        "anchor": "class RuntimeBoundaryTests"
+      },
+      {
+        "kind": "local",
+        "path": "scripts/tests/test_specification_benchmark.py",
+        "anchor": "class StrictDocumentTests"
+      },
+      {
+        "kind": "local",
+        "path": "tools/firecracker-capability-audit/tests/specification_benchmark_audit.rs",
+        "anchor": "fn checked_specification_benchmark_audit_is_canonical_and_fail_closed"
+      }
+    ],
+    "documentation": [
+      {
+        "kind": "local",
+        "path": "compat/firecracker/v1.16.0/specification-benchmark-contract.md",
+        "anchor": "## Exact terminal capability set"
+      },
+      {
+        "kind": "local",
+        "path": "docs/specification-benchmarks.md",
+        "anchor": "## Firecracker reference figures"
+      },
+      {
+        "kind": "local",
+        "path": "docs/specification-benchmarks.md",
+        "anchor": "## Interpretation and nonclaims"
+      },
+      {
+        "kind": "local",
+        "path": "docs/specification-benchmarks.md",
+        "anchor": "## Report identity and comparison"
+      }
+    ]
+  },
+  "nonclaims": [
+    "firecracker-or-aws-linux-kvm-parity",
+    "portable-numeric-threshold-or-regression-verdict",
+    "guest-map-excluding-vmm-overhead",
+    "coremark-fio-ping-or-iperf-equivalence",
+    "controlled-page-cache-or-bare-metal-ratio",
+    "network-availability-credentials-recovery-or-cleanup",
+    "tracked-hardware-report"
+  ]
+}

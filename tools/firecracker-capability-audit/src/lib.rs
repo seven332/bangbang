@@ -27,6 +27,9 @@ mod metrics_process_validate;
 mod metrics_upstream;
 mod metrics_validate;
 mod model;
+mod specification_benchmark_audit_model;
+mod specification_benchmark_audit_validate;
+mod specification_benchmark_certify;
 mod tracing_certify;
 mod tracing_model;
 mod tracing_validate;
@@ -134,6 +137,16 @@ pub use model::{
     AuditMode, Baseline, Capability, CapabilityInventory, Counts, Disposition, Input,
     PlatformExclusion, Reference, SourceItem, SourceManifest,
 };
+pub use specification_benchmark_audit_model::{
+    SpecificationBenchmarkAudit, SpecificationBenchmarkEvidence, SpecificationBenchmarkMeasurement,
+    SpecificationBenchmarkNonclaim, SpecificationBenchmarkPolicy,
+    SpecificationBenchmarkUpstreamSource,
+};
+pub use specification_benchmark_audit_validate::{
+    SPECIFICATION_BENCHMARK_AUDIT_PATH, SPECIFICATION_BENCHMARK_AUDIT_SCHEMA_VERSION,
+    SPECIFICATION_BENCHMARK_CAPABILITY_IDS, validate_specification_benchmark_audit,
+};
+pub use specification_benchmark_certify::validate_specification_benchmark_compatibility;
 pub use tracing_certify::{TRACING_COMPATIBILITY_CAPABILITY_IDS, validate_tracing_compatibility};
 pub use tracing_model::{
     TracingAudit, TracingCallSite, TracingCallSiteCategory, TracingDelivery,
@@ -349,6 +362,22 @@ pub fn read_formal_verification_audit(path: &Path) -> Result<FormalVerificationA
     })
 }
 
+/// Read and parse the checked specification-benchmark authority.
+pub fn read_specification_benchmark_audit(
+    path: &Path,
+) -> Result<SpecificationBenchmarkAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read specification benchmark audit: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse specification benchmark audit: {error}"
+        ))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -437,6 +466,13 @@ pub fn formal_verification_audit_json(
     audit: &FormalVerificationAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "formal verification audit")
+}
+
+/// Serialize the checked specification-benchmark authority using canonical pretty JSON.
+pub fn specification_benchmark_audit_json(
+    audit: &SpecificationBenchmarkAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "specification benchmark audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {

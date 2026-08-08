@@ -2725,6 +2725,23 @@ This does not broaden the supported API/device surface or claim arbitrary
 kernel/distribution boot, production containment, guest networking, artifact
 redistribution/authentication or byte-reproducible ext4.
 
+## Specification Benchmark Observations
+
+Bangbang provides a strict signed Apple Silicon collector for environment-
+labelled startup, whole-process RSS, production boot-timer, fixed guest
+compute/storage, and real metrics-FIFO loss/replay observations. Reports retain
+raw integers plus count/min/median/max, compare only when the complete
+host/build/binary/backend/guest/policy/method/unit identity matches, publish
+absent-only after cleanup, and never emit a hardware threshold or parity
+verdict. Network is absent unless an explicit credential-free bounded fixture
+is supplied, and such output does not certify #1378.
+
+The commands, formats, methods, Firecracker reference figures, privacy policy,
+and nonclaims live only in the
+[Specification Benchmark Observations](specification-benchmarks.md) guide. The
+three-row pinned evidence ledger is the
+[specification benchmark contract](../compat/firecracker/v1.16.0/specification-benchmark-contract.md).
+
 ## Internal Drive Configuration
 
 The API crate has strict Firecracker-shaped `PUT /drives/{drive_id}` and
