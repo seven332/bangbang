@@ -63,8 +63,16 @@ U64_MAX = (1 << 64) - 1
 
 
 MEASUREMENT_DEFINITIONS = (
-    ("process_startup_wall_us", "bangbang-initial-metrics-v1", "microseconds"),
-    ("process_startup_cpu_us", "bangbang-initial-metrics-v1", "microseconds"),
+    (
+        "process_startup_wall_us",
+        "bangbang-pre-spawn-monotonic-initial-metrics-v1",
+        "microseconds",
+    ),
+    (
+        "process_startup_cpu_us",
+        "bangbang-zero-process-cpu-initial-metrics-v1",
+        "microseconds",
+    ),
     ("whole_process_rss_kib", "ps-rss-kib-v1", "kibibytes"),
     ("guest_init_wall_us", "bangbang-boot-timer-v1", "microseconds"),
     ("guest_init_cpu_us", "bangbang-boot-timer-v1", "microseconds"),
@@ -809,6 +817,9 @@ def validate_report_document(document: object) -> dict[str, Any]:
     filled = raw_by_name["metrics_fifo_filled_bytes"]
     drained = raw_by_name["metrics_fifo_drained_bytes"]
     missed = raw_by_name["metrics_missed_count"]
+    for name in ("process_startup_wall_us", "process_startup_cpu_us"):
+        if any(value == 0 for value in raw_by_name[name]):
+            raise BenchmarkError("report", f"{name} observations must be positive")
     if any(value == 0 for value in filled):
         raise BenchmarkError("report", "metrics FIFO fill observations must be positive")
     if any(
@@ -1882,10 +1893,13 @@ def _startup_metrics(line: bytes) -> tuple[int, int]:
     api_server = value.get("api_server")
     if not isinstance(api_server, dict):
         raise BenchmarkError("metrics", "startup metrics family is missing")
-    return (
-        _u64(api_server.get("process_startup_time_us"), "startup wall metric"),
-        _u64(api_server.get("process_startup_time_cpu_us"), "startup CPU metric"),
+    wall_us = _u64(api_server.get("process_startup_time_us"), "startup wall metric")
+    cpu_us = _u64(
+        api_server.get("process_startup_time_cpu_us"), "startup CPU metric"
     )
+    if wall_us == 0 or cpu_us == 0:
+        raise BenchmarkError("metrics", "explicit startup metrics must be positive")
+    return wall_us, cpu_us
 
 
 def _sample_rss(pid: int, timeout_seconds: float) -> int:
@@ -1904,8 +1918,16 @@ def _sample_rss(pid: int, timeout_seconds: float) -> int:
 
 
 def _vmm_arguments(build: SignedBuild, socket_path: Path, instance_id: str) -> tuple[str, ...]:
+    try:
+        start_time_us = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+    except (AttributeError, OSError) as error:
+        raise BenchmarkError("platform", "failed to capture the startup clock") from error
     return (
         os.fspath(build.path),
+        "--start-time-us",
+        str(start_time_us),
+        "--start-time-cpu-us",
+        "0",
         "--api-sock",
         os.fspath(socket_path),
         "--boot-timer",

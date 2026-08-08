@@ -382,6 +382,17 @@ class ReportContractTests(unittest.TestCase):
         )
         by_name = {item["name"]: item for item in report["measurements"]}
 
+        zero_startup = copy.deepcopy(report)
+        startup = next(
+            item
+            for item in zero_startup["measurements"]
+            if item["name"] == "process_startup_wall_us"
+        )
+        startup["raw"] = [0, 1, 2]
+        startup["summary"] = benchmark.summarize(startup["raw"])
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "must be positive"):
+            benchmark.validate_report_document(zero_startup)
+
         zero_fill = copy.deepcopy(report)
         fill = next(
             item
@@ -479,6 +490,51 @@ class RuntimeBoundaryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(benchmark.BenchmarkError, "exactly one"):
             benchmark._missed_metrics(b'{"logger":{"missed_metrics_count":2}}')
+
+        self.assertEqual(
+            benchmark._startup_metrics(
+                b'{"api_server":{"process_startup_time_us":12,'
+                b'"process_startup_time_cpu_us":7}}'
+            ),
+            (12, 7),
+        )
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "must be positive"):
+            benchmark._startup_metrics(
+                b'{"api_server":{"process_startup_time_us":0,'
+                b'"process_startup_time_cpu_us":7}}'
+            )
+
+    def test_vmm_arguments_capture_explicit_wall_and_process_cpu_baselines(self) -> None:
+        build = benchmark.SignedBuild(
+            Path("/binary"),
+            "1" * 64,
+            123,
+            "3" * 40,
+            "4" * 40,
+            "cargo 1.90.0",
+            "rustc 1.90.0",
+        )
+        with mock.patch.object(
+            benchmark.time, "clock_gettime_ns", return_value=1_234_567_890
+        ):
+            arguments = benchmark._vmm_arguments(
+                build, Path("/private/api.sock"), "spec-workload-0"
+            )
+        self.assertEqual(
+            arguments,
+            (
+                "/binary",
+                "--start-time-us",
+                "1234567",
+                "--start-time-cpu-us",
+                "0",
+                "--api-sock",
+                "/private/api.sock",
+                "--boot-timer",
+                "--id",
+                "spec-workload-0",
+            ),
+        )
 
     def test_telemetry_sample_has_one_typed_failure_then_one_successful_retry(self) -> None:
         events: list[str] = []

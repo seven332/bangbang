@@ -46,16 +46,16 @@ struct MeasurementSpec {
 const MEASUREMENTS: [MeasurementSpec; 10] = [
     MeasurementSpec {
         name: "process_startup_wall_us",
-        method: "bangbang-initial-metrics-v1",
+        method: "bangbang-pre-spawn-monotonic-initial-metrics-v1",
         unit: "microseconds",
-        producer: "api_server.process_startup_time_us",
+        producer: "api_server.process_startup_time_us from a pre-spawn CLOCK_MONOTONIC baseline",
         interpretation: "signed process startup wall clock before retained guest work",
     },
     MeasurementSpec {
         name: "process_startup_cpu_us",
-        method: "bangbang-initial-metrics-v1",
+        method: "bangbang-zero-process-cpu-initial-metrics-v1",
         unit: "microseconds",
-        producer: "api_server.process_startup_time_cpu_us",
+        producer: "api_server.process_startup_time_cpu_us from the zero child-process CPU baseline",
         interpretation: "signed process startup CPU clock before retained guest work",
     },
     MeasurementSpec {

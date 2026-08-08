@@ -25,7 +25,8 @@ environment labels.
 `scripts/specification-benchmark.py` builds and signs one locked
 `aarch64-apple-darwin` release binary with `--no-default-features`, then uses
 two independent signed public-API/HVF sessions per iteration. It records exact
-production startup metrics, whole-process `ps` RSS at the guest release barrier,
+production startup metrics from explicit pre-spawn monotonic and zero-process-
+CPU baselines, whole-process `ps` RSS at the guest release barrier,
 the production boot timer, checked guest-clock compute/storage durations, and
 the real metrics-FIFO `EAGAIN` failure/drain/retry replay counter. Raw integers,
 integer count/min/median/max, and the complete comparison identity are retained.

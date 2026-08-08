@@ -99,8 +99,8 @@ The exact core series are:
 
 | Name | Unit | Producer or method |
 | --- | --- | --- |
-| `process_startup_wall_us` | microseconds | first production metrics line |
-| `process_startup_cpu_us` | microseconds | first production metrics line |
+| `process_startup_wall_us` | microseconds | first production metrics line from a pre-spawn `CLOCK_MONOTONIC` baseline |
+| `process_startup_cpu_us` | microseconds | first production metrics line from the zero child-process CPU baseline |
 | `whole_process_rss_kib` | KiB | `/bin/ps -o rss= -p PID` at the ready barrier |
 | `guest_init_wall_us` | microseconds | production `Guest-boot-time` record |
 | `guest_init_cpu_us` | microseconds | production `Guest-boot-time` record |
@@ -113,6 +113,11 @@ The exact core series are:
 Every series retains all raw nonnegative integer observations and derives only
 integer `count`, `min`, `median`, and `max`. The odd sample count makes median
 unambiguous without floating-point arithmetic.
+
+The collector passes each VMM the Firecracker-shaped `--start-time-us` value
+sampled immediately before spawn and `--start-time-cpu-us 0`, so the production
+startup stores measure elapsed wall time and the new child process's CPU time.
+Both observations must be positive; an unconfigured/default zero is rejected.
 
 ## Report identity and comparison
 
