@@ -614,7 +614,7 @@ fn finish_credential_exchange(
             match record.kind() {
                 CredentialRecordKind::WorkerTransitioned => record,
                 CredentialRecordKind::Failure => {
-                    credential_wait_for_exit(&mut spawned, 1)?;
+                    let _ = credential_wait_for_exit(&mut spawned, 1);
                     return credential_blocked_record(record);
                 }
                 CredentialRecordKind::LauncherTransitioned | CredentialRecordKind::WorkerFinal => {
@@ -702,19 +702,31 @@ fn finish_credential_exchange(
         }
     };
     let launcher_observations = [initial, after_worker, after_both];
-    let launcher_record = CredentialRecord::launcher_transitioned(
+    let launcher_record = match CredentialRecord::launcher_transitioned(
         bootstrap.mode(),
         transition.state(),
         launcher_observations,
         bootstrap.nonce(),
-    )
-    .map_err(|_| LauncherError::SessionProtocol)?;
+    ) {
+        Ok(record) => record,
+        Err(_) => {
+            return Ok(credential_protocol_blocked_after_reap(
+                &mut spawned,
+                transition.prefix(),
+                transition.state(),
+            ));
+        }
+    };
     if spawned
         .session
         .write_all(&launcher_record.encode())
         .is_err()
     {
-        return Err(LauncherError::SessionProtocol);
+        return Ok(credential_protocol_blocked_after_reap(
+            &mut spawned,
+            transition.prefix(),
+            transition.state(),
+        ));
     }
 
     let worker_final = match read_credential_record(&mut spawned.session) {
@@ -728,28 +740,34 @@ fn finish_credential_exchange(
             match record.kind() {
                 CredentialRecordKind::WorkerFinal => record,
                 CredentialRecordKind::Failure => {
-                    credential_wait_for_exit(&mut spawned, 1)?;
+                    let _ = credential_wait_for_exit(&mut spawned, 1);
                     return credential_blocked_record(record);
                 }
                 CredentialRecordKind::WorkerTransitioned
                 | CredentialRecordKind::LauncherTransitioned => {
-                    credential_wait_for_exit(&mut spawned, 1)?;
-                    return Ok(credential_blocked_value(
-                        CredentialRole::Launcher,
-                        credential_protocol_failure(transition.prefix(), transition.state()),
+                    return Ok(credential_protocol_blocked_after_reap(
+                        &mut spawned,
+                        transition.prefix(),
+                        transition.state(),
                     ));
                 }
             }
         }
         Ok(_) | Err(_) => {
-            credential_wait_for_exit(&mut spawned, 1)?;
-            return Ok(credential_blocked_value(
-                CredentialRole::Launcher,
-                credential_protocol_failure(transition.prefix(), transition.state()),
+            return Ok(credential_protocol_blocked_after_reap(
+                &mut spawned,
+                transition.prefix(),
+                transition.state(),
             ));
         }
     };
-    credential_wait_for_exit(&mut spawned, 0)?;
+    if credential_wait_for_exit(&mut spawned, 0).is_err() {
+        return Ok(credential_protocol_blocked_after_reap(
+            &mut spawned,
+            transition.prefix(),
+            transition.state(),
+        ));
+    }
 
     let worker_initial = worker_transitioned.observations();
     let worker_observations = worker_final.observations();
@@ -795,18 +813,38 @@ fn finish_credential_exchange(
         failure: CredentialFailureValue,
         initial: PeerObservation,
     ) -> Result<LauncherExit, LauncherError> {
-        let record = CredentialRecord::failure(
+        let record = match CredentialRecord::failure(
             bootstrap.mode(),
             CredentialRole::Launcher,
             failure,
             initial,
             bootstrap.nonce(),
-        )
-        .map_err(|_| LauncherError::SessionProtocol)?;
+        ) {
+            Ok(record) => record,
+            Err(_) => {
+                spawned.worker.terminate_and_reap();
+                return Ok(credential_blocked_value(CredentialRole::Launcher, failure));
+            }
+        };
         let _ = spawned.session.write_all(&record.encode());
-        credential_wait_for_exit(spawned, 1)?;
+        let _ = credential_wait_for_exit(spawned, 1);
         Ok(credential_blocked_value(CredentialRole::Launcher, failure))
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn credential_protocol_blocked_after_reap(
+    spawned: &mut crate::macos::spawn::SuspendedWorker,
+    prefix: bangbang_session::elevated_probe::CredentialPrefix,
+    state: bangbang_session::elevated_probe::CredentialSelfState,
+) -> LauncherExit {
+    use bangbang_session::elevated_probe::CredentialRole;
+
+    spawned.worker.terminate_and_reap();
+    credential_blocked_value(
+        CredentialRole::Launcher,
+        credential_protocol_failure(prefix, state),
+    )
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -819,24 +857,29 @@ fn credential_wait_for_exit(
     const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-    let deadline = Instant::now()
-        .checked_add(WAIT_TIMEOUT)
-        .ok_or(LauncherError::SessionProtocol)?;
-    loop {
-        if let Some(status) = spawned.worker.try_wait()? {
-            let exit = map_exit_status(status)?;
-            return if exit.code() == expected {
-                Ok(())
-            } else {
-                Err(LauncherError::SessionProtocol)
-            };
+    let result = (|| {
+        let deadline = Instant::now()
+            .checked_add(WAIT_TIMEOUT)
+            .ok_or(LauncherError::SessionProtocol)?;
+        loop {
+            if let Some(status) = spawned.worker.try_wait()? {
+                let exit = map_exit_status(status)?;
+                return if exit.code() == expected {
+                    Ok(())
+                } else {
+                    Err(LauncherError::SessionProtocol)
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(LauncherError::SessionProtocol);
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
-        if Instant::now() >= deadline {
-            spawned.worker.terminate_and_reap();
-            return Err(LauncherError::SessionProtocol);
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    })();
+    if result.is_err() {
+        spawned.worker.terminate_and_reap();
     }
+    result
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -1170,25 +1213,32 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
     #[test]
-    fn credential_protocol_failure_preserves_the_completed_transition_prefix() {
+    fn credential_protocol_failure_preserves_each_completed_transition_prefix() {
         use bangbang_session::elevated_probe::{
             CredentialGroupClass, CredentialIdentityClass, CredentialPrefix, CredentialSelfState,
         };
 
-        let failure = credential_protocol_failure(
-            CredentialPrefix::Irreversible,
-            CredentialSelfState::new(
-                CredentialIdentityClass::Target,
-                CredentialGroupClass::EffectiveOnly,
+        for (prefix, state) in [
+            (
+                CredentialPrefix::Irreversible,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::Target,
+                    CredentialGroupClass::EffectiveOnly,
+                ),
             ),
-        );
+            (
+                CredentialPrefix::RetainedRoot,
+                CredentialSelfState::new(
+                    CredentialIdentityClass::InitialAndTarget,
+                    CredentialGroupClass::Initial,
+                ),
+            ),
+        ] {
+            let failure = credential_protocol_failure(prefix, state);
 
-        assert_eq!(failure.prefix(), CredentialPrefix::Irreversible);
-        assert_eq!(failure.state().identity(), CredentialIdentityClass::Target);
-        assert_eq!(
-            failure.state().groups(),
-            CredentialGroupClass::EffectiveOnly
-        );
+            assert_eq!(failure.prefix(), prefix);
+            assert_eq!(failure.state(), state);
+        }
     }
 
     #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
