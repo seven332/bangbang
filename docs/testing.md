@@ -2028,6 +2028,25 @@ tool diagnostics. The report builds separate default and tracing release
 binaries, checks fixed-marker absence/presence, and prints descriptive size and
 timing data; it has no machine-independent threshold.
 
+## Wave 7 aggregate certification
+
+The final Wave 7 gate consumes the checked
+[`wave7-aggregate-audit.json`](../compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
+and composes the completed core API, logger, metrics, tracing, CPU-template,
+guest-workflow, formal-verification, and specification-benchmark authorities:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
+```
+
+It derives the exact 93 parent-owned identities, 37 design semantics, 958
+device-table relations, 261 API identities, 21 release entries, 55 public-tool
+leaves, and every supported virtio-MMIO profile. It succeeds only at inventory
+totals `376/9/3/30` with the exact nine audit and three feasible handoffs. It
+does not execute Kani, sign binaries, run HVF, or collect an environment report
+inside the Rust process: run the targeted Kani job, the full signed integration
+wrapper, and the specification collector separately for a current PR head.
+
 ## Running Tests
 
 Run the standard workspace checks before opening or updating a PR:
@@ -2043,6 +2062,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-te
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-dump-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-fingerprint-compare-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

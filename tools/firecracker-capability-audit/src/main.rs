@@ -10,13 +10,14 @@ use bangbang_firecracker_capability_audit::{
     LOGGER_PRODUCER_MANIFEST_PATH, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
     METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
     METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH, SPECIFICATION_BENCHMARK_AUDIT_PATH,
-    TRACING_AUDIT_PATH, derive_logger_producer_manifest, derive_metrics_schema_source,
-    derive_source_manifest, logger_producer_manifest_json, metrics_schema_source_candidate_json,
-    read_capability_inventory, read_cpu_template_helper_audit, read_formal_verification_audit,
-    read_guest_workflow_audit, read_logger_producer_audit, read_logger_producer_manifest,
-    read_metrics_device_producer_audit, read_metrics_lifecycle_audit,
-    read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
-    read_specification_benchmark_audit, read_tracing_audit, source_manifest_json, validate,
+    TRACING_AUDIT_PATH, WAVE7_AGGREGATE_AUDIT_PATH, derive_logger_producer_manifest,
+    derive_metrics_schema_source, derive_source_manifest, logger_producer_manifest_json,
+    metrics_schema_source_candidate_json, read_capability_inventory,
+    read_cpu_template_helper_audit, read_formal_verification_audit, read_guest_workflow_audit,
+    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
+    read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
+    read_metrics_schema_authority, read_source_manifest, read_specification_benchmark_audit,
+    read_tracing_audit, read_wave7_aggregate_audit, source_manifest_json, validate,
     validate_cpu_template_compatibility, validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility, validate_cpu_template_helper_audit,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
@@ -29,7 +30,8 @@ use bangbang_firecracker_capability_audit::{
     validate_metrics_process_producers, validate_metrics_schema,
     validate_metrics_schema_compatibility, validate_specification_benchmark_audit,
     validate_specification_benchmark_compatibility, validate_tracing_audit,
-    validate_tracing_compatibility,
+    validate_tracing_compatibility, validate_wave7_aggregate_audit,
+    validate_wave7_aggregate_compatibility,
 };
 
 fn main() -> ExitCode {
@@ -82,6 +84,7 @@ enum ValidateMode {
     GuestWorkflowFinal,
     FormalVerificationFinal,
     SpecificationBenchmarkFinal,
+    Wave7Final,
 }
 
 fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
@@ -110,8 +113,9 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
         [flag] if flag == "--specification-benchmark-final" => {
             Ok(ValidateMode::SpecificationBenchmarkFinal)
         }
+        [flag] if flag == "--wave7-final" => Ok(ValidateMode::Wave7Final),
         _ => Err(AuditError::new(
-            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, --guest-workflow-final, --formal-verification-final, or --specification-benchmark-final flag",
+            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, --guest-workflow-final, --formal-verification-final, --specification-benchmark-final, or --wave7-final flag",
         )),
     }
 }
@@ -139,6 +143,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         read_formal_verification_audit(&root.join(FORMAL_VERIFICATION_AUDIT_PATH))?;
     let specification_benchmark_audit =
         read_specification_benchmark_audit(&root.join(SPECIFICATION_BENCHMARK_AUDIT_PATH))?;
+    let wave7_aggregate_audit = read_wave7_aggregate_audit(&root.join(WAVE7_AGGREGATE_AUDIT_PATH))?;
     validate_cpu_template_helper_transition(&inventory).map_err(|errors| {
         AuditError::new(format!(
             "CPU-template helper transition validation errors:\n{errors}"
@@ -163,6 +168,13 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         |errors| {
             AuditError::new(format!(
                 "specification benchmark audit validation errors:\n{errors}"
+            ))
+        },
+    )?;
+    validate_wave7_aggregate_audit(&wave7_aggregate_audit, &manifest, &inventory, &root).map_err(
+        |errors| {
+            AuditError::new(format!(
+                "Wave 7 aggregate audit validation errors:\n{errors}"
             ))
         },
     )?;
@@ -888,6 +900,102 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
                     .to_string(),
             );
         }
+        ValidateMode::Wave7Final => {
+            validate_logger_compatibility(
+                &manifest,
+                &inventory,
+                &logger_manifest,
+                &logger_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("logger compatibility validation errors:\n{errors}"))
+            })?;
+            validate_metrics_compatibility(
+                &manifest,
+                &inventory,
+                &metrics_authority,
+                &metrics_process_audit,
+                &metrics_device_audit,
+                &metrics_lifecycle_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics aggregate compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_tracing_compatibility(
+                &manifest,
+                &inventory,
+                &logger_manifest,
+                &logger_audit,
+                &tracing_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "tracing compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_cpu_template_compatibility(
+                &manifest,
+                &inventory,
+                &cpu_template_helper_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "CPU-template aggregate compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_guest_workflow_compatibility(
+                &manifest,
+                &inventory,
+                &guest_workflow_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "guest workflow compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_formal_verification_compatibility(
+                &manifest,
+                &inventory,
+                &formal_verification_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "formal verification compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_specification_benchmark_compatibility(
+                &manifest,
+                &inventory,
+                &specification_benchmark_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "specification benchmark compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_wave7_aggregate_compatibility(
+                &manifest,
+                &inventory,
+                &wave7_aggregate_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("Wave 7 aggregate compatibility errors:\n{errors}"))
+            })?;
+            return Ok(
+                "Firecracker capability inventory and all Wave 7 component authorities are valid for the exact terminal Wave 7 aggregate scope"
+                    .to_string(),
+            );
+        }
     };
     let mut failures = Vec::new();
     if let Err(errors) = validate(&manifest, &inventory, &root, audit_mode) {
@@ -940,7 +1048,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         AuditMode::Final => "final",
     };
     Ok(format!(
-        "Firecracker capability inventory, canonical CPU-template helper, guest-workflow, formal-verification, and specification-benchmark audits, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
+        "Firecracker capability inventory, canonical CPU-template helper, guest-workflow, formal-verification, specification-benchmark, and Wave 7 aggregate audits, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
     ))
 }
 
@@ -1250,7 +1358,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final | --formal-verification-final | --specification-benchmark-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final | --formal-verification-final | --specification-benchmark-final | --wave7-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -1329,6 +1437,10 @@ mod tests {
             parse_validate_mode(&["--specification-benchmark-final".to_string()]).unwrap(),
             ValidateMode::SpecificationBenchmarkFinal
         );
+        assert_eq!(
+            parse_validate_mode(&["--wave7-final".to_string()]).unwrap(),
+            ValidateMode::Wave7Final
+        );
 
         for invalid in [
             vec!["--unknown".to_string()],
@@ -1377,6 +1489,10 @@ mod tests {
             vec![
                 "--formal-verification-final".to_string(),
                 "--specification-benchmark-final".to_string(),
+            ],
+            vec![
+                "--specification-benchmark-final".to_string(),
+                "--wave7-final".to_string(),
             ],
         ] {
             let error = parse_validate_mode(&invalid).expect_err("mode should be rejected");
@@ -1459,6 +1575,13 @@ mod tests {
         let message = run_validate(&["--specification-benchmark-final".to_string()])
             .expect("terminal specification benchmark validation must pass");
         assert!(message.contains("terminal threshold-free specification benchmark scope"));
+    }
+
+    #[test]
+    fn wave7_final_mode_certifies_the_terminal_aggregate_scope() {
+        let message = run_validate(&["--wave7-final".to_string()])
+            .expect("terminal Wave 7 aggregate validation must pass");
+        assert!(message.contains("exact terminal Wave 7 aggregate scope"));
     }
 
     #[test]

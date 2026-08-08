@@ -8,6 +8,13 @@ use crate::{
 };
 
 const CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/specification-benchmark-contract.md";
+const WAVE7_AGGREGATE_SUCCESSOR_IDS: [&str; 5] = [
+    "corpus:design",
+    "corpus:device-api",
+    "corpus:release-changelog",
+    "semantic.tools:packaging-help-errors-and-applicable-operations",
+    "semantic.transport:virtio-mmio-activation",
+];
 
 /// Certify exactly the terminal #1798 capability transition and totals.
 pub fn validate_specification_benchmark_compatibility(
@@ -115,9 +122,31 @@ fn validate_totals(inventory: &CapabilityInventory, errors: &mut Vec<String>) {
             Disposition::ProvenPlatformImpossible => impossible += 1,
         }
     }
-    if (implemented, audit_required, missing, impossible) != (371, 14, 3, 30) {
+    let totals = (implemented, audit_required, missing, impossible);
+    let expected_successor_disposition = match totals {
+        (371, 14, 3, 30) => Some(Disposition::AuditRequired),
+        (376, 9, 3, 30) => Some(Disposition::ImplementedAndVerified),
+        _ => None,
+    };
+    let capabilities = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(expected) = expected_successor_disposition {
+        for id in WAVE7_AGGREGATE_SUCCESSOR_IDS {
+            if capabilities
+                .get(id)
+                .is_none_or(|capability| capability.disposition != expected)
+            {
+                errors.push(format!(
+                    "specification benchmark successor phase drifted: {id}"
+                ));
+            }
+        }
+    } else {
         errors.push(format!(
-            "specification benchmark terminal totals must be 371/14/3/30, found {implemented}/{audit_required}/{missing}/{impossible}"
+            "specification benchmark terminal totals must be its exact 371/14/3/30 phase or the exact five-row Wave 7 successor 376/9/3/30 phase, found {implemented}/{audit_required}/{missing}/{impossible}"
         ));
     }
 }

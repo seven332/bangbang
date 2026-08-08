@@ -216,9 +216,49 @@ The existing arm64 `kvm_capabilities`, `vcpu_features`, and reviewed
 `reg_modifiers` behavior is unchanged; its own exact platform/safety outcomes
 remain in the CPU-template contract.
 
+## Wave 7 aggregate certification
+
+The terminal [Wave 7 aggregate authority](wave7-aggregate-audit.json) closes
+#1799 without hiding a producer or importing live sibling state. It binds the
+pinned design, device API, and v1.16.0 changelog blobs to five complete
+ledgers: all 37 semantic identities; all 958 device-table relations, including
+62 exact required producer mappings and 896 explicit optional cells; all 261
+generated API identities; all 21 ordered release entries; all 55 public-tool
+leaves; and the common virtio-MMIO transport plus every supported device
+profile. Historical device-API schema names and its `block_size_mi` spelling
+are normalized explicitly, while arm64 `SendCtrlAltDel` remains an intentional
+rejection.
+
+The scoped terminal gate is:
+
+```console
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
+```
+
+It composes every earlier Wave 7 authority and requires the exact 93-row parent
+distribution: 80 implemented and 13 proven-platform-impossible. Repository
+totals are exactly 376 implemented, nine audit-required, three
+missing-platform-feasible, and 30 proven-platform-impossible. The nonterminal
+set is also exact: three feasible #1351 isolation outcomes, six #1373
+jailer/production-host outcomes, two #1378 network outcomes, and one Wave 8
+interaction outcome. Aggregate completion does not infer completion of any of
+those handoffs.
+
+The public-tool ledger derives 46 implemented leaves, five terminal Linux-only
+jailer exclusions, and four #1373 jailer handoffs. The virtio-MMIO ledger
+requires common identity/features/queue/notification/interrupt/status/reset/
+activation/configuration/restore/observability behavior, file and vhost-user
+block variants, pmem, network, vsock, entropy, balloon, and virtio-mem, with
+focused, formal, and signed evidence. PCI-only evidence cannot substitute for
+MMIO evidence. Release completion retains Linux 6.18 as a #1373 Linux-host
+statement; it does not claim that macOS supplies that kernel. No aggregate row
+claims Firecracker binary/Linux/KVM identity, portable performance thresholds,
+tracked machine reports, credentials or network ownership, or final Wave 8
+interactions.
+
 ## Exact #1491-owned ledger
 
-| Identity | Owner | Result after #1784 |
+| Identity | Owner | Terminal Wave 7 result |
 | --- | --- | --- |
 | `api-operation:GET /` | #1784 | `implemented-and-verified` |
 | `api-operation:GET /version` | #1784 | `implemented-and-verified` |
@@ -308,11 +348,11 @@ remain in the CPU-template contract.
 | `corpus:network-performance` | #1798 | `implemented-and-verified` |
 | `corpus:specification` | #1798 | `implemented-and-verified` |
 | `semantic.specification:performance-resource-and-telemetry-outcomes` | #1798 | `implemented-and-verified` |
-| `corpus:design` | #1799 | `audit-required` |
-| `corpus:device-api` | #1799 | `audit-required` |
-| `corpus:release-changelog` | #1799 | `audit-required` |
-| `semantic.tools:packaging-help-errors-and-applicable-operations` | #1799 | `audit-required` |
-| `semantic.transport:virtio-mmio-activation` | #1799 | `audit-required` |
+| `corpus:design` | #1799 | `implemented-and-verified` |
+| `corpus:device-api` | #1799 | `implemented-and-verified` |
+| `corpus:release-changelog` | #1799 | `implemented-and-verified` |
+| `semantic.tools:packaging-help-errors-and-applicable-operations` | #1799 | `implemented-and-verified` |
+| `semantic.transport:virtio-mmio-activation` | #1799 | `implemented-and-verified` |
 
 ## Exact retained handoffs
 
@@ -363,10 +403,12 @@ contract](formal-verification-contract.md) all pass their fail-closed gates.
 #1798 then promotes its exact three reference and measured-outcome rows after
 the strict signed [specification benchmark](../../../docs/specification-benchmarks.md),
 real FIFO loss/replay, canonical comparison, optional-fixture, documentation,
-and terminal-audit gates pass. The current inventory is therefore exactly 371
-implemented, 14 audit-required, three
-missing-platform-feasible, and 30 proven-platform-impossible. If every other
-#1491-owned row later becomes implemented while the nine handoffs remain, the
-prospective Wave 7 endpoint is 376/9/3/30. These are exact consequences of the
-current row set, not quotas; the authoritative totals remain derived from
-`capabilities.json`.
+and terminal-audit gates pass. #1799 finally promotes its five aggregate rows
+after the checked source-complete authority derives every design semantic,
+device relation and API identity, release entry, public-tool leaf, and
+virtio-MMIO device profile while retaining all external handoffs. The current
+inventory is therefore exactly 376 implemented, nine audit-required, three
+missing-platform-feasible, and 30 proven-platform-impossible. These are exact
+consequences of the current row set, not quotas; the authoritative totals
+remain derived from `capabilities.json` and are rechecked by
+`validate --wave7-final`.

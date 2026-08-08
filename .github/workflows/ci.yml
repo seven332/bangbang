@@ -100,6 +100,9 @@ jobs:
       - name: Certify aggregate CPU-template compatibility scope
         run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
 
+      - name: Certify terminal Wave 7 aggregate scope
+        run: cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
+
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 

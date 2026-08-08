@@ -35,6 +35,9 @@ mod tracing_model;
 mod tracing_validate;
 mod upstream;
 mod validate;
+mod wave7_aggregate_audit_model;
+mod wave7_aggregate_audit_validate;
+mod wave7_aggregate_certify;
 
 pub use cpu_template_helper_audit_model::{
     CpuTemplateHelperArtifact, CpuTemplateHelperAudit, CpuTemplateHelperExecution,
@@ -155,6 +158,23 @@ pub use tracing_model::{
 pub use tracing_validate::{TRACING_CALL_SITE_IDS, validate_tracing_audit};
 pub use upstream::{derive_source_manifest, ensure_pinned_checkout};
 pub use validate::{ValidationErrors, validate};
+pub use wave7_aggregate_audit_model::{
+    Wave7AggregateAudit, Wave7AggregateEvidence, Wave7AggregateNonclaim, Wave7ApiPopulation,
+    Wave7DesignOutcome, Wave7DesignRecord, Wave7DesignSection, Wave7DeviceApiDimension,
+    Wave7DeviceApiLedger, Wave7DeviceApiNormalization, Wave7DeviceApiSection,
+    Wave7DispositionCounts, Wave7DocumentOwner, Wave7Handoff, Wave7HandoffOwner, Wave7PinnedSource,
+    Wave7ReleaseEntry, Wave7ReleaseOutcome, Wave7ReleaseSection, Wave7Tool, Wave7ToolCounts,
+    Wave7ToolExecution, Wave7ToolRecord, Wave7VirtioMmioClaim, Wave7VirtioMmioDevice,
+    Wave7VirtioMmioEvidence, Wave7VirtioMmioLedger,
+};
+pub use wave7_aggregate_audit_validate::{
+    WAVE7_AGGREGATE_AUDIT_PATH, WAVE7_AGGREGATE_AUDIT_SCHEMA_VERSION,
+    WAVE7_AGGREGATE_CAPABILITY_IDS, validate_wave7_aggregate_audit,
+};
+pub use wave7_aggregate_certify::{
+    WAVE7_OWNED_CAPABILITY_IDS, WAVE7_PLATFORM_IMPOSSIBLE_CAPABILITY_IDS,
+    validate_wave7_aggregate_compatibility,
+};
 
 use std::fmt;
 use std::path::Path;
@@ -378,6 +398,16 @@ pub fn read_specification_benchmark_audit(
     })
 }
 
+/// Read and parse the checked Wave 7 aggregate authority.
+pub fn read_wave7_aggregate_audit(path: &Path) -> Result<Wave7AggregateAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read Wave 7 aggregate audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!("failed to parse Wave 7 aggregate audit: {error}"))
+    })
+}
+
 /// Serialize a generated source manifest using canonical pretty JSON.
 pub fn source_manifest_json(manifest: &SourceManifest) -> Result<Vec<u8>, AuditError> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
@@ -473,6 +503,11 @@ pub fn specification_benchmark_audit_json(
     audit: &SpecificationBenchmarkAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "specification benchmark audit")
+}
+
+/// Serialize the checked Wave 7 aggregate authority using canonical pretty JSON.
+pub fn wave7_aggregate_audit_json(audit: &Wave7AggregateAudit) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "Wave 7 aggregate audit")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T, label: &str) -> Result<Vec<u8>, AuditError> {
