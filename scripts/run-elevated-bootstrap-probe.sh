@@ -4,6 +4,11 @@ LC_ALL=C
 export LC_ALL
 umask 077
 
+# The caller may supply an elevation credential on standard input. Sudo starts
+# this wrapper only after consuming it, so replace that descriptor before any
+# validation tool, launcher, or signed worker can inherit it.
+exec </dev/null
+
 usage() {
   /bin/cat <<'EOF'
 Usage: scripts/run-elevated-bootstrap-probe.sh --bundle /absolute/path/Bangbang.app
@@ -236,12 +241,25 @@ cleanup() {
       cleanup_status=1
     fi
   fi
-  if [[ -n "$workspace" && -d "$workspace" ]]; then
-    for output in "$workspace"/case-*; do
-      if [[ -f "$output" && ! -L "$output" ]]; then
-        /bin/unlink "$output" || cleanup_status=1
-      fi
-    done
+  if [[ -n "$workspace" && -e "$workspace" ]]; then
+    local workspace_current
+    local workspace_ownership
+    local workspace_shape
+    workspace_current="$(/usr/bin/stat -f '%d:%i' "$workspace" 2>/dev/null || true)"
+    workspace_ownership="$(/usr/bin/stat -f '%u:%g' "$workspace" 2>/dev/null || true)"
+    workspace_shape="$(/usr/bin/stat -f '%HT:%Lp' "$workspace" 2>/dev/null || true)"
+    if [[ -d "$workspace" && ! -L "$workspace" \
+      && "$workspace_current" == "$workspace_identity" \
+      && "$workspace_ownership" == "0:0" \
+      && "$workspace_shape" == "Directory:700" ]]; then
+      for output in "$workspace/case-a" "$workspace/case-b"; do
+        if [[ -f "$output" && ! -L "$output" ]]; then
+          /bin/unlink "$output" || cleanup_status=1
+        fi
+      done
+    else
+      cleanup_status=1
+    fi
   fi
   cleanup_directory "$concurrent_root_a" "$concurrent_root_a_identity" || cleanup_status=1
   cleanup_directory "$concurrent_root_b" "$concurrent_root_b_identity" || cleanup_status=1
