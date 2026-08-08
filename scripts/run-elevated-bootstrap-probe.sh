@@ -175,6 +175,7 @@ workspace=""
 workspace_identity=""
 symlink_root=""
 symlink_target=""
+symlink_placeholder_identity=""
 replacement_root=""
 replacement_root_identity=""
 replacement_candidate=""
@@ -237,6 +238,9 @@ cleanup() {
     if [[ -L "$symlink_root" \
       && "$(/usr/bin/readlink "$symlink_root")" == "$symlink_target" ]]; then
       /bin/unlink "$symlink_root" || cleanup_status=1
+    elif [[ -n "$symlink_placeholder_identity" ]]; then
+      cleanup_directory "$symlink_root" "$symlink_placeholder_identity" \
+        || cleanup_status=1
     else
       cleanup_status=1
     fi
@@ -331,13 +335,16 @@ assert_case "$probe_root" 0 0 control 1 \
   "bangbang launcher: invalid production launch policy"
 /bin/chmod 0700 "$probe_root"
 
-symlink_root="/private/var/root/bangbang-elevated-probe.Symlink1"
+create_private_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
+  symlink_root symlink_placeholder_identity
 symlink_target="$probe_root"
-if [[ -e "$symlink_root" || -L "$symlink_root" ]]; then
-  echo "bangbang elevated bootstrap proof: symlink fixture collision" >&2
-  exit 1
-fi
+trap '' INT TERM HUP
+cleanup_directory "$symlink_root" "$symlink_placeholder_identity"
 /bin/ln -s "$probe_root" "$symlink_root"
+symlink_placeholder_identity=""
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 set +e
 symlink_output="$(invoke "$symlink_root" 0 0 control 2>&1)"
 symlink_status=$?
