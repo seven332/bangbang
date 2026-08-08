@@ -99,13 +99,17 @@ local HVF without noninteractive root, missing credentials, a skipped test, or
 an unexecuted harness does not satisfy either gate. These are feasible external
 handoffs and are not platform-impossible classifications.
 
-That #1373 execution gate has since run on the controlled Apple Silicon host.
-The [elevated bootstrap evidence](elevated-bootstrap-evidence.md) records a
-successful unsandboxed root control and a repeated chroot-stage permission
-denial in the exact App Sandbox + Hypervisor worker. The six rows remain
-`audit-required` in this Wave 8 snapshot until #1371 performs its fresh
-ID-specific Challenge and an authoritative inventory transition; the evidence
-result itself does not silently rewrite this checked historical boundary.
+That same-host execution gate has since run on the controlled Apple Silicon
+host. The [elevated bootstrap evidence](elevated-bootstrap-evidence.md) records
+#1373's successful unsandboxed root control and repeated direct-worker chroot
+denial, plus #1884's follow-up. In the follow-up, the same unchrooted signed
+worker completed real HVF create/destroy; after the launcher entered an exact
+root containing the complete signed bundle and current dyld, `posix_spawn`
+returned success but the worker exited before the first application record.
+The six rows remain `audit-required` in this Wave 8 snapshot until #1371
+challenges the result and any remaining credible public alternative per ID and
+an authoritative inventory transition lands. Neither evidence PR silently
+rewrites this checked historical boundary.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378

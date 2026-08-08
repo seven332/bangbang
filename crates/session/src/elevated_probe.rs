@@ -5,21 +5,21 @@ use std::fmt;
 use crate::{ObjectIdentity, SessionId};
 
 /// Launcher argv activation compiled only into the evidence bundle.
-pub const LAUNCHER_ACTIVATION: &str = "--bangbang-internal-elevated-bootstrap-probe-v1";
+pub const LAUNCHER_ACTIVATION: &str = "--bangbang-internal-elevated-bootstrap-probe-v2";
 /// Worker argv activation compiled only into the evidence bundle.
-pub const WORKER_ACTIVATION: &str = "--bangbang-internal-elevated-bootstrap-worker-v1";
+pub const WORKER_ACTIVATION: &str = "--bangbang-internal-elevated-bootstrap-worker-v2";
 /// Fixed inherited descriptor carrying the exact private root.
 pub const ROOT_FD: libc::c_int = 8;
 /// Fixed worker-ready record sent before live code validation completes.
-pub const READY_RECORD: [u8; 16] = *b"BBEP-READY-V1\0\0\0";
+pub const READY_RECORD: [u8; 16] = *b"BBEP-READY-V2\0\0\0";
 /// Encoded bootstrap record length.
 pub const BOOTSTRAP_RECORD_BYTES: usize = 64;
 /// Encoded terminal result record length.
 pub const RESULT_RECORD_BYTES: usize = 48;
 
-const VERSION: u16 = 1;
-const BOOTSTRAP_MAGIC: [u8; 4] = *b"BBE1";
-const RESULT_MAGIC: [u8; 4] = *b"BBR1";
+const VERSION: u16 = 2;
+const BOOTSTRAP_MAGIC: [u8; 4] = *b"BBE2";
+const RESULT_MAGIC: [u8; 4] = *b"BBR2";
 
 /// Exact evidence mode selected by the explicit root wrapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +33,10 @@ pub enum ProbeMode {
     UnmappedSyscall = 3,
     /// Run the same chroot primitive in the unsandboxed launcher control process.
     Control = 4,
+    /// Run a real HVF create/destroy control in the unchrooted signed worker.
+    HvfControl = 5,
+    /// Inherit a launcher-entered root and run the sandbox/HVF evidence sequence.
+    InheritedRoot = 6,
 }
 
 impl ProbeMode {
@@ -43,6 +47,8 @@ impl ProbeMode {
             "retain-root" => Self::RetainRoot,
             "unmapped-syscall" => Self::UnmappedSyscall,
             "control" => Self::Control,
+            "hvf-control" => Self::HvfControl,
+            "inherited-root" => Self::InheritedRoot,
             _ => return None,
         };
         mode.accepts_target(uid, gid).then_some(mode)
@@ -56,6 +62,8 @@ impl ProbeMode {
             Self::RetainRoot => "retain-root",
             Self::UnmappedSyscall => "unmapped-syscall",
             Self::Control => "control",
+            Self::HvfControl => "hvf-control",
+            Self::InheritedRoot => "inherited-root",
         }
     }
 
@@ -64,7 +72,9 @@ impl ProbeMode {
     pub const fn accepts_target(self, uid: u32, gid: u32) -> bool {
         match self {
             Self::Drop | Self::UnmappedSyscall => uid != 0 && gid != 0,
-            Self::RetainRoot | Self::Control => uid == 0 && gid == 0,
+            Self::RetainRoot | Self::Control | Self::HvfControl | Self::InheritedRoot => {
+                uid == 0 && gid == 0
+            }
         }
     }
 
@@ -74,6 +84,8 @@ impl ProbeMode {
             2 => Ok(Self::RetainRoot),
             3 => Ok(Self::UnmappedSyscall),
             4 => Ok(Self::Control),
+            5 => Ok(Self::HvfControl),
+            6 => Ok(Self::InheritedRoot),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -97,6 +109,26 @@ pub enum ProbeStage {
     ChangeDirectory = 6,
     /// Fail closed if a future platform unexpectedly permits continuation.
     UnexpectedContinuation = 7,
+    /// Validate the complete fixed signed bundle staged inside the root.
+    ValidateStagedBundle = 8,
+    /// Validate the fixed Darwin loader staged inside the root.
+    ValidateStagedLoader = 9,
+    /// Spawn the signed worker by its fixed path inside the inherited root.
+    SpawnWorker = 10,
+    /// Validate the newly spawned worker while it remains suspended.
+    SuspendedIdentity = 11,
+    /// Prove slash and cwd are the exact inherited private root.
+    InheritedRoot = 12,
+    /// Re-run direct chroot as an App Sandbox denial control.
+    SandboxChrootControl = 13,
+    /// Revalidate the live worker after its authenticated ready record.
+    LiveIdentity = 14,
+    /// Create one real process-local Hypervisor.framework VM.
+    HvfCreate = 15,
+    /// Destroy the real process-local Hypervisor.framework VM.
+    HvfDestroy = 16,
+    /// Observe the first authenticated application record from the spawned worker.
+    WorkerBootstrap = 17,
 }
 
 impl ProbeStage {
@@ -111,6 +143,16 @@ impl ProbeStage {
             Self::Chroot => "chroot",
             Self::ChangeDirectory => "change-directory",
             Self::UnexpectedContinuation => "unexpected-continuation",
+            Self::ValidateStagedBundle => "validate-staged-bundle",
+            Self::ValidateStagedLoader => "validate-staged-loader",
+            Self::SpawnWorker => "spawn-worker",
+            Self::SuspendedIdentity => "suspended-identity",
+            Self::InheritedRoot => "inherited-root",
+            Self::SandboxChrootControl => "sandbox-chroot-control",
+            Self::LiveIdentity => "live-identity",
+            Self::HvfCreate => "hvf-create",
+            Self::HvfDestroy => "hvf-destroy",
+            Self::WorkerBootstrap => "worker-bootstrap",
         }
     }
 
@@ -123,6 +165,16 @@ impl ProbeStage {
             5 => Ok(Self::Chroot),
             6 => Ok(Self::ChangeDirectory),
             7 => Ok(Self::UnexpectedContinuation),
+            8 => Ok(Self::ValidateStagedBundle),
+            9 => Ok(Self::ValidateStagedLoader),
+            10 => Ok(Self::SpawnWorker),
+            11 => Ok(Self::SuspendedIdentity),
+            12 => Ok(Self::InheritedRoot),
+            13 => Ok(Self::SandboxChrootControl),
+            14 => Ok(Self::LiveIdentity),
+            15 => Ok(Self::HvfCreate),
+            16 => Ok(Self::HvfDestroy),
+            17 => Ok(Self::WorkerBootstrap),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -239,7 +291,7 @@ impl ProbeBootstrap {
         self.nonce
     }
 
-    /// Encodes the fixed v1 record.
+    /// Encodes the fixed v2 record.
     #[must_use]
     pub fn encode(self) -> [u8; BOOTSTRAP_RECORD_BYTES] {
         let mut bytes = [0_u8; BOOTSTRAP_RECORD_BYTES];
@@ -332,7 +384,7 @@ impl ProbeResult {
         self.nonce
     }
 
-    /// Encodes the fixed v1 terminal record.
+    /// Encodes the fixed v2 terminal record.
     #[must_use]
     pub fn encode(self) -> [u8; RESULT_RECORD_BYTES] {
         let mut bytes = [0_u8; RESULT_RECORD_BYTES];
@@ -459,6 +511,12 @@ mod tests {
             )
             .is_err()
         );
+        let mut version_one = encoded;
+        version_one[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(
+            ProbeBootstrap::decode(&version_one),
+            Err(ProbeProtocolError)
+        );
         assert!(
             ProbeBootstrap::new(
                 ProbeMode::Drop,
@@ -496,6 +554,36 @@ mod tests {
             .encode();
         malformed[8] = ProbeStage::Chroot as u8;
         assert_eq!(ProbeResult::decode(&malformed), Err(ProbeProtocolError));
+        for index in [0, 4, 10, 15] {
+            let mut malformed = ProbeResult::success(ProbeMode::Drop, nonce)
+                .expect("valid success")
+                .encode();
+            malformed[index] ^= 0xff;
+            assert_eq!(ProbeResult::decode(&malformed), Err(ProbeProtocolError));
+        }
+        let mut version_one = ProbeResult::success(ProbeMode::Drop, nonce)
+            .expect("valid success")
+            .encode();
+        version_one[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(ProbeResult::decode(&version_one), Err(ProbeProtocolError));
+        let mut unknown_mode = ProbeResult::success(ProbeMode::Drop, nonce)
+            .expect("valid success")
+            .encode();
+        unknown_mode[6] = u8::MAX;
+        assert_eq!(ProbeResult::decode(&unknown_mode), Err(ProbeProtocolError));
+        let mut unknown_failure = ProbeResult::failure(
+            ProbeMode::Drop,
+            nonce,
+            ProbeStage::Chroot,
+            ProbeErrorCategory::Other,
+        )
+        .expect("valid failure")
+        .encode();
+        unknown_failure[8] = u8::MAX;
+        assert_eq!(
+            ProbeResult::decode(&unknown_failure),
+            Err(ProbeProtocolError)
+        );
         assert!(ProbeResult::success(ProbeMode::Control, nonce).is_err());
         assert!(ProbeResult::success(ProbeMode::Drop, SessionId::pre_session()).is_err());
     }
@@ -509,6 +597,84 @@ mod tests {
             Some(ProbeMode::RetainRoot)
         );
         assert_eq!(ProbeMode::parse("retain-root", 501, 20), None);
+        assert_eq!(
+            ProbeMode::parse("hvf-control", 0, 0),
+            Some(ProbeMode::HvfControl)
+        );
+        assert_eq!(
+            ProbeMode::parse("inherited-root", 0, 0),
+            Some(ProbeMode::InheritedRoot)
+        );
+        assert_eq!(ProbeMode::parse("hvf-control", 501, 20), None);
+        assert_eq!(ProbeMode::parse("inherited-root", 501, 20), None);
         assert_eq!(ProbeMode::parse("unknown", 501, 20), None);
+    }
+
+    #[test]
+    fn every_stage_round_trips_through_a_failure_result() {
+        let nonce = SessionId::from_bytes([0x5a; 32]);
+        for stage in [
+            ProbeStage::InitialIdentity,
+            ProbeStage::TakeRoot,
+            ProbeStage::ValidateRoot,
+            ProbeStage::EnterRoot,
+            ProbeStage::Chroot,
+            ProbeStage::ChangeDirectory,
+            ProbeStage::UnexpectedContinuation,
+            ProbeStage::ValidateStagedBundle,
+            ProbeStage::ValidateStagedLoader,
+            ProbeStage::SpawnWorker,
+            ProbeStage::SuspendedIdentity,
+            ProbeStage::InheritedRoot,
+            ProbeStage::SandboxChrootControl,
+            ProbeStage::LiveIdentity,
+            ProbeStage::HvfCreate,
+            ProbeStage::HvfDestroy,
+            ProbeStage::WorkerBootstrap,
+        ] {
+            let result = ProbeResult::failure(
+                ProbeMode::InheritedRoot,
+                nonce,
+                stage,
+                ProbeErrorCategory::Other,
+            )
+            .expect("stage should produce a valid failure result");
+            assert_eq!(ProbeResult::decode(&result.encode()), Ok(result));
+        }
+    }
+
+    #[test]
+    fn every_worker_mode_and_error_category_round_trips() {
+        let nonce = SessionId::from_bytes([0x6b; 32]);
+        for (mode, uid, gid) in [
+            (ProbeMode::Drop, 501, 20),
+            (ProbeMode::RetainRoot, 0, 0),
+            (ProbeMode::UnmappedSyscall, u32::MAX, u32::MAX),
+            (ProbeMode::HvfControl, 0, 0),
+            (ProbeMode::InheritedRoot, 0, 0),
+        ] {
+            let bootstrap = ProbeBootstrap::new(
+                mode,
+                uid,
+                gid,
+                ObjectIdentity {
+                    device: 0x12,
+                    inode: 0x34,
+                },
+                nonce,
+            )
+            .expect("mode and target should construct");
+            assert_eq!(ProbeBootstrap::decode(&bootstrap.encode()), Ok(bootstrap));
+            for category in [
+                ProbeErrorCategory::PermissionDenied,
+                ProbeErrorCategory::InvalidInput,
+                ProbeErrorCategory::Other,
+            ] {
+                let result =
+                    ProbeResult::failure(mode, nonce, ProbeStage::WorkerBootstrap, category)
+                        .expect("mode and category should construct");
+                assert_eq!(ProbeResult::decode(&result.encode()), Ok(result));
+            }
+        }
     }
 }
