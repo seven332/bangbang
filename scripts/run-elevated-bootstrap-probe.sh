@@ -175,6 +175,7 @@ workspace=""
 workspace_identity=""
 symlink_root=""
 symlink_target=""
+symlink_identity=""
 symlink_placeholder_identity=""
 replacement_root=""
 replacement_root_identity=""
@@ -229,15 +230,28 @@ cleanup_directory() {
   /bin/rmdir "$path"
 }
 
+cleanup_symlink() {
+  local path="$1"
+  local target="$2"
+  local identity="$3"
+  if [[ ! -L "$path" \
+    || "$(/usr/bin/readlink "$path")" != "$target" \
+    || "$(/usr/bin/stat -f '%d:%i' "$path" 2>/dev/null || true)" != "$identity" \
+    || "$(/usr/bin/stat -f '%u:%g' "$path" 2>/dev/null || true)" != "0:0" ]]; then
+    return 1
+  fi
+  /bin/unlink "$path"
+}
+
 cleanup() {
   local prior_status=$?
   trap - EXIT
   trap '' INT TERM HUP
   local cleanup_status=0
   if [[ -n "$symlink_root" ]]; then
-    if [[ -L "$symlink_root" \
-      && "$(/usr/bin/readlink "$symlink_root")" == "$symlink_target" ]]; then
-      /bin/unlink "$symlink_root" || cleanup_status=1
+    if [[ -n "$symlink_identity" ]]; then
+      cleanup_symlink "$symlink_root" "$symlink_target" "$symlink_identity" \
+        || cleanup_status=1
     elif [[ -n "$symlink_placeholder_identity" ]]; then
       cleanup_directory "$symlink_root" "$symlink_placeholder_identity" \
         || cleanup_status=1
@@ -342,6 +356,7 @@ trap '' INT TERM HUP
 cleanup_directory "$symlink_root" "$symlink_placeholder_identity"
 /bin/ln -s "$probe_root" "$symlink_root"
 symlink_placeholder_identity=""
+symlink_identity="$(/usr/bin/stat -f '%d:%i' "$symlink_root")"
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
@@ -353,9 +368,10 @@ if [[ "$symlink_status" -ne 1 || "$symlink_output" != "bangbang launcher: invali
   echo "bangbang elevated bootstrap proof: symlink case failed" >&2
   exit 1
 fi
-/bin/unlink "$symlink_root"
+cleanup_symlink "$symlink_root" "$symlink_target" "$symlink_identity"
 symlink_root=""
 symlink_target=""
+symlink_identity=""
 
 original_replacement_identity=""
 create_private_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
