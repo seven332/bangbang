@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bangbang_session::macos::grant_transport::{GrantTransportError, send_grant};
 #[cfg(feature = "elevated-bootstrap-probe")]
-use bangbang_session::macos::runtime::ExplicitRuntimeRoot;
+use bangbang_session::macos::runtime::LauncherSessionHandles;
 use bangbang_session::macos::runtime::{
     LauncherNamespace, NamespaceIdentity, RuntimeError, SnapshotStagingOwnershipRecord,
     SocketOwnershipRecord,
@@ -188,42 +188,30 @@ pub(crate) fn wait_session(
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
-pub(crate) struct ExplicitSessionStart {
-    root: ExplicitRuntimeRoot,
+pub(crate) struct PreopenedSessionStart {
+    handles: LauncherSessionHandles,
     frame: Frame,
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
-impl ExplicitSessionStart {
-    pub(crate) const fn new(root: ExplicitRuntimeRoot, frame: Frame) -> Self {
-        Self { root, frame }
+impl PreopenedSessionStart {
+    pub(crate) const fn new(handles: LauncherSessionHandles, frame: Frame) -> Self {
+        Self { handles, frame }
     }
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
-pub(crate) fn wait_session_with_explicit_root(
+pub(crate) fn wait_session_with_preopened_namespace(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
     auxiliary: AuxiliaryChannels<'_>,
     lifecycle: LauncherLifecycle,
     wakeups: SignalWakeups,
     grants: &PreparedGrantBatch,
-    start: ExplicitSessionStart,
+    start: PreopenedSessionStart,
 ) -> Result<ExitStatus, LauncherError> {
-    let ExplicitSessionStart { root, frame } = start;
-    // Establish both independent namespace authorities before the worker can
-    // observe Start and publish a session. No failure after this point can
-    // strand a namespace solely because its recovery handle was unavailable.
-    let validation = root
-        .try_reopen(false)
-        .map_err(|_| LauncherError::RuntimeNamespace)?;
-    let recovery = root
-        .try_reopen(false)
-        .map_err(|_| LauncherError::RuntimeNamespace)?;
-    let mut roots = NamespaceRoots::Explicit {
-        validation: Some(validation),
-        recovery: Some(recovery),
-    };
+    let PreopenedSessionStart { handles, frame } = start;
+    let mut roots = NamespaceRoots::Preopened(handles);
     if let Err(error) = write_frame(session, frame) {
         terminate_session(worker, session, &auxiliary);
         roots
@@ -333,10 +321,7 @@ struct SessionOptions<'a> {
 enum NamespaceRoots {
     Ordinary,
     #[cfg(feature = "elevated-bootstrap-probe")]
-    Explicit {
-        validation: Option<ExplicitRuntimeRoot>,
-        recovery: Option<ExplicitRuntimeRoot>,
-    },
+    Preopened(LauncherSessionHandles),
 }
 
 impl NamespaceRoots {
@@ -348,11 +333,7 @@ impl NamespaceRoots {
         match self {
             Self::Ordinary => LauncherNamespace::validate(session, expected),
             #[cfg(feature = "elevated-bootstrap-probe")]
-            Self::Explicit { validation, .. } => LauncherNamespace::validate_from_explicit_root(
-                validation.take().ok_or(RuntimeError::InvalidRoot)?,
-                session,
-                expected,
-            ),
+            Self::Preopened(handles) => handles.validate_live(session, expected),
         }
     }
 
@@ -363,12 +344,7 @@ impl NamespaceRoots {
         match self {
             Self::Ordinary => LauncherNamespace::recover_after_worker_exit(session),
             #[cfg(feature = "elevated-bootstrap-probe")]
-            Self::Explicit { recovery, .. } => {
-                LauncherNamespace::recover_after_worker_exit_from_explicit_root(
-                    recovery.take().ok_or(RuntimeError::InvalidRoot)?,
-                    session,
-                )
-            }
+            Self::Preopened(handles) => handles.recover_after_worker_exit(session),
         }
     }
 }

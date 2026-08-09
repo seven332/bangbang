@@ -330,11 +330,9 @@ mod platform {
         GrantedFile, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
-    #[cfg(feature = "elevated-bootstrap-probe")]
-    use bangbang_session::macos::runtime::RuntimeError;
     use bangbang_session::macos::runtime::{
-        SnapshotStagingKind, SnapshotStagingName, SnapshotStagingOwnershipRecord, WorkerNamespace,
-        WorkerSocketNamespace,
+        RuntimeError, SnapshotStagingKind, SnapshotStagingName, SnapshotStagingOwnershipRecord,
+        WorkerNamespace, WorkerSocketNamespace,
     };
     use bangbang_session::macos::vhost_user_broker::{
         VhostUserBrokerError, VhostUserBrokerMessage, receive_vhost_user_broker_message,
@@ -368,18 +366,16 @@ mod platform {
     pub(crate) enum ContainedBootstrapError {
         Session,
         #[cfg(feature = "elevated-bootstrap-probe")]
-        RuntimeNamespace(RuntimeError),
+        RuntimeWorker(bangbang_session::elevated_probe::RuntimeWorkerFailure),
     }
 
     #[cfg(feature = "elevated-bootstrap-probe")]
     impl ContainedBootstrapError {
-        pub(crate) const fn is_runtime_namespace_permission_denied(self) -> bool {
-            matches!(
-                self,
-                Self::RuntimeNamespace(RuntimeError::NamespaceCreate(
-                    io::ErrorKind::PermissionDenied
-                ))
-            )
+        pub(crate) fn runtime_worker_exit_code(self) -> Option<u8> {
+            match self {
+                Self::RuntimeWorker(failure) => Some(failure.exit_code()),
+                Self::Session => None,
+            }
         }
     }
 
@@ -396,6 +392,32 @@ mod platform {
     }
 
     impl std::error::Error for ContainedBootstrapError {}
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn runtime_worker_failure(
+        stage: bangbang_session::elevated_probe::ProbeStage,
+        category: bangbang_session::elevated_probe::ProbeErrorCategory,
+    ) -> ContainedBootstrapError {
+        bangbang_session::elevated_probe::RuntimeWorkerFailure::new(stage, category).map_or(
+            ContainedBootstrapError::Session,
+            ContainedBootstrapError::RuntimeWorker,
+        )
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RuntimeBootstrapStage {
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        AuthorityValidate,
+        SessionEnter,
+        Prepared,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RuntimeBootstrapCategory {
+        InvalidInput,
+        Other,
+        Namespace(RuntimeError),
+    }
 
     #[cfg(feature = "grant-integration-probe")]
     fn grant_delay_requested() -> bool {
@@ -3535,7 +3557,8 @@ mod platform {
         Ordinary,
         #[cfg(feature = "elevated-bootstrap-probe")]
         Elevated {
-            root: Option<bangbang_session::macos::runtime::ExplicitRuntimeRoot>,
+            namespace: Option<WorkerNamespace>,
+            expected_session: SessionId,
             bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
             parent: libc::pid_t,
         },
@@ -3586,7 +3609,25 @@ mod platform {
             }
         }
 
-        fn create_namespace(
+        fn validate_start_session(
+            &self,
+            _session: SessionId,
+        ) -> Result<(), ContainedBootstrapError> {
+            match self {
+                Self::Ordinary => Ok(()),
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                Self::Elevated {
+                    expected_session, ..
+                } if *expected_session == _session => Ok(()),
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                Self::Elevated { .. } => Err(self.runtime_failure(
+                    RuntimeBootstrapStage::AuthorityValidate,
+                    RuntimeBootstrapCategory::InvalidInput,
+                )),
+            }
+        }
+
+        fn take_namespace(
             &mut self,
             session: SessionId,
         ) -> Result<WorkerNamespace, ContainedBootstrapError> {
@@ -3596,20 +3637,53 @@ mod platform {
                 }
                 #[cfg(feature = "elevated-bootstrap-probe")]
                 Self::Elevated {
-                    root, bootstrap, ..
+                    namespace,
+                    bootstrap,
+                    ..
                 } => {
                     if bootstrap.fault()
                         == bangbang_session::elevated_probe::RuntimeFault::Namespace
                     {
                         return Err(ContainedBootstrapError::Session);
                     }
-                    WorkerNamespace::create_from_explicit_root(
-                        root.take().ok_or(ContainedBootstrapError::Session)?,
-                        session,
-                    )
-                    .map_err(ContainedBootstrapError::RuntimeNamespace)
+                    namespace.take().ok_or(ContainedBootstrapError::Session)
                 }
             }
+        }
+
+        fn runtime_failure(
+            &self,
+            stage: RuntimeBootstrapStage,
+            category: RuntimeBootstrapCategory,
+        ) -> ContainedBootstrapError {
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if matches!(self, Self::Elevated { .. }) {
+                use bangbang_session::elevated_probe::{ProbeErrorCategory, ProbeStage};
+
+                let stage = match stage {
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    RuntimeBootstrapStage::AuthorityValidate => {
+                        ProbeStage::RuntimeAuthorityValidate
+                    }
+                    RuntimeBootstrapStage::SessionEnter => ProbeStage::RuntimeSessionEnter,
+                    RuntimeBootstrapStage::Prepared => ProbeStage::LifecyclePrepared,
+                };
+                let category = match category {
+                    RuntimeBootstrapCategory::InvalidInput => ProbeErrorCategory::InvalidInput,
+                    RuntimeBootstrapCategory::Other => ProbeErrorCategory::Other,
+                    RuntimeBootstrapCategory::Namespace(
+                        RuntimeError::Filesystem(kind) | RuntimeError::NamespaceCreate(kind),
+                    ) => ProbeErrorCategory::from_io_kind(kind),
+                    RuntimeBootstrapCategory::Namespace(
+                        RuntimeError::InvalidRoot
+                        | RuntimeError::InvalidEntry
+                        | RuntimeError::Collision,
+                    ) => ProbeErrorCategory::InvalidInput,
+                };
+                return runtime_worker_failure(stage, category);
+            }
+            let _ = (stage, category);
+            ContainedBootstrapError::Session
         }
 
         #[cfg(feature = "elevated-bootstrap-probe")]
@@ -3735,7 +3809,8 @@ mod platform {
                     .map_err(|_| ContainedSessionError)?;
             }
             let source = BootstrapSource::Elevated {
-                root: Some(continuation.root),
+                namespace: Some(continuation.namespace),
+                expected_session: continuation.expected_session,
                 bootstrap: continuation.bootstrap,
                 parent: continuation.parent,
             };
@@ -3781,20 +3856,51 @@ mod platform {
                 Message::Start(policy) => policy,
                 _ => return Err(ContainedSessionError.into()),
             };
-            install_worker_policy(policy, parent)?;
             let session = lifecycle.session().ok_or(ContainedSessionError)?;
-            let namespace = source.create_namespace(session)?;
-            namespace.enter().map_err(|_| ContainedSessionError)?;
+            source.validate_start_session(session)?;
+            install_worker_policy(policy, parent)?;
+            let namespace = source.take_namespace(session)?;
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if source.has_fault(bangbang_session::elevated_probe::RuntimeFault::SessionEnter) {
+                return Err(source.runtime_failure(
+                    RuntimeBootstrapStage::SessionEnter,
+                    RuntimeBootstrapCategory::Other,
+                ));
+            }
+            namespace.enter().map_err(|error| {
+                source.runtime_failure(
+                    RuntimeBootstrapStage::SessionEnter,
+                    RuntimeBootstrapCategory::Namespace(error),
+                )
+            })?;
             let identity = namespace.identity();
-            let socket_namespace = Rc::new(
-                namespace
-                    .socket_namespace()
-                    .map_err(|_| ContainedSessionError)?,
-            );
+            let socket_namespace = Rc::new(namespace.socket_namespace().map_err(|error| {
+                source.runtime_failure(
+                    RuntimeBootstrapStage::Prepared,
+                    RuntimeBootstrapCategory::Namespace(error),
+                )
+            })?);
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if source.has_fault(bangbang_session::elevated_probe::RuntimeFault::Prepared) {
+                return Err(source.runtime_failure(
+                    RuntimeBootstrapStage::Prepared,
+                    RuntimeBootstrapCategory::Other,
+                ));
+            }
             let prepared = lifecycle
                 .prepared(identity.device, identity.inode)
-                .map_err(|_| ContainedSessionError)?;
-            write_frame(&mut stream, prepared)?;
+                .map_err(|_| {
+                    source.runtime_failure(
+                        RuntimeBootstrapStage::Prepared,
+                        RuntimeBootstrapCategory::InvalidInput,
+                    )
+                })?;
+            write_frame(&mut stream, prepared).map_err(|_| {
+                source.runtime_failure(
+                    RuntimeBootstrapStage::Prepared,
+                    RuntimeBootstrapCategory::Other,
+                )
+            })?;
 
             #[cfg(feature = "elevated-bootstrap-probe")]
             if source.has_fault(bangbang_session::elevated_probe::RuntimeFault::GrantTransfer) {
@@ -4552,26 +4658,24 @@ mod platform {
 
         #[cfg(feature = "elevated-bootstrap-probe")]
         #[test]
-        fn runtime_permission_boundary_is_exactly_namespace_creation() {
-            use bangbang_session::macos::runtime::RuntimeError;
+        fn runtime_worker_failure_preserves_the_closed_exit_mapping() {
+            use bangbang_session::elevated_probe::{
+                ProbeErrorCategory, ProbeStage, RuntimeWorkerFailure,
+            };
 
-            assert!(
-                super::ContainedBootstrapError::RuntimeNamespace(RuntimeError::NamespaceCreate(
-                    io::ErrorKind::PermissionDenied
-                ))
-                .is_runtime_namespace_permission_denied()
+            let failure = RuntimeWorkerFailure::new(
+                ProbeStage::RuntimeSessionEnter,
+                ProbeErrorCategory::PermissionDenied,
+            )
+            .expect("worker stage should be supported");
+            assert_eq!(
+                super::ContainedBootstrapError::RuntimeWorker(failure).runtime_worker_exit_code(),
+                Some(failure.exit_code())
             );
-            for error in [
-                super::ContainedBootstrapError::Session,
-                super::ContainedBootstrapError::RuntimeNamespace(RuntimeError::Filesystem(
-                    io::ErrorKind::PermissionDenied,
-                )),
-                super::ContainedBootstrapError::RuntimeNamespace(RuntimeError::NamespaceCreate(
-                    io::ErrorKind::Other,
-                )),
-            ] {
-                assert!(!error.is_runtime_namespace_permission_denied());
-            }
+            assert_eq!(
+                super::ContainedBootstrapError::Session.runtime_worker_exit_code(),
+                None
+            );
         }
 
         pub(crate) struct TestDirectory(PathBuf);

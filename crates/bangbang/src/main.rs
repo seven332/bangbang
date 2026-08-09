@@ -188,10 +188,8 @@ fn run_process_lifecycle(
         Ok(contained) => contained,
         Err(err) => {
             #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
-            if err.is_runtime_namespace_permission_denied() {
-                return ExitCode::from(
-                    bangbang_session::elevated_probe::RUNTIME_NAMESPACE_PERMISSION_EXIT_CODE,
-                );
+            if let Some(exit_code) = err.runtime_worker_exit_code() {
+                return ExitCode::from(exit_code);
             }
             eprintln!("bangbang: {err}");
             return ProcessExitCode::ProcessFailure.into_exit_code();

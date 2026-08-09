@@ -15,17 +15,21 @@ use bangbang_session::elevated_probe::{
     CredentialFailureValue, CredentialGroupClass, CredentialIdentityClass, CredentialPrefix,
     CredentialRecord, CredentialRecordKind, CredentialRole, CredentialSelfState, CredentialStep,
     PeerObservation, ProbeBootstrap, ProbeErrorCategory, ProbeResult, ProbeStage, READY_RECORD,
-    RESULT_RECORD_BYTES, ROOT_FD, RuntimeFault, WORKER_ACTIVATION,
+    RESULT_RECORD_BYTES, ROOT_FD, RuntimeFault, RuntimeWorkerFailure, WORKER_ACTIVATION,
 };
 use bangbang_session::{GRANT_FD, ObjectIdentity, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD};
 
-use bangbang_session::macos::runtime::ExplicitRuntimeRoot;
+use bangbang_session::macos::grant_transport::GrantTransportError;
+use bangbang_session::macos::runtime::{
+    ExplicitRuntimeRoot, RuntimeError, ValidatedWorkerNamespace, WorkerNamespace,
+};
+use bangbang_session::macos::runtime_authority::receive_runtime_session_authority;
 
 const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CREDENTIAL_WORKER_ARTIFACT: &str =
     "bangbang-elevated-credential-worker-v1-credential-drop-BBC1-BBG1-restore-groups";
-const RUNTIME_WORKER_ARTIFACT: &str = "bangbang-elevated-runtime-worker-v1-runtime-drop-runtime-retain-root-runtime-unmapped-BBA1---bangbang-internal-grant-probe-v1-target-runtime";
-const RUNTIME_WORKER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-worker-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+const RUNTIME_WORKER_ARTIFACT: &str = "bangbang-elevated-runtime-worker-v2-runtime-drop-runtime-retain-root-runtime-unmapped-BBA1-BBN1-adopted-session---bangbang-internal-grant-probe-v1-target-runtime";
+const RUNTIME_WORKER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProbeError {
@@ -45,7 +49,8 @@ pub(crate) enum ProbeEntry {
 pub(crate) struct RuntimeContinuation {
     pub(crate) stream: UnixStream,
     pub(crate) grants: UnixDatagram,
-    pub(crate) root: ExplicitRuntimeRoot,
+    pub(crate) namespace: WorkerNamespace,
+    pub(crate) expected_session: bangbang_session::SessionId,
     pub(crate) bootstrap: ProbeBootstrap,
     pub(crate) parent: libc::pid_t,
     worker_args: Option<Vec<OsString>>,
@@ -63,23 +68,7 @@ impl RuntimeContinuation {
     }
 
     pub(crate) fn verify_witness(&self) -> Result<(), ()> {
-        // SAFETY: `getppid` has no pointer or ownership contract.
-        let live_parent = unsafe { libc::getppid() };
-        if live_parent != self.parent
-            || bangbang_session::macos::verify_peer_pid(self.stream.as_raw_fd(), self.parent)
-                .is_err()
-            || bangbang_session::macos::verify_peer_pid(self.grants.as_raw_fd(), self.parent)
-                .is_err()
-            || bangbang_session::elevated_credential::attest_current_process(
-                self.bootstrap.mode(),
-                self.bootstrap.target_uid(),
-                self.bootstrap.target_gid(),
-            )
-            .is_err()
-        {
-            return Err(());
-        }
-        Ok(())
+        verify_runtime_witness(&self.stream, &self.grants, self.bootstrap, self.parent)
     }
 }
 
@@ -490,23 +479,99 @@ fn run_credential_pair(
         || grants.set_read_timeout(None).is_err()
         || grants.set_write_timeout(None).is_err()
         || !transport_is_empty(stream.as_raw_fd())
-        || !transport_is_empty(grants.as_raw_fd())
     {
         return terminal(ExitCode::FAILURE);
     }
     if bootstrap.fault() == RuntimeFault::PostAck {
         return terminal(ExitCode::FAILURE);
     }
+    if verify_runtime_witness(&stream, &grants, bootstrap, parent).is_err() {
+        return terminal_runtime_failure(
+            ProbeStage::RuntimeAuthorityReceive,
+            ProbeErrorCategory::PermissionDenied,
+        );
+    }
+    if grants.set_read_timeout(Some(CREDENTIAL_TIMEOUT)).is_err() {
+        return terminal_runtime_failure(
+            ProbeStage::RuntimeAuthorityReceive,
+            ProbeErrorCategory::Other,
+        );
+    }
+    let received = match receive_runtime_session_authority(&grants) {
+        Ok(received) => received,
+        Err(error) => {
+            return terminal_runtime_failure(
+                ProbeStage::RuntimeAuthorityReceive,
+                runtime_transport_category(error),
+            );
+        }
+    };
+    if bootstrap.fault() == RuntimeFault::AuthorityReceive {
+        return terminal_runtime_failure(
+            ProbeStage::RuntimeAuthorityReceive,
+            ProbeErrorCategory::Other,
+        );
+    }
+    if bootstrap.fault() == RuntimeFault::AuthorityValidate {
+        return terminal_runtime_failure(
+            ProbeStage::RuntimeAuthorityValidate,
+            ProbeErrorCategory::Other,
+        );
+    }
+    let authority = received.authority;
+    let expected_session = authority.session();
+    if !authority.matches_expected(bootstrap, expected_session, authority.session_identity()) {
+        return terminal_runtime_failure(
+            ProbeStage::RuntimeAuthorityValidate,
+            ProbeErrorCategory::InvalidInput,
+        );
+    }
+    let validated = match ValidatedWorkerNamespace::from_explicit_root(
+        root,
+        received.descriptor,
+        expected_session,
+        authority.session_identity(),
+    ) {
+        Ok(validated) => validated,
+        Err(error) => {
+            return terminal_runtime_failure(
+                ProbeStage::RuntimeAuthorityValidate,
+                runtime_namespace_category(error),
+            );
+        }
+    };
+    if bootstrap.fault() == RuntimeFault::SessionLock {
+        return terminal_runtime_failure(ProbeStage::RuntimeSessionLock, ProbeErrorCategory::Other);
+    }
+    let namespace = match validated.lock() {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            return terminal_runtime_failure(
+                ProbeStage::RuntimeSessionLock,
+                runtime_namespace_category(error),
+            );
+        }
+    };
+    if grants.set_read_timeout(None).is_err() || !transport_is_empty(grants.as_raw_fd()) {
+        return terminal_runtime_failure(
+            ProbeStage::RuntimeAuthorityValidate,
+            ProbeErrorCategory::InvalidInput,
+        );
+    }
     let continuation = RuntimeContinuation {
         stream,
         grants,
-        root,
+        namespace,
+        expected_session,
         bootstrap,
         parent,
         worker_args: Some(worker_args),
     };
     if continuation.verify_witness().is_err() {
-        terminal(ExitCode::FAILURE)
+        terminal_runtime_failure(
+            ProbeStage::RuntimeAuthorityValidate,
+            ProbeErrorCategory::PermissionDenied,
+        )
     } else {
         ProbeEntry::Continue(continuation)
     }
@@ -514,6 +579,54 @@ fn run_credential_pair(
 
 const fn terminal(code: ExitCode) -> ProbeEntry {
     ProbeEntry::Terminal(code)
+}
+
+fn terminal_runtime_failure(stage: ProbeStage, category: ProbeErrorCategory) -> ProbeEntry {
+    let code = RuntimeWorkerFailure::new(stage, category).map_or(ExitCode::FAILURE, |failure| {
+        ExitCode::from(failure.exit_code())
+    });
+    terminal(code)
+}
+
+fn runtime_transport_category(error: GrantTransportError) -> ProbeErrorCategory {
+    match error {
+        GrantTransportError::Io(kind) => ProbeErrorCategory::from_io_kind(kind),
+        GrantTransportError::Invalid => ProbeErrorCategory::InvalidInput,
+    }
+}
+
+fn runtime_namespace_category(error: RuntimeError) -> ProbeErrorCategory {
+    match error {
+        RuntimeError::Filesystem(kind) | RuntimeError::NamespaceCreate(kind) => {
+            ProbeErrorCategory::from_io_kind(kind)
+        }
+        RuntimeError::InvalidRoot | RuntimeError::InvalidEntry | RuntimeError::Collision => {
+            ProbeErrorCategory::InvalidInput
+        }
+    }
+}
+
+fn verify_runtime_witness(
+    stream: &UnixStream,
+    grants: &UnixDatagram,
+    bootstrap: ProbeBootstrap,
+    parent: libc::pid_t,
+) -> Result<(), ()> {
+    // SAFETY: `getppid` has no pointer or ownership contract.
+    let live_parent = unsafe { libc::getppid() };
+    if live_parent != parent
+        || bangbang_session::macos::verify_peer_pid(stream.as_raw_fd(), parent).is_err()
+        || bangbang_session::macos::verify_peer_pid(grants.as_raw_fd(), parent).is_err()
+        || bangbang_session::elevated_credential::attest_current_process(
+            bootstrap.mode(),
+            bootstrap.target_uid(),
+            bootstrap.target_gid(),
+        )
+        .is_err()
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn take_credential_root(bootstrap: ProbeBootstrap) -> Result<Option<OwnedFd>, ProbeError> {

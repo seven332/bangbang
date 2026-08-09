@@ -1,8 +1,8 @@
 # Elevated macOS Bootstrap Evidence
 
 This contract records the #1373 direct-worker result, the #1884 inherited-root
-follow-up, the #1885 no-chroot credential-transition result, and the #1889
-target-owned runtime continuation result beneath #1371. Together they test
+follow-up, the #1885 no-chroot credential-transition result, and the #1889 / #1891
+target-owned runtime continuation results beneath #1371. Together they test
 public chroot orderings, numeric credential bootstrap, and same-process
 continuation into the ordinary production lifecycle against Bangbang's
 mandatory worker boundary. They do not add a public root mode, accept jailer
@@ -23,7 +23,7 @@ The evidence bundle keeps the production layout and identity split:
   grant consumer additionally requires `grant-integration-probe`. A normal
   `--no-default-features` build is checked for absence of launcher-owned worker
   activation, ready/status records, credential and runtime modes/phases/steps,
-  the `BBA1` continuation, grant activation, boundary vocabulary, and all
+  the `BBA1` continuation, `BBN1` session authority, grant activation, boundary vocabulary, and all
   evidence marker resources. The normal signed bundle dynamically rejects the
   historical, credential, runtime, and grant-probe internal argv.
 
@@ -32,8 +32,14 @@ uid/gid zero, accepts explicit numeric target uid/gid values, runs with a
 closed environment and fixed absolute tools, replaces inherited standard input
 with `/dev/null`, and refuses missing root or HVF support rather than skipping.
 Caller-provided elevation input therefore cannot be inherited by the launcher
-or worker. The wrapper creates only root-owned mode-0700 children beneath the
-fixed non-writable `/private/var/root` ancestry. The launcher walks that
+or worker.
+The wrapper is a manual capable-host certification artifact, not an ordinary
+PR or CI gate. CI builds and inspects the isolated bundle and verifies its
+fail-closed non-root boundary; deterministic tests cover the authority,
+session, fault, and recovery contracts without elevation.
+Historical roots remain root-owned mode-0700 children beneath the
+fixed non-writable `/private/var/root` ancestry; runtime-continuation roots are
+instead created with the exact selected target/no-drop ownership. The launcher walks that
 ancestry with no-follow directory descriptors, binds the leaf device and inode
 into a random nonce record, and transfers only the retained root descriptor as
 new filesystem authority, at fixed worker fd 8. The existing fixed production
@@ -72,16 +78,26 @@ The three runtime-continuation modes perform that same credential exchange but
 do not respawn either endpoint. The launcher sends one fixed, canonical,
 nonce-bound `BBA1` acknowledgment only after the credential transcript is
 complete and both the lifecycle stream and grant datagram are live and empty.
-The same launcher and worker PIDs then continue over those same transports. The
-worker reattests the exact parent and target/no-drop identity, emits ordinary
-lifecycle `Hello`, receives the ordinary `Start` policy, and attempts to create
-the random locked session beneath the already-opened exact target-owned root.
-If that succeeds, the unchanged production supervisor is prepared to validate
-the namespace, transfer and commit the representative read-only, write-only,
-and create-children grant batch, cross `Proceed`, validate terminal ownership,
-and perform exact recovery. Feature-only closed fault points cover pre/post
-acknowledgment and the later namespace/grant/lifecycle boundaries without
-changing normal bundle behavior.
+The same launcher and worker PIDs then continue over those same transports.
+After exact target/no-drop and live-worker reattestation, the permanently
+transitioned launcher generates the lifecycle session, creates its random
+mode-0700 child beneath the exact target-owned root, and opens three independent
+session descriptions. It sends one fixed canonical `BBN1` record plus exactly
+one transfer descriptor and consumes the sender alias. `BBN1` binds the
+bootstrap mode, nonce, target, root identity, nonzero lifecycle session, and
+session identity; all flags and reserved bytes are closed.
+
+The worker receives, validates, adopts, and exclusively locks that descriptor
+before it emits ordinary lifecycle `Hello`. The later `Start` must carry the
+same session before policy installation and descriptor-relative entry;
+`Prepared` must report the same inode, and the launcher must observe the live
+lock through a separately opened description before grants begin. The existing
+read-only, write-only, and create-children grant batch then commits atomically,
+the target performs the complete allowed/denied workload, and ordinary
+`Proceed`/`Starting`/terminal supervision and reap-before-cleanup complete.
+Feature-only closed fault points cover acknowledgment, session creation/open,
+authority send/receive/validation, lock, enter, `Prepared`, grant, proceed, and
+terminal boundaries without changing lifecycle v5 or normal bundle behavior.
 
 Each runtime case uses a mode-0700 root and a separate bounded workspace with a
 root-owned traversal-only ancestry and exact target-owned fixtures. A root-owned
@@ -97,8 +113,9 @@ groups are cleared, so the checked postcondition is `effective-only`, not a
 literal zero-length list. Real/effective ids must equal the target, and attempts
 to restore uid zero, gid zero, or a root group must all return permission denied
 before any later work. Retained-root performs no credential mutation and is
-reported as no-drop. The SDK-maximum unmapped numeric class is measured only at
-the syscall/postcondition boundary.
+reported as no-drop. The SDK-maximum unmapped numeric class uses no account or
+home lookup and is measured by the same numeric postconditions and runtime
+gates as the mapped class.
 
 Stream `getpeereid` and `LOCAL_PEERCRED`, live `LOCAL_PEERPID`, datagram
 `LOCAL_PEERCRED`, and opaque `LOCAL_PEERTOKEN` comparison remain separate
@@ -128,10 +145,10 @@ root authority. The complete matrix produced these results:
 | same fixed pair | uid/gid-zero retained-root, repeated three times | both endpoints retained exact root without claiming privilege separation |
 | same fixed pair | SDK-maximum unmapped numeric target | both endpoint syscalls, postconditions, and restoration denials completed independently of account-backed runtime feasibility |
 | two concurrent fixed credential pairs | distinct exact roots/workspaces | both ordinary-target transitions completed with byte-identical bounded results |
-| same fixed pair continued in place | mapped ordinary target, repeated three times | credential exchange and `BBA1` acknowledgment completed; ordinary `Hello`/`Start` completed; App Sandbox denied `mkdirat` for the target-owned session (`runtime-namespace` / `permission-denied` / `namespace-boundary`) |
-| same fixed pair continued in place | uid/gid-zero retained-root, repeated three times | no-drop credential exchange, acknowledgment, and ordinary `Hello`/`Start` completed; the same target-owned session creation was denied |
-| same fixed pair continued in place | SDK-maximum unmapped numeric target | credential exchange and acknowledgment completed; live code-identity revalidation stopped before lifecycle `Hello` (`live-identity` / `other` / `identity-boundary`) |
-| two concurrent runtime-continuation pairs | distinct exact roots and workspaces | both mapped-target pairs returned the same namespace boundary with byte-identical bounded result lines |
+| same fixed pair continued in place | mapped ordinary target, repeated three times | credential exchange and `BBA1` completed; the launcher created and published the target-owned session through `BBN1`; worker adoption, independent lock proof, exact grants, terminal lifecycle, and cleanup completed |
+| same fixed pair continued in place | uid/gid-zero retained-root, repeated three times | the identical authority/grant/lifecycle/cleanup path completed with explicit no-drop semantics |
+| same fixed pair continued in place | SDK-maximum unmapped numeric target, repeated three times | both live code/profile revalidations and the complete authority/grant/lifecycle/cleanup path completed without an account lookup or identity-check bypass |
+| two concurrent runtime-continuation pairs | distinct exact roots and workspaces | both mapped-target pairs completed with distinct sessions and byte-identical bounded result lines |
 
 Focused negative cases reject a group-writable root and a symlink root. The
 staged manifest also rejects a writable, missing, symlinked, or inode-replaced
@@ -155,13 +172,12 @@ result: the same exact unchrooted signed worker completed real HVF
 create/destroy in the same wrapper run. The inherited branch nevertheless
 never reached application entry, root attestation, the direct-chroot sandbox
 control, or HVF. The runtime continuation separately reached both signed
-application endpoints, completed the exact acknowledgment, and reached ordinary
-`Hello`/`Start` for mapped and retained-root modes. It then stopped at the exact
-target-owned session-directory creation call. The representative typed grants,
-`Prepared`/grant commitment, `Proceed`/`Starting`/terminal sequence, API, guest,
-daemon/crash recovery, and post-transition HVF therefore remained unreached or
-unmeasured. The high unmapped runtime case stopped earlier at live code-identity
-revalidation, so it makes no lifecycle claim.
+application endpoints, completed the exact acknowledgment, and reached the
+private pre-`Hello` `BBN1` adoption gate for all three runtime identity classes.
+Each class then completed exact `Start`/`Prepared` binding, representative typed
+grant commitment and consumption, `Proceed`/`Starting`/terminal ownership, and
+exact session recovery/cleanup. API/no-API real guests, daemon/crash
+convergence, and post-transition guest HVF remain unmeasured.
 
 After those results were established, the checked harness remained at the
 evidence boundary: it contains no credential-changing product path. If a
@@ -170,12 +186,12 @@ future platform permits the direct sandboxed `chroot`, that branch reports
 entry, it must pass exact root, sandbox-denial, and HVF checks before success.
 Either changed result forces fresh implementation research and Challenge. The
 harness leaves the normal peer verifier and public launch policy unchanged.
-Pre/post-acknowledgment fault cases reached their exact closed boundaries; the
-natural namespace denial masks grant-transfer, `Proceed`, and terminal fault
-points on this host, so those later hooks are only feature-isolation and unit/
-artifact validated here. A launcher-precreated session would change the
-authority ordering and remains a separately challenged follow-up rather than a
-hidden fallback in this result. #1885 and #1889 are evidence results; product
+All enabled runtime fault cases reached their exact closed boundary, including
+the launcher-create/open and authority-send paths, worker receive/validate/
+lock/enter/`Prepared` exits, and the grant/proceed/terminal paths. Exact object
+state and the final residue scan remained clean. #1891 is the separately
+challenged launcher-created-session authority result; it is not a hidden
+fallback in #1889. #1885, #1889, and #1891 are evidence results; product
 uid/gid behavior still requires the parent-selected continuation.
 
 ## Supported conclusion and nonclaims
@@ -208,15 +224,14 @@ The measured public credential primitives are available in the exact signed
 no-chroot process shape: mapped ordinary and SDK-maximum unmapped transitions
 both completed, while zero remained an explicit no-drop class. This is not yet
 a Firecracker uid/gid implementation. Same-process continuation is viable
-through exact acknowledgment and ordinary `Hello`/`Start` for mapped and
-retained-root identities, but the measured App Sandbox profile denies creation
-of a session beneath the target-owned root even when the process owns the
-validated descriptor and numeric identity. It therefore does not establish a
-target-owned session, grant commitment or consumption, lifecycle completion,
-API, daemon/crash cleanup, real guest/HVF work after transition, public policy,
-or aggregate jailer behavior. It also does not prove that a separately
-challenged launcher-precreated session, a larger fixed in-root Darwin dependency
-set, or a materially different security model cannot work; nor does it claim
+through exact acknowledgment, launcher-created session authority, worker
+adoption, the representative grant workload, and ordinary terminal cleanup for
+mapped, retained-root, and SDK-maximum unmapped numeric identities on the
+measured host. This establishes that narrow feature-only process/resource
+composition; it does not establish API/no-API real guests, daemon/crash
+convergence, real guest/HVF work after transition, public policy, or aggregate
+jailer behavior. It also does not prove that a larger fixed in-root Darwin
+dependency set or a materially different security model cannot work; nor does it claim
 Linux mount/PID/user namespace parity, notarized distribution, or behavior
 beyond the recorded OS/SDK. A changed platform result requires rerunning the
 wrapper and a fresh ID-by-ID Challenge.
@@ -230,24 +245,21 @@ scripts/build-elevated-bootstrap-probe.sh \
   --output /absolute/absent/path/Bangbang.app
 ```
 
-Capture target values before elevation, then explicitly run the root wrapper:
+Capture target values before elevation, then explicitly run the root wrapper
+through the native administrator authorization dialog (substitute the captured
+numeric values and absolute paths):
 
 ```sh
-target_uid="$(id -u)"
-target_gid="$(id -g)"
-sudo /usr/bin/env -i HOME=/var/root PATH=/usr/bin:/bin \
-  /bin/bash "$PWD/scripts/run-elevated-bootstrap-probe.sh" \
-  --bundle /absolute/absent/path/Bangbang.app \
-  --target-uid "$target_uid" \
-  --target-gid "$target_gid"
+/usr/bin/osascript -e \
+  'do shell script "/bin/bash /absolute/repo/scripts/run-elevated-bootstrap-probe.sh --bundle /absolute/absent/path/Bangbang.app --target-uid 501 --target-gid 20" with administrator privileges'
 ```
 
 The required terminal summary remains value-free and includes credential and
 runtime results, observations, residue, and nonclaim classes:
 
 ```text
-result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=namespace-boundary runtime-retained-root=namespace-boundary runtime-unmapped=identity-boundary grants=unreached lifecycle=hello-start controls=complete cleanup=exact
+result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=complete runtime-retained-root=complete-no-drop runtime-unmapped=complete authority=consumed lock=independent grants=committed lifecycle=terminal controls=complete cleanup=exact
 observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact
 residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero
-nonclaims: target-session=unreached grants=unreached proceed-starting-terminal=unreached api-no-api-real-guest=unmeasured daemon-crash=unmeasured post-drop-guest-hvf=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal
+nonclaims: api-no-api-real-guest=unmeasured daemon-crash=unmeasured post-drop-guest-hvf=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal
 ```

@@ -105,9 +105,10 @@ const ELEVATED_RUNTIME_RETAIN_MODE: &[u8] = b"runtime-retain-root";
 const ELEVATED_RUNTIME_UNMAPPED_MODE: &[u8] = b"runtime-unmapped";
 const ELEVATED_RUNTIME_STATUS: &[u8] = b"status: elevated runtime";
 const ELEVATED_CONTINUATION_RECORD: &[u8] = b"BBA1";
+const ELEVATED_RUNTIME_AUTHORITY_RECORD: &[u8] = b"BBN1";
 const ELEVATED_RUNTIME_GRANT_CASE: &[u8] = b"target-runtime";
-const ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-launcher-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
-const ELEVATED_RUNTIME_WORKER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-worker-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+const ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+const ELEVATED_RUNTIME_WORKER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
 const ELEVATED_PROBE_MARKER: &str = "elevated-bootstrap-probe.enabled";
 const ELEVATED_RUNTIME_MARKER: &str = "target-runtime-grant-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
@@ -13093,6 +13094,7 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_RUNTIME_UNMAPPED_MODE,
             ELEVATED_RUNTIME_STATUS,
             ELEVATED_CONTINUATION_RECORD,
+            ELEVATED_RUNTIME_AUTHORITY_RECORD,
             ELEVATED_RUNTIME_GRANT_CASE,
             ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
             ELEVATED_RUNTIME_WORKER_BOUNDARIES,
@@ -13137,6 +13139,7 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_CREDENTIAL_WORKER_ARTIFACT,
             ELEVATED_RUNTIME_STATUS,
             ELEVATED_CONTINUATION_RECORD,
+            ELEVATED_RUNTIME_AUTHORITY_RECORD,
             ELEVATED_RUNTIME_GRANT_CASE,
             ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
             ELEVATED_RUNTIME_WORKER_BOUNDARIES,

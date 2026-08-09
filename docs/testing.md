@@ -2099,10 +2099,15 @@ merged-main OID are checked and recorded by the pull-request workflow.
 ## Explicit Elevated Bootstrap Evidence
 
 The #1373 direct-worker, #1884 inherited-root, #1885 no-chroot credential, and
-#1889 target-owned runtime-continuation proofs are deliberately
+#1889 / #1891 target-owned runtime-continuation proofs are deliberately
 separate from `scripts/run-integration-tests.sh`. Normal validation never
 invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
 passing skip.
+The capable-host wrapper is a manual certification artifact, not an ordinary
+PR or CI gate. CI builds the statically isolated bundle and verifies its
+fail-closed non-root boundary; deterministic unit and process tests cover the
+authority codec and transport, session validation and locking, fault stages,
+and exact recovery without elevation.
 First build the test-only bundle as an ordinary user at an absent absolute
 destination:
 
@@ -2114,23 +2119,19 @@ scripts/build-elevated-bootstrap-probe.sh \
 The build compiles normal launcher and worker artifacts first and verifies that
 the V2 probe status, worker activation, Ready, inherited-root, HVF, credential
 and runtime modes, credential phases and restoration steps, `BBA1`
-acknowledgment, representative grant activation, and complete boundary
+acknowledgment, `BBN1` session authority, representative grant activation, and complete boundary
 vocabulary are absent. It then builds both ends with disabled-by-default
 evidence features, checks role-specific credential/runtime markers, adds three
 visible test-only resource markers, and uses the normal production packager,
 signature split, entitlements, Hardened Runtime, and inspections.
 
 On a capable Apple Silicon host, calculate the explicit numeric target before
-elevation and invoke the wrapper yourself:
+elevation and invoke the wrapper through the native administrator authorization
+dialog (substitute the captured numeric values and absolute paths):
 
 ```sh
-target_uid="$(id -u)"
-target_gid="$(id -g)"
-sudo /usr/bin/env -i HOME=/var/root PATH=/usr/bin:/bin \
-  /bin/bash "$PWD/scripts/run-elevated-bootstrap-probe.sh" \
-  --bundle /absolute/absent/path/Bangbang.app \
-  --target-uid "$target_uid" \
-  --target-gid "$target_gid"
+/usr/bin/osascript -e \
+  'do shell script "/bin/bash /absolute/repo/scripts/run-elevated-bootstrap-probe.sh --bundle /absolute/absent/path/Bangbang.app --target-uid 501 --target-gid 20" with administrator privileges'
 ```
 
 Do not use `--allow-unsupported` for this proof. Missing exact root, Apple
@@ -2162,28 +2163,38 @@ must find no launcher, worker, root, workspace, or named-socket residue.
 
 The runtime-continuation branch reuses the exact stream, grant datagram, and
 launcher/worker PIDs after the credential transcript. It requires one canonical
-nonce-bound `BBA1` acknowledgment, empty live transports, fresh parent and
-target/no-drop attestations, and ordinary lifecycle `Hello`/`Start`. Each case
-receives an already-opened exact target-owned root plus a separately ledgered
-workspace whose root-owned traversal-only ancestry contains the exact
-target-owned read-only, write-only, and create-children fixtures. Mapped and
-retained-root cases repeat three times, mapped cases run concurrently, and the
-high unmapped numeric case remains separate. Pre/post-acknowledgment fault cases
-prove the closed handoff; later fault hooks are expected to remain masked when a
-natural earlier boundary is observed. Runtime cleanup validates and removes only
-the exact owned root and workspace objects, followed by independent residue
-scans.
+nonce-bound `BBA1` acknowledgment, empty live transports, and fresh parent,
+target/no-drop, and live-code attestations. The transitioned launcher then
+creates the random session beneath the exact target-owned root, opens separate
+worker-transfer, live-validation, and recovery descriptions, and sends one
+fixed `BBN1` record with exactly one descriptor. The worker must consume,
+validate, and lock that authority before ordinary `Hello`; later `Start` and
+`Prepared` must bind the same session and inode before the launcher commits
+grants. Each case also receives a separately ledgered workspace whose
+root-owned traversal-only ancestry contains the exact target-owned read-only,
+write-only, and create-children fixtures.
+
+Mapped, retained-root, and high-unmapped cases each repeat three times, and two
+mapped cases run concurrently. Closed faults exercise acknowledgment,
+launcher create/open, authority send/receive/validate, worker lock/enter,
+`Prepared`, grant transfer, `Proceed`, and terminal boundaries. Runtime cleanup
+validates and removes only the exact owned session, root, and workspace objects,
+followed by independent residue scans. Unit tests additionally cover malformed,
+truncated, missing/extra-descriptor and queued authority records, sender-alias
+closure, wrong identity/nonempty/replaced sessions, independent lock
+descriptions, and recovery after worker release.
 
 It reports OS/SDK/architecture and only value-free terminal classes. The
 inherited result remains `worker-bootstrap` / `other`: in-root `posix_spawn`
 returned success but the worker exited before its earliest application record.
 The no-chroot credential result completed mapped ordinary, retained-root
-no-drop, and SDK-maximum unmapped transitions. The mapped and retained-root
-runtime cases then completed acknowledgment plus ordinary `Hello`/`Start`, but
-App Sandbox denied exact target-owned session `mkdirat`; the high unmapped case
-stopped earlier at live code-identity revalidation. Grants, `Proceed`,
-`Starting`, terminal ownership, API/guest, daemon/crash, and post-transition HVF
-were therefore unreached or unmeasured. Stream credentials remained
+no-drop, and SDK-maximum unmapped transitions. All three runtime classes then
+completed acknowledgment, launcher-created session authority, worker adoption,
+the representative grant workload, `Proceed`/`Starting`/terminal ownership,
+and exact cleanup. The SDK-maximum result retained both live-code checks and is
+therefore a changed same-check witness, not a bypass. API/no-API real guests,
+daemon/crash convergence, and post-transition guest HVF remain unmeasured.
+Stream credentials remained
 connection-time snapshots, datagram credentials were unsupported, opaque
 datagram tokens changed only for credential transitions, and live peer PIDs
 remained exact. The exact result line, supported conclusion, and nonclaims are

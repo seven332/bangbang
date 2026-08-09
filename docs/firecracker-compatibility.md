@@ -1231,18 +1231,27 @@ SIGINT/SIGTERM to that PID follows normal reap and cleanup. Signed evidence also
 covers two simultaneous daemon supervisors and peer survival after one stops.
 
 The disabled-by-default elevated evidence bundle additionally proves a
-no-chroot credential bootstrap boundary on Apple Silicon macOS 26.5.2 / SDK
-26.5. With explicit operator root, both fixed signed endpoints complete
+no-chroot credential and target-runtime boundary on Apple Silicon macOS 26.5.2
+/ SDK 26.5. With explicit operator root, both fixed signed endpoints complete
 worker-first then launcher-second mapped ordinary and SDK-maximum unmapped
 credential transitions. Public `setgroups`/`setgid`/`setuid` order, the Darwin
 `effective-only` access-group postcondition, exact real/effective target ids,
 and failed root restoration are checked; zero is retained-root/no-drop. Stream
 credentials remain connection-time snapshots, datagram peer credentials are
 unsupported, opaque datagram tokens distinguish changed from retained-root,
-and live PIDs remain exact. This is evidence for #1371, not a public launch
-policy or capability disposition: target-owned runtime/resources, typed grants,
-lifecycle/API, daemon/crash, guest/HVF continuation, and final uid/gid semantics
-remain unmeasured.
+and live PIDs remain exact.
+
+After the credential transcript, the transitioned launcher creates one random
+target-owned session, opens three independent descriptions, and transfers one
+canonical bootstrap/lifecycle-bound `BBN1` record plus exactly one descriptor.
+The worker validates, adopts, and locks it before ordinary `Hello`; later
+`Start`/`Prepared` bind the same session and inode before the existing typed
+grant transaction. Mapped, retained-root, and SDK-maximum unmapped cases each
+completed three times, including the unchanged live-code checks, representative
+grant workload, `Proceed`/`Starting`/terminal ownership, and exact cleanup. This
+is evidence for #1371, not a public launch policy or capability disposition:
+API/no-API real guests, daemon/crash convergence, post-transition guest HVF,
+and final uid/gid semantics remain unmeasured.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
