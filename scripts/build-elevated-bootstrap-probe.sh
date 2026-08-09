@@ -88,6 +88,15 @@ credential_datagram="BBG1"
 credential_step="restore-groups"
 credential_launcher_artifact="bangbang-elevated-credential-launcher-v1-credential-drop-BBC1-BBG1-restore-groups"
 credential_worker_artifact="bangbang-elevated-credential-worker-v1-credential-drop-BBC1-BBG1-restore-groups"
+runtime_drop_mode="runtime-drop"
+runtime_retain_mode="runtime-retain-root"
+runtime_unmapped_mode="runtime-unmapped"
+runtime_status="status: elevated runtime"
+continuation_record="BBA1"
+grant_activation="--bangbang-internal-grant-probe-v1"
+grant_runtime_case="target-runtime"
+runtime_launcher_boundary_artifact="bangbang-elevated-runtime-launcher-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
+runtime_worker_boundary_artifact="bangbang-elevated-runtime-worker-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
 
 cargo build \
   -p bangbang \
@@ -115,6 +124,15 @@ probe_markers=(
   "$credential_step"
   "$credential_launcher_artifact"
   "$credential_worker_artifact"
+  "$runtime_drop_mode"
+  "$runtime_retain_mode"
+  "$runtime_unmapped_mode"
+  "$runtime_status"
+  "$continuation_record"
+  "$grant_activation"
+  "$grant_runtime_case"
+  "$runtime_launcher_boundary_artifact"
+  "$runtime_worker_boundary_artifact"
 )
 for artifact in "$launcher_bin" "$worker_bin"; do
   for marker_value in "${probe_markers[@]}"; do
@@ -132,7 +150,7 @@ cargo build \
   --bin bangbang-launcher \
   --release \
   --no-default-features \
-  --features elevated-bootstrap-probe \
+  --features bangbang/elevated-bootstrap-probe,bangbang/grant-integration-probe,bangbang-launcher/elevated-bootstrap-probe \
   --locked \
   --target "$target_triple"
 
@@ -156,6 +174,18 @@ for marker_value in \
   fi
 done
 for marker_value in \
+  "$runtime_drop_mode" \
+  "$runtime_retain_mode" \
+  "$runtime_unmapped_mode" \
+  "$runtime_status" \
+  "$continuation_record" \
+  "$runtime_launcher_boundary_artifact"; do
+  if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$launcher_bin"; then
+    echo "evidence launcher is missing the runtime continuation boundary" >&2
+    exit 1
+  fi
+done
+for marker_value in \
   "$ready_activation" \
   "$credential_drop_mode" \
   "$credential_record" \
@@ -164,6 +194,19 @@ for marker_value in \
   "$credential_worker_artifact"; do
   if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$worker_bin"; then
     echo "evidence artifact is missing the elevated probe boundary" >&2
+    exit 1
+  fi
+done
+for marker_value in \
+  "$runtime_drop_mode" \
+  "$runtime_retain_mode" \
+  "$runtime_unmapped_mode" \
+  "$continuation_record" \
+  "$grant_activation" \
+  "$grant_runtime_case" \
+  "$runtime_worker_boundary_artifact"; do
+  if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$worker_bin"; then
+    echo "evidence worker is missing the runtime continuation boundary" >&2
     exit 1
   fi
 done
@@ -176,11 +219,19 @@ cargo build \
 
 resources="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/bangbang-elevated-resources.XXXXXXXX")"
 marker="$resources/elevated-bootstrap-probe.enabled"
+grant_marker="$resources/grant-integration-probe.enabled"
+runtime_marker="$resources/target-runtime-grant-probe.enabled"
 cleanup_resources() {
   local prior_status=$?
   trap - EXIT
   if [[ -f "$marker" && ! -L "$marker" ]]; then
     /bin/unlink "$marker" || exit 1
+  fi
+  if [[ -f "$grant_marker" && ! -L "$grant_marker" ]]; then
+    /bin/unlink "$grant_marker" || exit 1
+  fi
+  if [[ -f "$runtime_marker" && ! -L "$runtime_marker" ]]; then
+    /bin/unlink "$runtime_marker" || exit 1
   fi
   if [[ -d "$resources" && ! -L "$resources" ]]; then
     /bin/rmdir "$resources" || exit 1
@@ -191,6 +242,10 @@ trap cleanup_resources EXIT
 
 /usr/bin/printf 'test-only\n' > "$marker"
 /bin/chmod 0600 "$marker"
+/usr/bin/printf 'test-only\n' > "$grant_marker"
+/bin/chmod 0600 "$grant_marker"
+/usr/bin/printf 'test-only\n' > "$runtime_marker"
+/bin/chmod 0600 "$runtime_marker"
 
 "$repo_root/target/release/bangbang-bundle" build \
   --launcher "$launcher_bin" \

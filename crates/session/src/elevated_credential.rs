@@ -66,6 +66,38 @@ pub fn transition_process(
     transition_with(&mut DarwinCredentialOps, mode, target_uid, target_gid)
 }
 
+/// Re-attests the exact local post-transition identity before runtime work.
+pub fn attest_current_process(
+    mode: ProbeMode,
+    target_uid: u32,
+    target_gid: u32,
+) -> Result<CredentialSelfState, ProbeErrorCategory> {
+    if !mode.continues_runtime() || !mode.accepts_target(target_uid, target_gid) {
+        return Err(ProbeErrorCategory::InvalidInput);
+    }
+    let mut ops = DarwinCredentialOps;
+    let identities = ops.ids();
+    let groups = ops.groups().map_err(ProbeErrorCategory::from_io_kind)?;
+    if mode.retains_root() {
+        if identities != (0, 0, 0, 0) {
+            return Err(ProbeErrorCategory::PermissionDenied);
+        }
+        return Ok(CredentialSelfState::new(
+            CredentialIdentityClass::InitialAndTarget,
+            CredentialGroupClass::Initial,
+        ));
+    }
+    if identities != (target_uid, target_uid, target_gid, target_gid)
+        || groups.as_slice() != [target_gid]
+    {
+        return Err(ProbeErrorCategory::PermissionDenied);
+    }
+    Ok(CredentialSelfState::new(
+        CredentialIdentityClass::Target,
+        CredentialGroupClass::EffectiveOnly,
+    ))
+}
+
 /// Captures the initial connected stream/datagram peer observation.
 pub fn observe_initial_peer(
     stream: RawFd,
@@ -201,8 +233,11 @@ fn transition_with<O: CredentialOps>(
     target_gid: u32,
 ) -> Result<CredentialTransition, CredentialFailureValue> {
     let retains_root = match mode {
-        ProbeMode::CredentialRetainRoot => true,
-        ProbeMode::CredentialDrop | ProbeMode::CredentialUnmapped => false,
+        ProbeMode::CredentialRetainRoot | ProbeMode::RuntimeRetainRoot => true,
+        ProbeMode::CredentialDrop
+        | ProbeMode::CredentialUnmapped
+        | ProbeMode::RuntimeDrop
+        | ProbeMode::RuntimeUnmapped => false,
         ProbeMode::CredentialControl => target_uid == 0 && target_gid == 0,
         _ => {
             return Err(CredentialFailureValue::new(

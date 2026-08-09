@@ -328,6 +328,15 @@ impl WorkerPolicy {
         self
     }
 
+    /// Retargets only the authenticated worker identity, preserving all other policy.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[must_use]
+    pub const fn with_identity(mut self, uid: u32, gid: u32) -> Self {
+        self.uid = uid;
+        self.gid = gid;
+        self
+    }
+
     /// Returns the required real and effective user identity.
     #[must_use]
     pub const fn uid(self) -> u32 {

@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -10,23 +10,77 @@ use std::time::Duration;
 use bangbang_hvf::HvfBackend;
 use bangbang_runtime::VmBackend;
 use bangbang_session::elevated_probe::{
-    BOOTSTRAP_RECORD_BYTES, CREDENTIAL_DATAGRAM_BYTES, CREDENTIAL_RECORD_BYTES,
-    CredentialDatagramPhase, CredentialDatagramProof, CredentialFailureValue, CredentialGroupClass,
-    CredentialIdentityClass, CredentialPrefix, CredentialRecord, CredentialRecordKind,
-    CredentialRole, CredentialSelfState, CredentialStep, PeerObservation, ProbeBootstrap,
-    ProbeErrorCategory, ProbeResult, ProbeStage, READY_RECORD, RESULT_RECORD_BYTES, ROOT_FD,
-    WORKER_ACTIVATION,
+    BOOTSTRAP_RECORD_BYTES, CONTINUATION_ACK_BYTES, CREDENTIAL_DATAGRAM_BYTES,
+    CREDENTIAL_RECORD_BYTES, ContinuationAck, CredentialDatagramPhase, CredentialDatagramProof,
+    CredentialFailureValue, CredentialGroupClass, CredentialIdentityClass, CredentialPrefix,
+    CredentialRecord, CredentialRecordKind, CredentialRole, CredentialSelfState, CredentialStep,
+    PeerObservation, ProbeBootstrap, ProbeErrorCategory, ProbeResult, ProbeStage, READY_RECORD,
+    RESULT_RECORD_BYTES, ROOT_FD, RuntimeFault, WORKER_ACTIVATION,
 };
 use bangbang_session::{GRANT_FD, ObjectIdentity, SESSION_ENV_KEY, SESSION_ENV_VALUE, SESSION_FD};
+
+use bangbang_session::macos::runtime::ExplicitRuntimeRoot;
 
 const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CREDENTIAL_WORKER_ARTIFACT: &str =
     "bangbang-elevated-credential-worker-v1-credential-drop-BBC1-BBG1-restore-groups";
+const RUNTIME_WORKER_ARTIFACT: &str = "bangbang-elevated-runtime-worker-v1-runtime-drop-runtime-retain-root-runtime-unmapped-BBA1---bangbang-internal-grant-probe-v1-target-runtime";
+const RUNTIME_WORKER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-worker-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProbeError {
     stage: ProbeStage,
     kind: io::ErrorKind,
+}
+
+/// Result of the feature-only process-entry probe.
+pub(crate) enum ProbeEntry {
+    /// A historical mode or a failed continuation terminates at the probe boundary.
+    Terminal(ExitCode),
+    /// The same process and transports continue into the ordinary lifecycle.
+    Continue(RuntimeContinuation),
+}
+
+/// Single-use authority carried from credential transition into contained bootstrap.
+pub(crate) struct RuntimeContinuation {
+    pub(crate) stream: UnixStream,
+    pub(crate) grants: UnixDatagram,
+    pub(crate) root: ExplicitRuntimeRoot,
+    pub(crate) bootstrap: ProbeBootstrap,
+    pub(crate) parent: libc::pid_t,
+    worker_args: Option<Vec<OsString>>,
+}
+
+impl std::fmt::Debug for RuntimeContinuation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeContinuation(<redacted>)")
+    }
+}
+
+impl RuntimeContinuation {
+    pub(crate) fn take_worker_args(&mut self) -> Result<Vec<OsString>, ()> {
+        self.worker_args.take().ok_or(())
+    }
+
+    pub(crate) fn verify_witness(&self) -> Result<(), ()> {
+        // SAFETY: `getppid` has no pointer or ownership contract.
+        let live_parent = unsafe { libc::getppid() };
+        if live_parent != self.parent
+            || bangbang_session::macos::verify_peer_pid(self.stream.as_raw_fd(), self.parent)
+                .is_err()
+            || bangbang_session::macos::verify_peer_pid(self.grants.as_raw_fd(), self.parent)
+                .is_err()
+            || bangbang_session::elevated_credential::attest_current_process(
+                self.bootstrap.mode(),
+                self.bootstrap.target_uid(),
+                self.bootstrap.target_gid(),
+            )
+            .is_err()
+        {
+            return Err(());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn is_requested() -> bool {
@@ -35,13 +89,13 @@ pub(crate) fn is_requested() -> bool {
         .is_some_and(|argument| argument == OsStr::new(WORKER_ACTIVATION))
 }
 
-pub(crate) fn run() -> ExitCode {
-    let (mut stream, bootstrap, parent) = match probe_session() {
+pub(crate) fn run() -> ProbeEntry {
+    let (mut stream, bootstrap, parent, worker_args) = match probe_session() {
         Ok(session) => session,
-        Err(_) => return ExitCode::FAILURE,
+        Err(_) => return ProbeEntry::Terminal(ExitCode::FAILURE),
     };
     if bootstrap.mode().is_credential_pair() {
-        return run_credential_pair(stream, bootstrap, parent);
+        return run_credential_pair(stream, bootstrap, parent, worker_args);
     }
     let outcome = execute(bootstrap);
     let result = match outcome {
@@ -54,23 +108,26 @@ pub(crate) fn run() -> ExitCode {
         ),
     };
     let Ok(result) = result else {
-        return ExitCode::FAILURE;
+        return ProbeEntry::Terminal(ExitCode::FAILURE);
     };
     let encoded = result.encode();
     debug_assert_eq!(encoded.len(), RESULT_RECORD_BYTES);
     if stream.write_all(&encoded).is_err() {
-        return ExitCode::FAILURE;
+        return ProbeEntry::Terminal(ExitCode::FAILURE);
     }
-    if outcome.is_ok() {
+    ProbeEntry::Terminal(if outcome.is_ok() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
-    }
+    })
 }
 
-fn probe_session() -> Result<(UnixStream, ProbeBootstrap, libc::pid_t), ProbeError> {
+fn probe_session() -> Result<(UnixStream, ProbeBootstrap, libc::pid_t, Vec<OsString>), ProbeError> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.as_slice() != [OsStr::new(WORKER_ACTIVATION)] {
+    if arguments
+        .first()
+        .is_none_or(|arg| arg != OsStr::new(WORKER_ACTIVATION))
+    {
         return Err(invalid(ProbeStage::InitialIdentity));
     }
     let value = env::var_os(SESSION_ENV_KEY).ok_or_else(|| invalid(ProbeStage::InitialIdentity))?;
@@ -99,22 +156,29 @@ fn probe_session() -> Result<(UnixStream, ProbeBootstrap, libc::pid_t), ProbeErr
         .map_err(|error| with_kind(ProbeStage::InitialIdentity, error.kind()))?;
     let bootstrap =
         ProbeBootstrap::decode(&encoded).map_err(|_| invalid(ProbeStage::InitialIdentity))?;
-    Ok((stream, bootstrap, parent))
+    let worker_args = arguments.into_iter().skip(1).collect::<Vec<_>>();
+    if !bootstrap.mode().continues_runtime() && !worker_args.is_empty() {
+        return Err(invalid(ProbeStage::InitialIdentity));
+    }
+    Ok((stream, bootstrap, parent, worker_args))
 }
 
 fn run_credential_pair(
     mut stream: UnixStream,
     bootstrap: ProbeBootstrap,
     parent: libc::pid_t,
-) -> ExitCode {
+    worker_args: Vec<OsString>,
+) -> ProbeEntry {
     std::hint::black_box(CREDENTIAL_WORKER_ARTIFACT);
+    std::hint::black_box(RUNTIME_WORKER_ARTIFACT);
+    std::hint::black_box(RUNTIME_WORKER_BOUNDARY_ARTIFACT);
     if stream.set_read_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
     {
-        return ExitCode::FAILURE;
+        return terminal(ExitCode::FAILURE);
     }
     if let Err(error) = validate_initial_identity() {
-        return write_credential_failure(
+        return terminal(write_credential_failure(
             &mut stream,
             bootstrap,
             CredentialFailureValue::new(
@@ -124,12 +188,12 @@ fn run_credential_pair(
                 initial_credential_state(bootstrap),
             ),
             PeerObservation::NONE,
-        );
+        ));
     }
-    let root = match take_root(bootstrap) {
+    let runtime_root_descriptor = match take_credential_root(bootstrap) {
         Ok(root) => root,
         Err(error) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 CredentialFailureValue::new(
@@ -139,14 +203,13 @@ fn run_credential_pair(
                     initial_credential_state(bootstrap),
                 ),
                 PeerObservation::NONE,
-            );
+            ));
         }
     };
-    drop(root);
     let grants = match take_grants() {
         Ok(grants) => grants,
         Err(category) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -156,13 +219,13 @@ fn run_credential_pair(
                     initial_credential_state(bootstrap),
                 ),
                 PeerObservation::NONE,
-            );
+            ));
         }
     };
     if grants.set_read_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
         || grants.set_write_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
     {
-        return write_credential_failure(
+        return terminal(write_credential_failure(
             &mut stream,
             bootstrap,
             credential_failure(
@@ -172,7 +235,7 @@ fn run_credential_pair(
                 initial_credential_state(bootstrap),
             ),
             PeerObservation::NONE,
-        );
+        ));
     }
     match receive_credential_datagram(&grants) {
         Ok(proof)
@@ -183,7 +246,7 @@ fn run_credential_pair(
                 bootstrap.nonce(),
             ) => {}
         Ok(_) | Err(_) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -193,16 +256,16 @@ fn run_credential_pair(
                     initial_credential_state(bootstrap),
                 ),
                 PeerObservation::NONE,
-            );
+            ));
         }
     }
     let Ok(worker_ready) =
         CredentialDatagramProof::worker_ready(bootstrap.mode(), bootstrap.nonce())
     else {
-        return ExitCode::FAILURE;
+        return terminal(ExitCode::FAILURE);
     };
     if send_credential_datagram(&grants, worker_ready).is_err() {
-        return ExitCode::FAILURE;
+        return terminal(ExitCode::FAILURE);
     }
     match receive_credential_datagram(&grants) {
         Ok(proof)
@@ -213,7 +276,7 @@ fn run_credential_pair(
                 bootstrap.nonce(),
             ) => {}
         Ok(_) | Err(_) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -223,9 +286,37 @@ fn run_credential_pair(
                     initial_credential_state(bootstrap),
                 ),
                 PeerObservation::NONE,
-            );
+            ));
         }
     }
+    let runtime_root = match runtime_root_descriptor
+        .map(|root| {
+            ExplicitRuntimeRoot::from_owned_fd(
+                root,
+                bootstrap.root(),
+                bootstrap.target_uid(),
+                bootstrap.target_gid(),
+                true,
+            )
+            .map_err(|_| permission(ProbeStage::ValidateRoot))
+        })
+        .transpose()
+    {
+        Ok(root) => root,
+        Err(error) => {
+            return terminal(write_credential_failure(
+                &mut stream,
+                bootstrap,
+                CredentialFailureValue::new(
+                    CredentialStep::InitialIdentity,
+                    ProbeErrorCategory::from_io_kind(error.kind),
+                    CredentialPrefix::None,
+                    initial_credential_state(bootstrap),
+                ),
+                PeerObservation::NONE,
+            ));
+        }
+    };
     let (initial, baseline) = match bangbang_session::elevated_credential::observe_initial_peer(
         stream.as_raw_fd(),
         grants.as_raw_fd(),
@@ -236,7 +327,7 @@ fn run_credential_pair(
     ) {
         Ok(observation) => observation,
         Err(category) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -246,7 +337,7 @@ fn run_credential_pair(
                     initial_credential_state(bootstrap),
                 ),
                 PeerObservation::NONE,
-            );
+            ));
         }
     };
     let transition = match bangbang_session::elevated_credential::transition_process(
@@ -256,7 +347,12 @@ fn run_credential_pair(
     ) {
         Ok(transition) => transition,
         Err(failure) => {
-            return write_credential_failure(&mut stream, bootstrap, failure, initial);
+            return terminal(write_credential_failure(
+                &mut stream,
+                bootstrap,
+                failure,
+                initial,
+            ));
         }
     };
     let after_worker = match bangbang_session::elevated_credential::observe_later_peer(
@@ -270,7 +366,7 @@ fn run_credential_pair(
     ) {
         Ok(observation) => observation,
         Err(category) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -280,7 +376,7 @@ fn run_credential_pair(
                     transition.state(),
                 ),
                 initial,
-            );
+            ));
         }
     };
     let Ok(record) = CredentialRecord::worker_transitioned(
@@ -290,10 +386,10 @@ fn run_credential_pair(
         after_worker,
         bootstrap.nonce(),
     ) else {
-        return ExitCode::FAILURE;
+        return terminal(ExitCode::FAILURE);
     };
     if stream.write_all(&record.encode()).is_err() {
-        return ExitCode::FAILURE;
+        return terminal(ExitCode::FAILURE);
     }
 
     let launcher = match read_credential_record(&mut stream) {
@@ -307,7 +403,7 @@ fn run_credential_pair(
             record
         }
         Ok(_) | Err(_) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -317,14 +413,14 @@ fn run_credential_pair(
                     transition.state(),
                 ),
                 initial,
-            );
+            ));
         }
     };
     match launcher.kind() {
-        CredentialRecordKind::Failure => return ExitCode::FAILURE,
+        CredentialRecordKind::Failure => return terminal(ExitCode::FAILURE),
         CredentialRecordKind::LauncherTransitioned => {}
         CredentialRecordKind::WorkerTransitioned | CredentialRecordKind::WorkerFinal => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -334,7 +430,7 @@ fn run_credential_pair(
                     transition.state(),
                 ),
                 initial,
-            );
+            ));
         }
     }
     let after_both = match bangbang_session::elevated_credential::observe_later_peer(
@@ -348,7 +444,7 @@ fn run_credential_pair(
     ) {
         Ok(observation) => observation,
         Err(category) => {
-            return write_credential_failure(
+            return terminal(write_credential_failure(
                 &mut stream,
                 bootstrap,
                 credential_failure(
@@ -358,7 +454,7 @@ fn run_credential_pair(
                     transition.state(),
                 ),
                 initial,
-            );
+            ));
         }
     };
     let Ok(final_record) = CredentialRecord::worker_final(
@@ -367,23 +463,102 @@ fn run_credential_pair(
         [initial, after_worker, after_both],
         bootstrap.nonce(),
     ) else {
-        return ExitCode::FAILURE;
+        return terminal(ExitCode::FAILURE);
     };
     if stream.write_all(&final_record.encode()).is_err() {
-        ExitCode::FAILURE
+        return terminal(ExitCode::FAILURE);
+    }
+    if !bootstrap.mode().continues_runtime() {
+        return terminal(ExitCode::SUCCESS);
+    }
+    let Some(root) = runtime_root else {
+        return terminal(ExitCode::FAILURE);
+    };
+    if bootstrap.fault() == RuntimeFault::PreAck {
+        return terminal(ExitCode::FAILURE);
+    }
+    let mut encoded = [0_u8; CONTINUATION_ACK_BYTES];
+    if stream.read_exact(&mut encoded).is_err() {
+        return terminal(ExitCode::FAILURE);
+    }
+    let Ok(ack) = ContinuationAck::decode(&encoded) else {
+        return terminal(ExitCode::FAILURE);
+    };
+    if !ack.matches_expected(bootstrap.mode(), bootstrap.nonce())
+        || stream.set_read_timeout(None).is_err()
+        || stream.set_write_timeout(None).is_err()
+        || grants.set_read_timeout(None).is_err()
+        || grants.set_write_timeout(None).is_err()
+        || !transport_is_empty(stream.as_raw_fd())
+        || !transport_is_empty(grants.as_raw_fd())
+    {
+        return terminal(ExitCode::FAILURE);
+    }
+    if bootstrap.fault() == RuntimeFault::PostAck {
+        return terminal(ExitCode::FAILURE);
+    }
+    let continuation = RuntimeContinuation {
+        stream,
+        grants,
+        root,
+        bootstrap,
+        parent,
+        worker_args: Some(worker_args),
+    };
+    if continuation.verify_witness().is_err() {
+        terminal(ExitCode::FAILURE)
     } else {
-        ExitCode::SUCCESS
+        ProbeEntry::Continue(continuation)
     }
 }
 
+const fn terminal(code: ExitCode) -> ProbeEntry {
+    ProbeEntry::Terminal(code)
+}
+
+fn take_credential_root(bootstrap: ProbeBootstrap) -> Result<Option<OwnedFd>, ProbeError> {
+    let root = take_root_descriptor()?;
+    if bootstrap.mode().continues_runtime() {
+        return Ok(Some(root));
+    }
+    validate_root(root.as_raw_fd(), bootstrap.root())?;
+    Ok(None)
+}
+
 fn take_root(bootstrap: ProbeBootstrap) -> Result<OwnedFd, ProbeError> {
+    let root = take_root_descriptor()?;
+    validate_root(root.as_raw_fd(), bootstrap.root())?;
+    Ok(root)
+}
+
+fn take_root_descriptor() -> Result<OwnedFd, ProbeError> {
     bangbang_session::macos::set_cloexec(ROOT_FD)
         .map_err(|error| with_kind(ProbeStage::TakeRoot, error.kind()))?;
     // SAFETY: The feature-gated production spawn contract transfers fixed fd 8
     // exactly once to this process.
     let root = unsafe { OwnedFd::from_raw_fd(ROOT_FD) };
-    validate_root(root.as_raw_fd(), bootstrap.root())?;
     Ok(root)
+}
+
+fn transport_is_empty(fd: libc::c_int) -> bool {
+    let mut byte = 0_u8;
+    // SAFETY: `byte` is one writable byte, `fd` is a live connected local
+    // socket, and PEEK never consumes application bytes.
+    let result = unsafe {
+        libc::recv(
+            fd,
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        return error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK);
+    }
+    false
 }
 
 fn take_grants() -> Result<UnixDatagram, ProbeErrorCategory> {
@@ -490,7 +665,10 @@ fn execute(config: ProbeBootstrap) -> Result<(), ProbeError> {
         | bangbang_session::elevated_probe::ProbeMode::CredentialDrop
         | bangbang_session::elevated_probe::ProbeMode::CredentialRetainRoot
         | bangbang_session::elevated_probe::ProbeMode::CredentialUnmapped
-        | bangbang_session::elevated_probe::ProbeMode::CredentialControl => {
+        | bangbang_session::elevated_probe::ProbeMode::CredentialControl
+        | bangbang_session::elevated_probe::ProbeMode::RuntimeDrop
+        | bangbang_session::elevated_probe::ProbeMode::RuntimeRetainRoot
+        | bangbang_session::elevated_probe::ProbeMode::RuntimeUnmapped => {
             return Err(invalid(ProbeStage::InitialIdentity));
         }
     }
@@ -835,6 +1013,55 @@ mod tests {
         assert!(
             receive_credential_datagram(&datagram).is_err(),
             "a dead datagram endpoint must fail or time out without advancing"
+        );
+    }
+
+    #[test]
+    fn continuation_requires_empty_live_stream_and_datagram_transports() {
+        let (mut stream, mut stream_peer) =
+            UnixStream::pair().expect("stream pair should construct");
+        assert!(transport_is_empty(stream.as_raw_fd()));
+        stream_peer
+            .write_all(&[0x41, 0x42])
+            .expect("replay bytes should send");
+        assert!(!transport_is_empty(stream.as_raw_fd()));
+        let mut byte = [0_u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .expect("first replay byte should consume");
+        assert!(!transport_is_empty(stream.as_raw_fd()));
+        stream
+            .read_exact(&mut byte)
+            .expect("second replay byte should consume");
+        assert!(transport_is_empty(stream.as_raw_fd()));
+        drop(stream_peer);
+        assert!(
+            !transport_is_empty(stream.as_raw_fd()),
+            "EOF must not be mistaken for an empty live transport"
+        );
+
+        let (datagram, datagram_peer) =
+            UnixDatagram::pair().expect("datagram pair should construct");
+        assert!(transport_is_empty(datagram.as_raw_fd()));
+        datagram_peer
+            .send(&[0x51])
+            .expect("first datagram should send");
+        datagram_peer
+            .send(&[0x52])
+            .expect("second datagram should send");
+        assert!(!transport_is_empty(datagram.as_raw_fd()));
+        datagram
+            .recv(&mut byte)
+            .expect("first datagram should consume");
+        assert!(!transport_is_empty(datagram.as_raw_fd()));
+        datagram
+            .recv(&mut byte)
+            .expect("second datagram should consume");
+        assert!(transport_is_empty(datagram.as_raw_fd()));
+        drop(datagram_peer);
+        assert!(
+            !transport_is_empty(datagram.as_raw_fd()),
+            "dead datagram transport must fail closed"
         );
     }
 }

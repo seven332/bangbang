@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -330,6 +330,8 @@ impl fmt::Debug for NamespaceIdentity {
 pub enum RuntimeError {
     /// A filesystem operation failed.
     Filesystem(io::ErrorKind),
+    /// Creating the exact random session directory failed.
+    NamespaceCreate(io::ErrorKind),
     /// The expected fixed container/root contract was not satisfied.
     InvalidRoot,
     /// A session entry failed owner, mode, type, identity, lock, or emptiness checks.
@@ -346,12 +348,107 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+#[derive(Clone, Copy)]
+struct DirectoryOwner {
+    uid: libc::uid_t,
+    gid: Option<libc::gid_t>,
+}
+
+impl DirectoryOwner {
+    fn current_user() -> Self {
+        // SAFETY: The identity getter has no pointer or ownership contract.
+        let uid = unsafe { libc::geteuid() };
+        Self { uid, gid: None }
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    const fn exact(uid: libc::uid_t, gid: libc::gid_t) -> Self {
+        Self {
+            uid,
+            gid: Some(gid),
+        }
+    }
+}
+
+/// Independently opened, descriptor-rooted authority for evidence-only runtimes.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub struct ExplicitRuntimeRoot {
+    directory: OwnedFd,
+    identity: NamespaceIdentity,
+    owner: DirectoryOwner,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl fmt::Debug for ExplicitRuntimeRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExplicitRuntimeRoot(<redacted>)")
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl ExplicitRuntimeRoot {
+    /// Adopts and validates one already-opened exact target-owned runtime root.
+    pub fn from_owned_fd(
+        directory: OwnedFd,
+        expected: ObjectIdentity,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        require_empty: bool,
+    ) -> Result<Self, RuntimeError> {
+        let owner = DirectoryOwner::exact(uid, gid);
+        let stat = directory_stat(directory.as_raw_fd())?;
+        let linked = stat.st_nlink >= 2;
+        let identity = validate_directory_stat(stat, owner)?;
+        if !linked
+            || identity.device != expected.device
+            || identity.inode != expected.inode
+            || (require_empty && !directory_is_empty(directory.as_raw_fd())?)
+        {
+            return Err(RuntimeError::InvalidRoot);
+        }
+        Ok(Self {
+            directory,
+            identity,
+            owner,
+        })
+    }
+
+    /// Reopens the same directory with an independent file description.
+    pub fn try_reopen(&self, require_empty: bool) -> Result<Self, RuntimeError> {
+        let directory = openat_directory(self.directory.as_raw_fd(), c".")?;
+        let identity = validate_directory_owned(directory.as_raw_fd(), self.owner)?;
+        if identity != self.identity
+            || (require_empty && !directory_is_empty(directory.as_raw_fd())?)
+        {
+            return Err(RuntimeError::InvalidRoot);
+        }
+        Ok(Self {
+            directory,
+            identity,
+            owner: self.owner,
+        })
+    }
+
+    /// Returns the retained root descriptor without transferring ownership.
+    #[must_use]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.directory.as_raw_fd()
+    }
+
+    /// Returns the validated root identity without revealing its path.
+    #[must_use]
+    pub const fn identity(&self) -> NamespaceIdentity {
+        self.identity
+    }
+}
+
 /// Worker-owned locked namespace inside its App Sandbox container.
 pub struct WorkerNamespace {
     root: OwnedFd,
     directory: OwnedFd,
     name: CString,
     identity: NamespaceIdentity,
+    owner: DirectoryOwner,
     cleaned: bool,
 }
 
@@ -370,8 +467,26 @@ impl WorkerNamespace {
     pub fn create(session: SessionId) -> Result<Self, RuntimeError> {
         let root_path = worker_runtime_root()?;
         let root = ensure_runtime_root(&root_path)?;
+        Self::create_in_root(root, DirectoryOwner::current_user(), session)
+    }
+
+    /// Creates the exact session beneath an already-opened target-owned root.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn create_from_explicit_root(
+        root: ExplicitRuntimeRoot,
+        session: SessionId,
+    ) -> Result<Self, RuntimeError> {
+        Self::create_in_root(root.directory, root.owner, session)
+    }
+
+    fn create_in_root(
+        root: OwnedFd,
+        owner: DirectoryOwner,
+        session: SessionId,
+    ) -> Result<Self, RuntimeError> {
+        validate_directory_owned(root.as_raw_fd(), owner)?;
         let root_lock = RootLock::acquire(root.as_raw_fd())?;
-        recover_stale_entries(root.as_raw_fd())?;
+        recover_stale_entries(root.as_raw_fd(), owner)?;
         let name = session_name(session)?;
         // SAFETY: `root` is a live directory fd, `name` is NUL-terminated, and
         // no pointer is retained.
@@ -380,7 +495,7 @@ impl WorkerNamespace {
             return if error.kind() == io::ErrorKind::AlreadyExists {
                 Err(RuntimeError::Collision)
             } else {
-                Err(RuntimeError::Filesystem(error.kind()))
+                Err(RuntimeError::NamespaceCreate(error.kind()))
             };
         }
 
@@ -388,7 +503,7 @@ impl WorkerNamespace {
         // stale recovery. Blind rollback could remove a same-user replacement
         // installed between `mkdirat` and the failing operation.
         let directory = openat_directory(root.as_raw_fd(), &name)?;
-        let identity = validate_directory(directory.as_raw_fd())?;
+        let identity = validate_directory_owned(directory.as_raw_fd(), owner)?;
         lock_exclusive(directory.as_raw_fd())?;
         drop(root_lock);
         Ok(Self {
@@ -396,6 +511,7 @@ impl WorkerNamespace {
             directory,
             name,
             identity,
+            owner,
             cleaned: false,
         })
     }
@@ -425,8 +541,7 @@ impl WorkerNamespace {
 
     /// Rechecks that the process working directory is the retained namespace.
     pub fn verify_current_directory(&self) -> Result<(), RuntimeError> {
-        let current = open_directory(Path::new("."))?;
-        if validate_directory(current.as_raw_fd())? == self.identity {
+        if current_directory_identity(self.owner)? == self.identity {
             Ok(())
         } else {
             Err(RuntimeError::InvalidEntry)
@@ -443,6 +558,7 @@ impl WorkerNamespace {
             self.directory.as_raw_fd(),
             &self.name,
             self.identity,
+            self.owner,
         )?;
         self.cleaned = true;
         Ok(())
@@ -486,6 +602,7 @@ pub struct LauncherNamespace {
     directory: OwnedFd,
     name: CString,
     identity: NamespaceIdentity,
+    owner: DirectoryOwner,
     cleaned: bool,
 }
 
@@ -504,10 +621,29 @@ impl LauncherNamespace {
     pub fn validate(session: SessionId, expected: NamespaceIdentity) -> Result<Self, RuntimeError> {
         let root_path = launcher_runtime_root()?;
         let root = open_directory(&root_path)?;
-        validate_directory(root.as_raw_fd())?;
+        Self::validate_in_root(root, DirectoryOwner::current_user(), session, expected)
+    }
+
+    /// Validates a worker-created namespace beneath an explicit target-owned root.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn validate_from_explicit_root(
+        root: ExplicitRuntimeRoot,
+        session: SessionId,
+        expected: NamespaceIdentity,
+    ) -> Result<Self, RuntimeError> {
+        Self::validate_in_root(root.directory, root.owner, session, expected)
+    }
+
+    fn validate_in_root(
+        root: OwnedFd,
+        owner: DirectoryOwner,
+        session: SessionId,
+        expected: NamespaceIdentity,
+    ) -> Result<Self, RuntimeError> {
+        validate_directory_owned(root.as_raw_fd(), owner)?;
         let name = session_name(session)?;
         let directory = openat_directory(root.as_raw_fd(), &name)?;
-        let actual = validate_directory(directory.as_raw_fd())?;
+        let actual = validate_directory_owned(directory.as_raw_fd(), owner)?;
         if actual != expected || !directory_is_empty(directory.as_raw_fd())? {
             return Err(RuntimeError::InvalidEntry);
         }
@@ -522,6 +658,7 @@ impl LauncherNamespace {
             directory,
             name,
             identity: actual,
+            owner,
             cleaned: false,
         })
     }
@@ -538,14 +675,31 @@ impl LauncherNamespace {
             Err(RuntimeError::Filesystem(io::ErrorKind::NotFound)) => return Ok(None),
             Err(error) => return Err(error),
         };
-        validate_directory(root.as_raw_fd())?;
+        Self::recover_in_root(root, DirectoryOwner::current_user(), session)
+    }
+
+    /// Recovers an exact namespace after worker exit beneath an explicit root.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn recover_after_worker_exit_from_explicit_root(
+        root: ExplicitRuntimeRoot,
+        session: SessionId,
+    ) -> Result<Option<Self>, RuntimeError> {
+        Self::recover_in_root(root.directory, root.owner, session)
+    }
+
+    fn recover_in_root(
+        root: OwnedFd,
+        owner: DirectoryOwner,
+        session: SessionId,
+    ) -> Result<Option<Self>, RuntimeError> {
+        validate_directory_owned(root.as_raw_fd(), owner)?;
         let name = session_name(session)?;
         let directory = match openat_directory(root.as_raw_fd(), &name) {
             Ok(directory) => directory,
             Err(RuntimeError::Filesystem(io::ErrorKind::NotFound)) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let identity = validate_directory(directory.as_raw_fd())?;
+        let identity = validate_directory_owned(directory.as_raw_fd(), owner)?;
         if !try_lock_exclusive(directory.as_raw_fd())? {
             return Err(RuntimeError::InvalidEntry);
         }
@@ -557,6 +711,7 @@ impl LauncherNamespace {
             directory,
             name,
             identity,
+            owner,
             cleaned: false,
         }))
     }
@@ -578,6 +733,7 @@ impl LauncherNamespace {
             self.directory.as_raw_fd(),
             &self.name,
             self.identity,
+            self.owner,
         )?;
         self.cleaned = true;
         Ok(())
@@ -1148,18 +1304,53 @@ fn unlink_staged_socket(
 }
 
 fn validate_directory(fd: RawFd) -> Result<NamespaceIdentity, RuntimeError> {
+    validate_directory_owned(fd, DirectoryOwner::current_user())
+}
+
+fn validate_directory_owned(
+    fd: RawFd,
+    owner: DirectoryOwner,
+) -> Result<NamespaceIdentity, RuntimeError> {
+    validate_directory_stat(directory_stat(fd)?, owner)
+}
+
+fn directory_stat(fd: RawFd) -> Result<libc::stat, RuntimeError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is writable for one result and `fd` remains owned by caller.
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
         return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
     }
     // SAFETY: Successful `fstat` initialized the result.
-    let stat = unsafe { stat.assume_init() };
-    // SAFETY: Identity call has no pointer or ownership contract.
-    let uid = unsafe { libc::geteuid() };
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn current_directory_identity(owner: DirectoryOwner) -> Result<NamespaceIdentity, RuntimeError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: The fixed dot component is NUL-terminated, `AT_FDCWD` names the
+    // process cwd, and `stat` is writable for one result.
+    if unsafe {
+        libc::fstatat(
+            libc::AT_FDCWD,
+            c".".as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
+    }
+    // SAFETY: Successful `fstatat` initialized the result.
+    validate_directory_stat(unsafe { stat.assume_init() }, owner)
+}
+
+fn validate_directory_stat(
+    stat: libc::stat,
+    owner: DirectoryOwner,
+) -> Result<NamespaceIdentity, RuntimeError> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
         || stat.st_mode & 0o7777 != 0o700
-        || stat.st_uid != uid
+        || stat.st_uid != owner.uid
+        || owner.gid.is_some_and(|gid| stat.st_gid != gid)
     {
         return Err(RuntimeError::InvalidEntry);
     }
@@ -1184,7 +1375,7 @@ fn valid_session_name(name: &OsStr) -> bool {
         && suffix.iter().all(|byte| !byte.is_ascii_uppercase())
 }
 
-fn recover_stale_entries(root: RawFd) -> Result<(), RuntimeError> {
+fn recover_stale_entries(root: RawFd, owner: DirectoryOwner) -> Result<(), RuntimeError> {
     for entry in directory_entries(root, MAX_RECOVERY_ENTRIES)? {
         if !valid_session_name(&entry) {
             continue;
@@ -1195,7 +1386,7 @@ fn recover_stale_entries(root: RawFd) -> Result<(), RuntimeError> {
         let Ok(directory) = openat_directory(root, &name) else {
             continue;
         };
-        let Ok(identity) = validate_directory(directory.as_raw_fd()) else {
+        let Ok(identity) = validate_directory_owned(directory.as_raw_fd(), owner) else {
             continue;
         };
         if !try_lock_exclusive(directory.as_raw_fd())? {
@@ -1204,7 +1395,7 @@ fn recover_stale_entries(root: RawFd) -> Result<(), RuntimeError> {
         if !directory_is_empty(directory.as_raw_fd())? {
             continue;
         }
-        let _ = cleanup_exact(root, directory.as_raw_fd(), &name, identity);
+        let _ = cleanup_exact(root, directory.as_raw_fd(), &name, identity, owner);
     }
     Ok(())
 }
@@ -1213,18 +1404,11 @@ fn directory_entries(fd: RawFd, limit: usize) -> Result<Vec<OsString>, RuntimeEr
     if limit == 0 {
         return Ok(Vec::new());
     }
-    // SAFETY: `fd` is a live directory and the fixed relative path opens the
-    // same directory with an independent file description and directory cursor.
-    let independent = unsafe {
-        libc::openat(
-            fd,
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if independent < 0 {
-        return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
-    }
+    // Reopening an inherited directory through `openat(fd, ".")` performs a
+    // fresh path lookup that App Sandbox can deny even though the process owns
+    // the exact validated descriptor. Duplicate that authority instead and
+    // explicitly rewind its shared directory cursor before consuming it.
+    let independent = duplicate_fd(fd)?.into_raw_fd();
     // SAFETY: `independent` is a fresh descriptor; `fdopendir` takes ownership on success.
     let directory = unsafe { libc::fdopendir(independent) };
     if directory.is_null() {
@@ -1232,6 +1416,8 @@ fn directory_entries(fd: RawFd, limit: usize) -> Result<Vec<OsString>, RuntimeEr
         let _ = unsafe { libc::close(independent) };
         return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
     }
+    // SAFETY: `directory` is live and uniquely consumed by this bounded scan.
+    unsafe { libc::rewinddir(directory) };
     let mut entries = Vec::new();
     loop {
         // SAFETY: Darwin's thread-local errno pointer is writable for this call sequence.
@@ -1301,8 +1487,9 @@ fn cleanup_exact(
     directory: RawFd,
     name: &CStr,
     expected: NamespaceIdentity,
+    owner: DirectoryOwner,
 ) -> Result<(), RuntimeError> {
-    if validate_directory(directory)? != expected || !directory_is_empty(directory)? {
+    if validate_directory_owned(directory, owner)? != expected || !directory_is_empty(directory)? {
         return Err(RuntimeError::InvalidEntry);
     }
     match identity_at(root, name)? {
@@ -1462,6 +1649,82 @@ mod tests {
         assert_eq!(
             validate_directory(directory.as_raw_fd()),
             Err(RuntimeError::InvalidEntry)
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn explicit_roots_require_exact_owner_and_independent_session_locks() {
+        let root = TestRoot::new();
+        let metadata = fs::symlink_metadata(root.path()).expect("root metadata should read");
+        let expected = ObjectIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let uid = metadata.uid();
+        let gid = metadata.gid();
+
+        assert_eq!(
+            ExplicitRuntimeRoot::from_owned_fd(
+                open_directory(root.path()).expect("root should open"),
+                expected,
+                uid,
+                gid.wrapping_add(1),
+                true,
+            )
+            .expect_err("wrong gid must be rejected"),
+            RuntimeError::InvalidEntry
+        );
+
+        let unexpected = root.path().join("unexpected");
+        fs::write(&unexpected, b"occupied").expect("unexpected root entry should write");
+        assert_eq!(
+            ExplicitRuntimeRoot::from_owned_fd(
+                open_directory(root.path()).expect("root should open"),
+                expected,
+                uid,
+                gid,
+                true,
+            )
+            .expect_err("an explicit runtime root must be empty before handoff"),
+            RuntimeError::InvalidRoot
+        );
+        fs::remove_file(unexpected).expect("unexpected root entry should clean");
+
+        let root_authority = ExplicitRuntimeRoot::from_owned_fd(
+            open_directory(root.path()).expect("root should open"),
+            expected,
+            uid,
+            gid,
+            true,
+        )
+        .expect("exact root should validate");
+        let worker_root = root_authority
+            .try_reopen(true)
+            .expect("worker root should independently reopen");
+        let launcher_root = root_authority
+            .try_reopen(true)
+            .expect("launcher root should independently reopen");
+        drop(root_authority);
+
+        let session = SessionId::from_bytes([0x91; 32]);
+        let worker = WorkerNamespace::create_from_explicit_root(worker_root, session)
+            .expect("target-owned session should create and lock");
+        let identity = worker.identity();
+        let mut launcher =
+            LauncherNamespace::validate_from_explicit_root(launcher_root, session, identity)
+                .expect("independent launcher description should observe the worker lock");
+        drop(worker);
+        launcher
+            .cleanup()
+            .expect("launcher cleanup should accept worker removal");
+        assert!(
+            directory_is_empty(
+                open_directory(root.path())
+                    .expect("root should reopen")
+                    .as_raw_fd()
+            )
+            .expect("root should inspect")
         );
     }
 
@@ -1756,7 +2019,8 @@ mod tests {
         )
         .expect("populated marker should be written");
 
-        recover_stale_entries(directory.as_raw_fd()).expect("recovery should succeed");
+        recover_stale_entries(directory.as_raw_fd(), DirectoryOwner::current_user())
+            .expect("recovery should succeed");
 
         assert!(
             !root
@@ -1795,6 +2059,7 @@ mod tests {
             directory: original,
             name,
             identity,
+            owner: DirectoryOwner::current_user(),
             cleaned: false,
         };
 

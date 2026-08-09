@@ -20,6 +20,10 @@ pub const RESULT_RECORD_BYTES: usize = 48;
 pub const CREDENTIAL_RECORD_BYTES: usize = 80;
 /// Encoded credential datagram-possession record length.
 pub const CREDENTIAL_DATAGRAM_BYTES: usize = 48;
+/// Encoded credential-to-lifecycle continuation acknowledgment length.
+pub const CONTINUATION_ACK_BYTES: usize = 48;
+/// Private worker exit used to report the measured target namespace denial.
+pub const RUNTIME_NAMESPACE_PERMISSION_EXIT_CODE: u8 = 3;
 
 const VERSION: u16 = 2;
 const BOOTSTRAP_MAGIC: [u8; 4] = *b"BBE2";
@@ -27,6 +31,7 @@ const RESULT_MAGIC: [u8; 4] = *b"BBR2";
 const CREDENTIAL_VERSION: u16 = 1;
 const CREDENTIAL_MAGIC: [u8; 4] = *b"BBC1";
 const CREDENTIAL_DATAGRAM_MAGIC: [u8; 4] = *b"BBG1";
+const CONTINUATION_ACK_MAGIC: [u8; 4] = *b"BBA1";
 
 /// Exact evidence mode selected by the explicit root wrapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +57,12 @@ pub enum ProbeMode {
     CredentialUnmapped = 9,
     /// Run the same no-chroot credential primitive in the unsandboxed launcher.
     CredentialControl = 10,
+    /// Drop both endpoints, then continue into the target-owned runtime.
+    RuntimeDrop = 11,
+    /// Retain exact root on both endpoints, then continue into the root-owned runtime.
+    RuntimeRetainRoot = 12,
+    /// Use the SDK-maximum unmapped identity, then attempt the explicit runtime.
+    RuntimeUnmapped = 13,
 }
 
 impl ProbeMode {
@@ -68,6 +79,9 @@ impl ProbeMode {
             "credential-retain-root" => Self::CredentialRetainRoot,
             "credential-unmapped" => Self::CredentialUnmapped,
             "credential-control" => Self::CredentialControl,
+            "runtime-drop" => Self::RuntimeDrop,
+            "runtime-retain-root" => Self::RuntimeRetainRoot,
+            "runtime-unmapped" => Self::RuntimeUnmapped,
             _ => return None,
         };
         mode.accepts_target(uid, gid).then_some(mode)
@@ -87,6 +101,9 @@ impl ProbeMode {
             Self::CredentialRetainRoot => "credential-retain-root",
             Self::CredentialUnmapped => "credential-unmapped",
             Self::CredentialControl => "credential-control",
+            Self::RuntimeDrop => "runtime-drop",
+            Self::RuntimeRetainRoot => "runtime-retain-root",
+            Self::RuntimeUnmapped => "runtime-unmapped",
         }
     }
 
@@ -94,12 +111,16 @@ impl ProbeMode {
     #[must_use]
     pub const fn accepts_target(self, uid: u32, gid: u32) -> bool {
         match self {
-            Self::Drop | Self::UnmappedSyscall | Self::CredentialDrop => uid != 0 && gid != 0,
-            Self::CredentialUnmapped => uid == 2_147_483_647 && gid == 2_147_483_647,
+            Self::Drop | Self::UnmappedSyscall | Self::CredentialDrop | Self::RuntimeDrop => {
+                uid != 0 && gid != 0
+            }
+            Self::CredentialUnmapped | Self::RuntimeUnmapped => {
+                uid == 2_147_483_647 && gid == 2_147_483_647
+            }
             Self::RetainRoot | Self::Control | Self::HvfControl | Self::InheritedRoot => {
                 uid == 0 && gid == 0
             }
-            Self::CredentialRetainRoot => uid == 0 && gid == 0,
+            Self::CredentialRetainRoot | Self::RuntimeRetainRoot => uid == 0 && gid == 0,
             Self::CredentialControl => (uid == 0) == (gid == 0),
         }
     }
@@ -109,14 +130,28 @@ impl ProbeMode {
     pub const fn is_credential_pair(self) -> bool {
         matches!(
             self,
-            Self::CredentialDrop | Self::CredentialRetainRoot | Self::CredentialUnmapped
+            Self::CredentialDrop
+                | Self::CredentialRetainRoot
+                | Self::CredentialUnmapped
+                | Self::RuntimeDrop
+                | Self::RuntimeRetainRoot
+                | Self::RuntimeUnmapped
+        )
+    }
+
+    /// Returns whether the credential exchange must hand the same transports to lifecycle v6.
+    #[must_use]
+    pub const fn continues_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::RuntimeDrop | Self::RuntimeRetainRoot | Self::RuntimeUnmapped
         )
     }
 
     /// Returns whether this mode retains exact root without credential mutation.
     #[must_use]
     pub const fn retains_root(self) -> bool {
-        matches!(self, Self::CredentialRetainRoot)
+        matches!(self, Self::CredentialRetainRoot | Self::RuntimeRetainRoot)
     }
 
     fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
@@ -131,6 +166,9 @@ impl ProbeMode {
             8 => Ok(Self::CredentialRetainRoot),
             9 => Ok(Self::CredentialUnmapped),
             10 => Ok(Self::CredentialControl),
+            11 => Ok(Self::RuntimeDrop),
+            12 => Ok(Self::RuntimeRetainRoot),
+            13 => Ok(Self::RuntimeUnmapped),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -174,6 +212,22 @@ pub enum ProbeStage {
     HvfDestroy = 16,
     /// Observe the first authenticated application record from the spawned worker.
     WorkerBootstrap = 17,
+    /// Complete the exact credential-to-lifecycle acknowledgment.
+    ContinuationAck = 18,
+    /// Observe the ordinary lifecycle Hello on the reused stream.
+    LifecycleHello = 19,
+    /// Create or validate the explicit target-owned runtime namespace.
+    RuntimeNamespace = 20,
+    /// Transfer the exact committed representative grant batch.
+    GrantTransfer = 21,
+    /// Consume and validate the committed representative grants.
+    GrantAccepted = 22,
+    /// Cross the ordinary lifecycle Proceed boundary.
+    LifecycleProceed = 23,
+    /// Observe and validate the ordinary lifecycle terminal record.
+    LifecycleTerminal = 24,
+    /// Reap and clean every exact owned runtime object.
+    RuntimeCleanup = 25,
 }
 
 impl ProbeStage {
@@ -198,6 +252,14 @@ impl ProbeStage {
             Self::HvfCreate => "hvf-create",
             Self::HvfDestroy => "hvf-destroy",
             Self::WorkerBootstrap => "worker-bootstrap",
+            Self::ContinuationAck => "continuation-ack",
+            Self::LifecycleHello => "lifecycle-hello",
+            Self::RuntimeNamespace => "runtime-namespace",
+            Self::GrantTransfer => "grant-transfer",
+            Self::GrantAccepted => "grant-accepted",
+            Self::LifecycleProceed => "lifecycle-proceed",
+            Self::LifecycleTerminal => "lifecycle-terminal",
+            Self::RuntimeCleanup => "runtime-cleanup",
         }
     }
 
@@ -220,7 +282,114 @@ impl ProbeStage {
             15 => Ok(Self::HvfCreate),
             16 => Ok(Self::HvfDestroy),
             17 => Ok(Self::WorkerBootstrap),
+            18 => Ok(Self::ContinuationAck),
+            19 => Ok(Self::LifecycleHello),
+            20 => Ok(Self::RuntimeNamespace),
+            21 => Ok(Self::GrantTransfer),
+            22 => Ok(Self::GrantAccepted),
+            23 => Ok(Self::LifecycleProceed),
+            24 => Ok(Self::LifecycleTerminal),
+            25 => Ok(Self::RuntimeCleanup),
             _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// Feature-only deterministic stop boundary for runtime-continuation evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RuntimeFault {
+    /// Do not inject a fault.
+    #[default]
+    None = 0,
+    /// Stop immediately before the continuation acknowledgment.
+    PreAck = 1,
+    /// Stop after the acknowledgment and before lifecycle Hello.
+    PostAck = 2,
+    /// Stop at target-owned namespace creation.
+    Namespace = 3,
+    /// Stop while transferring the committed grant batch.
+    GrantTransfer = 4,
+    /// Stop at the ordinary Proceed boundary.
+    Proceed = 5,
+    /// Stop at terminal ownership validation.
+    Terminal = 6,
+}
+
+impl RuntimeFault {
+    /// Parses the closed wrapper spelling.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "pre-ack" => Some(Self::PreAck),
+            "post-ack" => Some(Self::PostAck),
+            "namespace" => Some(Self::Namespace),
+            "grant-transfer" => Some(Self::GrantTransfer),
+            "proceed" => Some(Self::Proceed),
+            "terminal" => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::PreAck),
+            2 => Ok(Self::PostAck),
+            3 => Ok(Self::Namespace),
+            4 => Ok(Self::GrantTransfer),
+            5 => Ok(Self::Proceed),
+            6 => Ok(Self::Terminal),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+
+    /// Returns the stable value-free fault spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PreAck => "pre-ack",
+            Self::PostAck => "post-ack",
+            Self::Namespace => "namespace",
+            Self::GrantTransfer => "grant-transfer",
+            Self::Proceed => "proceed",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// Value-free capable-host result class for one runtime continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeResultClass {
+    /// Target/no-drop execution completed the full foreground lifecycle.
+    Complete,
+    /// The exact credential-to-lifecycle continuation could not be completed.
+    ContinuationBoundary,
+    /// Live target/no-drop process or code identity could not be revalidated.
+    IdentityBoundary,
+    /// The explicit root could not be acquired or validated.
+    ExplicitRootBoundary,
+    /// Namespace creation, locking, validation, or recovery stopped progress.
+    NamespaceBoundary,
+    /// Grant transfer, commitment, or target-side consumption stopped progress.
+    GrantBoundary,
+    /// The ordinary lifecycle stopped after committed grants.
+    LifecycleBoundary,
+}
+
+impl RuntimeResultClass {
+    /// Returns the stable value-free result spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::ContinuationBoundary => "continuation-boundary",
+            Self::IdentityBoundary => "identity-boundary",
+            Self::ExplicitRootBoundary => "explicit-root-boundary",
+            Self::NamespaceBoundary => "namespace-boundary",
+            Self::GrantBoundary => "grant-boundary",
+            Self::LifecycleBoundary => "lifecycle-boundary",
         }
     }
 }
@@ -454,6 +623,90 @@ impl CredentialDatagramProof {
 impl fmt::Debug for CredentialDatagramProof {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CredentialDatagramProof(<redacted>)")
+    }
+}
+
+/// Exact single-use handoff from the credential exchange to lifecycle v6.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ContinuationAck {
+    mode: ProbeMode,
+    role: CredentialRole,
+    nonce: SessionId,
+}
+
+impl ContinuationAck {
+    /// Constructs the launcher's acknowledgment for one runtime continuation.
+    pub fn launcher(mode: ProbeMode, nonce: SessionId) -> Result<Self, ProbeProtocolError> {
+        if !mode.continues_runtime() || nonce.is_pre_session() {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            mode,
+            role: CredentialRole::Launcher,
+            nonce,
+        })
+    }
+
+    /// Returns the selected runtime mode.
+    #[must_use]
+    pub const fn mode(self) -> ProbeMode {
+        self.mode
+    }
+
+    /// Returns the fixed acknowledging role.
+    #[must_use]
+    pub const fn role(self) -> CredentialRole {
+        self.role
+    }
+
+    /// Returns the exact command nonce.
+    #[must_use]
+    pub const fn nonce(self) -> SessionId {
+        self.nonce
+    }
+
+    /// Returns whether this is the exact acknowledgment for an exchange.
+    #[must_use]
+    pub fn matches_expected(self, mode: ProbeMode, nonce: SessionId) -> bool {
+        self.mode == mode && self.role == CredentialRole::Launcher && self.nonce == nonce
+    }
+
+    /// Encodes the fixed acknowledgment record.
+    #[must_use]
+    pub fn encode(self) -> [u8; CONTINUATION_ACK_BYTES] {
+        let mut bytes = [0_u8; CONTINUATION_ACK_BYTES];
+        bytes[0..4].copy_from_slice(&CONTINUATION_ACK_MAGIC);
+        bytes[4..6].copy_from_slice(&CREDENTIAL_VERSION.to_be_bytes());
+        bytes[6] = self.mode as u8;
+        bytes[7] = self.role as u8;
+        bytes[16..48].copy_from_slice(self.nonce.as_bytes());
+        bytes
+    }
+
+    /// Decodes and canonically validates one acknowledgment record.
+    pub fn decode(bytes: &[u8; CONTINUATION_ACK_BYTES]) -> Result<Self, ProbeProtocolError> {
+        if bytes[0..4] != CONTINUATION_ACK_MAGIC
+            || bytes[4..6] != CREDENTIAL_VERSION.to_be_bytes()
+            || bytes[8..16] != [0; 8]
+        {
+            return Err(ProbeProtocolError);
+        }
+        let ack = Self::launcher(
+            ProbeMode::from_byte(bytes[6])?,
+            SessionId::from_bytes(array(bytes, 16)?),
+        )?;
+        if CredentialRole::from_byte(bytes[7])? != CredentialRole::Launcher
+            || ack.encode() != *bytes
+        {
+            return Err(ProbeProtocolError);
+        }
+        Ok(ack)
+    }
+}
+
+impl fmt::Debug for ContinuationAck {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContinuationAck(<redacted>)")
     }
 }
 
@@ -1290,6 +1543,7 @@ impl fmt::Debug for CredentialRecord {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ProbeBootstrap {
     mode: ProbeMode,
+    fault: RuntimeFault,
     target_uid: u32,
     target_gid: u32,
     root: ObjectIdentity,
@@ -1305,8 +1559,28 @@ impl ProbeBootstrap {
         root: ObjectIdentity,
         nonce: SessionId,
     ) -> Result<Self, ProbeProtocolError> {
+        Self::new_with_fault(
+            mode,
+            RuntimeFault::None,
+            target_uid,
+            target_gid,
+            root,
+            nonce,
+        )
+    }
+
+    /// Constructs a complete worker command with a new-mode-only deterministic fault.
+    pub fn new_with_fault(
+        mode: ProbeMode,
+        fault: RuntimeFault,
+        target_uid: u32,
+        target_gid: u32,
+        root: ObjectIdentity,
+        nonce: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
         if matches!(mode, ProbeMode::Control | ProbeMode::CredentialControl)
             || !mode.accepts_target(target_uid, target_gid)
+            || (!mode.continues_runtime() && fault != RuntimeFault::None)
             || root.device == 0
             || root.inode == 0
             || nonce.is_pre_session()
@@ -1315,6 +1589,7 @@ impl ProbeBootstrap {
         }
         Ok(Self {
             mode,
+            fault,
             target_uid,
             target_gid,
             root,
@@ -1326,6 +1601,12 @@ impl ProbeBootstrap {
     #[must_use]
     pub const fn mode(self) -> ProbeMode {
         self.mode
+    }
+
+    /// Returns the feature-only deterministic fault boundary.
+    #[must_use]
+    pub const fn fault(self) -> RuntimeFault {
+        self.fault
     }
 
     /// Returns the exact target user ID.
@@ -1359,6 +1640,7 @@ impl ProbeBootstrap {
         bytes[0..4].copy_from_slice(&BOOTSTRAP_MAGIC);
         bytes[4..6].copy_from_slice(&VERSION.to_be_bytes());
         bytes[6] = self.mode as u8;
+        bytes[7] = self.fault as u8;
         bytes[8..12].copy_from_slice(&self.target_uid.to_be_bytes());
         bytes[12..16].copy_from_slice(&self.target_gid.to_be_bytes());
         bytes[16..24].copy_from_slice(&self.root.device.to_be_bytes());
@@ -1369,10 +1651,11 @@ impl ProbeBootstrap {
 
     /// Decodes one exact fixed-size record.
     pub fn decode(bytes: &[u8; BOOTSTRAP_RECORD_BYTES]) -> Result<Self, ProbeProtocolError> {
-        if bytes[0..4] != BOOTSTRAP_MAGIC || bytes[4..6] != VERSION.to_be_bytes() || bytes[7] != 0 {
+        if bytes[0..4] != BOOTSTRAP_MAGIC || bytes[4..6] != VERSION.to_be_bytes() {
             return Err(ProbeProtocolError);
         }
         let mode = ProbeMode::from_byte(bytes[6])?;
+        let fault = RuntimeFault::from_byte(bytes[7])?;
         let target_uid = u32::from_be_bytes(array(bytes, 8)?);
         let target_gid = u32::from_be_bytes(array(bytes, 12)?);
         let root = ObjectIdentity {
@@ -1380,7 +1663,7 @@ impl ProbeBootstrap {
             inode: u64::from_be_bytes(array(bytes, 24)?),
         };
         let nonce = SessionId::from_bytes(array(bytes, 32)?);
-        Self::new(mode, target_uid, target_gid, root, nonce)
+        Self::new_with_fault(mode, fault, target_uid, target_gid, root, nonce)
     }
 }
 
@@ -1576,6 +1859,36 @@ mod tests {
             )
             .is_err()
         );
+
+        let runtime = ProbeBootstrap::new_with_fault(
+            ProbeMode::RuntimeDrop,
+            RuntimeFault::PostAck,
+            501,
+            20,
+            ObjectIdentity {
+                device: 1,
+                inode: 1,
+            },
+            SessionId::from_bytes([2; 32]),
+        )
+        .expect("runtime faults are explicit in new modes");
+        assert_eq!(runtime.fault(), RuntimeFault::PostAck);
+        assert_eq!(ProbeBootstrap::decode(&runtime.encode()), Ok(runtime));
+        assert!(
+            ProbeBootstrap::new_with_fault(
+                ProbeMode::CredentialDrop,
+                RuntimeFault::PostAck,
+                501,
+                20,
+                ObjectIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+                SessionId::from_bytes([2; 32]),
+            )
+            .is_err(),
+            "historical mode bytes must retain a zero reserved byte"
+        );
         let mut version_one = encoded;
         version_one[4..6].copy_from_slice(&1_u16.to_be_bytes());
         assert_eq!(
@@ -1698,6 +2011,19 @@ mod tests {
             Some(ProbeMode::CredentialControl)
         );
         assert_eq!(ProbeMode::parse("credential-control", 501, 0), None);
+        assert_eq!(
+            ProbeMode::parse("runtime-drop", 501, 20),
+            Some(ProbeMode::RuntimeDrop)
+        );
+        assert_eq!(ProbeMode::parse("runtime-drop", 0, 0), None);
+        assert_eq!(
+            ProbeMode::parse("runtime-retain-root", 0, 0),
+            Some(ProbeMode::RuntimeRetainRoot)
+        );
+        assert_eq!(
+            ProbeMode::parse("runtime-unmapped", 2_147_483_647, 2_147_483_647),
+            Some(ProbeMode::RuntimeUnmapped)
+        );
         assert_eq!(ProbeMode::parse("unknown", 501, 20), None);
     }
 
@@ -1722,6 +2048,14 @@ mod tests {
             ProbeStage::HvfCreate,
             ProbeStage::HvfDestroy,
             ProbeStage::WorkerBootstrap,
+            ProbeStage::ContinuationAck,
+            ProbeStage::LifecycleHello,
+            ProbeStage::RuntimeNamespace,
+            ProbeStage::GrantTransfer,
+            ProbeStage::GrantAccepted,
+            ProbeStage::LifecycleProceed,
+            ProbeStage::LifecycleTerminal,
+            ProbeStage::RuntimeCleanup,
         ] {
             let result = ProbeResult::failure(
                 ProbeMode::InheritedRoot,
@@ -1746,6 +2080,9 @@ mod tests {
             (ProbeMode::CredentialDrop, 501, 20),
             (ProbeMode::CredentialRetainRoot, 0, 0),
             (ProbeMode::CredentialUnmapped, 2_147_483_647, 2_147_483_647),
+            (ProbeMode::RuntimeDrop, 501, 20),
+            (ProbeMode::RuntimeRetainRoot, 0, 0),
+            (ProbeMode::RuntimeUnmapped, 2_147_483_647, 2_147_483_647),
         ] {
             let bootstrap = ProbeBootstrap::new(
                 mode,
@@ -1770,6 +2107,83 @@ mod tests {
                 assert_eq!(ProbeResult::decode(&result.encode()), Ok(result));
             }
         }
+    }
+
+    #[test]
+    fn runtime_fault_and_result_vocabularies_are_closed_and_exhaustive() {
+        for (fault, byte, name) in [
+            (RuntimeFault::None, 0, "none"),
+            (RuntimeFault::PreAck, 1, "pre-ack"),
+            (RuntimeFault::PostAck, 2, "post-ack"),
+            (RuntimeFault::Namespace, 3, "namespace"),
+            (RuntimeFault::GrantTransfer, 4, "grant-transfer"),
+            (RuntimeFault::Proceed, 5, "proceed"),
+            (RuntimeFault::Terminal, 6, "terminal"),
+        ] {
+            assert_eq!(RuntimeFault::parse(name), Some(fault));
+            assert_eq!(RuntimeFault::from_byte(byte), Ok(fault));
+            assert_eq!(fault.name(), name);
+        }
+        assert_eq!(RuntimeFault::parse("unknown"), None);
+        assert_eq!(RuntimeFault::from_byte(7), Err(ProbeProtocolError));
+
+        for (result, name) in [
+            (RuntimeResultClass::Complete, "complete"),
+            (
+                RuntimeResultClass::ContinuationBoundary,
+                "continuation-boundary",
+            ),
+            (RuntimeResultClass::IdentityBoundary, "identity-boundary"),
+            (
+                RuntimeResultClass::ExplicitRootBoundary,
+                "explicit-root-boundary",
+            ),
+            (RuntimeResultClass::NamespaceBoundary, "namespace-boundary"),
+            (RuntimeResultClass::GrantBoundary, "grant-boundary"),
+            (RuntimeResultClass::LifecycleBoundary, "lifecycle-boundary"),
+        ] {
+            assert_eq!(result.name(), name);
+        }
+    }
+
+    #[test]
+    fn continuation_ack_is_closed_nonce_bound_and_new_mode_only() {
+        let nonce = SessionId::from_bytes([0x71; 32]);
+        for mode in [
+            ProbeMode::RuntimeDrop,
+            ProbeMode::RuntimeRetainRoot,
+            ProbeMode::RuntimeUnmapped,
+        ] {
+            let ack = ContinuationAck::launcher(mode, nonce).expect("new mode should acknowledge");
+            let encoded = ack.encode();
+            assert_eq!(encoded.len(), CONTINUATION_ACK_BYTES);
+            assert_eq!(ContinuationAck::decode(&encoded), Ok(ack));
+            assert!(ack.matches_expected(mode, nonce));
+            assert_eq!(format!("{ack:?}"), "ContinuationAck(<redacted>)");
+            for index in [0, 4, 7] {
+                let mut malformed = encoded;
+                malformed[index] ^= 0xff;
+                assert_eq!(ContinuationAck::decode(&malformed), Err(ProbeProtocolError));
+            }
+            for index in 8..16 {
+                let mut malformed = encoded;
+                malformed[index] = 1;
+                assert_eq!(ContinuationAck::decode(&malformed), Err(ProbeProtocolError));
+            }
+            let other_mode = if mode == ProbeMode::RuntimeDrop {
+                ProbeMode::RuntimeRetainRoot
+            } else {
+                ProbeMode::RuntimeDrop
+            };
+            let cross_mode = ContinuationAck::launcher(other_mode, nonce)
+                .expect("another runtime acknowledgment should construct");
+            assert!(!cross_mode.matches_expected(mode, nonce));
+            assert!(!ack.matches_expected(mode, SessionId::from_bytes([0x72; 32])));
+        }
+        assert!(ContinuationAck::launcher(ProbeMode::CredentialDrop, nonce).is_err());
+        assert!(
+            ContinuationAck::launcher(ProbeMode::RuntimeDrop, SessionId::pre_session()).is_err()
+        );
     }
 
     fn observation(identity: CredentialIdentityClass, token: PeerTokenClass) -> PeerObservation {

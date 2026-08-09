@@ -2098,8 +2098,8 @@ merged-main OID are checked and recorded by the pull-request workflow.
 
 ## Explicit Elevated Bootstrap Evidence
 
-The #1373 direct-worker, #1884 inherited-root, and #1885 no-chroot credential
-proofs are deliberately
+The #1373 direct-worker, #1884 inherited-root, #1885 no-chroot credential, and
+#1889 target-owned runtime-continuation proofs are deliberately
 separate from `scripts/run-integration-tests.sh`. Normal validation never
 invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
 passing skip.
@@ -2113,11 +2113,12 @@ scripts/build-elevated-bootstrap-probe.sh \
 
 The build compiles normal launcher and worker artifacts first and verifies that
 the V2 probe status, worker activation, Ready, inherited-root, HVF, credential
-mode, credential phase, and restoration-step markers are absent. It then builds
-both ends with the same disabled-by-default feature, checks role-specific
-credential markers, adds a visible test-only resource marker, and uses the
-normal production packager, signature split, entitlements, Hardened Runtime,
-and inspections.
+and runtime modes, credential phases and restoration steps, `BBA1`
+acknowledgment, representative grant activation, and complete boundary
+vocabulary are absent. It then builds both ends with disabled-by-default
+evidence features, checks role-specific credential/runtime markers, adds three
+visible test-only resource markers, and uses the normal production packager,
+signature split, entitlements, Hardened Runtime, and inspections.
 
 On a capable Apple Silicon host, calculate the explicit numeric target before
 elevation and invoke the wrapper yourself:
@@ -2140,7 +2141,7 @@ input with `/dev/null`, so elevation input cannot flow into the launcher or
 signed worker.
 
 The inherited branch stages exactly the complete signed evidence bundle and
-current `/usr/lib/dyld` in a root-owned private root. A 20-entry private ledger
+current `/usr/lib/dyld` in a root-owned private root. A 22-entry private ledger
 binds every device/inode/owner/group/type/mode; preactivation negatives cover a
 writable, missing, symlinked, and inode-replaced loader, a missing nested
 worker, and an unexpected entry. The wrapper retains the #1373 direct denial,
@@ -2159,14 +2160,34 @@ group restoration. Ordinary and retained-root cases repeat, and two ordinary
 pairs run concurrently against distinct private roots. Final independent scans
 must find no launcher, worker, root, workspace, or named-socket residue.
 
+The runtime-continuation branch reuses the exact stream, grant datagram, and
+launcher/worker PIDs after the credential transcript. It requires one canonical
+nonce-bound `BBA1` acknowledgment, empty live transports, fresh parent and
+target/no-drop attestations, and ordinary lifecycle `Hello`/`Start`. Each case
+receives an already-opened exact target-owned root plus a separately ledgered
+workspace whose root-owned traversal-only ancestry contains the exact
+target-owned read-only, write-only, and create-children fixtures. Mapped and
+retained-root cases repeat three times, mapped cases run concurrently, and the
+high unmapped numeric case remains separate. Pre/post-acknowledgment fault cases
+prove the closed handoff; later fault hooks are expected to remain masked when a
+natural earlier boundary is observed. Runtime cleanup validates and removes only
+the exact owned root and workspace objects, followed by independent residue
+scans.
+
 It reports OS/SDK/architecture and only value-free terminal classes. The
 inherited result remains `worker-bootstrap` / `other`: in-root `posix_spawn`
 returned success but the worker exited before its earliest application record.
 The no-chroot credential result completed mapped ordinary, retained-root
-no-drop, and SDK-maximum unmapped transitions. Stream credentials remained
+no-drop, and SDK-maximum unmapped transitions. The mapped and retained-root
+runtime cases then completed acknowledgment plus ordinary `Hello`/`Start`, but
+App Sandbox denied exact target-owned session `mkdirat`; the high unmapped case
+stopped earlier at live code-identity revalidation. Grants, `Proceed`,
+`Starting`, terminal ownership, API/guest, daemon/crash, and post-transition HVF
+were therefore unreached or unmeasured. Stream credentials remained
 connection-time snapshots, datagram credentials were unsupported, opaque
 datagram tokens changed only for credential transitions, and live peer PIDs
-remained exact. Its supported conclusion and nonclaims are in the
+remained exact. The exact result line, supported conclusion, and nonclaims are
+in the
 [elevated bootstrap evidence
 contract](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 

@@ -97,6 +97,11 @@ const FIRECRACKER_DEFAULT_NOFILE_LIMIT: RawFd = 2048;
 const PROCESS_STDOUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &["no-seccomp", "seccomp-filter"];
 
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+type ProcessContinuation = Option<elevated_bootstrap_probe::RuntimeContinuation>;
+#[cfg(not(all(target_os = "macos", feature = "elevated-bootstrap-probe")))]
+type ProcessContinuation = ();
+
 fn write_process_stdout_line(
     arguments: fmt::Arguments<'_>,
     mut stdout: Option<ProcessStdoutLogger>,
@@ -116,9 +121,21 @@ fn write_process_stdout_line(
 
 fn main() -> ExitCode {
     #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
-    if elevated_bootstrap_probe::is_requested() {
-        return elevated_bootstrap_probe::run();
-    }
+    let (continuation, elevated_args) = if elevated_bootstrap_probe::is_requested() {
+        match elevated_bootstrap_probe::run() {
+            elevated_bootstrap_probe::ProbeEntry::Terminal(code) => return code,
+            elevated_bootstrap_probe::ProbeEntry::Continue(mut continuation) => {
+                let Ok(args) = continuation.take_worker_args() else {
+                    return ExitCode::FAILURE;
+                };
+                (Some(continuation), Some(args))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    #[cfg(not(all(target_os = "macos", feature = "elevated-bootstrap-probe")))]
+    let (continuation, elevated_args) = ((), None);
     #[cfg(target_os = "macos")]
     if anchored_socket::is_binder_invocation() {
         return if anchored_socket::run_binder() {
@@ -130,7 +147,7 @@ fn main() -> ExitCode {
     let bridge = panic_bridge::PanicBridge::install();
     let mut contained = None;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_process_lifecycle(&bridge, &mut contained)
+        run_process_lifecycle(&bridge, &mut contained, continuation, elevated_args)
     }));
     match outcome {
         Ok(exit_code) => {
@@ -157,15 +174,30 @@ fn main() -> ExitCode {
 fn run_process_lifecycle(
     bridge: &panic_bridge::PanicBridge,
     contained: &mut Option<ContainedSession>,
+    continuation: ProcessContinuation,
+    raw_args: Option<Vec<OsString>>,
 ) -> ExitCode {
-    *contained = match ContainedSession::bootstrap() {
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    let bootstrap = ContainedSession::bootstrap_with_continuation(continuation);
+    #[cfg(not(all(target_os = "macos", feature = "elevated-bootstrap-probe")))]
+    let bootstrap = {
+        let () = continuation;
+        ContainedSession::bootstrap()
+    };
+    *contained = match bootstrap {
         Ok(contained) => contained,
         Err(err) => {
+            #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+            if err.is_runtime_namespace_permission_denied() {
+                return ExitCode::from(
+                    bangbang_session::elevated_probe::RUNTIME_NAMESPACE_PERMISSION_EXIT_CODE,
+                );
+            }
             eprintln!("bangbang: {err}");
             return ProcessExitCode::ProcessFailure.into_exit_code();
         }
     };
-    let result = run(bridge, contained);
+    let result = run(bridge, contained, raw_args);
     let (category, exit_code) = terminal_result(&result, contained.as_ref());
     if let Some(session) = contained.as_mut() {
         let _ = session.finish(category, exit_code);
@@ -185,6 +217,7 @@ fn run_process_lifecycle(
 fn run(
     bridge: &panic_bridge::PanicBridge,
     contained: &mut Option<ContainedSession>,
+    raw_args: Option<Vec<OsString>>,
 ) -> Result<(), ProcessError> {
     let snapshot_cancellation = NativeV1SnapshotCaptureCancellation::default();
     let mut contained_shutdown = if let Some(session) = contained.as_mut() {
@@ -202,7 +235,7 @@ fn run(
     if contained_shutdown_requested(contained)? {
         return Ok(());
     }
-    let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
+    let raw_args = raw_args.unwrap_or_else(|| env::args_os().skip(1).collect::<Vec<_>>());
     #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
     let mut raw_args = raw_args;
     #[cfg(all(target_os = "macos", feature = "grant-integration-probe"))]
