@@ -9,6 +9,8 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use bangbang_session::macos::grant_transport::{GrantTransportError, send_grant};
+#[cfg(feature = "elevated-bootstrap-probe")]
+use bangbang_session::macos::runtime::ExplicitRuntimeRoot;
 use bangbang_session::macos::runtime::{
     LauncherNamespace, NamespaceIdentity, RuntimeError, SnapshotStagingOwnershipRecord,
     SocketOwnershipRecord,
@@ -165,12 +167,102 @@ pub(crate) fn read_bootstrap_hello(
 pub(crate) fn wait_session(
     worker: &mut OwnedWorker,
     session: &mut UnixStream,
+    auxiliary: AuxiliaryChannels<'_>,
+    lifecycle: LauncherLifecycle,
+    wakeups: SignalWakeups,
+    grants: &PreparedGrantBatch,
+    notifier: Option<&mut DaemonNotifier>,
+) -> Result<ExitStatus, LauncherError> {
+    wait_session_with_roots(
+        worker,
+        session,
+        auxiliary,
+        lifecycle,
+        wakeups,
+        grants,
+        SessionOptions {
+            notifier,
+            roots: NamespaceRoots::Ordinary,
+        },
+    )
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) struct ExplicitSessionStart {
+    root: ExplicitRuntimeRoot,
+    frame: Frame,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl ExplicitSessionStart {
+    pub(crate) const fn new(root: ExplicitRuntimeRoot, frame: Frame) -> Self {
+        Self { root, frame }
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn wait_session_with_explicit_root(
+    worker: &mut OwnedWorker,
+    session: &mut UnixStream,
+    auxiliary: AuxiliaryChannels<'_>,
+    lifecycle: LauncherLifecycle,
+    wakeups: SignalWakeups,
+    grants: &PreparedGrantBatch,
+    start: ExplicitSessionStart,
+) -> Result<ExitStatus, LauncherError> {
+    let ExplicitSessionStart { root, frame } = start;
+    // Establish both independent namespace authorities before the worker can
+    // observe Start and publish a session. No failure after this point can
+    // strand a namespace solely because its recovery handle was unavailable.
+    let validation = root
+        .try_reopen(false)
+        .map_err(|_| LauncherError::RuntimeNamespace)?;
+    let recovery = root
+        .try_reopen(false)
+        .map_err(|_| LauncherError::RuntimeNamespace)?;
+    let mut roots = NamespaceRoots::Explicit {
+        validation: Some(validation),
+        recovery: Some(recovery),
+    };
+    if let Err(error) = write_frame(session, frame) {
+        terminate_session(worker, session, &auxiliary);
+        roots
+            .recover_after_worker_exit(lifecycle.session())
+            .and_then(|recovered| {
+                recovered.map_or(Ok(()), |mut namespace| {
+                    cleanup_namespace_after_worker(&mut namespace, grants)
+                })
+            })
+            .map_err(|_| LauncherError::RuntimeNamespace)?;
+        return Err(error);
+    }
+    wait_session_with_roots(
+        worker,
+        session,
+        auxiliary,
+        lifecycle,
+        wakeups,
+        grants,
+        SessionOptions {
+            notifier: None,
+            roots,
+        },
+    )
+}
+
+fn wait_session_with_roots(
+    worker: &mut OwnedWorker,
+    session: &mut UnixStream,
     mut auxiliary: AuxiliaryChannels<'_>,
     mut lifecycle: LauncherLifecycle,
     mut wakeups: SignalWakeups,
     grants: &PreparedGrantBatch,
-    notifier: Option<&mut DaemonNotifier>,
+    options: SessionOptions<'_>,
 ) -> Result<ExitStatus, LauncherError> {
+    let SessionOptions {
+        notifier,
+        mut roots,
+    } = options;
     let session_id = lifecycle.session();
     let mut observation = SessionObservation::default();
     let result = wait_session_inner(
@@ -183,29 +275,23 @@ pub(crate) fn wait_session(
         SessionHooks {
             observation: &mut observation,
             notifier,
+            roots: &mut roots,
         },
     );
     if result.is_err() {
-        let _ = session.shutdown(std::net::Shutdown::Both);
-        shutdown_grants(auxiliary.grant_socket);
-        let _ = auxiliary.socket_broker.shutdown(std::net::Shutdown::Both);
-        let _ = auxiliary
-            .vhost_user_broker
-            .shutdown(std::net::Shutdown::Both);
-        let _ = auxiliary
-            .block_control_broker
-            .shutdown(std::net::Shutdown::Both);
-        worker.terminate_and_reap();
+        terminate_session(worker, session, &auxiliary);
     }
 
     let cleanup = if let Some(namespace) = observation.namespace.as_mut() {
         cleanup_namespace_after_worker(namespace, grants)
     } else {
-        LauncherNamespace::recover_after_worker_exit(session_id).and_then(|recovered| {
-            recovered.map_or(Ok(()), |mut namespace| {
-                cleanup_namespace_after_worker(&mut namespace, grants)
+        roots
+            .recover_after_worker_exit(session_id)
+            .and_then(|recovered| {
+                recovered.map_or(Ok(()), |mut namespace| {
+                    cleanup_namespace_after_worker(&mut namespace, grants)
+                })
             })
-        })
     }
     .map_err(|_| LauncherError::RuntimeNamespace);
 
@@ -218,6 +304,71 @@ pub(crate) fn wait_session(
         Err(error) => {
             let _ = cleanup;
             Err(error)
+        }
+    }
+}
+
+fn terminate_session(
+    worker: &mut OwnedWorker,
+    session: &UnixStream,
+    auxiliary: &AuxiliaryChannels<'_>,
+) {
+    let _ = session.shutdown(std::net::Shutdown::Both);
+    shutdown_grants(auxiliary.grant_socket);
+    let _ = auxiliary.socket_broker.shutdown(std::net::Shutdown::Both);
+    let _ = auxiliary
+        .vhost_user_broker
+        .shutdown(std::net::Shutdown::Both);
+    let _ = auxiliary
+        .block_control_broker
+        .shutdown(std::net::Shutdown::Both);
+    worker.terminate_and_reap();
+}
+
+struct SessionOptions<'a> {
+    notifier: Option<&'a mut DaemonNotifier>,
+    roots: NamespaceRoots,
+}
+
+enum NamespaceRoots {
+    Ordinary,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    Explicit {
+        validation: Option<ExplicitRuntimeRoot>,
+        recovery: Option<ExplicitRuntimeRoot>,
+    },
+}
+
+impl NamespaceRoots {
+    fn validate(
+        &mut self,
+        session: bangbang_session::SessionId,
+        expected: NamespaceIdentity,
+    ) -> Result<LauncherNamespace, RuntimeError> {
+        match self {
+            Self::Ordinary => LauncherNamespace::validate(session, expected),
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            Self::Explicit { validation, .. } => LauncherNamespace::validate_from_explicit_root(
+                validation.take().ok_or(RuntimeError::InvalidRoot)?,
+                session,
+                expected,
+            ),
+        }
+    }
+
+    fn recover_after_worker_exit(
+        &mut self,
+        session: bangbang_session::SessionId,
+    ) -> Result<Option<LauncherNamespace>, RuntimeError> {
+        match self {
+            Self::Ordinary => LauncherNamespace::recover_after_worker_exit(session),
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            Self::Explicit { recovery, .. } => {
+                LauncherNamespace::recover_after_worker_exit_from_explicit_root(
+                    recovery.take().ok_or(RuntimeError::InvalidRoot)?,
+                    session,
+                )
+            }
         }
     }
 }
@@ -380,6 +531,7 @@ impl<'a> AuxiliaryChannels<'a> {
 struct SessionHooks<'a> {
     observation: &'a mut SessionObservation,
     notifier: Option<&'a mut DaemonNotifier>,
+    roots: &'a mut NamespaceRoots,
 }
 
 fn wait_session_inner(
@@ -398,6 +550,7 @@ fn wait_session_inner(
     let SessionHooks {
         observation,
         mut notifier,
+        roots,
     } = hooks;
     session
         .set_nonblocking(true)
@@ -534,6 +687,7 @@ fn wait_session_inner(
                     lifecycle,
                     observation,
                     &mut grant_send,
+                    roots,
                 )?;
                 if session_closed {
                     exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
@@ -720,6 +874,7 @@ fn wait_session_inner(
                     lifecycle,
                     observation,
                     &mut grant_send,
+                    roots,
                 )?;
             }
             break;
@@ -806,6 +961,7 @@ fn drain_session(
     lifecycle: &mut LauncherLifecycle,
     observation: &mut SessionObservation,
     grant_send: &mut GrantSendState,
+    roots: &mut NamespaceRoots,
 ) -> Result<bool, LauncherError> {
     let mut buffer = [0_u8; 4096];
     loop {
@@ -840,11 +996,9 @@ fn drain_session(
                             if observation.namespace.is_some() {
                                 return Err(LauncherError::SessionProtocol);
                             }
-                            let validated = LauncherNamespace::validate(
-                                lifecycle.session(),
-                                NamespaceIdentity { device, inode },
-                            )
-                            .map_err(|_| LauncherError::RuntimeNamespace)?;
+                            let validated = roots
+                                .validate(lifecycle.session(), NamespaceIdentity { device, inode })
+                                .map_err(|_| LauncherError::RuntimeNamespace)?;
                             observation.namespace = Some(validated);
                             if !lifecycle.is_cancelled() {
                                 lifecycle

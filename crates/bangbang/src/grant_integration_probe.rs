@@ -1,11 +1,12 @@
 //! Test-bundle-only exercise of committed startup grant authority.
 
 use std::cell::Cell;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +33,7 @@ use bangbang_runtime::snapshot_restore::{
 };
 use bangbang_runtime::virtio_queue::VirtqueueAvailableRing;
 use bangbang_runtime::vsock::VsockBackendSelector;
-use bangbang_session::{GrantAccess, GrantId, GrantObjectKind, ResourceRole};
+use bangbang_session::{GrantAccess, GrantId, GrantObjectKind, ObjectIdentity, ResourceRole};
 
 use crate::contained_session::{
     ContainedSession, ContainedSessionError, ContainedSnapshotRestoreAuthority,
@@ -192,19 +193,27 @@ pub(crate) fn run(
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
         Ok(_) | Err(_) => return Err(ContainedSessionError),
     }
-    let child = directory
-        .path()
-        .join(format!("bangbang-grant-{}.out", probe.name));
-    let mut output = OpenOptions::new();
-    output
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW_ANY);
-    output
-        .open(child)
-        .and_then(|mut file| file.write_all(expected_write.as_bytes()))
-        .map_err(|_| ContainedSessionError)?;
+    if probe.verifies_target_runtime() {
+        create_validate_remove_child(
+            directory.anchor_fd(),
+            &format!("bangbang-grant-{}.out", probe.name),
+            expected_write.as_bytes(),
+        )?;
+    } else {
+        let child = directory
+            .path()
+            .join(format!("bangbang-grant-{}.out", probe.name));
+        let mut output = OpenOptions::new();
+        output
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW_ANY);
+        output
+            .open(child)
+            .and_then(|mut file| file.write_all(expected_write.as_bytes()))
+            .map_err(|_| ContainedSessionError)?;
+    }
 
     if probe.verifies_shared_memory() {
         verify_shared_guest_memory_in_containment()?;
@@ -224,6 +233,172 @@ pub(crate) fn run(
         }
     }
     Ok(())
+}
+
+fn create_validate_remove_child(
+    directory: RawFd,
+    name: &str,
+    expected: &[u8],
+) -> Result<(), ContainedSessionError> {
+    let mut child = ExactGrantChild::create(directory, name)?;
+    child
+        .file
+        .write_all(expected)
+        .and_then(|()| child.file.sync_all())
+        .map_err(|_| ContainedSessionError)?;
+    let expected_identity = child.identity()?;
+
+    // SAFETY: Same retained anchor and exact component; no path fallback.
+    let descriptor = unsafe {
+        libc::openat(
+            directory,
+            child.name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(ContainedSessionError);
+    }
+    // SAFETY: `descriptor` is a fresh successful result owned by this scope.
+    let mut input = File::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
+    let metadata = input.metadata().map_err(|_| ContainedSessionError)?;
+    // SAFETY: Identity getters have no pointer or ownership contract.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.nlink() != 1
+        || (ObjectIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }) != expected_identity
+    {
+        return Err(ContainedSessionError);
+    }
+    let mut actual = Vec::new();
+    input
+        .read_to_end(&mut actual)
+        .map_err(|_| ContainedSessionError)?;
+    if actual != expected {
+        return Err(ContainedSessionError);
+    }
+    drop(input);
+    child.remove()
+}
+
+struct ExactGrantChild {
+    directory: RawFd,
+    name: CString,
+    file: File,
+    armed: bool,
+}
+
+impl ExactGrantChild {
+    fn create(directory: RawFd, name: &str) -> Result<Self, ContainedSessionError> {
+        let name = CString::new(name).map_err(|_| ContainedSessionError)?;
+        // SAFETY: `directory` is the retained granted anchor, `name` is one
+        // bounded component, and success transfers the fresh descriptor.
+        let descriptor = unsafe {
+            libc::openat(
+                directory,
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(ContainedSessionError);
+        }
+        // SAFETY: `descriptor` is a fresh successful result owned by this scope.
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
+        Ok(Self {
+            directory,
+            name,
+            file,
+            armed: true,
+        })
+    }
+
+    fn identity(&self) -> Result<ObjectIdentity, ContainedSessionError> {
+        let metadata = self.file.metadata().map_err(|_| ContainedSessionError)?;
+        Ok(ObjectIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn remove(&mut self) -> Result<(), ContainedSessionError> {
+        self.remove_if_same()
+    }
+
+    fn remove_if_same(&mut self) -> Result<(), ContainedSessionError> {
+        if !self.armed {
+            return Ok(());
+        }
+        if !self.current_name_is_exact()? {
+            return Err(ContainedSessionError);
+        }
+        // SAFETY: The exact live child identity was revalidated beneath the retained anchor.
+        if unsafe { libc::unlinkat(self.directory, self.name.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(ContainedSessionError);
+            }
+        }
+        self.armed = false;
+        Ok(())
+    }
+
+    fn current_name_is_exact(&mut self) -> Result<bool, ContainedSessionError> {
+        let mut source = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: The guard owns the live source descriptor and stat is writable.
+        if unsafe { libc::fstat(self.file.as_raw_fd(), source.as_mut_ptr()) } != 0 {
+            return Err(ContainedSessionError);
+        }
+        // SAFETY: Successful fstat initialized the complete result.
+        let source = unsafe { source.assume_init() };
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: The retained anchor and bounded name remain live; stat is writable.
+        if unsafe {
+            libc::fstatat(
+                self.directory,
+                self.name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                self.armed = false;
+                return Ok(true);
+            }
+            return Err(ContainedSessionError);
+        }
+        // SAFETY: Successful fstatat initialized the complete result.
+        let stat = unsafe { stat.assume_init() };
+        if source.st_mode & libc::S_IFMT != libc::S_IFREG
+            || source.st_mode & 0o7777 != 0o600
+            || source.st_nlink != 1
+            || stat.st_dev != source.st_dev
+            || stat.st_ino != source.st_ino
+            || stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_mode & 0o7777 != 0o600
+            || stat.st_uid != source.st_uid
+            || stat.st_gid != source.st_gid
+            || stat.st_nlink != 1
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+impl Drop for ExactGrantChild {
+    fn drop(&mut self) {
+        let _ = self.remove_if_same();
+    }
 }
 
 fn verify_pager_in_containment(
@@ -1318,6 +1493,12 @@ impl ProbeCase {
                 expected_no_file: 2048,
                 expected_file_size: None,
             }),
+            Some("target-runtime") => Ok(Self {
+                name: "target-runtime",
+                hold: false,
+                expected_no_file: 2048,
+                expected_file_size: None,
+            }),
             _ => Err(ContainedSessionError),
         }
     }
@@ -1337,6 +1518,10 @@ impl ProbeCase {
     fn verifies_block_control(self) -> bool {
         self.name == "block-control"
     }
+
+    fn verifies_target_runtime(self) -> bool {
+        self.name == "target-runtime"
+    }
 }
 
 fn probe_args(args: &[OsString]) -> Option<&[OsString]> {
@@ -1351,4 +1536,142 @@ fn probe_args(args: &[OsString]) -> Option<&[OsString]> {
         && start_cpu == "--start-time-cpu-us"
         && parent_cpu == "--parent-cpu-time-us")
         .then_some(rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory {
+        path: std::path::PathBuf,
+        anchor: File,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            loop {
+                let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = std::path::PathBuf::from("/tmp").join(format!(
+                    "bangbang-exact-grant-child-{}-{suffix}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => {
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                            .expect("test directory mode should set");
+                        let anchor = File::open(&path).expect("test directory should open");
+                        return Self { path, anchor };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("test directory should create: {error}"),
+                }
+            }
+        }
+
+        fn child(&self) -> std::path::PathBuf {
+            self.path.join("owned-child")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            if self.child().exists() {
+                fs::remove_file(self.child()).expect("test child should clean");
+            }
+            fs::remove_dir(&self.path).expect("test directory should clean");
+        }
+    }
+
+    #[test]
+    fn exact_grant_child_removes_success_and_failure_paths() {
+        let directory = TestDirectory::new();
+        let mut child = ExactGrantChild::create(directory.anchor.as_raw_fd(), "owned-child")
+            .expect("exact child should create");
+        child
+            .file
+            .write_all(b"complete")
+            .expect("exact child should write");
+        let source = child.file.metadata().expect("source metadata should read");
+        let named = fs::symlink_metadata(directory.child()).expect("named metadata should read");
+        assert_eq!(
+            (source.dev(), source.ino(), source.uid(), source.gid()),
+            (named.dev(), named.ino(), named.uid(), named.gid())
+        );
+        assert_eq!(named.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(named.nlink(), 1);
+        let mut source_stat = MaybeUninit::<libc::stat>::uninit();
+        let mut named_stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: The source descriptor is live and the output is writable.
+        let source_status =
+            unsafe { libc::fstat(child.file.as_raw_fd(), source_stat.as_mut_ptr()) };
+        assert_eq!(source_status, 0);
+        // SAFETY: The anchor/name are live and the output is writable.
+        let named_status = unsafe {
+            libc::fstatat(
+                directory.anchor.as_raw_fd(),
+                child.name.as_ptr(),
+                named_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(named_status, 0);
+        // SAFETY: Both successful stat calls initialized their outputs.
+        let (source_stat, named_stat) =
+            unsafe { (source_stat.assume_init(), named_stat.assume_init()) };
+        assert_eq!(
+            (
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_mode & 0o7777,
+                source_stat.st_uid,
+                source_stat.st_gid,
+                source_stat.st_nlink,
+            ),
+            (
+                named_stat.st_dev,
+                named_stat.st_ino,
+                named_stat.st_mode & 0o7777,
+                named_stat.st_uid,
+                named_stat.st_gid,
+                named_stat.st_nlink,
+            )
+        );
+        assert!(
+            child
+                .current_name_is_exact()
+                .expect("exact name validation should run")
+        );
+        child.remove().expect("exact child should remove");
+        assert!(!directory.child().exists());
+
+        let mut child = ExactGrantChild::create(directory.anchor.as_raw_fd(), "owned-child")
+            .expect("failure-path child should create");
+        child
+            .file
+            .write_all(b"partial")
+            .expect("failure-path child should write");
+        drop(child);
+        assert!(!directory.child().exists());
+    }
+
+    #[test]
+    fn exact_grant_child_drop_refuses_a_replacement() {
+        let directory = TestDirectory::new();
+        let child = ExactGrantChild::create(directory.anchor.as_raw_fd(), "owned-child")
+            .expect("exact child should create");
+        fs::remove_file(directory.child()).expect("original child should unlink");
+        fs::write(directory.child(), b"replacement").expect("replacement should create");
+
+        drop(child);
+
+        assert_eq!(
+            fs::read(directory.child()).expect("replacement should remain"),
+            b"replacement"
+        );
+    }
 }

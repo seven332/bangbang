@@ -330,6 +330,8 @@ mod platform {
         GrantedFile, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    use bangbang_session::macos::runtime::RuntimeError;
     use bangbang_session::macos::runtime::{
         SnapshotStagingKind, SnapshotStagingName, SnapshotStagingOwnershipRecord, WorkerNamespace,
         WorkerSocketNamespace,
@@ -361,6 +363,39 @@ mod platform {
     const GRANT_DELAY_PROBE: &str = "--bangbang-internal-grant-delay-v1";
     #[cfg(feature = "grant-integration-probe")]
     const GRANT_DELAY_READY: &str = "status: grant integration delay ready";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ContainedBootstrapError {
+        Session,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        RuntimeNamespace(RuntimeError),
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    impl ContainedBootstrapError {
+        pub(crate) const fn is_runtime_namespace_permission_denied(self) -> bool {
+            matches!(
+                self,
+                Self::RuntimeNamespace(RuntimeError::NamespaceCreate(
+                    io::ErrorKind::PermissionDenied
+                ))
+            )
+        }
+    }
+
+    impl From<ContainedSessionError> for ContainedBootstrapError {
+        fn from(_: ContainedSessionError) -> Self {
+            Self::Session
+        }
+    }
+
+    impl fmt::Display for ContainedBootstrapError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("private launcher session failed")
+        }
+    }
+
+    impl std::error::Error for ContainedBootstrapError {}
 
     #[cfg(feature = "grant-integration-probe")]
     fn grant_delay_requested() -> bool {
@@ -3490,8 +3525,108 @@ mod platform {
         restore_generations: ContainedSnapshotRestoreGenerationAuthority,
         restore_wakeup: Option<Rc<UnixStream>>,
         policy: WorkerPolicy,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        runtime_fault: bangbang_session::elevated_probe::RuntimeFault,
         started: bool,
         closed: bool,
+    }
+
+    enum BootstrapSource {
+        Ordinary,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        Elevated {
+            root: Option<bangbang_session::macos::runtime::ExplicitRuntimeRoot>,
+            bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+            parent: libc::pid_t,
+        },
+    }
+
+    struct BootstrapChannels {
+        stream: UnixStream,
+        grant_socket: UnixDatagram,
+        socket_broker: UnixDatagram,
+        vhost_user_broker: UnixDatagram,
+        block_control_broker: UnixDatagram,
+    }
+
+    impl BootstrapSource {
+        fn verify_peer(
+            &self,
+            stream: &UnixStream,
+            _grant_socket: &UnixDatagram,
+            parent: libc::pid_t,
+        ) -> Result<(), ContainedSessionError> {
+            match self {
+                Self::Ordinary => verify_peer(stream.as_raw_fd(), parent)
+                    .map(|_| ())
+                    .map_err(|_| ContainedSessionError),
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                Self::Elevated {
+                    bootstrap,
+                    parent: expected_parent,
+                    ..
+                } => {
+                    // SAFETY: `getppid` has no pointer or ownership contract.
+                    let live_parent = unsafe { libc::getppid() };
+                    if parent != *expected_parent
+                        || live_parent != *expected_parent
+                        || verify_peer_pid(stream.as_raw_fd(), *expected_parent).is_err()
+                        || verify_peer_pid(_grant_socket.as_raw_fd(), *expected_parent).is_err()
+                        || bangbang_session::elevated_credential::attest_current_process(
+                            bootstrap.mode(),
+                            bootstrap.target_uid(),
+                            bootstrap.target_gid(),
+                        )
+                        .is_err()
+                    {
+                        return Err(ContainedSessionError);
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        fn create_namespace(
+            &mut self,
+            session: SessionId,
+        ) -> Result<WorkerNamespace, ContainedBootstrapError> {
+            match self {
+                Self::Ordinary => {
+                    WorkerNamespace::create(session).map_err(|_| ContainedBootstrapError::Session)
+                }
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                Self::Elevated {
+                    root, bootstrap, ..
+                } => {
+                    if bootstrap.fault()
+                        == bangbang_session::elevated_probe::RuntimeFault::Namespace
+                    {
+                        return Err(ContainedBootstrapError::Session);
+                    }
+                    WorkerNamespace::create_from_explicit_root(
+                        root.take().ok_or(ContainedBootstrapError::Session)?,
+                        session,
+                    )
+                    .map_err(ContainedBootstrapError::RuntimeNamespace)
+                }
+            }
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn has_fault(&self, expected: bangbang_session::elevated_probe::RuntimeFault) -> bool {
+            matches!(
+                self,
+                Self::Elevated { bootstrap, .. } if bootstrap.fault() == expected
+            )
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn fault(&self) -> bangbang_session::elevated_probe::RuntimeFault {
+            match self {
+                Self::Ordinary => bangbang_session::elevated_probe::RuntimeFault::None,
+                Self::Elevated { bootstrap, .. } => bootstrap.fault(),
+            }
+        }
     }
 
     impl std::fmt::Debug for ContainedSession {
@@ -3526,7 +3661,7 @@ mod platform {
             // SAFETY: The validated private bootstrap contract transfers the
             // fixed descriptor exactly once into this process object.
             let owned = unsafe { OwnedFd::from_raw_fd(SESSION_FD) };
-            let mut stream = UnixStream::from(owned);
+            let stream = UnixStream::from(owned);
             // SAFETY: The same validated bootstrap contract transfers fixed
             // grant descriptor 4 exactly once into this process object.
             let grant_owned = unsafe { OwnedFd::from_raw_fd(GRANT_FD) };
@@ -3554,6 +3689,86 @@ mod platform {
             verify_peer_pid(block_control_socket.as_raw_fd(), parent)
                 .map_err(|_| ContainedSessionError)?;
 
+            Self::bootstrap_session(
+                BootstrapChannels {
+                    stream,
+                    grant_socket,
+                    socket_broker: broker_socket,
+                    vhost_user_broker: vhost_broker_socket,
+                    block_control_broker: block_control_socket,
+                },
+                parent,
+                BootstrapSource::Ordinary,
+            )
+            .map_err(|_| ContainedSessionError)
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        pub(crate) fn bootstrap_with_continuation(
+            continuation: Option<crate::elevated_bootstrap_probe::RuntimeContinuation>,
+        ) -> Result<Option<Self>, ContainedBootstrapError> {
+            let Some(continuation) = continuation else {
+                return Self::bootstrap().map_err(ContainedBootstrapError::from);
+            };
+            if env::var_os(SESSION_ENV_KEY).is_some() || continuation.verify_witness().is_err() {
+                return Err(ContainedSessionError.into());
+            }
+            set_cloexec(SOCKET_BROKER_FD).map_err(|_| ContainedSessionError)?;
+            set_cloexec(VHOST_USER_BROKER_FD).map_err(|_| ContainedSessionError)?;
+            set_cloexec(BLOCK_CONTROL_BROKER_FD).map_err(|_| ContainedSessionError)?;
+            // SAFETY: The continuation owns fd 3 and fd 4. The original spawn
+            // still transfers each dormant broker descriptor exactly once.
+            let broker_socket =
+                UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(SOCKET_BROKER_FD) });
+            // SAFETY: Same fixed one-time bootstrap ownership for fd 6.
+            let vhost_broker_socket =
+                UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(VHOST_USER_BROKER_FD) });
+            // SAFETY: Same fixed one-time bootstrap ownership for fd 7.
+            let block_control_socket =
+                UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(BLOCK_CONTROL_BROKER_FD) });
+            for descriptor in [
+                broker_socket.as_raw_fd(),
+                vhost_broker_socket.as_raw_fd(),
+                block_control_socket.as_raw_fd(),
+            ] {
+                verify_peer_pid(descriptor, continuation.parent)
+                    .map_err(|_| ContainedSessionError)?;
+            }
+            let source = BootstrapSource::Elevated {
+                root: Some(continuation.root),
+                bootstrap: continuation.bootstrap,
+                parent: continuation.parent,
+            };
+            Self::bootstrap_session(
+                BootstrapChannels {
+                    stream: continuation.stream,
+                    grant_socket: continuation.grants,
+                    socket_broker: broker_socket,
+                    vhost_user_broker: vhost_broker_socket,
+                    block_control_broker: block_control_socket,
+                },
+                continuation.parent,
+                source,
+            )
+        }
+
+        fn bootstrap_session(
+            channels: BootstrapChannels,
+            parent: libc::pid_t,
+            mut source: BootstrapSource,
+        ) -> Result<Option<Self>, ContainedBootstrapError> {
+            let BootstrapChannels {
+                mut stream,
+                grant_socket,
+                socket_broker: broker_socket,
+                vhost_user_broker: vhost_broker_socket,
+                block_control_broker: block_control_socket,
+            } = channels;
+            stream
+                .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+                .map_err(|_| ContainedSessionError)?;
+            source.verify_peer(&stream, &grant_socket, parent)?;
+
             let mut decoder = FrameDecoder::default();
             let mut lifecycle = WorkerLifecycle::new();
             let hello = lifecycle.hello().map_err(|_| ContainedSessionError)?;
@@ -3564,11 +3779,11 @@ mod platform {
                 .map_err(|_| ContainedSessionError)?
             {
                 Message::Start(policy) => policy,
-                _ => return Err(ContainedSessionError),
+                _ => return Err(ContainedSessionError.into()),
             };
             install_worker_policy(policy, parent)?;
             let session = lifecycle.session().ok_or(ContainedSessionError)?;
-            let namespace = WorkerNamespace::create(session).map_err(|_| ContainedSessionError)?;
+            let namespace = source.create_namespace(session)?;
             namespace.enter().map_err(|_| ContainedSessionError)?;
             let identity = namespace.identity();
             let socket_namespace = Rc::new(
@@ -3580,6 +3795,11 @@ mod platform {
                 .prepared(identity.device, identity.inode)
                 .map_err(|_| ContainedSessionError)?;
             write_frame(&mut stream, prepared)?;
+
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if source.has_fault(bangbang_session::elevated_probe::RuntimeFault::GrantTransfer) {
+                return Err(ContainedSessionError.into());
+            }
 
             #[cfg(feature = "grant-integration-probe")]
             let receive_grants = if grant_delay_requested() {
@@ -3603,7 +3823,6 @@ mod platform {
                 handshake_deadline()?,
                 receive_grants,
             )?;
-            drop(grant_socket);
             let (mut grants, cancelled) = match grant_outcome {
                 GrantPhaseOutcome::Committed(committed) => {
                     let accepted = lifecycle
@@ -3625,16 +3844,21 @@ mod platform {
                 let next = lifecycle.receive(next).map_err(|_| ContainedSessionError)?;
                 match next {
                     Message::Proceed => {
-                        verify_peer(stream.as_raw_fd(), parent)
-                            .map_err(|_| ContainedSessionError)?;
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        if source.has_fault(bangbang_session::elevated_probe::RuntimeFault::Proceed)
+                        {
+                            return Err(ContainedSessionError.into());
+                        }
+                        source.verify_peer(&stream, &grant_socket, parent)?;
                         let starting = lifecycle.starting().map_err(|_| ContainedSessionError)?;
                         write_frame(&mut stream, starting)?;
                         true
                     }
                     Message::Cancel(_) => false,
-                    _ => return Err(ContainedSessionError),
+                    _ => return Err(ContainedSessionError.into()),
                 }
             };
+            drop(grant_socket);
             stream
                 .set_read_timeout(None)
                 .map_err(|_| ContainedSessionError)?;
@@ -3658,6 +3882,8 @@ mod platform {
             let vhost_user_broker =
                 VhostUserBrokerAuthority::new(vhost_broker_socket, session, parent);
             let restore_generations = ContainedSnapshotRestoreGenerationAuthority::new(session);
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let runtime_fault = source.fault();
             let lifecycle = Arc::new(Mutex::new(lifecycle));
             let namespace = Arc::new(Mutex::new(Some(namespace)));
             let (wakeup_reader, mut wakeup_writer) =
@@ -3704,6 +3930,8 @@ mod platform {
                 restore_generations,
                 restore_wakeup: None,
                 policy,
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                runtime_fault,
                 started,
                 closed: false,
             }))
@@ -3873,6 +4101,11 @@ mod platform {
         ) -> Result<(), ContainedSessionError> {
             if self.closed {
                 return Ok(());
+            }
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if self.runtime_fault == bangbang_session::elevated_probe::RuntimeFault::Terminal {
+                self.close();
+                return Err(ContainedSessionError);
             }
             let terminal_result = if self.started {
                 let frame = self
@@ -4316,6 +4549,30 @@ mod platform {
         };
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        #[test]
+        fn runtime_permission_boundary_is_exactly_namespace_creation() {
+            use bangbang_session::macos::runtime::RuntimeError;
+
+            assert!(
+                super::ContainedBootstrapError::RuntimeNamespace(RuntimeError::NamespaceCreate(
+                    io::ErrorKind::PermissionDenied
+                ))
+                .is_runtime_namespace_permission_denied()
+            );
+            for error in [
+                super::ContainedBootstrapError::Session,
+                super::ContainedBootstrapError::RuntimeNamespace(RuntimeError::Filesystem(
+                    io::ErrorKind::PermissionDenied,
+                )),
+                super::ContainedBootstrapError::RuntimeNamespace(RuntimeError::NamespaceCreate(
+                    io::ErrorKind::Other,
+                )),
+            ] {
+                assert!(!error.is_runtime_namespace_permission_denied());
+            }
+        }
 
         pub(crate) struct TestDirectory(PathBuf);
 

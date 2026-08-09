@@ -100,7 +100,16 @@ const ELEVATED_CREDENTIAL_LAUNCHER_ARTIFACT: &[u8] =
     b"bangbang-elevated-credential-launcher-v1-credential-drop-BBC1-BBG1-restore-groups";
 const ELEVATED_CREDENTIAL_WORKER_ARTIFACT: &[u8] =
     b"bangbang-elevated-credential-worker-v1-credential-drop-BBC1-BBG1-restore-groups";
+const ELEVATED_RUNTIME_DROP_MODE: &[u8] = b"runtime-drop";
+const ELEVATED_RUNTIME_RETAIN_MODE: &[u8] = b"runtime-retain-root";
+const ELEVATED_RUNTIME_UNMAPPED_MODE: &[u8] = b"runtime-unmapped";
+const ELEVATED_RUNTIME_STATUS: &[u8] = b"status: elevated runtime";
+const ELEVATED_CONTINUATION_RECORD: &[u8] = b"BBA1";
+const ELEVATED_RUNTIME_GRANT_CASE: &[u8] = b"target-runtime";
+const ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-launcher-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+const ELEVATED_RUNTIME_WORKER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-worker-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
 const ELEVATED_PROBE_MARKER: &str = "elevated-bootstrap-probe.enabled";
+const ELEVATED_RUNTIME_MARKER: &str = "target-runtime-grant-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
 const RESTORE_ROOT_ID: &str = "restore-root-1601";
 const RESTORE_VSOCK_ID: &str = "restore-vsock-1601";
@@ -13053,6 +13062,13 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             .exists(),
         "normal production bundle must not carry the elevated probe marker"
     );
+    assert!(
+        !worker_bundle(&bundle)
+            .join("Contents/Resources")
+            .join(ELEVATED_RUNTIME_MARKER)
+            .exists(),
+        "normal production bundle must not carry the target runtime marker"
+    );
     let launcher_bytes = fs::read(launcher(&bundle)).expect("normal launcher should read");
     let worker_bytes = fs::read(worker_executable(&bundle)).expect("normal worker should read");
     for artifact in [&launcher_bytes, &worker_bytes] {
@@ -13072,6 +13088,14 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_CREDENTIAL_STEP,
             ELEVATED_CREDENTIAL_LAUNCHER_ARTIFACT,
             ELEVATED_CREDENTIAL_WORKER_ARTIFACT,
+            ELEVATED_RUNTIME_DROP_MODE,
+            ELEVATED_RUNTIME_RETAIN_MODE,
+            ELEVATED_RUNTIME_UNMAPPED_MODE,
+            ELEVATED_RUNTIME_STATUS,
+            ELEVATED_CONTINUATION_RECORD,
+            ELEVATED_RUNTIME_GRANT_CASE,
+            ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
+            ELEVATED_RUNTIME_WORKER_BOUNDARIES,
         ] {
             assert!(
                 !artifact
@@ -13082,7 +13106,7 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
         }
     }
 
-    for mode in ["drop", "credential-drop"] {
+    for mode in ["drop", "credential-drop", "runtime-drop"] {
         let output = run_launcher(
             &bundle,
             &[
@@ -13111,6 +13135,11 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_CREDENTIAL_STEP,
             ELEVATED_CREDENTIAL_LAUNCHER_ARTIFACT,
             ELEVATED_CREDENTIAL_WORKER_ARTIFACT,
+            ELEVATED_RUNTIME_STATUS,
+            ELEVATED_CONTINUATION_RECORD,
+            ELEVATED_RUNTIME_GRANT_CASE,
+            ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
+            ELEVATED_RUNTIME_WORKER_BOUNDARIES,
         ] {
             assert!(
                 !diagnostics

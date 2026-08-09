@@ -134,28 +134,44 @@ where
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 fn launch_elevated_prepared(
     layout: &BundleLayout,
-    launch: crate::launch_policy::PreparedLaunch,
-    elevated_probe: crate::elevated_probe::Config,
+    mut launch: crate::launch_policy::PreparedLaunch,
+    mut elevated_probe: crate::elevated_probe::Config,
 ) -> Result<LauncherExit, LauncherError> {
     let bootstrap = elevated_probe.bootstrap()?;
     if elevated_probe.mode() == bangbang_session::elevated_probe::ProbeMode::InheritedRoot {
         return launch_inherited_prepared(launch, elevated_probe, bootstrap);
     }
+    let runtime = if bootstrap.mode().continues_runtime() {
+        launch.worker_policy = launch
+            .worker_policy
+            .with_identity(bootstrap.target_uid(), bootstrap.target_gid());
+        Some(ElevatedRuntimeLaunch {
+            root: elevated_probe.take_runtime_root()?,
+        })
+    } else {
+        None
+    };
+    let worker_args = std::mem::take(&mut launch.worker_args);
     let spawned = crate::macos::spawn::prepare_suspended_elevated(
         layout.worker_executable(),
-        launch.worker_args,
+        worker_args,
         elevated_probe.root_fd(),
     )?
     .spawn()?;
     // The completed spawn copied the fixed root descriptor into the worker.
     // Close the launcher-owned copy before any credential transition begins.
     drop(elevated_probe);
-    finish_elevated_exchange(spawned, launch.worker_profile, bootstrap, false)
+    finish_elevated_exchange(spawned, launch, bootstrap, false, runtime)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+struct ElevatedRuntimeLaunch {
+    root: bangbang_session::macos::runtime::ExplicitRuntimeRoot,
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 fn launch_inherited_prepared(
-    launch: crate::launch_policy::PreparedLaunch,
+    mut launch: crate::launch_policy::PreparedLaunch,
     elevated_probe: crate::elevated_probe::Config,
     bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
 ) -> Result<LauncherExit, LauncherError> {
@@ -200,9 +216,10 @@ fn launch_inherited_prepared(
             ));
         }
     };
+    let worker_args = std::mem::take(&mut launch.worker_args);
     let prepared = match crate::macos::spawn::prepare_suspended_elevated(
         worker,
-        launch.worker_args,
+        worker_args,
         elevated_probe.root_fd(),
     ) {
         Ok(prepared) => prepared,
@@ -225,15 +242,16 @@ fn launch_inherited_prepared(
             ));
         }
     };
-    finish_elevated_exchange(spawned, launch.worker_profile, bootstrap, true)
+    finish_elevated_exchange(spawned, launch, bootstrap, true, None)
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 fn finish_elevated_exchange(
     mut spawned: crate::macos::spawn::SuspendedWorker,
-    expected_profile: crate::macos::code_sign::WorkerProfile,
+    launch: crate::launch_policy::PreparedLaunch,
     bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
     inherited_root: bool,
+    runtime: Option<ElevatedRuntimeLaunch>,
 ) -> Result<LauncherExit, LauncherError> {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -244,6 +262,7 @@ fn finish_elevated_exchange(
     };
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+    let expected_profile = launch.worker_profile.clone();
 
     match crate::macos::code_sign::validate_worker_process(spawned.worker.pid()) {
         Ok(profile) if profile == expected_profile => {}
@@ -355,7 +374,7 @@ fn finish_elevated_exchange(
                 ));
             }
         };
-        return finish_credential_exchange(spawned, bootstrap, initial, baseline);
+        return finish_credential_exchange(spawned, launch, bootstrap, initial, baseline, runtime);
     }
     let mut encoded_result = [0_u8; RESULT_RECORD_BYTES];
     if spawned.session.read_exact(&mut encoded_result).is_err() {
@@ -587,9 +606,11 @@ fn send_credential_datagram(
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 fn finish_credential_exchange(
     mut spawned: crate::macos::spawn::SuspendedWorker,
+    launch: crate::launch_policy::PreparedLaunch,
     bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
     initial: bangbang_session::elevated_probe::PeerObservation,
     baseline: bangbang_session::elevated_credential::PeerBaseline,
+    runtime: Option<ElevatedRuntimeLaunch>,
 ) -> Result<LauncherExit, LauncherError> {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -761,14 +782,6 @@ fn finish_credential_exchange(
             ));
         }
     };
-    if credential_wait_for_exit(&mut spawned, 0).is_err() {
-        return Ok(credential_protocol_blocked_after_reap(
-            &mut spawned,
-            transition.prefix(),
-            transition.state(),
-        ));
-    }
-
     let worker_initial = worker_transitioned.observations();
     let worker_observations = worker_final.observations();
     if worker_initial[0] != worker_observations[0]
@@ -788,6 +801,23 @@ fn finish_credential_exchange(
             credential_protocol_failure(transition.prefix(), transition.state()),
         ));
     };
+    if bootstrap.mode().continues_runtime() {
+        let Some(runtime) = runtime else {
+            return Ok(credential_protocol_blocked_after_reap(
+                &mut spawned,
+                transition.prefix(),
+                transition.state(),
+            ));
+        };
+        return continue_runtime_session(spawned, launch, runtime, bootstrap, semantics);
+    }
+    if runtime.is_some() || credential_wait_for_exit(&mut spawned, 0).is_err() {
+        return Ok(credential_protocol_blocked_after_reap(
+            &mut spawned,
+            transition.prefix(),
+            transition.state(),
+        ));
+    }
     println!(
         "status: elevated credential {} complete stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={}",
         bootstrap.mode().name(),
@@ -829,6 +859,181 @@ fn finish_credential_exchange(
         let _ = spawned.session.write_all(&record.encode());
         let _ = credential_wait_for_exit(spawned, 1);
         Ok(credential_blocked_value(CredentialRole::Launcher, failure))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn continue_runtime_session(
+    mut spawned: crate::macos::spawn::SuspendedWorker,
+    launch: crate::launch_policy::PreparedLaunch,
+    runtime: ElevatedRuntimeLaunch,
+    bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+    semantics: CredentialSemantics,
+) -> Result<LauncherExit, LauncherError> {
+    const RUNTIME_LAUNCHER_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-v1-runtime-drop-runtime-retain-root-runtime-unmapped-status: elevated runtime-BBA1";
+    const RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    use bangbang_session::elevated_probe::{
+        ContinuationAck, ProbeErrorCategory, ProbeStage, RuntimeFault,
+    };
+    use bangbang_session::{LauncherLifecycle, SessionId};
+
+    std::hint::black_box(RUNTIME_LAUNCHER_ARTIFACT);
+    std::hint::black_box(RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT);
+    let blocked = |stage, category| {
+        Ok(elevated_runtime_blocked(
+            bootstrap, &semantics, stage, category,
+        ))
+    };
+    if bootstrap.fault() == RuntimeFault::PreAck {
+        let _ = credential_wait_for_exit(&mut spawned, 1);
+        return blocked(ProbeStage::ContinuationAck, ProbeErrorCategory::Other);
+    }
+    let ack = ContinuationAck::launcher(bootstrap.mode(), bootstrap.nonce())
+        .map_err(|_| LauncherError::SessionProtocol)?;
+    if spawned.session.write_all(&ack.encode()).is_err() {
+        return blocked(ProbeStage::ContinuationAck, ProbeErrorCategory::Other);
+    }
+    if spawned.session.set_read_timeout(None).is_err()
+        || spawned.session.set_write_timeout(None).is_err()
+        || spawned.grants.set_read_timeout(None).is_err()
+        || spawned.grants.set_write_timeout(None).is_err()
+    {
+        return blocked(ProbeStage::ContinuationAck, ProbeErrorCategory::Other);
+    }
+    if bootstrap.fault() == RuntimeFault::PostAck {
+        let _ = credential_wait_for_exit(&mut spawned, 1);
+        return blocked(ProbeStage::LifecycleHello, ProbeErrorCategory::Other);
+    }
+    if bangbang_session::elevated_credential::attest_current_process(
+        bootstrap.mode(),
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+    )
+    .is_err()
+        || bangbang_session::macos::verify_peer_pid(
+            spawned.session.as_raw_fd(),
+            spawned.worker.pid(),
+        )
+        .is_err()
+    {
+        return blocked(
+            ProbeStage::LiveIdentity,
+            ProbeErrorCategory::PermissionDenied,
+        );
+    }
+    if let Err(category) = validate_runtime_worker(spawned.worker.pid(), &launch.worker_profile) {
+        return blocked(ProbeStage::LiveIdentity, category);
+    }
+
+    let wakeups = match crate::macos::supervise::SignalWakeups::install() {
+        Ok(wakeups) => wakeups,
+        Err(_) => return blocked(ProbeStage::LifecycleHello, ProbeErrorCategory::Other),
+    };
+    let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
+    let mut lifecycle = LauncherLifecycle::new(session_id);
+    if crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle).is_err()
+    {
+        return blocked(ProbeStage::LifecycleHello, ProbeErrorCategory::Other);
+    }
+    if bangbang_session::macos::verify_peer_pid(spawned.session.as_raw_fd(), spawned.worker.pid())
+        .is_err()
+        || bangbang_session::elevated_credential::attest_current_process(
+            bootstrap.mode(),
+            bootstrap.target_uid(),
+            bootstrap.target_gid(),
+        )
+        .is_err()
+    {
+        return blocked(
+            ProbeStage::LiveIdentity,
+            ProbeErrorCategory::PermissionDenied,
+        );
+    }
+    if let Err(category) = validate_runtime_worker(spawned.worker.pid(), &launch.worker_profile) {
+        return blocked(ProbeStage::LiveIdentity, category);
+    }
+    let start = lifecycle
+        .start(launch.worker_policy)
+        .map_err(|_| LauncherError::SessionProtocol)?;
+    let status = match crate::macos::supervise::wait_session_with_explicit_root(
+        &mut spawned.worker,
+        &mut spawned.session,
+        crate::macos::supervise::AuxiliaryChannels::new(
+            &mut spawned.grants,
+            &mut spawned.socket_broker,
+            &mut spawned.vhost_user_broker,
+            &mut spawned.block_control_broker,
+        ),
+        lifecycle,
+        wakeups,
+        &launch.grants,
+        crate::macos::supervise::ExplicitSessionStart::new(runtime.root, start),
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            let stage = match bootstrap.fault() {
+                RuntimeFault::Namespace => ProbeStage::RuntimeNamespace,
+                RuntimeFault::GrantTransfer => ProbeStage::GrantTransfer,
+                RuntimeFault::Proceed => ProbeStage::LifecycleProceed,
+                RuntimeFault::Terminal => ProbeStage::LifecycleTerminal,
+                RuntimeFault::None | RuntimeFault::PreAck | RuntimeFault::PostAck => match error {
+                    LauncherError::RuntimeNamespace => ProbeStage::RuntimeNamespace,
+                    LauncherError::GrantProtocol | LauncherError::GrantPreparation => {
+                        ProbeStage::GrantAccepted
+                    }
+                    _ => ProbeStage::LifecycleTerminal,
+                },
+            };
+            return blocked(stage, probe_error_category(&error));
+        }
+    };
+    let exit = map_exit_status(status)?;
+    if exit.code() == bangbang_session::elevated_probe::RUNTIME_NAMESPACE_PERMISSION_EXIT_CODE {
+        return blocked(
+            ProbeStage::RuntimeNamespace,
+            ProbeErrorCategory::PermissionDenied,
+        );
+    }
+    if bootstrap.fault() != RuntimeFault::None || exit.code() != 0 {
+        let stage = match bootstrap.fault() {
+            RuntimeFault::Namespace => ProbeStage::RuntimeNamespace,
+            RuntimeFault::GrantTransfer => ProbeStage::GrantTransfer,
+            RuntimeFault::Proceed => ProbeStage::LifecycleProceed,
+            RuntimeFault::Terminal => ProbeStage::LifecycleTerminal,
+            RuntimeFault::None | RuntimeFault::PreAck | RuntimeFault::PostAck => {
+                ProbeStage::LifecycleTerminal
+            }
+        };
+        return blocked(stage, ProbeErrorCategory::Other);
+    }
+    println!(
+        "status: elevated runtime {} complete result={} stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={} namespace=target-owned grants=committed lifecycle=terminal cleanup=complete",
+        bootstrap.mode().name(),
+        bangbang_session::elevated_probe::RuntimeResultClass::Complete.name(),
+        semantics.stream_eid,
+        semantics.stream_cred,
+        semantics.datagram_cred,
+        semantics.datagram_token,
+        semantics.datagram_pid
+    );
+    Ok(exit)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn validate_runtime_worker(
+    pid: libc::pid_t,
+    expected: &crate::macos::code_sign::WorkerProfile,
+) -> Result<(), bangbang_session::elevated_probe::ProbeErrorCategory> {
+    use bangbang_session::elevated_probe::ProbeErrorCategory;
+
+    match crate::macos::code_sign::validate_worker_process(pid) {
+        Ok(profile) if &profile == expected => Ok(()),
+        Ok(_) => Err(ProbeErrorCategory::InvalidInput),
+        Err(_) => Err(ProbeErrorCategory::Other),
     }
 }
 
@@ -920,6 +1125,7 @@ fn credential_blocked_value(
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+#[derive(Clone, Copy)]
 struct CredentialSemantics {
     stream_eid: &'static str,
     stream_cred: &'static str,
@@ -1075,6 +1281,57 @@ fn elevated_blocked(
         "status: elevated bootstrap blocked stage={} error={}",
         stage.name(),
         category.name()
+    );
+    LauncherExit(3)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn elevated_runtime_blocked(
+    bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+    semantics: &CredentialSemantics,
+    stage: bangbang_session::elevated_probe::ProbeStage,
+    category: bangbang_session::elevated_probe::ProbeErrorCategory,
+) -> LauncherExit {
+    use bangbang_session::elevated_probe::{ProbeStage, RuntimeResultClass};
+
+    let result = match stage {
+        ProbeStage::ContinuationAck => RuntimeResultClass::ContinuationBoundary,
+        ProbeStage::RuntimeNamespace => RuntimeResultClass::NamespaceBoundary,
+        ProbeStage::GrantTransfer | ProbeStage::GrantAccepted => RuntimeResultClass::GrantBoundary,
+        ProbeStage::LifecycleHello
+        | ProbeStage::LifecycleProceed
+        | ProbeStage::LifecycleTerminal
+        | ProbeStage::RuntimeCleanup => RuntimeResultClass::LifecycleBoundary,
+        ProbeStage::InitialIdentity | ProbeStage::LiveIdentity => {
+            RuntimeResultClass::IdentityBoundary
+        }
+        ProbeStage::TakeRoot
+        | ProbeStage::ValidateRoot
+        | ProbeStage::EnterRoot
+        | ProbeStage::Chroot
+        | ProbeStage::ChangeDirectory
+        | ProbeStage::UnexpectedContinuation
+        | ProbeStage::ValidateStagedBundle
+        | ProbeStage::ValidateStagedLoader
+        | ProbeStage::SpawnWorker
+        | ProbeStage::SuspendedIdentity
+        | ProbeStage::InheritedRoot
+        | ProbeStage::SandboxChrootControl
+        | ProbeStage::HvfCreate
+        | ProbeStage::HvfDestroy
+        | ProbeStage::WorkerBootstrap => RuntimeResultClass::ExplicitRootBoundary,
+    };
+    println!(
+        "status: elevated runtime {} blocked stage={} error={} result={} stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={}",
+        bootstrap.mode().name(),
+        stage.name(),
+        category.name(),
+        result.name(),
+        semantics.stream_eid,
+        semantics.stream_cred,
+        semantics.datagram_cred,
+        semantics.datagram_token,
+        semantics.datagram_pid,
     );
     LauncherExit(3)
 }

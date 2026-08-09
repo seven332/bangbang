@@ -5,9 +5,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use bangbang_session::elevated_probe::{
-    LAUNCHER_ACTIVATION, ProbeBootstrap, ProbeErrorCategory, ProbeMode, ProbeStage,
+    LAUNCHER_ACTIVATION, ProbeBootstrap, ProbeErrorCategory, ProbeMode, ProbeStage, RuntimeFault,
     WORKER_ACTIVATION,
 };
+use bangbang_session::macos::runtime::ExplicitRuntimeRoot;
 use bangbang_session::{ObjectIdentity, SessionId};
 
 use crate::{BundleLayout, LauncherError};
@@ -16,6 +17,7 @@ const ROOT_OPTION: &str = "--root";
 const TARGET_UID_OPTION: &str = "--target-uid";
 const TARGET_GID_OPTION: &str = "--target-gid";
 const MODE_OPTION: &str = "--mode";
+const FAULT_OPTION: &str = "--fault";
 const DELIMITER: &str = "--";
 const MAX_ROOT_PATH_BYTES: usize = 1024;
 const ROOT_CHILD_PREFIX: &str = "bangbang-elevated-probe.";
@@ -35,10 +37,12 @@ pub(crate) struct Config {
     root: OwnedFd,
     root_path: PathBuf,
     root_identity: ObjectIdentity,
+    runtime_root: Option<ExplicitRuntimeRoot>,
     staged_loader_identity: Option<ObjectIdentity>,
     target_uid: u32,
     target_gid: u32,
     mode: ProbeMode,
+    fault: RuntimeFault,
 }
 
 impl std::fmt::Debug for Config {
@@ -57,12 +61,11 @@ impl Config {
         {
             return Ok((None, args));
         }
-        if args.len() != 10
+        if args.len() < 10
             || args.get(1) != Some(&OsString::from(ROOT_OPTION))
             || args.get(3) != Some(&OsString::from(TARGET_UID_OPTION))
             || args.get(5) != Some(&OsString::from(TARGET_GID_OPTION))
             || args.get(7) != Some(&OsString::from(MODE_OPTION))
-            || args.get(9) != Some(&OsString::from(DELIMITER))
         {
             return Err(LauncherError::InvalidLaunchPolicy);
         }
@@ -84,8 +87,51 @@ impl Config {
             .and_then(|value| value.to_str())
             .and_then(|value| ProbeMode::parse(value, target_uid, target_gid))
             .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        let (fault, delimiter) = if args.get(9) == Some(&OsString::from(DELIMITER)) {
+            (RuntimeFault::None, 9)
+        } else if mode.continues_runtime()
+            && args.get(9) == Some(&OsString::from(FAULT_OPTION))
+            && args.get(11) == Some(&OsString::from(DELIMITER))
+        {
+            let fault = args
+                .get(10)
+                .and_then(|value| value.to_str())
+                .and_then(RuntimeFault::parse)
+                .ok_or(LauncherError::InvalidLaunchPolicy)?;
+            (fault, 11)
+        } else {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        };
+        if !mode.continues_runtime() && fault != RuntimeFault::None {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        if !mode.continues_runtime() && delimiter + 1 != args.len() {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
         validate_initial_root()?;
-        let (root, root_identity) = open_private_root(&root_path)?;
+        let (root, root_identity) = open_private_root(
+            &root_path,
+            if mode.continues_runtime() {
+                (target_uid, target_gid)
+            } else {
+                (0, 0)
+            },
+        )?;
+        let runtime_root = if mode.continues_runtime() {
+            let independent = openat_directory(root.as_raw_fd(), c".")?;
+            Some(
+                ExplicitRuntimeRoot::from_owned_fd(
+                    independent,
+                    root_identity,
+                    target_uid,
+                    target_gid,
+                    true,
+                )
+                .map_err(|_| LauncherError::InvalidLaunchPolicy)?,
+            )
+        } else {
+            None
+        };
         let staged_loader_identity = if mode == ProbeMode::InheritedRoot {
             Some(validate_staged_loader(root.as_raw_fd(), None)?)
         } else {
@@ -96,12 +142,14 @@ impl Config {
                 root,
                 root_path,
                 root_identity,
+                runtime_root,
                 staged_loader_identity,
                 target_uid,
                 target_gid,
                 mode,
+                fault,
             }),
-            Vec::new(),
+            args.into_iter().skip(delimiter + 1).collect(),
         ))
     }
 
@@ -109,10 +157,10 @@ impl Config {
         &self,
         worker_args: &mut Vec<OsString>,
     ) -> Result<(), LauncherError> {
-        if !worker_args.is_empty() {
+        if !self.mode.continues_runtime() && !worker_args.is_empty() {
             return Err(LauncherError::InvalidLaunchPolicy);
         }
-        worker_args.push(OsString::from(WORKER_ACTIVATION));
+        worker_args.insert(0, OsString::from(WORKER_ACTIVATION));
         Ok(())
     }
 
@@ -122,6 +170,12 @@ impl Config {
 
     pub(crate) const fn mode(&self) -> ProbeMode {
         self.mode
+    }
+
+    pub(crate) fn take_runtime_root(&mut self) -> Result<ExplicitRuntimeRoot, LauncherError> {
+        self.runtime_root
+            .take()
+            .ok_or(LauncherError::InvalidLaunchPolicy)
     }
 
     pub(crate) fn staged_layout(&self) -> Result<BundleLayout, LauncherError> {
@@ -148,8 +202,9 @@ impl Config {
 
     pub(crate) fn bootstrap(&self) -> Result<ProbeBootstrap, LauncherError> {
         let nonce = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
-        ProbeBootstrap::new(
+        ProbeBootstrap::new_with_fault(
             self.mode,
+            self.fault,
             self.target_uid,
             self.target_gid,
             self.root_identity,
@@ -357,7 +412,10 @@ fn validate_initial_root() -> Result<(), LauncherError> {
     }
 }
 
-fn open_private_root(path: &Path) -> Result<(OwnedFd, ObjectIdentity), LauncherError> {
+fn open_private_root(
+    path: &Path,
+    expected_owner: (u32, u32),
+) -> Result<(OwnedFd, ObjectIdentity), LauncherError> {
     let child = private_root_child(path).ok_or(LauncherError::InvalidLaunchPolicy)?;
     let mut directory = open_directory(c"/")?;
     validate_ancestor(directory.as_raw_fd())?;
@@ -371,8 +429,8 @@ fn open_private_root(path: &Path) -> Result<(OwnedFd, ObjectIdentity), LauncherE
     let stat = descriptor_stat(root.as_raw_fd())?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
         || stat.st_mode & 0o7777 != 0o700
-        || stat.st_uid != 0
-        || stat.st_gid != 0
+        || stat.st_uid != expected_owner.0
+        || stat.st_gid != expected_owner.1
         || stat.st_nlink < 2
     {
         return Err(LauncherError::InvalidLaunchPolicy);
@@ -522,10 +580,12 @@ mod tests {
                 device: 123,
                 inode: 456,
             },
+            runtime_root: None,
             staged_loader_identity: None,
             target_uid: 1_234_567_891,
             target_gid: 1_234_567_893,
             mode: ProbeMode::Drop,
+            fault: RuntimeFault::None,
         };
         let output = format!("{config:?}");
         assert_eq!(output, "ElevatedProbeConfig(<redacted>)");
