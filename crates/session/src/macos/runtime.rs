@@ -319,6 +319,17 @@ pub struct NamespaceIdentity {
     pub inode: u64,
 }
 
+impl NamespaceIdentity {
+    /// Returns the equivalent protocol object identity.
+    #[must_use]
+    pub const fn object_identity(self) -> ObjectIdentity {
+        ObjectIdentity {
+            device: self.device,
+            inode: self.inode,
+        }
+    }
+}
+
 impl fmt::Debug for NamespaceIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("NamespaceIdentity(<redacted>)")
@@ -442,6 +453,405 @@ impl ExplicitRuntimeRoot {
     }
 }
 
+/// Unpublished launcher-created session with three independent descriptions.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub struct PreparedLauncherSession {
+    transfer: OwnedFd,
+    handles: LauncherSessionHandles,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl fmt::Debug for PreparedLauncherSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedLauncherSession(<redacted>)")
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl PreparedLauncherSession {
+    /// Creates one target-owned session and preopens every later authority.
+    pub fn create(root: ExplicitRuntimeRoot, session: SessionId) -> Result<Self, RuntimeError> {
+        let validation_root = root.try_reopen(true)?;
+        let recovery_root = root.try_reopen(true)?;
+        let ExplicitRuntimeRoot {
+            directory: root,
+            identity: root_identity,
+            owner,
+        } = root;
+        if validate_directory_owned(root.as_raw_fd(), owner)? != root_identity
+            || !directory_is_empty(root.as_raw_fd())?
+        {
+            return Err(RuntimeError::InvalidRoot);
+        }
+        let root_lock = RootLock::acquire(root.as_raw_fd())?;
+        recover_stale_entries(root.as_raw_fd(), owner)?;
+        let name = session_name(session)?;
+        // SAFETY: `root` is a live exact directory, `name` is NUL-terminated,
+        // and the permanently transitioned launcher owns the new child.
+        if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::AlreadyExists {
+                Err(RuntimeError::Collision)
+            } else {
+                Err(RuntimeError::NamespaceCreate(error.kind()))
+            };
+        }
+
+        let transfer = match openat_directory(root.as_raw_fd(), &name) {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                return Err(cleanup_created_session_after_error(
+                    root.as_raw_fd(),
+                    &name,
+                    owner,
+                    error,
+                ));
+            }
+        };
+        let identity = match validate_linked_directory_owned(transfer.as_raw_fd(), owner) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(cleanup_open_session_after_error(
+                    root.as_raw_fd(),
+                    transfer.as_raw_fd(),
+                    &name,
+                    owner,
+                    error,
+                ));
+            }
+        };
+        let session_is_exact = match directory_is_empty(transfer.as_raw_fd()).and_then(|empty| {
+            identity_at(root.as_raw_fd(), &name).map(|linked| empty && linked == Some(identity))
+        }) {
+            Ok(exact) => exact,
+            Err(error) => {
+                return Err(cleanup_open_session_after_error(
+                    root.as_raw_fd(),
+                    transfer.as_raw_fd(),
+                    &name,
+                    owner,
+                    error,
+                ));
+            }
+        };
+        if !session_is_exact {
+            return Err(cleanup_open_session_after_error(
+                root.as_raw_fd(),
+                transfer.as_raw_fd(),
+                &name,
+                owner,
+                RuntimeError::InvalidEntry,
+            ));
+        }
+
+        let validation =
+            openat_directory(validation_root.directory.as_raw_fd(), &name).and_then(|directory| {
+                PreopenedLauncherNamespace::new(
+                    validation_root.directory,
+                    directory,
+                    name.clone(),
+                    identity,
+                    owner,
+                )
+            });
+        let validation = match validation {
+            Ok(validation) => validation,
+            Err(error) => {
+                return Err(cleanup_open_session_after_error(
+                    root.as_raw_fd(),
+                    transfer.as_raw_fd(),
+                    &name,
+                    owner,
+                    error,
+                ));
+            }
+        };
+        let recovery =
+            openat_directory(recovery_root.directory.as_raw_fd(), &name).and_then(|directory| {
+                PreopenedLauncherNamespace::new(
+                    recovery_root.directory,
+                    directory,
+                    name.clone(),
+                    identity,
+                    owner,
+                )
+            });
+        let recovery = match recovery {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                return Err(cleanup_open_session_after_error(
+                    root.as_raw_fd(),
+                    transfer.as_raw_fd(),
+                    &name,
+                    owner,
+                    error,
+                ));
+            }
+        };
+        drop(root_lock);
+        drop(root);
+        Ok(Self {
+            transfer,
+            handles: LauncherSessionHandles {
+                validation: Some(validation),
+                recovery: Some(recovery),
+                session,
+                identity,
+            },
+        })
+    }
+
+    /// Returns the exact created session identity.
+    #[must_use]
+    pub const fn identity(&self) -> NamespaceIdentity {
+        self.handles.identity
+    }
+
+    /// Separates the single-use transfer descriptor from later launcher state.
+    #[must_use]
+    pub fn into_publication(self) -> (OwnedFd, LauncherSessionHandles) {
+        (self.transfer, self.handles)
+    }
+
+    /// Removes an exact session that was never published to the worker.
+    pub fn cleanup_unpublished(self) -> Result<(), RuntimeError> {
+        let Self {
+            transfer,
+            mut handles,
+        } = self;
+        drop(transfer);
+        handles.discard_validation();
+        let session = handles.session();
+        handles
+            .recover_after_worker_exit(session)?
+            .map_or(Ok(()), |mut namespace| namespace.cleanup())
+    }
+}
+
+/// Preopened independent validation and recovery state after publication.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub struct LauncherSessionHandles {
+    validation: Option<PreopenedLauncherNamespace>,
+    recovery: Option<PreopenedLauncherNamespace>,
+    session: SessionId,
+    identity: NamespaceIdentity,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl fmt::Debug for LauncherSessionHandles {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LauncherSessionHandles(<redacted>)")
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl LauncherSessionHandles {
+    /// Returns the exact created session identity.
+    #[must_use]
+    pub const fn identity(&self) -> NamespaceIdentity {
+        self.identity
+    }
+
+    /// Returns the lifecycle session bound to the canonical directory name.
+    #[must_use]
+    pub const fn session(&self) -> SessionId {
+        self.session
+    }
+
+    /// Consumes the independent live-validation description after Prepared.
+    pub fn validate_live(
+        &mut self,
+        session: SessionId,
+        expected: NamespaceIdentity,
+    ) -> Result<LauncherNamespace, RuntimeError> {
+        if session != self.session || expected != self.identity {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        self.validation
+            .take()
+            .ok_or(RuntimeError::InvalidEntry)?
+            .validate_live(expected)
+    }
+
+    /// Consumes the independent recovery description after the worker is reaped.
+    pub fn recover_after_worker_exit(
+        &mut self,
+        session: SessionId,
+    ) -> Result<Option<LauncherNamespace>, RuntimeError> {
+        if session != self.session {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        self.recovery
+            .take()
+            .ok_or(RuntimeError::InvalidEntry)?
+            .recover_after_worker_exit()
+    }
+
+    fn discard_validation(&mut self) {
+        drop(self.validation.take());
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+struct PreopenedLauncherNamespace {
+    root: OwnedFd,
+    directory: OwnedFd,
+    name: CString,
+    identity: NamespaceIdentity,
+    owner: DirectoryOwner,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl PreopenedLauncherNamespace {
+    fn new(
+        root: OwnedFd,
+        directory: OwnedFd,
+        name: CString,
+        identity: NamespaceIdentity,
+        owner: DirectoryOwner,
+    ) -> Result<Self, RuntimeError> {
+        validate_preopened_namespace(
+            root.as_raw_fd(),
+            directory.as_raw_fd(),
+            &name,
+            identity,
+            owner,
+            true,
+        )?;
+        Ok(Self {
+            root,
+            directory,
+            name,
+            identity,
+            owner,
+        })
+    }
+
+    fn validate_live(self, expected: NamespaceIdentity) -> Result<LauncherNamespace, RuntimeError> {
+        validate_preopened_namespace(
+            self.root.as_raw_fd(),
+            self.directory.as_raw_fd(),
+            &self.name,
+            expected,
+            self.owner,
+            true,
+        )?;
+        if expected != self.identity {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        if try_lock_exclusive(self.directory.as_raw_fd())? {
+            unlock(self.directory.as_raw_fd());
+            return Err(RuntimeError::InvalidEntry);
+        }
+        Ok(LauncherNamespace {
+            root: self.root,
+            directory: self.directory,
+            name: self.name,
+            identity: self.identity,
+            owner: self.owner,
+            cleaned: false,
+        })
+    }
+
+    fn recover_after_worker_exit(self) -> Result<Option<LauncherNamespace>, RuntimeError> {
+        validate_directory_owned(self.root.as_raw_fd(), self.owner)?;
+        if identity_at(self.root.as_raw_fd(), &self.name)?.is_none() {
+            return Ok(None);
+        }
+        validate_preopened_namespace(
+            self.root.as_raw_fd(),
+            self.directory.as_raw_fd(),
+            &self.name,
+            self.identity,
+            self.owner,
+            false,
+        )?;
+        if !try_lock_exclusive(self.directory.as_raw_fd())?
+            || !directory_contains_only_ownership_records(self.directory.as_raw_fd())?
+        {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        Ok(Some(LauncherNamespace {
+            root: self.root,
+            directory: self.directory,
+            name: self.name,
+            identity: self.identity,
+            owner: self.owner,
+            cleaned: false,
+        }))
+    }
+}
+
+/// Validated but not yet locked worker adoption state.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub struct ValidatedWorkerNamespace {
+    root: OwnedFd,
+    directory: OwnedFd,
+    name: CString,
+    identity: NamespaceIdentity,
+    owner: DirectoryOwner,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl fmt::Debug for ValidatedWorkerNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ValidatedWorkerNamespace(<redacted>)")
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl ValidatedWorkerNamespace {
+    /// Validates one launcher-created session without acquiring its live lock.
+    pub fn from_explicit_root(
+        root: ExplicitRuntimeRoot,
+        directory: OwnedFd,
+        session: SessionId,
+        expected: ObjectIdentity,
+    ) -> Result<Self, RuntimeError> {
+        let name = session_name(session)?;
+        let identity = NamespaceIdentity {
+            device: expected.device,
+            inode: expected.inode,
+        };
+        validate_preopened_namespace(
+            root.directory.as_raw_fd(),
+            directory.as_raw_fd(),
+            &name,
+            identity,
+            root.owner,
+            true,
+        )?;
+        Ok(Self {
+            root: root.directory,
+            directory,
+            name,
+            identity,
+            owner: root.owner,
+        })
+    }
+
+    /// Acquires the worker lock and repeats every identity/emptiness check.
+    pub fn lock(self) -> Result<WorkerNamespace, RuntimeError> {
+        lock_exclusive(self.directory.as_raw_fd())?;
+        validate_preopened_namespace(
+            self.root.as_raw_fd(),
+            self.directory.as_raw_fd(),
+            &self.name,
+            self.identity,
+            self.owner,
+            true,
+        )?;
+        Ok(WorkerNamespace {
+            root: self.root,
+            directory: self.directory,
+            name: self.name,
+            identity: self.identity,
+            owner: self.owner,
+            cleaned: false,
+        })
+    }
+}
+
 /// Worker-owned locked namespace inside its App Sandbox container.
 pub struct WorkerNamespace {
     root: OwnedFd,
@@ -477,6 +887,17 @@ impl WorkerNamespace {
         session: SessionId,
     ) -> Result<Self, RuntimeError> {
         Self::create_in_root(root.directory, root.owner, session)
+    }
+
+    /// Validates, locks, and adopts one launcher-created target session.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn adopt_from_explicit_root(
+        root: ExplicitRuntimeRoot,
+        directory: OwnedFd,
+        session: SessionId,
+        expected: ObjectIdentity,
+    ) -> Result<Self, RuntimeError> {
+        ValidatedWorkerNamespace::from_explicit_root(root, directory, session, expected)?.lock()
     }
 
     fn create_in_root(
@@ -1314,6 +1735,68 @@ fn validate_directory_owned(
     validate_directory_stat(directory_stat(fd)?, owner)
 }
 
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_linked_directory_owned(
+    fd: RawFd,
+    owner: DirectoryOwner,
+) -> Result<NamespaceIdentity, RuntimeError> {
+    let stat = directory_stat(fd)?;
+    if stat.st_nlink < 2 {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    validate_directory_stat(stat, owner)
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_preopened_namespace(
+    root: RawFd,
+    directory: RawFd,
+    name: &CStr,
+    expected: NamespaceIdentity,
+    owner: DirectoryOwner,
+    require_empty: bool,
+) -> Result<(), RuntimeError> {
+    validate_linked_directory_owned(root, owner)?;
+    if validate_linked_directory_owned(directory, owner)? != expected
+        || identity_at(root, name)? != Some(expected)
+        || (require_empty && !directory_is_empty(directory)?)
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn cleanup_created_session_after_error(
+    root: RawFd,
+    name: &CStr,
+    owner: DirectoryOwner,
+    error: RuntimeError,
+) -> RuntimeError {
+    match openat_directory(root, name) {
+        Ok(directory) => {
+            cleanup_open_session_after_error(root, directory.as_raw_fd(), name, owner, error)
+        }
+        Err(cleanup_error) => cleanup_error,
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn cleanup_open_session_after_error(
+    root: RawFd,
+    directory: RawFd,
+    name: &CStr,
+    owner: DirectoryOwner,
+    error: RuntimeError,
+) -> RuntimeError {
+    match validate_linked_directory_owned(directory, owner)
+        .and_then(|identity| cleanup_exact(root, directory, name, identity, owner))
+    {
+        Ok(()) => error,
+        Err(cleanup_error) => cleanup_error,
+    }
+}
+
 fn directory_stat(fd: RawFd) -> Result<libc::stat, RuntimeError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is writable for one result and `fd` remains owned by caller.
@@ -1609,6 +2092,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn explicit_test_root(root: &TestRoot) -> ExplicitRuntimeRoot {
+        let metadata = fs::symlink_metadata(root.path()).expect("root metadata should read");
+        ExplicitRuntimeRoot::from_owned_fd(
+            open_directory(root.path()).expect("root should open"),
+            ObjectIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            metadata.uid(),
+            metadata.gid(),
+            true,
+        )
+        .expect("explicit root should validate")
+    }
+
     impl Drop for TestRoot {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).expect("test root should be removed");
@@ -1725,6 +2224,222 @@ mod tests {
                     .as_raw_fd()
             )
             .expect("root should inspect")
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn launcher_created_session_is_adopted_locked_validated_and_cleaned() {
+        let root = TestRoot::new();
+        let worker_root = explicit_test_root(&root);
+        let session = SessionId::from_bytes([0x92; 32]);
+        let prepared = PreparedLauncherSession::create(explicit_test_root(&root), session)
+            .expect("launcher session should prepare");
+        let identity = prepared.identity();
+        assert_eq!(
+            format!("{prepared:?}"),
+            "PreparedLauncherSession(<redacted>)"
+        );
+        let (transfer, mut handles) = prepared.into_publication();
+        assert_eq!(handles.session(), session);
+        assert_eq!(handles.identity(), identity);
+        assert_eq!(format!("{handles:?}"), "LauncherSessionHandles(<redacted>)");
+
+        let validated = ValidatedWorkerNamespace::from_explicit_root(
+            worker_root,
+            transfer,
+            session,
+            identity.object_identity(),
+        )
+        .expect("transferred session should validate");
+        assert_eq!(
+            format!("{validated:?}"),
+            "ValidatedWorkerNamespace(<redacted>)"
+        );
+        let mut worker = validated.lock().expect("worker should acquire its lock");
+        let mut launcher = handles
+            .validate_live(session, identity)
+            .expect("independent launcher description should observe the lock");
+
+        // Model an abrupt worker exit: close its descriptions without running
+        // the worker-owned best-effort removal, then let the launcher clean.
+        worker.cleaned = true;
+        drop(worker);
+        launcher
+            .cleanup()
+            .expect("launcher should remove the exact unlocked session");
+        drop(handles);
+        assert!(
+            directory_is_empty(
+                open_directory(root.path())
+                    .expect("root should reopen")
+                    .as_raw_fd()
+            )
+            .expect("root should inspect")
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn unpublished_and_post_exit_recovery_use_only_preopened_handles() {
+        let root = TestRoot::new();
+        let unpublished_session = SessionId::from_bytes([0x93; 32]);
+        PreparedLauncherSession::create(explicit_test_root(&root), unpublished_session)
+            .expect("unpublished session should prepare")
+            .cleanup_unpublished()
+            .expect("unpublished session should clean");
+
+        let session = SessionId::from_bytes([0x94; 32]);
+        let worker_root = explicit_test_root(&root);
+        let prepared = PreparedLauncherSession::create(explicit_test_root(&root), session)
+            .expect("published session should prepare");
+        let identity = prepared.identity();
+        let (transfer, mut handles) = prepared.into_publication();
+        let mut worker = WorkerNamespace::adopt_from_explicit_root(
+            worker_root,
+            transfer,
+            session,
+            identity.object_identity(),
+        )
+        .expect("worker should adopt the exact session");
+        worker.cleaned = true;
+        drop(worker);
+        handles.discard_validation();
+        let mut recovered = handles
+            .recover_after_worker_exit(session)
+            .expect("recovery should validate")
+            .expect("session should remain after abrupt exit");
+        recovered
+            .cleanup()
+            .expect("recovery handle should remove exact session");
+        assert!(
+            directory_is_empty(
+                open_directory(root.path())
+                    .expect("root should reopen")
+                    .as_raw_fd()
+            )
+            .expect("root should inspect")
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn adopted_session_rejects_wrong_identity_content_and_replacement() {
+        let wrong_root = TestRoot::new();
+        let session = SessionId::from_bytes([0x95; 32]);
+        let wrong_worker_root = explicit_test_root(&wrong_root);
+        let prepared = PreparedLauncherSession::create(explicit_test_root(&wrong_root), session)
+            .expect("session should prepare");
+        let identity = prepared.identity();
+        let (transfer, _handles) = prepared.into_publication();
+        assert_eq!(
+            ValidatedWorkerNamespace::from_explicit_root(
+                wrong_worker_root,
+                transfer,
+                session,
+                ObjectIdentity {
+                    device: identity.device,
+                    inode: identity.inode.wrapping_add(1),
+                },
+            )
+            .expect_err("wrong identity must fail"),
+            RuntimeError::InvalidEntry
+        );
+
+        let wrong_session_root = TestRoot::new();
+        let correct_session = SessionId::from_bytes([0x98; 32]);
+        let wrong_session = SessionId::from_bytes([0x99; 32]);
+        let wrong_session_worker_root = explicit_test_root(&wrong_session_root);
+        let prepared = PreparedLauncherSession::create(
+            explicit_test_root(&wrong_session_root),
+            correct_session,
+        )
+        .expect("wrong-session fixture should prepare");
+        let identity = prepared.identity();
+        let (transfer, _handles) = prepared.into_publication();
+        assert_eq!(
+            ValidatedWorkerNamespace::from_explicit_root(
+                wrong_session_worker_root,
+                transfer,
+                wrong_session,
+                identity.object_identity(),
+            )
+            .expect_err("wrong session name must fail"),
+            RuntimeError::InvalidEntry
+        );
+
+        let source_root = TestRoot::new();
+        let foreign_root = TestRoot::new();
+        let cross_root_session = SessionId::from_bytes([0x9a; 32]);
+        let prepared =
+            PreparedLauncherSession::create(explicit_test_root(&source_root), cross_root_session)
+                .expect("cross-root fixture should prepare");
+        let identity = prepared.identity();
+        let (transfer, _handles) = prepared.into_publication();
+        assert_eq!(
+            ValidatedWorkerNamespace::from_explicit_root(
+                explicit_test_root(&foreign_root),
+                transfer,
+                cross_root_session,
+                identity.object_identity(),
+            )
+            .expect_err("cross-root descriptor must fail"),
+            RuntimeError::InvalidEntry
+        );
+
+        let populated_root = TestRoot::new();
+        let populated_session = SessionId::from_bytes([0x96; 32]);
+        let populated_worker_root = explicit_test_root(&populated_root);
+        let populated =
+            PreparedLauncherSession::create(explicit_test_root(&populated_root), populated_session)
+                .expect("populated session should prepare");
+        let populated_identity = populated.identity();
+        let populated_name = session_name(populated_session).expect("name should derive");
+        fs::write(
+            populated_root
+                .path()
+                .join(OsStr::from_bytes(populated_name.as_bytes()))
+                .join("unexpected"),
+            b"occupied",
+        )
+        .expect("unexpected entry should write");
+        let (populated_transfer, _populated_handles) = populated.into_publication();
+        assert_eq!(
+            ValidatedWorkerNamespace::from_explicit_root(
+                populated_worker_root,
+                populated_transfer,
+                populated_session,
+                populated_identity.object_identity(),
+            )
+            .expect_err("nonempty session must fail"),
+            RuntimeError::InvalidEntry
+        );
+
+        let replacement_root = TestRoot::new();
+        let replacement_session = SessionId::from_bytes([0x97; 32]);
+        let replacement = PreparedLauncherSession::create(
+            explicit_test_root(&replacement_root),
+            replacement_session,
+        )
+        .expect("replacement session should prepare");
+        let replacement_name = session_name(replacement_session).expect("name should derive");
+        let named_path = replacement_root
+            .path()
+            .join(OsStr::from_bytes(replacement_name.as_bytes()));
+        let moved_path = replacement_root.path().join("moved-launcher-session");
+        fs::rename(&named_path, &moved_path).expect("original session should move");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&named_path)
+            .expect("replacement should create");
+        assert_eq!(
+            replacement.cleanup_unpublished(),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert!(named_path.is_dir(), "replacement must be preserved");
+        assert!(
+            moved_path.is_dir(),
+            "original descriptor target must be preserved"
         );
     }
 

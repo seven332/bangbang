@@ -8,6 +8,8 @@ pub mod bookmark;
 pub mod grant_registry;
 pub mod grant_transport;
 pub mod runtime;
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub mod runtime_authority;
 pub mod socket_broker;
 pub mod vhost_user_broker;
 

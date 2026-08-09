@@ -22,6 +22,8 @@ pub const CREDENTIAL_RECORD_BYTES: usize = 80;
 pub const CREDENTIAL_DATAGRAM_BYTES: usize = 48;
 /// Encoded credential-to-lifecycle continuation acknowledgment length.
 pub const CONTINUATION_ACK_BYTES: usize = 48;
+/// Encoded launcher-created runtime-session authority length.
+pub const RUNTIME_SESSION_AUTHORITY_BYTES: usize = 120;
 /// Private worker exit used to report the measured target namespace denial.
 pub const RUNTIME_NAMESPACE_PERMISSION_EXIT_CODE: u8 = 3;
 
@@ -32,6 +34,9 @@ const CREDENTIAL_VERSION: u16 = 1;
 const CREDENTIAL_MAGIC: [u8; 4] = *b"BBC1";
 const CREDENTIAL_DATAGRAM_MAGIC: [u8; 4] = *b"BBG1";
 const CONTINUATION_ACK_MAGIC: [u8; 4] = *b"BBA1";
+const RUNTIME_SESSION_AUTHORITY_MAGIC: [u8; 4] = *b"BBN1";
+const RUNTIME_SESSION_AUTHORITY_VERSION: u16 = 1;
+const RUNTIME_WORKER_FAILURE_EXIT_BASE: u8 = 64;
 
 /// Exact evidence mode selected by the explicit root wrapper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +233,22 @@ pub enum ProbeStage {
     LifecycleTerminal = 24,
     /// Reap and clean every exact owned runtime object.
     RuntimeCleanup = 25,
+    /// Create the canonical session as the permanently transitioned launcher.
+    RuntimeSessionCreate = 26,
+    /// Open and validate independent session descriptions before publication.
+    RuntimeSessionOpen = 27,
+    /// Publish the canonical session authority and exact descriptor.
+    RuntimeAuthoritySend = 28,
+    /// Receive the exact session-authority datagram in the worker.
+    RuntimeAuthorityReceive = 29,
+    /// Validate the authority record, descriptor, and parent association.
+    RuntimeAuthorityValidate = 30,
+    /// Acquire and revalidate the worker-owned session lock.
+    RuntimeSessionLock = 31,
+    /// Enter and revalidate the adopted session after Start.
+    RuntimeSessionEnter = 32,
+    /// Publish and independently validate Prepared for the adopted session.
+    LifecyclePrepared = 33,
 }
 
 impl ProbeStage {
@@ -260,6 +281,14 @@ impl ProbeStage {
             Self::LifecycleProceed => "lifecycle-proceed",
             Self::LifecycleTerminal => "lifecycle-terminal",
             Self::RuntimeCleanup => "runtime-cleanup",
+            Self::RuntimeSessionCreate => "runtime-session-create",
+            Self::RuntimeSessionOpen => "runtime-session-open",
+            Self::RuntimeAuthoritySend => "runtime-authority-send",
+            Self::RuntimeAuthorityReceive => "runtime-authority-receive",
+            Self::RuntimeAuthorityValidate => "runtime-authority-validate",
+            Self::RuntimeSessionLock => "runtime-session-lock",
+            Self::RuntimeSessionEnter => "runtime-session-enter",
+            Self::LifecyclePrepared => "lifecycle-prepared",
         }
     }
 
@@ -290,6 +319,14 @@ impl ProbeStage {
             23 => Ok(Self::LifecycleProceed),
             24 => Ok(Self::LifecycleTerminal),
             25 => Ok(Self::RuntimeCleanup),
+            26 => Ok(Self::RuntimeSessionCreate),
+            27 => Ok(Self::RuntimeSessionOpen),
+            28 => Ok(Self::RuntimeAuthoritySend),
+            29 => Ok(Self::RuntimeAuthorityReceive),
+            30 => Ok(Self::RuntimeAuthorityValidate),
+            31 => Ok(Self::RuntimeSessionLock),
+            32 => Ok(Self::RuntimeSessionEnter),
+            33 => Ok(Self::LifecyclePrepared),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -314,6 +351,22 @@ pub enum RuntimeFault {
     Proceed = 5,
     /// Stop at terminal ownership validation.
     Terminal = 6,
+    /// Stop while the launcher creates the canonical target session.
+    SessionCreate = 7,
+    /// Stop while the launcher opens independent session descriptions.
+    SessionOpen = 8,
+    /// Stop before the launcher publishes session authority.
+    AuthoritySend = 9,
+    /// Stop before the worker receives session authority.
+    AuthorityReceive = 10,
+    /// Stop before the worker validates received session authority.
+    AuthorityValidate = 11,
+    /// Stop before the worker locks the adopted session.
+    SessionLock = 12,
+    /// Stop before the worker enters the adopted session.
+    SessionEnter = 13,
+    /// Stop before the worker publishes Prepared for the adopted session.
+    Prepared = 14,
 }
 
 impl RuntimeFault {
@@ -327,6 +380,14 @@ impl RuntimeFault {
             "grant-transfer" => Some(Self::GrantTransfer),
             "proceed" => Some(Self::Proceed),
             "terminal" => Some(Self::Terminal),
+            "session-create" => Some(Self::SessionCreate),
+            "session-open" => Some(Self::SessionOpen),
+            "authority-send" => Some(Self::AuthoritySend),
+            "authority-receive" => Some(Self::AuthorityReceive),
+            "authority-validate" => Some(Self::AuthorityValidate),
+            "session-lock" => Some(Self::SessionLock),
+            "session-enter" => Some(Self::SessionEnter),
+            "prepared" => Some(Self::Prepared),
             _ => None,
         }
     }
@@ -340,6 +401,14 @@ impl RuntimeFault {
             4 => Ok(Self::GrantTransfer),
             5 => Ok(Self::Proceed),
             6 => Ok(Self::Terminal),
+            7 => Ok(Self::SessionCreate),
+            8 => Ok(Self::SessionOpen),
+            9 => Ok(Self::AuthoritySend),
+            10 => Ok(Self::AuthorityReceive),
+            11 => Ok(Self::AuthorityValidate),
+            12 => Ok(Self::SessionLock),
+            13 => Ok(Self::SessionEnter),
+            14 => Ok(Self::Prepared),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -355,6 +424,14 @@ impl RuntimeFault {
             Self::GrantTransfer => "grant-transfer",
             Self::Proceed => "proceed",
             Self::Terminal => "terminal",
+            Self::SessionCreate => "session-create",
+            Self::SessionOpen => "session-open",
+            Self::AuthoritySend => "authority-send",
+            Self::AuthorityReceive => "authority-receive",
+            Self::AuthorityValidate => "authority-validate",
+            Self::SessionLock => "session-lock",
+            Self::SessionEnter => "session-enter",
+            Self::Prepared => "prepared",
         }
     }
 }
@@ -436,6 +513,77 @@ impl ProbeErrorCategory {
             3 => Ok(Self::Other),
             _ => Err(ProbeProtocolError),
         }
+    }
+}
+
+/// Closed private worker exit used before a lifecycle failure can be framed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeWorkerFailure {
+    stage: ProbeStage,
+    category: ProbeErrorCategory,
+}
+
+impl RuntimeWorkerFailure {
+    /// Constructs one worker-owned runtime failure.
+    pub fn new(
+        stage: ProbeStage,
+        category: ProbeErrorCategory,
+    ) -> Result<Self, ProbeProtocolError> {
+        if runtime_worker_stage_index(stage).is_none() {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self { stage, category })
+    }
+
+    /// Returns the exact value-free stage.
+    #[must_use]
+    pub const fn stage(self) -> ProbeStage {
+        self.stage
+    }
+
+    /// Returns the exact value-free category.
+    #[must_use]
+    pub const fn category(self) -> ProbeErrorCategory {
+        self.category
+    }
+
+    /// Encodes the failure into the reserved feature-only worker exit range.
+    #[must_use]
+    pub fn exit_code(self) -> u8 {
+        let stage = runtime_worker_stage_index(self.stage).unwrap_or(0);
+        RUNTIME_WORKER_FAILURE_EXIT_BASE + stage * 3 + self.category as u8 - 1
+    }
+
+    /// Decodes one exact feature-only worker exit.
+    pub fn from_exit_code(exit_code: u8) -> Result<Self, ProbeProtocolError> {
+        let offset = exit_code
+            .checked_sub(RUNTIME_WORKER_FAILURE_EXIT_BASE)
+            .ok_or(ProbeProtocolError)?;
+        let stage = runtime_worker_stage(offset / 3).ok_or(ProbeProtocolError)?;
+        let category = ProbeErrorCategory::from_byte(offset % 3 + 1)?;
+        Self::new(stage, category)
+    }
+}
+
+const fn runtime_worker_stage_index(stage: ProbeStage) -> Option<u8> {
+    match stage {
+        ProbeStage::RuntimeAuthorityReceive => Some(0),
+        ProbeStage::RuntimeAuthorityValidate => Some(1),
+        ProbeStage::RuntimeSessionLock => Some(2),
+        ProbeStage::RuntimeSessionEnter => Some(3),
+        ProbeStage::LifecyclePrepared => Some(4),
+        _ => None,
+    }
+}
+
+const fn runtime_worker_stage(index: u8) -> Option<ProbeStage> {
+    match index {
+        0 => Some(ProbeStage::RuntimeAuthorityReceive),
+        1 => Some(ProbeStage::RuntimeAuthorityValidate),
+        2 => Some(ProbeStage::RuntimeSessionLock),
+        3 => Some(ProbeStage::RuntimeSessionEnter),
+        4 => Some(ProbeStage::LifecyclePrepared),
+        _ => None,
     }
 }
 
@@ -707,6 +855,180 @@ impl ContinuationAck {
 impl fmt::Debug for ContinuationAck {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ContinuationAck(<redacted>)")
+    }
+}
+
+/// Canonical one-descriptor authority for a launcher-created runtime session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSessionAuthority {
+    mode: ProbeMode,
+    role: CredentialRole,
+    target_uid: u32,
+    target_gid: u32,
+    root: ObjectIdentity,
+    session_identity: ObjectIdentity,
+    nonce: SessionId,
+    session: SessionId,
+}
+
+impl RuntimeSessionAuthority {
+    /// Constructs the launcher's exact authority for one adopted session.
+    pub fn launcher(
+        mode: ProbeMode,
+        target_uid: u32,
+        target_gid: u32,
+        root: ObjectIdentity,
+        session_identity: ObjectIdentity,
+        nonce: SessionId,
+        session: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        if !mode.continues_runtime()
+            || !mode.accepts_target(target_uid, target_gid)
+            || root.device == 0
+            || root.inode == 0
+            || session_identity.device == 0
+            || session_identity.inode == 0
+            || nonce.is_pre_session()
+            || session.is_pre_session()
+        {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            mode,
+            role: CredentialRole::Launcher,
+            target_uid,
+            target_gid,
+            root,
+            session_identity,
+            nonce,
+            session,
+        })
+    }
+
+    /// Returns the selected runtime mode.
+    #[must_use]
+    pub const fn mode(self) -> ProbeMode {
+        self.mode
+    }
+
+    /// Returns the fixed sending role.
+    #[must_use]
+    pub const fn role(self) -> CredentialRole {
+        self.role
+    }
+
+    /// Returns the exact target uid.
+    #[must_use]
+    pub const fn target_uid(self) -> u32 {
+        self.target_uid
+    }
+
+    /// Returns the exact target gid.
+    #[must_use]
+    pub const fn target_gid(self) -> u32 {
+        self.target_gid
+    }
+
+    /// Returns the exact inherited runtime-root identity.
+    #[must_use]
+    pub const fn root(self) -> ObjectIdentity {
+        self.root
+    }
+
+    /// Returns the exact launcher-created session identity.
+    #[must_use]
+    pub const fn session_identity(self) -> ObjectIdentity {
+        self.session_identity
+    }
+
+    /// Returns the credential/bootstrap nonce.
+    #[must_use]
+    pub const fn nonce(self) -> SessionId {
+        self.nonce
+    }
+
+    /// Returns the lifecycle session bound to the authority.
+    #[must_use]
+    pub const fn session(self) -> SessionId {
+        self.session
+    }
+
+    /// Returns whether every bootstrap, session, and object field is exact.
+    #[must_use]
+    pub fn matches_expected(
+        self,
+        bootstrap: ProbeBootstrap,
+        session: SessionId,
+        session_identity: ObjectIdentity,
+    ) -> bool {
+        self.mode == bootstrap.mode()
+            && self.role == CredentialRole::Launcher
+            && self.target_uid == bootstrap.target_uid()
+            && self.target_gid == bootstrap.target_gid()
+            && self.root == bootstrap.root()
+            && self.session_identity == session_identity
+            && self.nonce == bootstrap.nonce()
+            && self.session == session
+    }
+
+    /// Encodes the fixed canonical authority record.
+    #[must_use]
+    pub fn encode(self) -> [u8; RUNTIME_SESSION_AUTHORITY_BYTES] {
+        let mut bytes = [0_u8; RUNTIME_SESSION_AUTHORITY_BYTES];
+        bytes[0..4].copy_from_slice(&RUNTIME_SESSION_AUTHORITY_MAGIC);
+        bytes[4..6].copy_from_slice(&RUNTIME_SESSION_AUTHORITY_VERSION.to_be_bytes());
+        bytes[6] = self.mode as u8;
+        bytes[7] = self.role as u8;
+        bytes[8] = 1;
+        bytes[16..20].copy_from_slice(&self.target_uid.to_be_bytes());
+        bytes[20..24].copy_from_slice(&self.target_gid.to_be_bytes());
+        bytes[24..32].copy_from_slice(&self.root.device.to_be_bytes());
+        bytes[32..40].copy_from_slice(&self.root.inode.to_be_bytes());
+        bytes[40..48].copy_from_slice(&self.session_identity.device.to_be_bytes());
+        bytes[48..56].copy_from_slice(&self.session_identity.inode.to_be_bytes());
+        bytes[56..88].copy_from_slice(self.nonce.as_bytes());
+        bytes[88..120].copy_from_slice(self.session.as_bytes());
+        bytes
+    }
+
+    /// Decodes and validates one exact authority record.
+    pub fn decode(
+        bytes: &[u8; RUNTIME_SESSION_AUTHORITY_BYTES],
+    ) -> Result<Self, ProbeProtocolError> {
+        if bytes[0..4] != RUNTIME_SESSION_AUTHORITY_MAGIC
+            || bytes[4..6] != RUNTIME_SESSION_AUTHORITY_VERSION.to_be_bytes()
+            || bytes[8] != 1
+            || bytes[9..16] != [0; 7]
+        {
+            return Err(ProbeProtocolError);
+        }
+        let authority = Self::launcher(
+            ProbeMode::from_byte(bytes[6])?,
+            u32::from_be_bytes(array(bytes, 16)?),
+            u32::from_be_bytes(array(bytes, 20)?),
+            ObjectIdentity {
+                device: u64::from_be_bytes(array(bytes, 24)?),
+                inode: u64::from_be_bytes(array(bytes, 32)?),
+            },
+            ObjectIdentity {
+                device: u64::from_be_bytes(array(bytes, 40)?),
+                inode: u64::from_be_bytes(array(bytes, 48)?),
+            },
+            SessionId::from_bytes(array(bytes, 56)?),
+            SessionId::from_bytes(array(bytes, 88)?),
+        )?;
+        if CredentialRole::from_byte(bytes[7])? != CredentialRole::Launcher
+            || authority.encode() != *bytes
+        {
+            return Err(ProbeProtocolError);
+        }
+        Ok(authority)
+    }
+}
+
+impl fmt::Debug for RuntimeSessionAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RuntimeSessionAuthority(<redacted>)")
     }
 }
 
@@ -2056,6 +2378,14 @@ mod tests {
             ProbeStage::LifecycleProceed,
             ProbeStage::LifecycleTerminal,
             ProbeStage::RuntimeCleanup,
+            ProbeStage::RuntimeSessionCreate,
+            ProbeStage::RuntimeSessionOpen,
+            ProbeStage::RuntimeAuthoritySend,
+            ProbeStage::RuntimeAuthorityReceive,
+            ProbeStage::RuntimeAuthorityValidate,
+            ProbeStage::RuntimeSessionLock,
+            ProbeStage::RuntimeSessionEnter,
+            ProbeStage::LifecyclePrepared,
         ] {
             let result = ProbeResult::failure(
                 ProbeMode::InheritedRoot,
@@ -2119,13 +2449,21 @@ mod tests {
             (RuntimeFault::GrantTransfer, 4, "grant-transfer"),
             (RuntimeFault::Proceed, 5, "proceed"),
             (RuntimeFault::Terminal, 6, "terminal"),
+            (RuntimeFault::SessionCreate, 7, "session-create"),
+            (RuntimeFault::SessionOpen, 8, "session-open"),
+            (RuntimeFault::AuthoritySend, 9, "authority-send"),
+            (RuntimeFault::AuthorityReceive, 10, "authority-receive"),
+            (RuntimeFault::AuthorityValidate, 11, "authority-validate"),
+            (RuntimeFault::SessionLock, 12, "session-lock"),
+            (RuntimeFault::SessionEnter, 13, "session-enter"),
+            (RuntimeFault::Prepared, 14, "prepared"),
         ] {
             assert_eq!(RuntimeFault::parse(name), Some(fault));
             assert_eq!(RuntimeFault::from_byte(byte), Ok(fault));
             assert_eq!(fault.name(), name);
         }
         assert_eq!(RuntimeFault::parse("unknown"), None);
-        assert_eq!(RuntimeFault::from_byte(7), Err(ProbeProtocolError));
+        assert_eq!(RuntimeFault::from_byte(15), Err(ProbeProtocolError));
 
         for (result, name) in [
             (RuntimeResultClass::Complete, "complete"),
@@ -2144,6 +2482,230 @@ mod tests {
         ] {
             assert_eq!(result.name(), name);
         }
+    }
+
+    #[test]
+    fn runtime_session_authority_is_canonical_bound_and_redacted() {
+        let bootstrap = ProbeBootstrap::new(
+            ProbeMode::RuntimeDrop,
+            501,
+            20,
+            ObjectIdentity {
+                device: 101,
+                inode: 103,
+            },
+            SessionId::from_bytes([0x81; 32]),
+        )
+        .expect("runtime bootstrap should construct");
+        let session = SessionId::from_bytes([0x82; 32]);
+        let identity = ObjectIdentity {
+            device: 107,
+            inode: 109,
+        };
+        let authority = RuntimeSessionAuthority::launcher(
+            bootstrap.mode(),
+            bootstrap.target_uid(),
+            bootstrap.target_gid(),
+            bootstrap.root(),
+            identity,
+            bootstrap.nonce(),
+            session,
+        )
+        .expect("authority should construct");
+        let encoded = authority.encode();
+        assert_eq!(encoded.len(), RUNTIME_SESSION_AUTHORITY_BYTES);
+        assert_eq!(RuntimeSessionAuthority::decode(&encoded), Ok(authority));
+        assert!(authority.matches_expected(bootstrap, session, identity));
+        assert_eq!(authority.mode(), bootstrap.mode());
+        assert_eq!(authority.role(), CredentialRole::Launcher);
+        assert_eq!(authority.target_uid(), bootstrap.target_uid());
+        assert_eq!(authority.target_gid(), bootstrap.target_gid());
+        assert_eq!(authority.root(), bootstrap.root());
+        assert_eq!(authority.session_identity(), identity);
+        assert_eq!(authority.nonce(), bootstrap.nonce());
+        assert_eq!(authority.session(), session);
+        assert_eq!(
+            format!("{authority:?}"),
+            "RuntimeSessionAuthority(<redacted>)"
+        );
+
+        for index in [0, 4, 6, 7, 8, 9] {
+            let mut malformed = encoded;
+            malformed[index] ^= 0xff;
+            assert_eq!(
+                RuntimeSessionAuthority::decode(&malformed),
+                Err(ProbeProtocolError),
+                "byte {index} must be canonical"
+            );
+        }
+        for index in 9..16 {
+            let mut malformed = encoded;
+            malformed[index] = 1;
+            assert_eq!(
+                RuntimeSessionAuthority::decode(&malformed),
+                Err(ProbeProtocolError)
+            );
+        }
+        for range in [
+            16..20,
+            20..24,
+            24..32,
+            32..40,
+            40..48,
+            48..56,
+            56..88,
+            88..120,
+        ] {
+            let mut malformed = encoded;
+            malformed[range].fill(0);
+            assert_eq!(
+                RuntimeSessionAuthority::decode(&malformed),
+                Err(ProbeProtocolError)
+            );
+        }
+        for index in 0..encoded.len() {
+            let mut hostile = encoded;
+            hostile[index] ^= 1;
+            if let Ok(decoded) = RuntimeSessionAuthority::decode(&hostile) {
+                assert!(
+                    !decoded.matches_expected(bootstrap, session, identity),
+                    "mutated byte {index} must not retain the original authority"
+                );
+            }
+        }
+
+        let other_session = SessionId::from_bytes([0x83; 32]);
+        let other_identity = ObjectIdentity {
+            device: 107,
+            inode: 113,
+        };
+        assert!(!authority.matches_expected(bootstrap, other_session, identity));
+        assert!(!authority.matches_expected(bootstrap, session, other_identity));
+        let other_bootstrap = ProbeBootstrap::new(
+            ProbeMode::RuntimeDrop,
+            502,
+            20,
+            bootstrap.root(),
+            bootstrap.nonce(),
+        )
+        .expect("other bootstrap should construct");
+        assert!(!authority.matches_expected(other_bootstrap, session, identity));
+        let other_root = ProbeBootstrap::new(
+            ProbeMode::RuntimeDrop,
+            501,
+            20,
+            ObjectIdentity {
+                device: 101,
+                inode: 127,
+            },
+            bootstrap.nonce(),
+        )
+        .expect("other-root bootstrap should construct");
+        assert!(!authority.matches_expected(other_root, session, identity));
+        let other_nonce = ProbeBootstrap::new(
+            ProbeMode::RuntimeDrop,
+            501,
+            20,
+            bootstrap.root(),
+            SessionId::from_bytes([0x84; 32]),
+        )
+        .expect("other-nonce bootstrap should construct");
+        assert!(!authority.matches_expected(other_nonce, session, identity));
+        let other_mode = ProbeBootstrap::new(
+            ProbeMode::RuntimeUnmapped,
+            2_147_483_647,
+            2_147_483_647,
+            bootstrap.root(),
+            bootstrap.nonce(),
+        )
+        .expect("other-mode bootstrap should construct");
+        assert!(!authority.matches_expected(other_mode, session, identity));
+        assert!(
+            RuntimeSessionAuthority::launcher(
+                ProbeMode::CredentialDrop,
+                501,
+                20,
+                bootstrap.root(),
+                identity,
+                bootstrap.nonce(),
+                session,
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeSessionAuthority::launcher(
+                ProbeMode::RuntimeDrop,
+                501,
+                20,
+                ObjectIdentity {
+                    device: 0,
+                    inode: 1,
+                },
+                identity,
+                bootstrap.nonce(),
+                session,
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeSessionAuthority::launcher(
+                ProbeMode::RuntimeDrop,
+                501,
+                20,
+                bootstrap.root(),
+                identity,
+                bootstrap.nonce(),
+                SessionId::pre_session(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_worker_failure_exit_range_is_closed_and_exact() {
+        let stages = [
+            ProbeStage::RuntimeAuthorityReceive,
+            ProbeStage::RuntimeAuthorityValidate,
+            ProbeStage::RuntimeSessionLock,
+            ProbeStage::RuntimeSessionEnter,
+            ProbeStage::LifecyclePrepared,
+        ];
+        let categories = [
+            ProbeErrorCategory::PermissionDenied,
+            ProbeErrorCategory::InvalidInput,
+            ProbeErrorCategory::Other,
+        ];
+        for (stage_index, stage) in stages.into_iter().enumerate() {
+            for category in categories {
+                let failure = RuntimeWorkerFailure::new(stage, category)
+                    .expect("worker failure should construct");
+                assert_eq!(
+                    failure.exit_code(),
+                    RUNTIME_WORKER_FAILURE_EXIT_BASE
+                        + u8::try_from(stage_index).expect("small stage index") * 3
+                        + category as u8
+                        - 1
+                );
+                assert_eq!(
+                    RuntimeWorkerFailure::from_exit_code(failure.exit_code()),
+                    Ok(failure)
+                );
+                assert_eq!(failure.stage(), stage);
+                assert_eq!(failure.category(), category);
+            }
+        }
+        assert!(
+            RuntimeWorkerFailure::new(ProbeStage::RuntimeSessionCreate, ProbeErrorCategory::Other)
+                .is_err()
+        );
+        assert_eq!(
+            RuntimeWorkerFailure::from_exit_code(RUNTIME_WORKER_FAILURE_EXIT_BASE - 1),
+            Err(ProbeProtocolError)
+        );
+        assert_eq!(
+            RuntimeWorkerFailure::from_exit_code(RUNTIME_WORKER_FAILURE_EXIT_BASE + 15),
+            Err(ProbeProtocolError)
+        );
     }
 
     #[test]

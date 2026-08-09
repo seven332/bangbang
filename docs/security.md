@@ -60,10 +60,11 @@ singleton write-only sink grants; vhost-user endpoints require repeatable
 connect-only directory grants and launcher-returned streams. Public product
 uid/gid transition, configurable chroot ownership, and complete
 distribution-signing policy remain absent. A disabled evidence bundle has
-measured credential bootstrap plus same-process continuation into ordinary
-`Hello`/`Start`; the current App Sandbox profile denies creation of the random
-session beneath an exact target-owned root, and the representative grants and
-later lifecycle remain unreached. The
+measured credential bootstrap plus same-process continuation through a
+launcher-created target-owned session. The worker consumes one exact
+session-bound descriptor authority before `Hello`; mapped, retained-root, and
+SDK-maximum unmapped cases then complete the representative grants and terminal
+lifecycle. The
 exact seccomp, cgroup, network-namespace, and PID-namespace mechanisms are now
 certified public-macOS exclusions rather than unresolved or silently accepted
 inputs.
@@ -85,15 +86,18 @@ without reopening their tagged path strings. General dynamic post-Ready
 delivery and hard revocation still need dedicated designs.
 
 The elevated evidence result is intentionally narrower than product support.
-For mapped and retained-root identities, the signed launcher and worker retain
-the same PIDs, lifecycle stream, and grant datagram through a canonical
-nonce-bound acknowledgment and ordinary `Hello`/`Start`. The worker then
-receives an already-opened validated target-owned root, but its exact session
-`mkdirat` returns permission denied under App Sandbox. The high unmapped case
-stops earlier at live code-identity revalidation. No hidden launcher-created
-session fallback is used: changing that authority ordering requires a separate
-Challenge. This evidence does not establish grants, `Proceed`, terminal
-ownership, API/guest execution, daemon recovery, or post-transition HVF.
+For mapped, retained-root, and SDK-maximum unmapped identities, the signed
+launcher and worker retain the same PIDs, lifecycle stream, and grant datagram
+through a canonical nonce-bound acknowledgment. After the unchanged live-code
+checks, the permanently transitioned launcher creates the exact target-owned
+session and sends one canonical `BBN1` record plus one descriptor. The worker
+validates, adopts, and locks it before ordinary `Hello`; `Start` and `Prepared`
+bind the same session/inode, and the launcher proves the lock through an
+independent description before committing grants. The representative grant
+workload, `Proceed`/`Starting`/terminal ownership, reap, and exact cleanup all
+complete. This separately challenged test-only authority path does not establish
+public uid/gid policy, API/guest execution, daemon/crash convergence, or
+post-transition guest HVF.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -253,7 +257,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 
 | Area | Current status | Review expectation |
 | --- | --- | --- |
-| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; disabled evidence reaches credential continuation and mapped/retained-root `Hello`/`Start`, then stops at App Sandbox target-session creation | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate the measured namespace boundary with grants, lifecycle completion, product uid/gid support, or chroot. |
+| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; disabled evidence completes numeric credential continuation, launcher-created target-session adoption, representative grants, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate the feature-only evidence with product uid/gid support, configurable chroot, or Linux isolation parity. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
@@ -514,7 +518,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
-| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; the disabled bootstrap harness reaches mapped/retained-root credential continuation and ordinary `Hello`/`Start`, then records App Sandbox denial at exact target-session creation. | Keep product uid/gid pending a separately challenged session-authority direction and dynamic grants/lifecycle/guest evidence; keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
+| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption, representative grants, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep product uid/gid pending the remaining real-guest and daemon/resilience evidence; keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
@@ -3490,23 +3494,34 @@ remained exact.
 
 #1889 continued the same launcher and worker PIDs over those exact transports.
 One canonical nonce-bound `BBA1` acknowledgment closes the credential transcript
-and rejects buffered/replayed bytes before lifecycle reuse. Mapped ordinary and
-retained-root no-drop cases then completed ordinary `Hello`/`Start`, but the
-worker's exact `mkdirat` for a random session beneath the already-opened
-target-owned root returned permission denied under App Sandbox. The
-SDK-maximum unmapped case completed the acknowledgment but stopped earlier at
-live code-identity revalidation. Repeated and concurrent runs left no exact
-process, private root, root-owned workspace ancestry, target-owned fixture, or
-named-socket residue.
+and rejects buffered/replayed bytes before lifecycle reuse. It measured the
+App Sandbox worker's exact target-session `mkdirat` denial for mapped and
+retained-root classes and an earlier live-code boundary for SDK-maximum
+unmapped.
 
-The representative typed grant and later production lifecycle code are
-feature-isolated and statically checked, but the natural namespace denial means
-grant commitment/consumption, `Proceed`/`Starting`/terminal, API/guest,
-daemon/crash behavior, and post-transition HVF were not dynamically reached.
-A launcher-precreated session changes authority ordering and is a separately
-challenged follow-up, not an implicit fallback. The complete boundary,
-alternatives, exact cleanup rules, reproduction command, and future-OS nonclaim
-are in the checked
+#1891 separately challenged and changed only the session-creation authority.
+After the same prepublication live-code and target/no-drop checks, the
+permanently transitioned launcher creates the random target-owned session,
+opens independent worker/validation/recovery descriptions, and sends one fixed
+bootstrap- and lifecycle-bound `BBN1` record plus exactly one descriptor. The
+worker validates the record, root association, metadata, emptiness, and inode,
+then acquires and revalidates the exclusive lock before `Hello`. A later exact
+`Start` match precedes policy and descriptor entry; `Prepared` reports the same
+inode, and an independent launcher description must observe the live lock
+before the existing grant transaction begins. No account lookup, ownership
+change, credential restoration, ambient path fallback, or lifecycle-v5 change
+is introduced.
+
+On the capable host, mapped, retained-root no-drop, and SDK-maximum unmapped
+cases each completed three times, including both unchanged dynamic worker-code
+checks. Two mapped sessions also completed concurrently. Every class reached
+representative grant commitment and target-side allow/deny checks,
+`Proceed`/`Starting`/terminal ownership, reap, and exact session/workspace
+cleanup; final process, root, workspace, and socket scans were zero. The earlier
+unmapped identity boundary is superseded by this same-check witness, not by a
+bypass. API/no-API real guests, daemon/crash convergence, and post-transition
+guest HVF remain unmeasured. The complete boundary, alternatives, exact cleanup
+rules, reproduction command, and future-OS nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 The six rows remain audit outcomes until #1371 challenges the controlled result

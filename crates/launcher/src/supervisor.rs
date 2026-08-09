@@ -870,15 +870,18 @@ fn continue_runtime_session(
     bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
     semantics: CredentialSemantics,
 ) -> Result<LauncherExit, LauncherError> {
-    const RUNTIME_LAUNCHER_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-v1-runtime-drop-runtime-retain-root-runtime-unmapped-status: elevated runtime-BBA1";
-    const RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+    const RUNTIME_LAUNCHER_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-v2-runtime-drop-runtime-retain-root-runtime-unmapped-status: elevated runtime-BBA1-BBN1-launcher-created-session";
+    const RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
 
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
     use bangbang_session::elevated_probe::{
-        ContinuationAck, ProbeErrorCategory, ProbeStage, RuntimeFault,
+        ContinuationAck, ProbeErrorCategory, ProbeStage, RuntimeFault, RuntimeSessionAuthority,
+        RuntimeWorkerFailure,
     };
+    use bangbang_session::macos::runtime::{PreparedLauncherSession, RuntimeError};
+    use bangbang_session::macos::runtime_authority::send_runtime_session_authority;
     use bangbang_session::{LauncherLifecycle, SessionId};
 
     std::hint::black_box(RUNTIME_LAUNCHER_ARTIFACT);
@@ -935,9 +938,106 @@ fn continue_runtime_session(
     };
     let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
     let mut lifecycle = LauncherLifecycle::new(session_id);
+    if bootstrap.fault() == RuntimeFault::SessionCreate {
+        spawned.worker.terminate_and_reap();
+        return blocked(ProbeStage::RuntimeSessionCreate, ProbeErrorCategory::Other);
+    }
+    let prepared = match PreparedLauncherSession::create(runtime.root, session_id) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let stage = match error {
+                RuntimeError::NamespaceCreate(_) | RuntimeError::Collision => {
+                    ProbeStage::RuntimeSessionCreate
+                }
+                RuntimeError::Filesystem(_)
+                | RuntimeError::InvalidRoot
+                | RuntimeError::InvalidEntry => ProbeStage::RuntimeSessionOpen,
+            };
+            return blocked(stage, runtime_namespace_error_category(error));
+        }
+    };
+    if bootstrap.fault() == RuntimeFault::SessionOpen {
+        if prepared.cleanup_unpublished().is_err() {
+            spawned.worker.terminate_and_reap();
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        spawned.worker.terminate_and_reap();
+        return blocked(ProbeStage::RuntimeSessionOpen, ProbeErrorCategory::Other);
+    }
+    let authority = match RuntimeSessionAuthority::launcher(
+        bootstrap.mode(),
+        bootstrap.target_uid(),
+        bootstrap.target_gid(),
+        bootstrap.root(),
+        prepared.identity().object_identity(),
+        bootstrap.nonce(),
+        session_id,
+    ) {
+        Ok(authority) => authority,
+        Err(_) => {
+            if prepared.cleanup_unpublished().is_err() {
+                spawned.worker.terminate_and_reap();
+                return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+            }
+            spawned.worker.terminate_and_reap();
+            return blocked(
+                ProbeStage::RuntimeAuthoritySend,
+                ProbeErrorCategory::InvalidInput,
+            );
+        }
+    };
+    if bootstrap.fault() == RuntimeFault::AuthoritySend {
+        if prepared.cleanup_unpublished().is_err() {
+            spawned.worker.terminate_and_reap();
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        spawned.worker.terminate_and_reap();
+        return blocked(ProbeStage::RuntimeAuthoritySend, ProbeErrorCategory::Other);
+    }
+    let (transfer, handles) = prepared.into_publication();
+    if let Err(error) = send_runtime_session_authority(&spawned.grants, authority, transfer) {
+        if finish_published_runtime_session(&mut spawned, handles).is_err() {
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        return blocked(
+            ProbeStage::RuntimeAuthoritySend,
+            runtime_transport_error_category(error),
+        );
+    }
+    let mut handles = Some(handles);
     if crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle).is_err()
     {
-        return blocked(ProbeStage::LifecycleHello, ProbeErrorCategory::Other);
+        let outcome = finish_published_runtime_session(
+            &mut spawned,
+            handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+        );
+        return match outcome {
+            Ok(Some(failure)) => blocked(failure.stage(), failure.category()),
+            Ok(None) => {
+                let stage = match bootstrap.fault() {
+                    RuntimeFault::AuthorityReceive => ProbeStage::RuntimeAuthorityReceive,
+                    RuntimeFault::AuthorityValidate => ProbeStage::RuntimeAuthorityValidate,
+                    RuntimeFault::SessionLock => ProbeStage::RuntimeSessionLock,
+                    _ => ProbeStage::LifecycleHello,
+                };
+                blocked(stage, ProbeErrorCategory::Other)
+            }
+            Err(_) => blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other),
+        };
+    }
+    if !runtime_transport_is_empty(spawned.grants.as_raw_fd()) {
+        if finish_published_runtime_session(
+            &mut spawned,
+            handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+        )
+        .is_err()
+        {
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        return blocked(
+            ProbeStage::RuntimeAuthorityValidate,
+            ProbeErrorCategory::InvalidInput,
+        );
     }
     if bangbang_session::macos::verify_peer_pid(spawned.session.as_raw_fd(), spawned.worker.pid())
         .is_err()
@@ -948,18 +1048,45 @@ fn continue_runtime_session(
         )
         .is_err()
     {
+        if finish_published_runtime_session(
+            &mut spawned,
+            handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+        )
+        .is_err()
+        {
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
         return blocked(
             ProbeStage::LiveIdentity,
             ProbeErrorCategory::PermissionDenied,
         );
     }
     if let Err(category) = validate_runtime_worker(spawned.worker.pid(), &launch.worker_profile) {
+        if finish_published_runtime_session(
+            &mut spawned,
+            handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+        )
+        .is_err()
+        {
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
         return blocked(ProbeStage::LiveIdentity, category);
     }
-    let start = lifecycle
-        .start(launch.worker_policy)
-        .map_err(|_| LauncherError::SessionProtocol)?;
-    let status = match crate::macos::supervise::wait_session_with_explicit_root(
+    let start = match lifecycle.start(launch.worker_policy) {
+        Ok(start) => start,
+        Err(_) => {
+            if finish_published_runtime_session(
+                &mut spawned,
+                handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+            )
+            .is_err()
+            {
+                return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+            }
+            return blocked(ProbeStage::LifecycleHello, ProbeErrorCategory::InvalidInput);
+        }
+    };
+    let status = match crate::macos::supervise::wait_session_with_preopened_namespace(
         &mut spawned.worker,
         &mut spawned.session,
         crate::macos::supervise::AuxiliaryChannels::new(
@@ -971,7 +1098,10 @@ fn continue_runtime_session(
         lifecycle,
         wakeups,
         &launch.grants,
-        crate::macos::supervise::ExplicitSessionStart::new(runtime.root, start),
+        crate::macos::supervise::PreopenedSessionStart::new(
+            handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+            start,
+        ),
     ) {
         Ok(status) => status,
         Err(error) => {
@@ -980,6 +1110,14 @@ fn continue_runtime_session(
                 RuntimeFault::GrantTransfer => ProbeStage::GrantTransfer,
                 RuntimeFault::Proceed => ProbeStage::LifecycleProceed,
                 RuntimeFault::Terminal => ProbeStage::LifecycleTerminal,
+                RuntimeFault::SessionEnter => ProbeStage::RuntimeSessionEnter,
+                RuntimeFault::Prepared => ProbeStage::LifecyclePrepared,
+                RuntimeFault::SessionCreate => ProbeStage::RuntimeSessionCreate,
+                RuntimeFault::SessionOpen => ProbeStage::RuntimeSessionOpen,
+                RuntimeFault::AuthoritySend => ProbeStage::RuntimeAuthoritySend,
+                RuntimeFault::AuthorityReceive => ProbeStage::RuntimeAuthorityReceive,
+                RuntimeFault::AuthorityValidate => ProbeStage::RuntimeAuthorityValidate,
+                RuntimeFault::SessionLock => ProbeStage::RuntimeSessionLock,
                 RuntimeFault::None | RuntimeFault::PreAck | RuntimeFault::PostAck => match error {
                     LauncherError::RuntimeNamespace => ProbeStage::RuntimeNamespace,
                     LauncherError::GrantProtocol | LauncherError::GrantPreparation => {
@@ -992,6 +1130,9 @@ fn continue_runtime_session(
         }
     };
     let exit = map_exit_status(status)?;
+    if let Ok(failure) = RuntimeWorkerFailure::from_exit_code(exit.code()) {
+        return blocked(failure.stage(), failure.category());
+    }
     if exit.code() == bangbang_session::elevated_probe::RUNTIME_NAMESPACE_PERMISSION_EXIT_CODE {
         return blocked(
             ProbeStage::RuntimeNamespace,
@@ -1004,6 +1145,14 @@ fn continue_runtime_session(
             RuntimeFault::GrantTransfer => ProbeStage::GrantTransfer,
             RuntimeFault::Proceed => ProbeStage::LifecycleProceed,
             RuntimeFault::Terminal => ProbeStage::LifecycleTerminal,
+            RuntimeFault::SessionCreate => ProbeStage::RuntimeSessionCreate,
+            RuntimeFault::SessionOpen => ProbeStage::RuntimeSessionOpen,
+            RuntimeFault::AuthoritySend => ProbeStage::RuntimeAuthoritySend,
+            RuntimeFault::AuthorityReceive => ProbeStage::RuntimeAuthorityReceive,
+            RuntimeFault::AuthorityValidate => ProbeStage::RuntimeAuthorityValidate,
+            RuntimeFault::SessionLock => ProbeStage::RuntimeSessionLock,
+            RuntimeFault::SessionEnter => ProbeStage::RuntimeSessionEnter,
+            RuntimeFault::Prepared => ProbeStage::LifecyclePrepared,
             RuntimeFault::None | RuntimeFault::PreAck | RuntimeFault::PostAck => {
                 ProbeStage::LifecycleTerminal
             }
@@ -1011,7 +1160,7 @@ fn continue_runtime_session(
         return blocked(stage, ProbeErrorCategory::Other);
     }
     println!(
-        "status: elevated runtime {} complete result={} stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={} namespace=target-owned grants=committed lifecycle=terminal cleanup=complete",
+        "status: elevated runtime {} complete result={} stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={} namespace=launcher-created-target-owned authority=consumed lock=independent grants=committed lifecycle=terminal cleanup=complete",
         bootstrap.mode().name(),
         bangbang_session::elevated_probe::RuntimeResultClass::Complete.name(),
         semantics.stream_eid,
@@ -1021,6 +1170,86 @@ fn continue_runtime_session(
         semantics.datagram_pid
     );
     Ok(exit)
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn finish_published_runtime_session(
+    spawned: &mut crate::macos::spawn::SuspendedWorker,
+    mut handles: bangbang_session::macos::runtime::LauncherSessionHandles,
+) -> Result<Option<bangbang_session::elevated_probe::RuntimeWorkerFailure>, LauncherError> {
+    let status = match spawned.worker.try_wait()? {
+        Some(status) => status,
+        None => {
+            spawned
+                .worker
+                .signal(libc::SIGKILL)
+                .map_err(LauncherError::SignalForward)?;
+            spawned.worker.wait()?
+        }
+    };
+    let session = handles.session();
+    if let Some(mut namespace) = handles
+        .recover_after_worker_exit(session)
+        .map_err(|_| LauncherError::RuntimeNamespace)?
+    {
+        namespace
+            .cleanup()
+            .map_err(|_| LauncherError::RuntimeNamespace)?;
+    }
+    let exit = map_exit_status(status)?;
+    Ok(bangbang_session::elevated_probe::RuntimeWorkerFailure::from_exit_code(exit.code()).ok())
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+const fn runtime_namespace_error_category(
+    error: bangbang_session::macos::runtime::RuntimeError,
+) -> bangbang_session::elevated_probe::ProbeErrorCategory {
+    use bangbang_session::elevated_probe::ProbeErrorCategory;
+    use bangbang_session::macos::runtime::RuntimeError;
+
+    match error {
+        RuntimeError::Filesystem(kind) | RuntimeError::NamespaceCreate(kind) => {
+            ProbeErrorCategory::from_io_kind(kind)
+        }
+        RuntimeError::InvalidRoot | RuntimeError::InvalidEntry | RuntimeError::Collision => {
+            ProbeErrorCategory::InvalidInput
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+const fn runtime_transport_error_category(
+    error: bangbang_session::macos::grant_transport::GrantTransportError,
+) -> bangbang_session::elevated_probe::ProbeErrorCategory {
+    use bangbang_session::elevated_probe::ProbeErrorCategory;
+    use bangbang_session::macos::grant_transport::GrantTransportError;
+
+    match error {
+        GrantTransportError::Io(kind) => ProbeErrorCategory::from_io_kind(kind),
+        GrantTransportError::Invalid => ProbeErrorCategory::InvalidInput,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn runtime_transport_is_empty(fd: libc::c_int) -> bool {
+    let mut byte = 0_u8;
+    // SAFETY: `byte` is writable for one non-consuming byte probe and `fd` is
+    // the live connected evidence datagram endpoint.
+    let result = unsafe {
+        libc::recv(
+            fd,
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        return error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK);
+    }
+    false
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -1296,7 +1525,15 @@ fn elevated_runtime_blocked(
 
     let result = match stage {
         ProbeStage::ContinuationAck => RuntimeResultClass::ContinuationBoundary,
-        ProbeStage::RuntimeNamespace => RuntimeResultClass::NamespaceBoundary,
+        ProbeStage::RuntimeNamespace
+        | ProbeStage::RuntimeSessionCreate
+        | ProbeStage::RuntimeSessionOpen
+        | ProbeStage::RuntimeAuthoritySend
+        | ProbeStage::RuntimeAuthorityReceive
+        | ProbeStage::RuntimeAuthorityValidate
+        | ProbeStage::RuntimeSessionLock
+        | ProbeStage::RuntimeSessionEnter
+        | ProbeStage::LifecyclePrepared => RuntimeResultClass::NamespaceBoundary,
         ProbeStage::GrantTransfer | ProbeStage::GrantAccepted => RuntimeResultClass::GrantBoundary,
         ProbeStage::LifecycleHello
         | ProbeStage::LifecycleProceed

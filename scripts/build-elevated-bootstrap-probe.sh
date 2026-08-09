@@ -93,10 +93,11 @@ runtime_retain_mode="runtime-retain-root"
 runtime_unmapped_mode="runtime-unmapped"
 runtime_status="status: elevated runtime"
 continuation_record="BBA1"
+runtime_authority_record="BBN1"
 grant_activation="--bangbang-internal-grant-probe-v1"
 grant_runtime_case="target-runtime"
-runtime_launcher_boundary_artifact="bangbang-elevated-runtime-launcher-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
-runtime_worker_boundary_artifact="bangbang-elevated-runtime-worker-boundaries-v1-pre-ack-post-ack-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
+runtime_launcher_boundary_artifact="bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
+runtime_worker_boundary_artifact="bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
 
 cargo build \
   -p bangbang \
@@ -129,6 +130,7 @@ probe_markers=(
   "$runtime_unmapped_mode"
   "$runtime_status"
   "$continuation_record"
+  "$runtime_authority_record"
   "$grant_activation"
   "$grant_runtime_case"
   "$runtime_launcher_boundary_artifact"
@@ -179,6 +181,7 @@ for marker_value in \
   "$runtime_unmapped_mode" \
   "$runtime_status" \
   "$continuation_record" \
+  "$runtime_authority_record" \
   "$runtime_launcher_boundary_artifact"; do
   if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$launcher_bin"; then
     echo "evidence launcher is missing the runtime continuation boundary" >&2
@@ -202,6 +205,7 @@ for marker_value in \
   "$runtime_retain_mode" \
   "$runtime_unmapped_mode" \
   "$continuation_record" \
+  "$runtime_authority_record" \
   "$grant_activation" \
   "$grant_runtime_case" \
   "$runtime_worker_boundary_artifact"; do

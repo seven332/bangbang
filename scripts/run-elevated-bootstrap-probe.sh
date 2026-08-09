@@ -4,9 +4,9 @@ LC_ALL=C
 export LC_ALL
 umask 077
 
-# The caller may supply an elevation credential on standard input. Sudo starts
-# this wrapper only after consuming it, so replace that descriptor before any
-# validation tool, launcher, or signed worker can inherit it.
+# The caller's elevation mechanism may use standard input. Replace that
+# descriptor before any validation tool, launcher, or signed worker can inherit
+# it. Ordinary tests and CI do not invoke this manual capable-host certifier.
 exec </dev/null
 
 usage() {
@@ -14,9 +14,10 @@ usage() {
 Usage: scripts/run-elevated-bootstrap-probe.sh --bundle /absolute/path/Bangbang.app
        --target-uid UID --target-gid GID
 
-Run the no-skip elevated bootstrap evidence matrix on a capable Apple Silicon
-host. This wrapper must already have exact real/effective uid/gid zero. It does
-not invoke sudo or infer authority from SUDO_*, HOME, PATH, or account names.
+Manually certify the no-skip elevated bootstrap evidence matrix on a capable
+Apple Silicon host. This wrapper is separate from ordinary tests and CI and
+must already have exact real/effective uid/gid zero. It does not elevate itself
+or infer authority from SUDO_*, HOME, PATH, or account names.
 EOF
 }
 
@@ -237,7 +238,6 @@ replacement_root=""
 replacement_root_identity=""
 replacement_candidate=""
 replacement_candidate_identity=""
-unmapped_runtime_result="unmeasured"
 cleanup_return=false
 
 bundle_directories=(
@@ -1038,6 +1038,27 @@ assert_runtime_output_redacted() {
   done
 }
 
+reset_runtime_write_fixture() {
+  local runtime_workspace_path="$1"
+  local runtime_workspace_object="$2"
+  local ledger="$3"
+  local ledger_identity="$4"
+  local uid="$5"
+  local gid="$6"
+  if ! validate_runtime_workspace \
+    "$runtime_workspace_path" \
+    "$runtime_workspace_object" \
+    "$ledger" \
+    "$ledger_identity" \
+    "$uid" \
+    "$gid"; then
+    echo "bangbang elevated bootstrap proof: runtime fixture reset validation failed" >&2
+    exit 1
+  fi
+  /usr/bin/printf '%36s\n' '' | /usr/bin/tr ' ' '?' \
+    > "$runtime_workspace_path/write.output"
+}
+
 output_has_exact_line() {
   local output="$1"
   local expected="$2"
@@ -1060,6 +1081,13 @@ assert_runtime_case() {
   local fault="${13:-}"
   local output
   local status
+  reset_runtime_write_fixture \
+    "$runtime_workspace_path" \
+    "$runtime_workspace_object" \
+    "$ledger" \
+    "$ledger_identity" \
+    "$uid" \
+    "$gid"
   set +e
   output="$(invoke_runtime \
     "$root" \
@@ -1106,6 +1134,7 @@ assert_runtime_case() {
     /usr/bin/printf \
       'bangbang elevated bootstrap proof: runtime failure output mismatch mode=%s fault=%s\n' \
       "$mode" "${fault:-none}" >&2
+    /usr/bin/printf '%s\n' "$output" >&2
     exit 1
   fi
   assert_runtime_objects \
@@ -1118,44 +1147,6 @@ assert_runtime_case() {
     "$uid" \
     "$gid" \
     "$write_state"
-}
-
-assert_unmapped_runtime_case() {
-  local expected_boundary="$1"
-  local output
-  local status
-  set +e
-  output="$(invoke_runtime \
-    "$runtime_unmapped_root" \
-    2147483647 \
-    2147483647 \
-    runtime-unmapped \
-    "$runtime_unmapped_workspace" \
-    2>&1)"
-  status=$?
-  set -e
-  assert_runtime_output_redacted \
-    "$output" "$runtime_unmapped_root" "$runtime_unmapped_workspace"
-  if [[ "$status" -eq 3 ]] \
-    && output_has_exact_line "$output" "$expected_boundary"; then
-    unmapped_runtime_result="identity-boundary"
-    assert_runtime_objects \
-      "$runtime_unmapped_root" \
-      "$runtime_unmapped_root_identity" \
-      "$runtime_unmapped_workspace" \
-      "$runtime_unmapped_workspace_identity" \
-      "$runtime_unmapped_ledger" \
-      "$runtime_unmapped_ledger_identity" \
-      2147483647 \
-      2147483647 \
-      initial
-    return 0
-  fi
-  /usr/bin/printf \
-    'bangbang elevated bootstrap proof: unmapped runtime result was not an allowed exact boundary status=%s\n' \
-    "$status" >&2
-  /usr/bin/printf '%s\n' "$output" >&2
-  exit 1
 }
 
 invoke_inherited() {
@@ -1248,9 +1239,9 @@ assert_case "$probe_root" 2147483647 2147483647 credential-unmapped 0 \
 
 runtime_drop_semantics="stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed datagram-pid=exact"
 runtime_retain_semantics="stream-eid=stable-root stream-cred=stable-root stream-pid=exact datagram-cred=unsupported datagram-token=unchanged datagram-pid=exact"
-expected_runtime_drop_boundary="status: elevated runtime runtime-drop blocked stage=runtime-namespace error=permission-denied result=namespace-boundary $runtime_drop_semantics"
-expected_runtime_retain_boundary="status: elevated runtime runtime-retain-root blocked stage=runtime-namespace error=permission-denied result=namespace-boundary $runtime_retain_semantics"
-expected_runtime_unmapped_boundary="status: elevated runtime runtime-unmapped blocked stage=live-identity error=other result=identity-boundary $runtime_drop_semantics"
+expected_runtime_drop_complete="status: elevated runtime runtime-drop complete result=complete $runtime_drop_semantics namespace=launcher-created-target-owned authority=consumed lock=independent grants=committed lifecycle=terminal cleanup=complete"
+expected_runtime_retain_complete="status: elevated runtime runtime-retain-root complete result=complete $runtime_retain_semantics namespace=launcher-created-target-owned authority=consumed lock=independent grants=committed lifecycle=terminal cleanup=complete"
+expected_runtime_unmapped_complete="status: elevated runtime runtime-unmapped complete result=complete $runtime_drop_semantics namespace=launcher-created-target-owned authority=consumed lock=independent grants=committed lifecycle=terminal cleanup=complete"
 
 create_owned_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
   "$target_uid" "$target_gid" runtime_root runtime_root_identity
@@ -1272,9 +1263,9 @@ for _ in 1 2 3; do
     "$target_uid" \
     "$target_gid" \
     runtime-drop \
-    3 \
-    "$expected_runtime_drop_boundary" \
-    initial
+    0 \
+    "$expected_runtime_drop_complete" \
+    complete
 done
 
 create_owned_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
@@ -1297,14 +1288,22 @@ for _ in 1 2 3; do
     0 \
     0 \
     runtime-retain-root \
-    3 \
-    "$expected_runtime_retain_boundary" \
-    initial
+    0 \
+    "$expected_runtime_retain_complete" \
+    complete
 done
 
 for fault_case in \
   "pre-ack:continuation-ack:continuation-boundary:initial" \
   "post-ack:lifecycle-hello:lifecycle-boundary:initial" \
+  "session-create:runtime-session-create:namespace-boundary:initial" \
+  "session-open:runtime-session-open:namespace-boundary:initial" \
+  "authority-send:runtime-authority-send:namespace-boundary:initial" \
+  "authority-receive:runtime-authority-receive:namespace-boundary:initial" \
+  "authority-validate:runtime-authority-validate:namespace-boundary:initial" \
+  "session-lock:runtime-session-lock:namespace-boundary:initial" \
+  "session-enter:runtime-session-enter:namespace-boundary:initial" \
+  "prepared:lifecycle-prepared:namespace-boundary:initial" \
   "namespace:runtime-namespace:namespace-boundary:initial"; do
   IFS=: read -r fault stage result_class write_state <<< "$fault_case"
   expected_fault="status: elevated runtime runtime-drop blocked stage=$stage error=other result=$result_class $runtime_drop_semantics"
@@ -1324,7 +1323,12 @@ for fault_case in \
     "$fault"
 done
 
-for fault in grant-transfer proceed terminal; do
+for fault_case in \
+  "grant-transfer:grant-transfer:grant-boundary:initial" \
+  "proceed:lifecycle-proceed:lifecycle-boundary:initial" \
+  "terminal:lifecycle-terminal:lifecycle-boundary:complete"; do
+  IFS=: read -r fault stage result_class write_state <<< "$fault_case"
+  expected_fault="status: elevated runtime runtime-drop blocked stage=$stage error=other result=$result_class $runtime_drop_semantics"
   assert_runtime_case \
     "$runtime_root" \
     "$runtime_root_identity" \
@@ -1336,8 +1340,8 @@ for fault in grant-transfer proceed terminal; do
     "$target_gid" \
     runtime-drop \
     3 \
-    "$expected_runtime_drop_boundary" \
-    initial \
+    "$expected_fault" \
+    "$write_state" \
     "$fault"
 done
 
@@ -1350,7 +1354,21 @@ create_runtime_workspace \
   runtime_unmapped_workspace_identity \
   runtime_unmapped_ledger \
   runtime_unmapped_ledger_identity
-assert_unmapped_runtime_case "$expected_runtime_unmapped_boundary"
+for _ in 1 2 3; do
+  assert_runtime_case \
+    "$runtime_unmapped_root" \
+    "$runtime_unmapped_root_identity" \
+    "$runtime_unmapped_workspace" \
+    "$runtime_unmapped_workspace_identity" \
+    "$runtime_unmapped_ledger" \
+    "$runtime_unmapped_ledger_identity" \
+    2147483647 \
+    2147483647 \
+    runtime-unmapped \
+    0 \
+    "$expected_runtime_unmapped_complete" \
+    complete
+done
 
 create_private_directory "/private/var/root/bangbang-elevated-probe.XXXXXXXX" \
   inherited_root inherited_root_identity
@@ -1620,9 +1638,9 @@ assert_runtime_output_redacted \
   "$runtime_output_a" "$runtime_concurrent_root_a" "$runtime_concurrent_workspace_a"
 assert_runtime_output_redacted \
   "$runtime_output_b" "$runtime_concurrent_root_b" "$runtime_concurrent_workspace_b"
-if [[ "$runtime_status_a" -ne 3 || "$runtime_status_b" -ne 3 ]] \
-  || ! output_has_exact_line "$runtime_output_a" "$expected_runtime_drop_boundary" \
-  || ! output_has_exact_line "$runtime_output_b" "$expected_runtime_drop_boundary"; then
+if [[ "$runtime_status_a" -ne 0 || "$runtime_status_b" -ne 0 \
+  || "$runtime_output_a" != "$expected_runtime_drop_complete" \
+  || "$runtime_output_b" != "$expected_runtime_drop_complete" ]]; then
   echo "bangbang elevated bootstrap proof: runtime concurrency case failed" >&2
   exit 1
 fi
@@ -1635,7 +1653,7 @@ assert_runtime_objects \
   "$runtime_concurrent_ledger_a_identity" \
   "$target_uid" \
   "$target_gid" \
-  initial
+  complete
 assert_runtime_objects \
   "$runtime_concurrent_root_b" \
   "$runtime_concurrent_root_b_identity" \
@@ -1645,7 +1663,7 @@ assert_runtime_objects \
   "$runtime_concurrent_ledger_b_identity" \
   "$target_uid" \
   "$target_gid" \
-  initial
+  complete
 /bin/unlink "$workspace/runtime-case-a"
 /bin/unlink "$workspace/runtime-case-b"
 
@@ -1740,7 +1758,7 @@ if [[ "$socket_residue" -ne 0 || "$root_residue" -ne 0 \
   exit 1
 fi
 
-echo "result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=namespace-boundary runtime-retained-root=namespace-boundary runtime-unmapped=$unmapped_runtime_result grants=unreached lifecycle=hello-start controls=complete cleanup=exact"
+echo "result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=complete runtime-retained-root=complete-no-drop runtime-unmapped=complete authority=consumed lock=independent grants=committed lifecycle=terminal controls=complete cleanup=exact"
 echo "observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact"
 echo "residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero"
-echo "nonclaims: target-session=unreached grants=unreached proceed-starting-terminal=unreached api-no-api-real-guest=unmeasured daemon-crash=unmeasured post-drop-guest-hvf=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal"
+echo "nonclaims: api-no-api-real-guest=unmeasured daemon-crash=unmeasured post-drop-guest-hvf=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal"
