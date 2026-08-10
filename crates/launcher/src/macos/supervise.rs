@@ -228,6 +228,15 @@ pub(crate) fn wait_session_with_preopened_namespace(
         frame,
         guest,
     } = start;
+    let socket_record_policy = guest
+        .as_ref()
+        .map_or(SocketRecordPolicy::Ordinary, |guest| {
+            if guest.forbids_api_socket_record() {
+                SocketRecordPolicy::RejectTransferredApi
+            } else {
+                SocketRecordPolicy::Ordinary
+            }
+        });
     let mut roots = NamespaceRoots::Preopened(handles);
     if let Err(error) = write_frame(session, frame) {
         terminate_session(worker, session, &auxiliary);
@@ -235,7 +244,7 @@ pub(crate) fn wait_session_with_preopened_namespace(
             .recover_after_worker_exit(lifecycle.session())
             .and_then(|recovered| {
                 recovered.map_or(Ok(()), |mut namespace| {
-                    cleanup_namespace_after_worker(&mut namespace, grants, None)
+                    cleanup_namespace_after_worker(&mut namespace, grants, socket_record_policy)
                 })
             })
             .map_err(|_| LauncherError::RuntimeNamespace)?;
@@ -293,48 +302,47 @@ fn wait_session_with_roots(
     }
 
     #[cfg(feature = "elevated-bootstrap-probe")]
-    let strict_api_cleanup = guest
+    let socket_cleanup = guest
         .as_ref()
-        .and_then(ElevatedGuestSupervisor::cleanup_policy)
-        .map(|policy| StrictSocketCleanupPolicy {
-            anchor_descriptor: policy.anchor_descriptor(),
-            anchor_identity: policy.anchor_identity(),
-            target_uid: policy.target_uid(),
-            target_gid: policy.target_gid(),
-            path_identity: policy.path_identity(),
+        .map_or(SocketRecordPolicy::Ordinary, |guest| {
+            if guest.forbids_api_socket_record() {
+                SocketRecordPolicy::RejectTransferredApi
+            } else {
+                SocketRecordPolicy::Ordinary
+            }
         });
     #[cfg(not(feature = "elevated-bootstrap-probe"))]
-    let strict_api_cleanup = None;
+    let socket_cleanup: Option<StrictSocketCleanupPolicy> = None;
 
     let cleanup = if let Some(namespace) = observation.namespace.as_mut() {
-        cleanup_namespace_after_worker(namespace, grants, strict_api_cleanup)
+        cleanup_namespace_after_worker(namespace, grants, socket_cleanup)
     } else {
         roots
             .recover_after_worker_exit(session_id)
             .and_then(|recovered| {
                 recovered.map_or(Ok(()), |mut namespace| {
-                    cleanup_namespace_after_worker(&mut namespace, grants, strict_api_cleanup)
+                    cleanup_namespace_after_worker(&mut namespace, grants, socket_cleanup)
                 })
             })
     }
     .map_err(|_| LauncherError::RuntimeNamespace);
 
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    let guest_cleanup = guest
+        .as_mut()
+        .map_or(Ok(()), ElevatedGuestSupervisor::finish_cleanup);
     match result {
         Ok(status) => {
             cleanup?;
             #[cfg(feature = "elevated-bootstrap-probe")]
-            if observation
-                .terminal
-                .is_some_and(|(category, _)| category == TerminalCategory::Success)
-                && let Some(guest) = guest.as_mut()
-            {
-                guest.finish_cleanup()?;
-            }
+            guest_cleanup?;
             validate_terminal(status, observation.terminal)?;
             Ok(status)
         }
         Err(error) => {
             let _ = cleanup;
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let _ = guest_cleanup;
             Err(error)
         }
     }
@@ -395,6 +403,7 @@ impl NamespaceRoots {
     }
 }
 
+#[cfg(not(feature = "elevated-bootstrap-probe"))]
 #[derive(Clone, Copy)]
 struct StrictSocketCleanupPolicy {
     anchor_descriptor: RawFd,
@@ -404,6 +413,40 @@ struct StrictSocketCleanupPolicy {
     path_identity: bangbang_session::ObjectIdentity,
 }
 
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketRecordPolicy {
+    Ordinary,
+    RejectTransferredApi,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn cleanup_namespace_after_worker(
+    namespace: &mut LauncherNamespace,
+    grants: &PreparedGrantBatch,
+    socket_record_policy: SocketRecordPolicy,
+) -> Result<(), RuntimeError> {
+    for record in namespace.socket_ownership_records()? {
+        validate_socket_record_policy(&record, socket_record_policy)?;
+        let anchor = grants
+            .socket_directory_anchor(record.role())
+            .ok_or(RuntimeError::InvalidEntry)?;
+        unlink_owned_socket(anchor.descriptor(), &record)?;
+        namespace.unlink_staged_socket(&record)?;
+        namespace.clear_socket_record(&record)?;
+    }
+    for record in namespace.snapshot_staging_records()? {
+        let anchor = grants
+            .snapshot_directory_anchor(record.directory_identity())
+            .ok_or(RuntimeError::InvalidEntry)?;
+        debug_assert_eq!(anchor.identity(), record.directory_identity());
+        unlink_owned_snapshot_staging(anchor.descriptor(), &record)?;
+        namespace.clear_snapshot_staging_record(&record)?;
+    }
+    namespace.cleanup()
+}
+
+#[cfg(not(feature = "elevated-bootstrap-probe"))]
 fn cleanup_namespace_after_worker(
     namespace: &mut LauncherNamespace,
     grants: &PreparedGrantBatch,
@@ -443,6 +486,19 @@ fn cleanup_namespace_after_worker(
         namespace.clear_snapshot_staging_record(&record)?;
     }
     namespace.cleanup()
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_socket_record_policy(
+    record: &SocketOwnershipRecord,
+    policy: SocketRecordPolicy,
+) -> Result<(), RuntimeError> {
+    if policy == SocketRecordPolicy::RejectTransferredApi
+        && record.role() == bangbang_session::ResourceRole::ApiSocketDirectory
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    Ok(())
 }
 
 fn unlink_owned_socket(
@@ -1748,6 +1804,40 @@ mod tests {
         );
         let signaled = ExitStatus::from_raw(libc::SIGTERM);
         assert_eq!(public_exit_code(signaled), Some(128 + 15));
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn transferred_api_policy_rejects_only_api_socket_records() {
+        let identity = ObjectIdentity {
+            device: 17,
+            inode: 19,
+        };
+        let api = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("api.sock").expect("API child should parse"),
+            identity,
+        )
+        .expect("API record should construct");
+        let vsock = SocketOwnershipRecord::new(
+            ResourceRole::VsockSocketDirectory,
+            SocketChild::parse("vsock.sock").expect("vsock child should parse"),
+            identity,
+        )
+        .expect("vsock record should construct");
+
+        assert_eq!(
+            validate_socket_record_policy(&api, SocketRecordPolicy::Ordinary),
+            Ok(())
+        );
+        assert_eq!(
+            validate_socket_record_policy(&api, SocketRecordPolicy::RejectTransferredApi,),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
+            validate_socket_record_policy(&vsock, SocketRecordPolicy::RejectTransferredApi,),
+            Ok(())
+        );
     }
 
     #[test]

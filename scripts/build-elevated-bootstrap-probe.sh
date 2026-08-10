@@ -99,8 +99,8 @@ grant_activation="--bangbang-internal-grant-probe-v1"
 grant_runtime_case="target-runtime"
 runtime_launcher_boundary_artifact="bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
 runtime_worker_boundary_artifact="bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
-api_listener_launcher_boundary_artifact="bangbang-elevated-api-listener-launcher-v1-BBL1-request-bind-transfer-adoption-final-child-one-right"
-api_listener_worker_boundary_artifact="bangbang-elevated-api-listener-worker-v1-BBL1-request-ack-adoption-record-readiness"
+api_listener_launcher_boundary_artifact="bangbang-elevated-api-listener-launcher-v2-BBL1-request-bind-transfer-adoption-final-child-one-right-retained-exact-post-reap-cleanup"
+api_listener_worker_boundary_artifact="bangbang-elevated-api-listener-worker-v2-BBL1-request-ack-adoption-record-free-exact-owner-readiness"
 guest_no_api_drop_mode="guest-no-api-drop"
 guest_no_api_retain_mode="guest-no-api-retain-root"
 guest_no_api_unmapped_mode="guest-no-api-unmapped"
@@ -133,6 +133,7 @@ guest_isolation_markers=(
   api-listener-bind
   api-listener-transfer
   api-listener-adoption
+  api-listener-endpoint-death
   api-socket-publication
   api-logger-configuration
   api-metrics-configuration

@@ -493,7 +493,7 @@ pub enum ProbeStage {
     ApiListenerBind = 55,
     /// Transfer the exact launcher-created API listener to the worker.
     ApiListenerTransfer = 56,
-    /// Adopt, record, and validate the transferred API listener in the worker.
+    /// Adopt and validate the transferred API listener in the worker.
     ApiListenerAdoption = 57,
 }
 
@@ -711,8 +711,10 @@ pub enum RuntimeFault {
     ApiListenerBind = 38,
     /// Stop while transferring the launcher-created API listener.
     ApiListenerTransfer = 39,
-    /// Stop while the worker adopts and records the transferred listener.
+    /// Stop while the worker adopts and validates the transferred listener.
     ApiListenerAdoption = 40,
+    /// Stop after exact listener adoption and before API readiness.
+    ApiListenerEndpointDeath = 41,
 }
 
 impl RuntimeFault {
@@ -760,6 +762,7 @@ impl RuntimeFault {
             "api-listener-bind" => Some(Self::ApiListenerBind),
             "api-listener-transfer" => Some(Self::ApiListenerTransfer),
             "api-listener-adoption" => Some(Self::ApiListenerAdoption),
+            "api-listener-endpoint-death" => Some(Self::ApiListenerEndpointDeath),
             _ => None,
         }
     }
@@ -807,6 +810,7 @@ impl RuntimeFault {
             38 => Ok(Self::ApiListenerBind),
             39 => Ok(Self::ApiListenerTransfer),
             40 => Ok(Self::ApiListenerAdoption),
+            41 => Ok(Self::ApiListenerEndpointDeath),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -856,6 +860,7 @@ impl RuntimeFault {
             Self::ApiListenerBind => "api-listener-bind",
             Self::ApiListenerTransfer => "api-listener-transfer",
             Self::ApiListenerAdoption => "api-listener-adoption",
+            Self::ApiListenerEndpointDeath => "api-listener-endpoint-death",
         }
     }
 
@@ -904,6 +909,7 @@ impl RuntimeFault {
             Self::ApiListenerBind => Some(ProbeStage::ApiListenerBind),
             Self::ApiListenerTransfer => Some(ProbeStage::ApiListenerTransfer),
             Self::ApiListenerAdoption => Some(ProbeStage::ApiListenerAdoption),
+            Self::ApiListenerEndpointDeath => Some(ProbeStage::ApiListenerAdoption),
         }
     }
 }
@@ -3629,13 +3635,18 @@ mod tests {
                 40,
                 "api-listener-adoption",
             ),
+            (
+                RuntimeFault::ApiListenerEndpointDeath,
+                41,
+                "api-listener-endpoint-death",
+            ),
         ] {
             assert_eq!(RuntimeFault::parse(name), Some(fault));
             assert_eq!(RuntimeFault::from_byte(byte), Ok(fault));
             assert_eq!(fault.name(), name);
         }
         assert_eq!(RuntimeFault::parse("unknown"), None);
-        assert_eq!(RuntimeFault::from_byte(41), Err(ProbeProtocolError));
+        assert_eq!(RuntimeFault::from_byte(42), Err(ProbeProtocolError));
 
         for (result, name) in [
             (RuntimeResultClass::Complete, "complete"),

@@ -28,6 +28,9 @@ BARRIER_TIMEOUT_SECONDS = 10
 MAX_OUTPUT_BYTES = 1024 * 1024
 ADOPTION_BARRIER_OPTION = "--bangbang-internal-post-adoption-stop-v1"
 REPLACEMENT_BYTES = b"invalid-adoption-replacement\n"
+API_SOCKET_CHILD = "evidence-api.sock"
+API_DISPLACED_SOCKET_CHILD = ".displaced-evidence-api.sock"
+API_SOCKET_REPLACEMENT_BYTES = b"preserved-api-socket-replacement\n"
 ROOT_PARENT = Path("/private/var/root")
 ROOT_PREFIX = "bangbang-elevated-probe."
 SESSION_PREFIX = "session-"
@@ -177,43 +180,16 @@ FAULT_CASES = (
 )
 
 MATRIX_SUMMARY = (
-    "guest-matrix: api-mapped=blocked-listener-adoption "
-    "api-retained-root=blocked-listener-adoption-no-drop "
-    "api-unmapped=blocked-listener-adoption no-api-mapped=complete "
+    "guest-matrix: api-mapped=complete api-retained-root=complete-no-drop "
+    "api-unmapped=complete no-api-mapped=complete "
     "no-api-retained-root=complete-no-drop no-api-unmapped=complete "
-    "repeats=three concurrency=no-api-complete-api-isolated-blocked "
-    "faults=no-api-reachable-api-through-adoption "
-    "deaths=no-api-worker-first-launcher-first tamper=rejected-both-workloads "
-    "adoption-replacement=no-api-preopened-api-rejected-at-grant cleanup=exact"
+    "repeats=three concurrency=api-no-api-complete faults=all-reachable "
+    "deaths=no-api-post-worker-first-launcher-first-"
+    "api-pre-post-worker-first-launcher-first "
+    "tamper=rejected-both-workloads "
+    "adoption-replacement=no-api-complete-api-rejected-at-grant "
+    "socket-replacement=both-cleanup-owners-preserve cleanup=exact"
 )
-
-API_BOUNDARIES = {
-    "mapped": FaultCase(
-        "api-listener-adoption",
-        "api-listener-adoption",
-        "api-boundary",
-        "api",
-    ),
-    "retained-root": FaultCase(
-        "api-listener-adoption",
-        "api-listener-adoption",
-        "api-boundary",
-        "api",
-    ),
-    "unmapped": FaultCase(
-        "api-listener-adoption",
-        "api-listener-adoption",
-        "api-boundary",
-        "api",
-    ),
-}
-
-REACHABLE_API_FAULTS = {
-    "api-listener-request",
-    "api-listener-bind",
-    "api-listener-transfer",
-    "api-listener-adoption",
-}
 
 API_PREOPENED_REPLACEMENT_BOUNDARY = FaultCase(
     "",
@@ -714,14 +690,6 @@ class Fixture:
             if self.paths[name].stat().st_size > MAX_OUTPUT_BYTES:
                 _fail("fault-output-bound")
 
-    def validate_api_boundary_block_outputs(self) -> None:
-        self.validate_shape(require_outputs=True)
-        if any(
-            self.paths[name].stat().st_size != 0
-            for name in ("logger", "metrics", "serial")
-        ):
-            _fail("api-transfer-output-prefix")
-
     def capture_runtime_session(self) -> tuple[Path, ObjectIdentity]:
         root = ObjectIdentity.capture(self.root)
         if (
@@ -783,6 +751,63 @@ class Fixture:
         self.workspace.chmod(0o700)
         self.workspace.rmdir()
         self.root.rmdir()
+        self.cleaned = True
+
+
+class ApiSocketReplacement:
+    def __init__(self, fixture: Fixture) -> None:
+        if fixture.case.workload != "api":
+            _fail("api-socket-replacement-workload")
+        directory = fixture.authority_path("api")
+        self.original = directory / API_SOCKET_CHILD
+        self.displaced = directory / API_DISPLACED_SOCKET_CHILD
+        if self.displaced.exists() or self.displaced.is_symlink():
+            _fail("api-socket-replacement-collision")
+        metadata = self.original.lstat()
+        self.owned = ObjectIdentity.capture(self.original)
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or self.owned.uid != fixture.uid
+            or self.owned.gid != fixture.gid
+            or self.owned.mode != 0o600
+            or self.owned.links != 1
+        ):
+            _fail("api-socket-replacement-owned-shape")
+        self.original.rename(self.displaced)
+        _create_file(
+            self.original,
+            API_SOCKET_REPLACEMENT_BYTES,
+            fixture.uid,
+            fixture.gid,
+            0o600,
+        )
+        self.replacement = ResourceIdentity(
+            ObjectIdentity.capture(self.original),
+            _sha256(self.original),
+        )
+        self.cleaned = False
+        self.validate()
+
+    def validate(self) -> None:
+        if self.cleaned:
+            _fail("api-socket-replacement-already-cleaned")
+        replacement_metadata = self.original.lstat()
+        displaced_metadata = self.displaced.lstat()
+        if (
+            not stat.S_ISREG(replacement_metadata.st_mode)
+            or ObjectIdentity.capture(self.original) != self.replacement.identity
+            or _sha256(self.original) != self.replacement.sha256
+            or not stat.S_ISSOCK(displaced_metadata.st_mode)
+            or ObjectIdentity.capture(self.displaced) != self.owned
+        ):
+            _fail("api-socket-replacement-identity")
+
+    def cleanup(self) -> None:
+        if self.cleaned:
+            return
+        self.validate()
+        self.original.unlink()
+        self.displaced.unlink()
         self.cleaned = True
 
 
@@ -905,15 +930,19 @@ def expected_success_line(case: ModeCase) -> str:
 
 
 def expected_success_output(case: ModeCase) -> str:
-    readiness = (
-        "status: VM running without API"
-        if case.workload == "no-api"
-        else "status: API server listening"
-    )
+    if case.workload == "no-api":
+        prefix = "status: VM running without API\n"
+    else:
+        prefix = (
+            "operation=server outcome=running\n"
+            "operation=process-startup outcome=running\n"
+            "status: API server listening\n"
+            'The API server received a Put request on "/logger".\n'
+        )
     return (
         "bangbang 0.1.0\n"
         "hvf target supported: true\n"
-        f"{readiness}\n"
+        f"{prefix}"
         f"{expected_success_line(case)}"
     )
 
@@ -924,15 +953,6 @@ def expected_fault_line(case: ModeCase, fault: FaultCase) -> str:
         f"error={fault.category} "
         f"result={fault.result} {case.semantics}"
     )
-
-
-def api_boundary(case: ModeCase) -> FaultCase:
-    if case.workload != "api":
-        _fail("api-boundary-case")
-    try:
-        return API_BOUNDARIES[case.identity]
-    except KeyError as error:
-        raise MatrixError("api-boundary-identity") from error
 
 
 def _decode_output(output: bytes) -> str:
@@ -1082,33 +1102,6 @@ def assert_success(launcher: Path, fixture: Fixture) -> None:
     fixture.validate_success_outputs()
 
 
-def assert_api_transfer_blocked(launcher: Path, fixture: Fixture) -> None:
-    if fixture.case.workload != "api":
-        _fail("api-transfer-case")
-    status, raw_output = run_process(fixture.command(launcher))
-    output = _decode_output(raw_output).rstrip("\n")
-    validate_redacted(output, fixture)
-    expected = expected_fault_line(fixture.case, api_boundary(fixture.case))
-    if (
-        status != 3
-        or expected not in output.splitlines()
-        or expected_success_line(fixture.case) in output.splitlines()
-        or "status: API server listening" in output.splitlines()
-    ):
-        prefix = f"status: elevated runtime {fixture.case.mode} blocked stage="
-        for line in output.splitlines():
-            if line.startswith(prefix):
-                fields = line.removeprefix(prefix).split()
-                stage = fields[0] if fields else "unknown"
-                category = next(
-                    (field.removeprefix("error=") for field in fields if field.startswith("error=")),
-                    "unknown",
-                )
-                _fail(f"api-transfer-result-{fixture.case.mode}-{stage}-{category}")
-        _fail(f"api-transfer-result-{fixture.case.mode}-exit")
-    fixture.validate_api_boundary_block_outputs()
-
-
 def assert_adoption_replacement(
     launcher: Path,
     fixture: Fixture,
@@ -1192,13 +1185,33 @@ def assert_fault(launcher: Path, fixture: Fixture, fault: FaultCase) -> None:
     fixture.validate_fault_outputs()
 
 
-def assert_endpoint_death(launcher: Path, fixture: Fixture, first: str) -> None:
-    fault = FaultCase(
-        "guest-endpoint-death",
-        "guest-endpoint-death",
-        "guest-boundary",
-        fixture.case.workload,
-    )
+def assert_endpoint_death(
+    launcher: Path,
+    fixture: Fixture,
+    first: str,
+    boundary: str,
+    replace_api_socket: bool = False,
+) -> None:
+    if boundary == "pre-readiness":
+        if fixture.case.workload != "api":
+            _fail("death-pre-readiness-workload")
+        fault = FaultCase(
+            "api-listener-endpoint-death",
+            "api-listener-adoption",
+            "api-boundary",
+            "api",
+        )
+    elif boundary == "post-hvf":
+        fault = FaultCase(
+            "guest-endpoint-death",
+            "guest-endpoint-death",
+            "guest-boundary",
+            fixture.case.workload,
+        )
+    else:
+        _fail("death-boundary")
+    if replace_api_socket and boundary != "pre-readiness":
+        _fail("death-replacement-boundary")
     process = subprocess.Popen(
         fixture.command(launcher, fault.fault),
         stdin=subprocess.DEVNULL,
@@ -1208,9 +1221,12 @@ def assert_endpoint_death(launcher: Path, fixture: Fixture, first: str) -> None:
     )
     worker_pid: int | None = None
     runtime_session: tuple[Path, ObjectIdentity] | None = None
+    replacement: ApiSocketReplacement | None = None
     try:
         worker_pid = wait_for_stopped_worker(process)
         runtime_session = fixture.capture_runtime_session()
+        if replace_api_socket:
+            replacement = ApiSocketReplacement(fixture)
         if first == "worker":
             os.kill(worker_pid, signal.SIGKILL)
         elif first == "launcher":
@@ -1236,6 +1252,9 @@ def assert_endpoint_death(launcher: Path, fixture: Fixture, first: str) -> None:
         if first == "launcher":
             session, identity = runtime_session
             fixture.cleanup_runtime_session(session, identity)
+        if replacement is not None:
+            replacement.validate()
+            replacement.cleanup()
         fixture.validate_fault_outputs()
     finally:
         if process.poll() is None:
@@ -1246,14 +1265,19 @@ def assert_endpoint_death(launcher: Path, fixture: Fixture, first: str) -> None:
                 os.kill(worker_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            else:
+                try:
+                    wait_for_pid_exit(worker_pid)
+                except MatrixError:
+                    pass
+        if replacement is not None and not replacement.cleaned:
+            try:
+                replacement.cleanup()
+            except (MatrixError, OSError):
+                pass
 
 
-def run_concurrent(
-    launcher: Path,
-    fixtures: list[Fixture],
-    *,
-    api_transfer_blocked: bool = False,
-) -> None:
+def run_concurrent(launcher: Path, fixtures: list[Fixture]) -> None:
     processes = [
         subprocess.Popen(
             fixture.command(launcher),
@@ -1278,15 +1302,9 @@ def run_concurrent(
                 raise MatrixError("concurrent-timeout") from error
             decoded = _decode_output(output).rstrip("\n")
             validate_redacted(decoded, fixture)
-            if api_transfer_blocked:
-                expected = expected_fault_line(fixture.case, api_boundary(fixture.case))
-                if process.returncode != 3 or expected not in decoded.splitlines():
-                    _fail("concurrent-result")
-                fixture.validate_api_boundary_block_outputs()
-            else:
-                if process.returncode != 0 or decoded != expected_success_output(fixture.case):
-                    _fail("concurrent-result")
-                fixture.validate_success_outputs()
+            if process.returncode != 0 or decoded != expected_success_output(fixture.case):
+                _fail("concurrent-result")
+            fixture.validate_success_outputs()
     finally:
         for process in processes:
             if process.poll() is None:
@@ -1321,10 +1339,7 @@ def run_matrix(
             for _ in range(3):
                 fixture = Fixture(resources, case, target_uid, target_gid)
                 live.append(fixture)
-                if case.workload == "api":
-                    assert_api_transfer_blocked(launcher, fixture)
-                else:
-                    assert_success(launcher, fixture)
+                assert_success(launcher, fixture)
                 verify_resources(resources, resource_ledger)
                 fixture.cleanup()
         for workload in ("no-api", "api"):
@@ -1333,17 +1348,11 @@ def run_matrix(
                 for _ in range(2)
             ]
             live.extend(fixtures)
-            run_concurrent(
-                launcher,
-                fixtures,
-                api_transfer_blocked=workload == "api",
-            )
+            run_concurrent(launcher, fixtures)
             verify_resources(resources, resource_ledger)
             for fixture in fixtures:
                 fixture.cleanup()
         for fault in FAULT_CASES:
-            if fault.workload == "api" and fault.fault not in REACHABLE_API_FAULTS:
-                continue
             fixture = Fixture(
                 resources,
                 mode_for(fault.workload),
@@ -1362,9 +1371,27 @@ def run_matrix(
                 target_gid,
             )
             live.append(fixture)
-            assert_endpoint_death(launcher, fixture, first)
+            assert_endpoint_death(launcher, fixture, first, "post-hvf")
             verify_resources(resources, resource_ledger)
             fixture.cleanup()
+        for boundary in ("pre-readiness", "post-hvf"):
+            for first in ("worker", "launcher"):
+                fixture = Fixture(
+                    resources,
+                    mode_for("api"),
+                    target_uid,
+                    target_gid,
+                )
+                live.append(fixture)
+                assert_endpoint_death(
+                    launcher,
+                    fixture,
+                    first,
+                    boundary,
+                    replace_api_socket=boundary == "pre-readiness",
+                )
+                verify_resources(resources, resource_ledger)
+                fixture.cleanup()
         for workload in ("no-api", "api"):
             tamper_fixture = Fixture(
                 sidecar,

@@ -22,8 +22,7 @@ use bangbang_session::{Readiness, SessionId, TerminalCategory};
 
 use super::code_sign::{WorkerProfile, validate_launcher_process, validate_worker_process};
 use super::elevated_api_listener::{
-    ElevatedApiCleanupPolicy, ElevatedApiListenerError, ElevatedApiPublication,
-    bind_elevated_api_listener,
+    ElevatedApiListenerError, ElevatedApiPublication, bind_elevated_api_listener,
 };
 use super::local_socket::{
     LocalSocketConnectStart, PendingLocalSocket, anchored_child_is_absent, begin_connect_anchored,
@@ -138,12 +137,14 @@ enum ApiIo {
     Writing {
         stream: UnixStream,
         source_identity: bangbang_session::ObjectIdentity,
+        peer_pid: libc::pid_t,
         request: Vec<u8>,
         written: usize,
     },
     Reading {
         stream: UnixStream,
         source_identity: bangbang_session::ObjectIdentity,
+        peer_pid: libc::pid_t,
         response: Vec<u8>,
     },
 }
@@ -218,13 +219,16 @@ impl ElevatedApiDriver {
                 let source_identity = connection.source_identity();
                 self.accept_socket_identity(stage, source_identity)?;
                 let stream = connection.into_stream();
-                verify_peer_pid(stream.as_raw_fd(), worker_pid).map_err(|_| ApiDriverFailure {
-                    stage,
-                    category: ProbeErrorCategory::PermissionDenied,
+                let peer_pid = verify_peer_pid(stream.as_raw_fd(), worker_pid).map_err(|_| {
+                    ApiDriverFailure {
+                        stage,
+                        category: ProbeErrorCategory::PermissionDenied,
+                    }
                 })?;
                 ApiIo::Writing {
                     stream,
                     source_identity,
+                    peer_pid,
                     request: api_request(self.step),
                     written: 0,
                 }
@@ -296,37 +300,39 @@ impl ElevatedApiDriver {
                 })
             };
         };
-        let io = match io {
-            ApiIo::Connecting(pending) if readable || writable => {
-                match finish_connect_anchored(pending)
-                    .map_err(|error| api_socket_failure(stage, error))?
-                {
-                    LocalSocketConnectStart::Pending(pending) => ApiIo::Connecting(pending),
-                    LocalSocketConnectStart::Connected(connection) => {
-                        let source_identity = connection.source_identity();
-                        self.accept_socket_identity(stage, source_identity)?;
-                        let stream = connection.into_stream();
-                        verify_peer_pid(stream.as_raw_fd(), worker_pid).map_err(|_| {
-                            ApiDriverFailure {
-                                stage,
-                                category: ProbeErrorCategory::PermissionDenied,
+        let io =
+            match io {
+                ApiIo::Connecting(pending) if readable || writable => {
+                    match finish_connect_anchored(pending)
+                        .map_err(|error| api_socket_failure(stage, error))?
+                    {
+                        LocalSocketConnectStart::Pending(pending) => ApiIo::Connecting(pending),
+                        LocalSocketConnectStart::Connected(connection) => {
+                            let source_identity = connection.source_identity();
+                            self.accept_socket_identity(stage, source_identity)?;
+                            let stream = connection.into_stream();
+                            let peer_pid = verify_peer_pid(stream.as_raw_fd(), worker_pid)
+                                .map_err(|_| ApiDriverFailure {
+                                    stage,
+                                    category: ProbeErrorCategory::PermissionDenied,
+                                })?;
+                            ApiIo::Writing {
+                                stream,
+                                source_identity,
+                                peer_pid,
+                                request: api_request(self.step),
+                                written: 0,
                             }
-                        })?;
-                        ApiIo::Writing {
-                            stream,
-                            source_identity,
-                            request: api_request(self.step),
-                            written: 0,
                         }
                     }
                 }
-            }
-            io => io,
-        };
+                io => io,
+            };
         let io = match io {
             ApiIo::Writing {
                 mut stream,
                 source_identity,
+                peer_pid,
                 request,
                 mut written,
             } if writable => {
@@ -363,12 +369,14 @@ impl ElevatedApiDriver {
                     ApiIo::Reading {
                         stream,
                         source_identity,
+                        peer_pid,
                         response: Vec::with_capacity(API_RESPONSE.len()),
                     }
                 } else {
                     ApiIo::Writing {
                         stream,
                         source_identity,
+                        peer_pid,
                         request,
                         written,
                     }
@@ -380,6 +388,7 @@ impl ElevatedApiDriver {
             ApiIo::Reading {
                 mut stream,
                 source_identity,
+                peer_pid,
                 mut response,
             } if readable => {
                 let mut buffer = [0_u8; 128];
@@ -402,12 +411,16 @@ impl ElevatedApiDriver {
                                 source_identity,
                             )
                             .map_err(|error| api_socket_failure(stage, error))?;
-                            verify_peer_pid(stream.as_raw_fd(), worker_pid).map_err(|_| {
-                                ApiDriverFailure {
+                            // A connected Unix stream cannot change peers. The
+                            // server closes its half after this exact response,
+                            // so retain the PID verified before request write
+                            // instead of re-querying a retired endpoint.
+                            if peer_pid != worker_pid {
+                                return Err(ApiDriverFailure {
                                     stage,
                                     category: ProbeErrorCategory::PermissionDenied,
-                                }
-                            })?;
+                                });
+                            }
                             self.retired.push(stream);
                             self.step = self.step.next();
                             self.deadline = None;
@@ -441,6 +454,7 @@ impl ElevatedApiDriver {
                 ApiIo::Reading {
                     stream,
                     source_identity,
+                    peer_pid,
                     response,
                 }
             }
@@ -1337,10 +1351,8 @@ impl ElevatedGuestSupervisor {
         Ok(())
     }
 
-    pub(crate) fn cleanup_policy(&self) -> Option<ElevatedApiCleanupPolicy> {
-        self.publication
-            .as_ref()
-            .map(ElevatedApiPublication::cleanup_policy)
+    pub(crate) const fn forbids_api_socket_record(&self) -> bool {
+        matches!(self.contract.workload(), RuntimeWorkload::GuestApi)
     }
 
     pub(crate) fn finish_cleanup(&mut self) -> Result<(), LauncherError> {

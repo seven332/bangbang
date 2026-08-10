@@ -30,7 +30,7 @@ pub(crate) enum ElevatedApiListenerError {
 
 /// Strict post-reap policy for the one feature-owned final socket.
 #[derive(Clone, Copy)]
-pub(crate) struct ElevatedApiCleanupPolicy {
+struct ElevatedApiCleanupPolicy {
     anchor_descriptor: RawFd,
     anchor_identity: ObjectIdentity,
     target_uid: u32,
@@ -41,28 +41,6 @@ pub(crate) struct ElevatedApiCleanupPolicy {
 impl std::fmt::Debug for ElevatedApiCleanupPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ElevatedApiCleanupPolicy(<redacted>)")
-    }
-}
-
-impl ElevatedApiCleanupPolicy {
-    pub(crate) const fn anchor_descriptor(self) -> RawFd {
-        self.anchor_descriptor
-    }
-
-    pub(crate) const fn anchor_identity(self) -> ObjectIdentity {
-        self.anchor_identity
-    }
-
-    pub(crate) const fn target_uid(self) -> u32 {
-        self.target_uid
-    }
-
-    pub(crate) const fn target_gid(self) -> u32 {
-        self.target_gid
-    }
-
-    pub(crate) const fn path_identity(self) -> ObjectIdentity {
-        self.path_identity
     }
 }
 
@@ -91,22 +69,19 @@ impl ElevatedApiPublication {
             .ok_or(ElevatedApiListenerError::Invalid)
     }
 
-    pub(crate) const fn record(&self) -> &SocketOwnershipRecord {
+    #[cfg(test)]
+    const fn record(&self) -> &SocketOwnershipRecord {
         &self.record
     }
 
     pub(crate) const fn path_identity(&self) -> ObjectIdentity {
-        self.path_guard.policy.path_identity
-    }
-
-    pub(crate) fn cleanup_policy(&self) -> ElevatedApiCleanupPolicy {
-        ElevatedApiCleanupPolicy {
-            path_identity: self.record().identity(),
-            ..self.path_guard.policy
-        }
+        self.record.identity()
     }
 
     pub(crate) fn validate_path(&self) -> Result<(), ElevatedApiListenerError> {
+        if self.record.identity() != self.path_guard.policy.path_identity {
+            return Err(ElevatedApiListenerError::Invalid);
+        }
         self.path_guard.validate()
     }
 
