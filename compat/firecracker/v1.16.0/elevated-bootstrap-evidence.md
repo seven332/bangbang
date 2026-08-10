@@ -3,7 +3,8 @@
 This contract records the #1373 direct-worker result, the #1884 inherited-root
 follow-up, the #1885 no-chroot credential-transition result, the #1889 / #1891
 target-owned runtime continuation results, and the #1893 post-transition guest
-result plus the #1895 launcher-created API-listener result beneath #1371.
+result plus the #1895 / #1897 launcher-created API-listener results beneath
+#1371.
 Together they test public chroot orderings, numeric
 credential bootstrap, same-process continuation into the ordinary production
 lifecycle, and real guest execution against Bangbang's mandatory worker
@@ -124,12 +125,18 @@ claim, it sends a canonical zero-right `BBL1` request; the transitioned launcher
 enters the retained exact anchor, binds fixed final `evidence-api.sock`, and
 sends one canonical acknowledgment plus exactly one listener descriptor. A
 complete send releases the launcher descriptor alias while retaining exact
-post-reap cleanup metadata. The worker must validate and adopt the listener,
-sync the existing socket ownership record, and install its exact cleanup guard
-before API readiness. Guest success requires the exact HTTP responses, serial
-oracle, guest poweroff, ordered logger evidence, bounded metrics, lifecycle
-terminal, replacement-safe authority cleanup, and zero residue; launcher
-output alone is not sufficient.
+post-reap cleanup metadata. #1895's worker then attempted to synchronize the
+ordinary runtime-session socket ownership record. #1897 identifies App Sandbox
+denial of that redundant record create after all path and descriptor checks.
+Ordinary API/vsock listeners remain record-backed; only the transferred
+listener installs an exact record-free in-memory worker guard, while the
+launcher retains its independent exact publication guard through reap. Guest
+success requires the exact HTTP responses, serial oracle, guest poweroff,
+ordered logger evidence, bounded metrics, lifecycle terminal,
+replacement-safe cleanup by both ownership guards, and zero residue; launcher
+output alone is not sufficient. Each new API stream verifies the live worker
+PID before sending and carries that immutable connected-stream fact through
+the close-delimited response.
 
 Each runtime case uses a mode-0700 root and a separate bounded workspace with a
 root-owned traversal-only ancestry and exact target-owned fixtures. A root-owned
@@ -188,6 +195,10 @@ root authority. The complete matrix produced these results:
 | two concurrent #1893 ordinary-binder API attempts | distinct mapped-target roots, sessions, and API authorities | both returned the same `api-socket-publication` boundary and cleaned exactly |
 | #1895 launcher-created final listener | mapped ordinary, uid/gid-zero retained-root, and SDK-maximum unmapped targets, each repeated three times | the request, direct final bind, exactly-one-descriptor transfer, and launcher alias release completed; the signed worker then stopped in the closed receive/adoption interval reported as `api-listener-adoption` / `other` before readiness |
 | two concurrent #1895 launcher-created-listener attempts | distinct mapped-target roots, sessions, anchors, sockets, outputs, launchers, and workers | both returned the same `api-listener-adoption` boundary and cleaned exactly |
+| #1897 record-free transferred listener and real API guest | mapped ordinary, uid/gid-zero retained-root, and SDK-maximum unmapped targets, each repeated three times | listener adoption and readiness, canonical HTTP configuration, both late reattestations, real HVF, the fixed guest oracle, guest-requested poweroff, terminal ownership, and cleanup completed |
+| two concurrent #1897 API guests | distinct mapped-target roots, sessions, anchors, sockets, outputs, launchers, and workers | both completed independently through canonical API configuration and real guest shutdown |
+| #1897 closed API faults and endpoint death | every API fault plus pre-readiness and post-HVF worker-first and launcher-first death | every first-failure boundary remained exact; surviving cleanup completed without leaving process, root, workspace, or socket residue |
+| #1897 transferred-listener replacement | both pre-readiness endpoint-death orders with a target-owned same-name replacement | the surviving worker and launcher cleanup owners each preserved the replacement and the evidence ledger then removed it exactly |
 
 Focused negative cases reject a group-writable root and a symlink root. The
 staged manifest also rejects a writable, missing, symlinked, or inode-replaced
@@ -234,7 +245,17 @@ Sandbox worker stopped in the closed receive/adoption interval reported as
 configuration, or HVF. Two concurrent mapped attempts returned the same
 boundary. This result establishes the producer and transfer prefix, but does
 not identify the exact failing operation or kernel/sandbox sub-cause inside
-that closed interval. Daemon/crash convergence remains unmeasured.
+that closed interval. #1897's fresh diagnosis identifies App Sandbox
+`file-write-create` for runtime-session `.api-socket-owner` after exact path and
+descriptor validation. Removing only that redundant feature record leaves
+ordinary API/vsock sockets record-backed and gives the transferred listener an
+exact in-memory worker guard; the launcher independently retains exact
+publication ownership through reap. All three API identity classes then
+complete three times through readiness, canonical HTTP configuration, real
+HVF, the guest oracle, poweroff, terminal ownership, and cleanup. Two mapped
+API guests complete concurrently. Every API fault is reachable; both endpoint-
+death orders pass before readiness and after HVF; and both cleanup owners
+preserve same-name replacements. Daemon/crash convergence remains unmeasured.
 
 After those results were established, the checked harness remained at the
 evidence boundary: it contains no credential-changing product path. If a
@@ -243,17 +264,19 @@ future platform permits the direct sandboxed `chroot`, that branch reports
 entry, it must pass exact root, sandbox-denial, and HVF checks before success.
 Either changed result forces fresh implementation research and Challenge. The
 harness leaves the normal peer verifier and public launch policy unchanged.
-All reachable runtime and no-API guest fault cases reached their exact closed
+All reachable runtime, no-API guest, and API guest fault cases reached their exact closed
 boundary, including the launcher-create/open and authority-send paths, worker
 receive/validate/lock/enter/`Prepared` exits, grant/proceed/terminal paths, late
 reattestation, HVF creation, guest execution/oracle/poweroff, endpoint death,
-and cleanup. #1895 additionally reaches deterministic listener request, bind,
-transfer, and adoption faults; API configuration and later faults remain
-ineligible because the measured adoption boundary occurs first. Exact object
-state and the final residue scan remained clean. #1891 is the separately
+and cleanup. #1895 additionally reached deterministic listener request, bind,
+transfer, and adoption faults. #1897 makes the later API faults reachable and
+adds pre-readiness/post-HVF death in both endpoint orders plus replacement-safe
+cleanup by both listener owners. Exact object state and the final residue scan
+remained clean. #1891 is the separately
 challenged launcher-created-session authority result; it is not a hidden
-fallback in #1889. #1885, #1889, #1891, #1893, and #1895 are evidence results; product
-uid/gid behavior still requires the parent-selected continuation.
+fallback in #1889. #1885, #1889, #1891, #1893, #1895, and #1897 are evidence
+results; product uid/gid behavior still requires the parent-selected
+continuation.
 
 ## Supported conclusion and nonclaims
 
@@ -296,16 +319,19 @@ launcher can instead bind the fixed final listener and transfer exactly one
 descriptor, but the same worker then stops in the closed receive/adoption
 interval before durable ownership or readiness. It therefore establishes
 neither API configuration nor an API-started guest and does not establish the
-exact cause within that interval. Any next producer, helper, signing, sandbox,
-or topology alternative requires a fresh parent Challenge; this evidence does
-not weaken App Sandbox, use a private extension API, or treat a different
-topology as equivalent. Daemon/
-crash convergence, public policy, and aggregate jailer behavior remain
-unmeasured. It also does not prove that a larger fixed in-root Darwin dependency
-set or a materially different security model cannot work; nor does it claim
-Linux mount/PID/user namespace parity, notarized distribution, or behavior
-beyond the recorded OS/SDK. A changed platform result requires rerunning the
-wrapper and a fresh ID-by-ID Challenge.
+exact cause within that interval. #1897 identifies the redundant ownership-
+record create as that cause and proves record-free transferred-listener
+ownership through canonical API configuration and a real guest for all three
+identities, without changing the helper topology, signing roles, entitlements,
+or public sandbox policy. Every API connection still verifies the live worker
+PID before sending. Daemon/crash convergence, public policy, and aggregate
+jailer behavior remain unmeasured. This evidence does not weaken App Sandbox,
+use a private extension API, or treat a different topology as equivalent. It
+also does not prove that a larger fixed in-root Darwin dependency set or a
+materially different security model cannot work; nor does it claim Linux
+mount/PID/user namespace parity, notarized distribution, or behavior beyond
+the recorded OS/SDK. A changed platform result requires rerunning the wrapper
+and a fresh ID-by-ID Challenge.
 
 ## Reproduction
 
@@ -333,7 +359,7 @@ runtime results, observations, residue, and nonclaim classes:
 
 ```text
 result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=complete runtime-retained-root=complete-no-drop runtime-unmapped=complete authority=consumed lock=independent grants=committed lifecycle=terminal controls=complete cleanup=exact
-guest-matrix: api-mapped=blocked-listener-adoption api-retained-root=blocked-listener-adoption-no-drop api-unmapped=blocked-listener-adoption no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=no-api-complete-api-isolated-blocked faults=no-api-reachable-api-through-adoption deaths=no-api-worker-first-launcher-first tamper=rejected-both-workloads adoption-replacement=no-api-preopened-api-rejected-at-grant cleanup=exact
+guest-matrix: api-mapped=complete api-retained-root=complete-no-drop api-unmapped=complete no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=api-no-api-complete faults=all-reachable deaths=no-api-post-worker-first-launcher-first-api-pre-post-worker-first-launcher-first tamper=rejected-both-workloads adoption-replacement=no-api-complete-api-rejected-at-grant socket-replacement=both-cleanup-owners-preserve cleanup=exact
 observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact
 residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero
 nonclaims: daemon-crash=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal

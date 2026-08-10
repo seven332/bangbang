@@ -498,6 +498,7 @@ fn run(
                             }
                             match claim {
                                 Some(claim) => {
+                                    #[cfg(not(feature = "elevated-bootstrap-probe"))]
                                     let namespace = contained
                                         .as_ref()
                                         .ok_or(ProcessError::ContainedSession)?
@@ -513,13 +514,9 @@ fn run(
                                         .flatten();
                                     #[cfg(feature = "elevated-bootstrap-probe")]
                                     let socket = if let Some(received) = elevated_listener {
-                                        let socket =
-                                            adopt_elevated_api_listener(namespace, claim, received)
-                                                .map_err(|error| {
-                                                    ProcessError::ApiServer(
-                                                        ApiServerError::Anchored(error),
-                                                    )
-                                                })?;
+                                        let socket = adopt_elevated_api_listener(claim, received)
+                                            .map_err(ApiServerError::Anchored)
+                                            .map_err(ProcessError::ApiServer)?;
                                         contained
                                             .as_ref()
                                             .ok_or(ProcessError::ContainedSession)?
@@ -527,6 +524,12 @@ fn run(
                                             .map_err(|_| ProcessError::ContainedSession)?;
                                         socket
                                     } else {
+                                        let namespace = contained
+                                            .as_ref()
+                                            .ok_or(ProcessError::ContainedSession)?
+                                            .socket_namespace()
+                                            .map_err(|_| ProcessError::ContainedSession)?
+                                            .ok_or(ProcessError::ContainedSession)?;
                                         bind_anchored_socket(
                                             namespace,
                                             claim,

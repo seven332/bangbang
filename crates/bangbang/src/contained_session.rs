@@ -3929,18 +3929,30 @@ mod platform {
         }
 
         fn confirm_api_listener_adopted(&self) -> Result<(), ContainedSessionError> {
-            let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
-            let state = locked.as_mut().ok_or(ContainedSessionError)?;
-            if state.step != GuestEvidenceStep::ApiListenerReceived
-                || state.mode.runtime_workload()
-                    != Some(bangbang_session::elevated_probe::RuntimeWorkload::GuestApi)
-                || !state.directory_authority_consumed
-                || !guest_evidence_transport_is_empty(&state.socket)
-            {
-                return Err(ContainedSessionError);
+            let stop_for_endpoint_death = {
+                let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+                let state = locked.as_mut().ok_or(ContainedSessionError)?;
+                if state.step != GuestEvidenceStep::ApiListenerReceived
+                    || state.mode.runtime_workload()
+                        != Some(bangbang_session::elevated_probe::RuntimeWorkload::GuestApi)
+                    || !state.directory_authority_consumed
+                    || !guest_evidence_transport_is_empty(&state.socket)
+                {
+                    return Err(ContainedSessionError);
+                }
+                validate_guest_evidence_worker(state)?;
+                state.step = GuestEvidenceStep::HvfCreate;
+                state.fault
+                    == bangbang_session::elevated_probe::RuntimeFault::ApiListenerEndpointDeath
+            };
+            if stop_for_endpoint_death {
+                // SAFETY: `raise` targets the current process with the fixed
+                // uncatchable stop signal used by the external death matrix.
+                if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+                    self.invalidate();
+                    return Err(ContainedSessionError);
+                }
             }
-            validate_guest_evidence_worker(state)?;
-            state.step = GuestEvidenceStep::HvfCreate;
             Ok(())
         }
 

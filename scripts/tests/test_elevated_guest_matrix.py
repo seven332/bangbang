@@ -195,12 +195,28 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
             self.assertNotIn("/private/", line)
             self.assertNotIn("bangbang-grant:", line)
         self.assertEqual(
-            matrix.REACHABLE_API_FAULTS,
+            {fault.stage for fault in matrix.FAULT_CASES if fault.workload == "api"},
             {
                 "api-listener-request",
                 "api-listener-bind",
                 "api-listener-transfer",
                 "api-listener-adoption",
+                "api-socket-publication",
+                "api-logger-configuration",
+                "api-metrics-configuration",
+                "api-serial-configuration",
+                "api-machine-configuration",
+                "api-boot-configuration",
+                "api-drive-configuration",
+                "api-instance-start",
+                "guest-hvf-witness",
+                "guest-hvf-create",
+                "guest-execution",
+                "guest-oracle",
+                "guest-poweroff",
+                "guest-timeout",
+                "guest-terminal-evidence",
+                "guest-cleanup",
             },
         )
 
@@ -208,25 +224,28 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
         no_api = matrix.expected_success_output(matrix.mode_for("no-api"))
         api = matrix.expected_success_output(matrix.mode_for("api"))
         for output in (no_api, api):
-            self.assertEqual(len(output.splitlines()), 4)
             self.assertTrue(output.startswith("bangbang 0.1.0\nhvf target supported: true\n"))
             self.assertTrue(output.endswith("lifecycle=terminal cleanup=complete"))
+        self.assertEqual(len(no_api.splitlines()), 4)
+        self.assertEqual(len(api.splitlines()), 7)
         self.assertIn("status: VM running without API", no_api)
         self.assertIn("status: API server listening", api)
+        self.assertIn('The API server received a Put request on "/logger".', api)
 
-    def test_measured_api_adoption_boundary_is_exact_and_value_free(self) -> None:
+    def test_api_completion_and_endpoint_death_summary_are_value_free(self) -> None:
         for identity in ("mapped", "retained-root", "unmapped"):
             case = matrix.mode_for("api", identity)
-            boundary = matrix.api_boundary(case)
-            output = matrix.expected_fault_line(case, boundary)
-            self.assertIn("stage=api-listener-adoption", output)
-            self.assertIn("error=other", output)
-            self.assertIn("result=api-boundary", output)
+            output = matrix.expected_success_line(case)
+            self.assertIn("resources=consumed workload=api api=complete", output)
             self.assertNotIn("/private/", output)
             self.assertNotIn("bangbang-grant:", output)
-        self.assertIn("api-mapped=blocked-listener-adoption", matrix.MATRIX_SUMMARY)
+        self.assertIn("api-mapped=complete", matrix.MATRIX_SUMMARY)
         self.assertIn("no-api-mapped=complete", matrix.MATRIX_SUMMARY)
-        self.assertIn("api-through-adoption", matrix.MATRIX_SUMMARY)
+        self.assertIn(
+            "api-pre-post-worker-first-launcher-first",
+            matrix.MATRIX_SUMMARY,
+        )
+        self.assertIn("faults=all-reachable", matrix.MATRIX_SUMMARY)
 
     def test_post_adoption_barrier_is_internal_and_precedes_worker_envelope(self) -> None:
         fixture = object.__new__(matrix.Fixture)
@@ -280,6 +299,34 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
                 set(matrix.RESOURCE_NAMES.values()),
             )
 
+    def test_api_socket_replacement_preserves_both_exact_inode_ledgers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            api = Path(directory) / "api"
+            api.mkdir(mode=0o700)
+            socket = api / matrix.API_SOCKET_CHILD
+            import socket as socket_module
+
+            listener = socket_module.socket(socket_module.AF_UNIX)
+            listener.bind(os.fspath(socket))
+            socket.chmod(0o600)
+            fixture = object.__new__(matrix.Fixture)
+            fixture.case = matrix.mode_for("api")
+            fixture.uid = os.getuid()
+            fixture.gid = os.getgid()
+            fixture.paths = {"api": api}
+            try:
+                replacement = matrix.ApiSocketReplacement(fixture)
+                replacement.validate()
+                self.assertTrue(replacement.displaced.is_socket())
+                self.assertEqual(
+                    replacement.original.read_bytes(),
+                    matrix.API_SOCKET_REPLACEMENT_BYTES,
+                )
+                replacement.cleanup()
+                self.assertEqual(list(api.iterdir()), [])
+            finally:
+                listener.close()
+
     def test_manual_scripts_never_request_or_load_credentials(self) -> None:
         for relative in (
             "scripts/build-elevated-bootstrap-probe.sh",
@@ -303,10 +350,18 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
             '/usr/bin/python3 "$repo_root/scripts/elevated_guest_matrix.py"', wrapper
         )
         self.assertIn('--sidecar "$guest_sidecar"', wrapper)
-        self.assertIn("deaths=no-api-worker-first-launcher-first", wrapper)
+        self.assertIn(
+            "deaths=no-api-post-worker-first-launcher-first-"
+            "api-pre-post-worker-first-launcher-first",
+            wrapper,
+        )
         self.assertIn("tamper=rejected-both-workloads", wrapper)
         self.assertIn(
-            "adoption-replacement=no-api-preopened-api-rejected-at-grant",
+            "adoption-replacement=no-api-complete-api-rejected-at-grant",
+            wrapper,
+        )
+        self.assertIn(
+            "socket-replacement=both-cleanup-owners-preserve",
             wrapper,
         )
 

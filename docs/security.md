@@ -101,9 +101,15 @@ binder stops at the App Sandbox `api-socket-publication` boundary. #1895's
 feature-only launcher-created path advances through direct final bind and an
 exactly-one-descriptor transfer, then the same worker stops in the closed
 receive/adoption interval reported as `api-listener-adoption` / `other` before
-durable ownership or readiness. This does not establish public uid/gid policy,
-API-started guest execution, the exact failing operation or sub-cause, or
-daemon/crash convergence.
+durable ownership or readiness. #1897 identifies the denied operation as the
+redundant runtime-session `.api-socket-owner` create after exact listener
+validation. Ordinary API/vsock sockets remain record-backed; only the
+transferred listener uses an exact record-free worker guard, while the launcher
+retains an independent exact post-reap guard. All three identity classes now
+complete canonical API configuration and real guest/HVF execution, including
+concurrency, every closed API fault, both endpoint-death orders, and
+replacement-safe cleanup by both owners. This does not establish public uid/gid
+policy or daemon/crash convergence.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -3566,10 +3572,27 @@ failing operation or kernel/sandbox sub-cause within that interval. It returns
 the parent to fresh Challenge rather than selecting a helper,
 sandbox change, topology change, or platform-impossible disposition.
 
-API configuration, API-started guest execution, and later API faults are
-consequently ineligible. Daemon/crash convergence remains unmeasured. The
-complete boundary, alternatives, exact cleanup rules, reproduction command,
-and future-OS nonclaim are in the checked
+#1897's fresh diagnosis identifies the first denied operation as App Sandbox
+`file-write-create` for runtime-session `.api-socket-owner`, after exact path,
+owner, descriptor, and queued-client validation. That record was redundant for
+the feature path: the launcher already retained exact publication ownership.
+#1897 therefore leaves ordinary API/vsock publication record-backed, gives only
+the transferred listener a closed record-free worker guard, and keeps the
+launcher's independent exact guard through reap. An unexpected feature API
+record is rejected.
+
+Mapped, retained-root/no-drop, and SDK-maximum unmapped API modes each complete
+three times through readiness, canonical HTTP configuration, real HVF, the
+fixed guest oracle, guest-requested poweroff, terminal ownership, and cleanup.
+Two mapped API guests complete concurrently; every closed API fault is
+reachable; pre-readiness and post-HVF worker-first and launcher-first deaths
+pass; and both exact cleanup owners preserve same-name replacements. Every new
+API stream verifies the live worker PID before sending and retains that
+immutable connected-stream fact through the close-delimited response. No
+helper, signing role, entitlement, bookmark, broker, private sandbox authority,
+or public policy changed. Daemon/crash convergence remains unmeasured. The
+complete evidence, exact cleanup rules, reproduction command, and future-OS
+nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 The six rows remain audit outcomes until #1371 challenges the controlled result

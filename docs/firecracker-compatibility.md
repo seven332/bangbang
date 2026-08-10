@@ -1255,10 +1255,17 @@ fixed guest oracle, and guest-requested poweroff for all three identities.
 `api-socket-publication` boundary. #1895's feature-only transitioned launcher
 instead binds the fixed final listener and transfers exactly one descriptor,
 then the same worker stops in the closed receive/adoption interval reported as
-`api-listener-adoption` / `other` before readiness. This is evidence for #1371,
-not a public launch policy or capability disposition; the exact failing
-operation and sub-cause, daemon/crash convergence, and final uid/gid semantics
-remain unmeasured.
+`api-listener-adoption` / `other` before readiness. #1897 identifies the denied
+operation as creation of redundant runtime-session `.api-socket-owner` after
+the exact path and descriptor validations. It keeps ordinary API/vsock sockets
+record-backed, adopts only the transferred listener with an exact record-free
+worker guard, and retains the launcher's independent exact post-reap guard.
+All three identity classes then complete the canonical API/HVF guest three
+times; mapped API guests also complete concurrently, every closed API fault is
+reachable, and deterministic pre-readiness/post-HVF death plus replacement
+cases prove both exact cleanup owners. This is evidence for #1371, not a public
+launch policy or capability disposition; daemon/crash convergence and final
+uid/gid semantics remain unmeasured.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
@@ -2777,7 +2784,7 @@ This does not broaden the supported API/device surface or claim arbitrary
 kernel/distribution boot, production containment, guest networking, artifact
 redistribution/authentication or byte-reproducible ext4.
 
-The separate #1893 / #1895 exact-root evidence composes the same checked guest
+The separate #1893 / #1895 / #1897 exact-root evidence composes the same checked guest
 inputs with the fixed production launcher and mandatory App Sandbox +
 Hypervisor worker after numeric credential transition. Mapped, retained-root
 no-drop, and SDK-maximum unmapped no-API modes all complete the real HVF guest,
@@ -2798,10 +2805,21 @@ stable closed receive/adoption interval reported as `api-listener-adoption` /
 `other` before durable ownership, readiness, HTTP, or HVF. The ordinary
 rootless API workflow above remains complete, so the blocked evidence is
 specifically the post-transition signed worker receive/adoption composition.
-The closed result does not identify its exact failing operation or kernel/
-sandbox sub-cause. Adding a different helper/signing role or private sandbox
-authority is not treated as Firecracker API parity or as an implementation in
-this slice.
+Fresh #1897 diagnosis isolates the exact denied operation as App Sandbox
+`file-write-create` for runtime-session `.api-socket-owner`, after the worker
+has validated the final path and transferred descriptor. #1897 removes only
+that redundant feature record: ordinary API/vsock sockets remain durable-
+record-backed, while the transferred listener retains exact in-memory worker
+ownership and the launcher independently retains its exact publication through
+reap. Mapped, retained-root/no-drop, and SDK-maximum unmapped API modes then each
+complete three times through readiness, the canonical HTTP configuration
+sequence, real HVF, the fixed guest oracle, guest-requested poweroff, terminal
+ownership, and cleanup. Two mapped API guests complete concurrently; every
+closed API fault is reachable; pre-readiness and post-HVF worker-first and
+launcher-first cases pass; and same-name replacements are preserved by both
+cleanup owners. No helper/signing role, entitlement, bookmark, broker, or
+public sandbox authority changed. Daemon/crash convergence remains a separate
+nonclaim.
 
 ## Specification Benchmark Observations
 

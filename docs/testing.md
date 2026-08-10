@@ -2100,7 +2100,7 @@ merged-main OID are checked and recorded by the pull-request workflow.
 
 The #1373 direct-worker, #1884 inherited-root, #1885 no-chroot credential,
 #1889 / #1891 target-owned runtime-continuation, #1893 post-transition guest,
-and #1895 launcher-created API-listener proofs are deliberately
+and #1895 / #1897 launcher-created API-listener proofs are deliberately
 separate from `scripts/run-integration-tests.sh`. Normal validation never
 invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
 passing skip.
@@ -2196,14 +2196,17 @@ credential, `BBA1`, `BBN1`, lifecycle, or grant prefix. Guest artifacts must be
 prepared and digest-verified before elevation; the exact-root run only verifies
 and opens the sealed copies. The matrix repeats every identity/workload three
 times, runs two concurrent mapped no-API successes and two concurrent mapped
-API boundary cases, and then exercises every no-API fault plus API listener
-request, bind, transfer, and adoption faults reachable before the measured
-stop. It also checks worker-first and launcher-first no-API death,
-immutable-input tampering for both workloads, successful no-API post-adoption
-pathname replacement, API preopened-anchor replacement rejection, exact output
-ledgers, and final zero residue. Launcher-first cleanup removes only the
-pre-recorded empty session after both signed endpoints have exited and rejects
-an identity replacement.
+API successes, and exercises every closed no-API and API fault through cleanup.
+It checks worker-first and launcher-first no-API death after HVF creation plus
+API death both immediately after listener adoption and after API readiness/HVF.
+The two pre-readiness API death orders displace the exact socket and install a
+same-name target-owned replacement, proving the surviving launcher and worker
+cleanup owners independently preserve it. Immutable-input tampering for both
+workloads, successful no-API post-adoption pathname replacement, API
+preopened-anchor replacement rejection, exact output ledgers, and final zero
+residue remain mandatory. Launcher-first cleanup removes only the pre-recorded
+empty session after both signed endpoints have exited and rejects an identity
+replacement.
 
 It reports OS/SDK/architecture and only value-free terminal classes. The
 inherited result remains `worker-bootstrap` / `other`: in-root `posix_spawn`
@@ -2226,10 +2229,26 @@ with exactly one listener descriptor. All three identities completed direct
 bind and transfer, including launcher alias release, before the same signed
 worker stopped in the closed receive/adoption interval reported as
 `api-listener-adoption` / `other`; two mapped attempts reproduced that boundary
-concurrently. No durable listener record, readiness, HTTP configuration, or
-API-started HVF guest followed. The exact failing operation and sub-cause remain
-unclaimed, and API configuration plus later faults are ineligible in this
-measured shape. Daemon/crash convergence remains unmeasured.
+concurrently. Fresh #1897 diagnosis identifies the first denied operation as
+App Sandbox `file-write-create` for `.api-socket-owner` in the unscoped
+target-owned runtime session, after exact path and descriptor validation. The
+feature listener already had independent exact launcher ownership, so #1897
+keeps ordinary API/vsock publication record-backed but gives only the
+transferred listener a closed record-free worker guard. The launcher retains
+its exact publication through reap and explicitly cleans it on every outcome;
+an unexpected feature API record is rejected.
+
+With that redundant record create removed, mapped, retained-root/no-drop, and
+SDK-maximum unmapped API modes each completed three times through API readiness,
+the canonical logger/metrics/serial/machine/boot/drive/InstanceStart `204`
+sequence, late resource/HVF witnesses, real HVF creation, the fixed guest
+oracle, guest-requested poweroff, terminal ownership, and cleanup. Two mapped
+API guests completed concurrently. Every API fault became reachable at its
+exact first stage, both endpoint-death orders passed at both API lifetime
+boundaries, and both exact cleanup owners preserved replacements. Each new API
+connection verifies the live worker PID before request transmission and carries
+that immutable connected-stream fact through the close-delimited response.
+Daemon/crash convergence remains unmeasured.
 Stream credentials remained
 connection-time snapshots, datagram credentials were unsupported, opaque
 datagram tokens changed only for credential transitions, and live peer PIDs
