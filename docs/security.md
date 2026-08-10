@@ -95,9 +95,11 @@ validates, adopts, and locks it before ordinary `Hello`; `Start` and `Prepared`
 bind the same session/inode, and the launcher proves the lock through an
 independent description before committing grants. The representative grant
 workload, `Proceed`/`Starting`/terminal ownership, reap, and exact cleanup all
-complete. This separately challenged test-only authority path does not establish
-public uid/gid policy, API/guest execution, daemon/crash convergence, or
-post-transition guest HVF.
+complete. The same test-only authority now also completes real no-API
+guest/HVF execution for all three identities. Its contained API path stops at
+the separately measured App Sandbox `api-socket-publication` boundary before
+HTTP configuration. This does not establish public uid/gid policy, API-started
+guest execution, or daemon/crash convergence.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -3519,9 +3521,32 @@ representative grant commitment and target-side allow/deny checks,
 `Proceed`/`Starting`/terminal ownership, reap, and exact session/workspace
 cleanup; final process, root, workspace, and socket scans were zero. The earlier
 unmapped identity boundary is superseded by this same-check witness, not by a
-bypass. API/no-API real guests, daemon/crash convergence, and post-transition
-guest HVF remain unmeasured. The complete boundary, alternatives, exact cleanup
-rules, reproduction command, and future-OS nonclaim are in the checked
+bypass.
+
+#1893 retained that exact process, credential, session, transport, and grant
+prefix and added late reattestation before guest resource use and HVF creation.
+Mapped, retained-root no-drop, and SDK-maximum unmapped no-API cases each
+completed three times through exact grant-backed startup, real HVF creation,
+the fixed guest oracle, guest-requested poweroff, terminal ownership, and
+cleanup; two mapped guests also completed concurrently. Immutable-input
+tampering, post-adoption pathname replacement, reachable first-failure stages,
+worker-first/launcher-first death, and final zero residue all passed.
+
+The three contained API modes independently reached the first publication
+attempt and then stopped at `api-socket-publication` / `other`. For mapped and
+unmapped identities, the signed binder image was rejected while
+`libsystem_secinit` reinitialized App Sandbox after the root-originated numeric
+transition, before authenticated binder application code ran. Retained-root
+reached that code, but App Sandbox denied creation of the descriptor-rooted
+staging socket beneath the explicit runtime namespace. The worker and launcher
+remain correctly signed and the same no-API worker completes real HVF, so this
+is not a missing-HVF or generic signature result. Bypassing it would require a
+new non-sandboxed helper/signing role, a private sandbox extension mechanism,
+or another process topology; #1893 does not weaken the mandatory worker profile
+or treat those alternatives as equivalent. API configuration, API-started
+guest execution, and later API faults are consequently ineligible. Daemon/
+crash convergence remains unmeasured. The complete boundary, alternatives,
+exact cleanup rules, reproduction command, and future-OS nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 The six rows remain audit outcomes until #1371 challenges the controlled result

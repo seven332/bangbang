@@ -23,6 +23,8 @@ use signal_hook::{SigId, low_level};
 
 use super::block_control::LauncherBlockControlBroker;
 use super::daemon::{DaemonNotifier, NotifierEvent};
+#[cfg(feature = "elevated-bootstrap-probe")]
+use super::elevated_guest::ElevatedGuestSupervisor;
 use super::socket_broker::LauncherSocketBroker;
 use super::spawn::OwnedWorker;
 use super::vhost_user_broker::LauncherVhostUserBroker;
@@ -183,6 +185,8 @@ pub(crate) fn wait_session(
         SessionOptions {
             notifier,
             roots: NamespaceRoots::Ordinary,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            guest: None,
         },
     )
 }
@@ -191,12 +195,21 @@ pub(crate) fn wait_session(
 pub(crate) struct PreopenedSessionStart {
     handles: LauncherSessionHandles,
     frame: Frame,
+    guest: Option<ElevatedGuestSupervisor>,
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
 impl PreopenedSessionStart {
-    pub(crate) const fn new(handles: LauncherSessionHandles, frame: Frame) -> Self {
-        Self { handles, frame }
+    pub(crate) const fn new(
+        handles: LauncherSessionHandles,
+        frame: Frame,
+        guest: Option<ElevatedGuestSupervisor>,
+    ) -> Self {
+        Self {
+            handles,
+            frame,
+            guest,
+        }
     }
 }
 
@@ -210,7 +223,11 @@ pub(crate) fn wait_session_with_preopened_namespace(
     grants: &PreparedGrantBatch,
     start: PreopenedSessionStart,
 ) -> Result<ExitStatus, LauncherError> {
-    let PreopenedSessionStart { handles, frame } = start;
+    let PreopenedSessionStart {
+        handles,
+        frame,
+        guest,
+    } = start;
     let mut roots = NamespaceRoots::Preopened(handles);
     if let Err(error) = write_frame(session, frame) {
         terminate_session(worker, session, &auxiliary);
@@ -234,6 +251,7 @@ pub(crate) fn wait_session_with_preopened_namespace(
         SessionOptions {
             notifier: None,
             roots,
+            guest,
         },
     )
 }
@@ -250,6 +268,8 @@ fn wait_session_with_roots(
     let SessionOptions {
         notifier,
         mut roots,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        mut guest,
     } = options;
     let session_id = lifecycle.session();
     let mut observation = SessionObservation::default();
@@ -264,6 +284,8 @@ fn wait_session_with_roots(
             observation: &mut observation,
             notifier,
             roots: &mut roots,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            guest: &mut guest,
         },
     );
     if result.is_err() {
@@ -286,6 +308,14 @@ fn wait_session_with_roots(
     match result {
         Ok(status) => {
             cleanup?;
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if observation
+                .terminal
+                .is_some_and(|(category, _)| category == TerminalCategory::Success)
+                && let Some(guest) = guest.as_mut()
+            {
+                guest.finish_cleanup()?;
+            }
             validate_terminal(status, observation.terminal)?;
             Ok(status)
         }
@@ -316,6 +346,8 @@ fn terminate_session(
 struct SessionOptions<'a> {
     notifier: Option<&'a mut DaemonNotifier>,
     roots: NamespaceRoots,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    guest: Option<ElevatedGuestSupervisor>,
 }
 
 enum NamespaceRoots {
@@ -508,6 +540,8 @@ struct SessionHooks<'a> {
     observation: &'a mut SessionObservation,
     notifier: Option<&'a mut DaemonNotifier>,
     roots: &'a mut NamespaceRoots,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    guest: &'a mut Option<ElevatedGuestSupervisor>,
 }
 
 fn wait_session_inner(
@@ -527,6 +561,8 @@ fn wait_session_inner(
         observation,
         mut notifier,
         roots,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        guest,
     } = hooks;
     session
         .set_nonblocking(true)
@@ -608,6 +644,15 @@ fn wait_session_inner(
             0,
         ),
     ];
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    if guest.is_some() {
+        changes.push(event(
+            grant_fd,
+            libc::EVFILT_READ,
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            0,
+        ));
+    }
     let notifier_fd = notifier
         .as_ref()
         .map(|notifier| {
@@ -633,6 +678,8 @@ fn wait_session_inner(
     let mut broker = LauncherSocketBroker::new(lifecycle.session());
     let mut vhost_broker = LauncherVhostUserBroker::new(lifecycle.session());
     let mut block_control = LauncherBlockControlBroker::new(lifecycle.session());
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    let mut api_registration = GuestApiEventRegistration::default();
     loop {
         let notifier_deadline = notifier.as_ref().and_then(|notifier| notifier.deadline());
         let deadline = [
@@ -640,6 +687,8 @@ fn wait_session_inner(
             exit_deadline,
             grant_send.deadline(),
             notifier_deadline,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            guest.as_ref().and_then(ElevatedGuestSupervisor::deadline),
         ]
         .into_iter()
         .flatten()
@@ -659,11 +708,16 @@ fn wait_session_inner(
                 session_closed = drain_session(
                     session,
                     grant_socket,
-                    &mut decoder,
-                    lifecycle,
-                    observation,
-                    &mut grant_send,
-                    roots,
+                    worker.pid(),
+                    SessionDrainState {
+                        decoder: &mut decoder,
+                        lifecycle,
+                        observation,
+                        grant_send: &mut grant_send,
+                        roots,
+                    },
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    guest.as_mut(),
                 )?;
                 if session_closed {
                     exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
@@ -674,8 +728,64 @@ fn wait_session_inner(
                 }
             }
         }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        if session_closed
+            && observation.terminal.is_none()
+            && let Some(guest) = guest.as_mut()
+        {
+            guest.fail_endpoint_death()?;
+        }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        if !child_exited
+            && !lifecycle.is_cancelled()
+            && events
+                .iter()
+                .any(|queued| queued.filter == libc::EVFILT_READ && queued.ident == grant_fd)
+            && let Some(guest) = guest.as_mut()
+        {
+            guest.handle_readable(
+                grant_socket,
+                worker.pid(),
+                session,
+                observation.namespace.as_ref(),
+            )?;
+        }
         if observation.terminal.is_some() {
             exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
+        }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        {
+            sync_guest_api_events(kqueue.as_raw_fd(), guest.as_mut(), &mut api_registration)?;
+            if !child_exited
+                && !lifecycle.is_cancelled()
+                && let Some(api_fd) = api_registration.descriptor
+            {
+                let readable = events.iter().any(|queued| {
+                    queued.ident == api_fd
+                        && queued.filter == libc::EVFILT_READ
+                        && queued.flags & libc::EV_ERROR == 0
+                });
+                let writable = events.iter().any(|queued| {
+                    queued.ident == api_fd
+                        && queued.filter == libc::EVFILT_WRITE
+                        && queued.flags & libc::EV_ERROR == 0
+                });
+                let failed = events
+                    .iter()
+                    .any(|queued| queued.ident == api_fd && queued.flags & libc::EV_ERROR != 0);
+                if failed {
+                    if let Some(guest) = guest.as_mut() {
+                        guest.fail_api_event()?;
+                    }
+                    return Err(LauncherError::SessionProtocol);
+                }
+                if (readable || writable)
+                    && let Some(guest) = guest.as_mut()
+                {
+                    guest.handle_api_event(readable, writable, worker.pid())?;
+                    sync_guest_api_events(kqueue.as_raw_fd(), Some(guest), &mut api_registration)?;
+                }
+            }
         }
         if session_closed || observation.terminal.is_some() {
             BlockControlShutdown {
@@ -818,7 +928,18 @@ fn wait_session_inner(
             }
         }
 
-        sync_grant_write_event(kqueue.as_raw_fd(), grant_fd, &mut grant_send)?;
+        let grant_write_required = grant_send.requires_write_event();
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        let grant_write_required = grant_write_required
+            || guest
+                .as_ref()
+                .is_some_and(|guest| guest.requires_write_event());
+        sync_grant_write_event(
+            kqueue.as_raw_fd(),
+            grant_fd,
+            &mut grant_send,
+            grant_write_required,
+        )?;
         if !lifecycle.is_cancelled()
             && events.iter().any(|queued| {
                 queued.filter == libc::EVFILT_WRITE
@@ -826,6 +947,12 @@ fn wait_session_inner(
                     && queued.flags & libc::EV_ERROR != 0
             })
         {
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if !grant_send.requires_write_event()
+                && let Some(guest) = guest.as_mut()
+            {
+                guest.fail_transport_event()?;
+            }
             return Err(LauncherError::GrantProtocol);
         }
         if events.iter().any(|queued| {
@@ -835,8 +962,27 @@ fn wait_session_inner(
         }) && !lifecycle.is_cancelled()
             && !child_exited
         {
-            grant_send.pump(grant_socket)?;
-            sync_grant_write_event(kqueue.as_raw_fd(), grant_fd, &mut grant_send)?;
+            if grant_send.requires_write_event() {
+                grant_send.pump(grant_socket)?;
+            }
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if !grant_send.requires_write_event()
+                && let Some(guest) = guest.as_mut()
+            {
+                guest.pump_write(grant_socket)?;
+            }
+            let grant_write_required = grant_send.requires_write_event();
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let grant_write_required = grant_write_required
+                || guest
+                    .as_ref()
+                    .is_some_and(|guest| guest.requires_write_event());
+            sync_grant_write_event(
+                kqueue.as_raw_fd(),
+                grant_fd,
+                &mut grant_send,
+                grant_write_required,
+            )?;
         }
 
         if child_exited {
@@ -846,11 +992,27 @@ fn wait_session_inner(
                 let _ = drain_session(
                     session,
                     grant_socket,
-                    &mut decoder,
-                    lifecycle,
-                    observation,
-                    &mut grant_send,
-                    roots,
+                    worker.pid(),
+                    SessionDrainState {
+                        decoder: &mut decoder,
+                        lifecycle,
+                        observation,
+                        grant_send: &mut grant_send,
+                        roots,
+                    },
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    guest.as_mut(),
+                )?;
+            }
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if !lifecycle.is_cancelled()
+                && let Some(guest) = guest.as_mut()
+            {
+                guest.handle_readable(
+                    grant_socket,
+                    worker.pid(),
+                    session,
+                    observation.namespace.as_ref(),
                 )?;
             }
             break;
@@ -867,6 +1029,12 @@ fn wait_session_inner(
         if grant_send.has_timed_out(Instant::now()) {
             return Err(LauncherError::GrantProtocol);
         }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        if !lifecycle.is_cancelled()
+            && let Some(guest) = guest.as_mut()
+        {
+            guest.has_timed_out(Instant::now())?;
+        }
         if notifier
             .as_ref()
             .and_then(|notifier| notifier.deadline())
@@ -876,7 +1044,120 @@ fn wait_session_inner(
         }
     }
 
-    worker.wait()
+    let status = worker.wait()?;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    if let Some(guest) = guest.as_mut() {
+        guest.finish_after_worker_exit(grant_socket, worker.pid(), observation.terminal)?;
+    }
+    Ok(status)
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Debug, Default)]
+struct GuestApiEventRegistration {
+    descriptor: Option<usize>,
+    read: bool,
+    write: bool,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn sync_guest_api_events(
+    kqueue: RawFd,
+    guest: Option<&mut ElevatedGuestSupervisor>,
+    registration: &mut GuestApiEventRegistration,
+) -> Result<(), LauncherError> {
+    let descriptor = guest
+        .as_ref()
+        .and_then(|guest| guest.api_descriptor())
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| LauncherError::SessionProtocol)?;
+    let interest = guest
+        .as_ref()
+        .map_or_else(Default::default, |guest| guest.api_interest());
+    if registration.descriptor != descriptor {
+        if let Some(previous) = registration.descriptor {
+            register_events(
+                kqueue,
+                &[
+                    event(previous, libc::EVFILT_READ, libc::EV_DELETE, 0),
+                    event(previous, libc::EVFILT_WRITE, libc::EV_DELETE, 0),
+                ],
+            )?;
+        }
+        if let Some(guest) = guest {
+            guest.clear_retired_api_streams();
+        }
+        registration.descriptor = descriptor;
+        registration.read = interest.read;
+        registration.write = interest.write;
+        if let Some(descriptor) = descriptor {
+            register_events(
+                kqueue,
+                &[
+                    event(
+                        descriptor,
+                        libc::EVFILT_READ,
+                        libc::EV_ADD
+                            | libc::EV_CLEAR
+                            | if interest.read {
+                                libc::EV_ENABLE
+                            } else {
+                                libc::EV_DISABLE
+                            },
+                        0,
+                    ),
+                    event(
+                        descriptor,
+                        libc::EVFILT_WRITE,
+                        libc::EV_ADD
+                            | libc::EV_CLEAR
+                            | if interest.write {
+                                libc::EV_ENABLE
+                            } else {
+                                libc::EV_DISABLE
+                            },
+                        0,
+                    ),
+                ],
+            )?;
+        }
+        return Ok(());
+    }
+    let Some(descriptor) = descriptor else {
+        return Ok(());
+    };
+    let mut changes = Vec::with_capacity(2);
+    if registration.read != interest.read {
+        changes.push(event(
+            descriptor,
+            libc::EVFILT_READ,
+            if interest.read {
+                libc::EV_ENABLE
+            } else {
+                libc::EV_DISABLE
+            },
+            0,
+        ));
+        registration.read = interest.read;
+    }
+    if registration.write != interest.write {
+        changes.push(event(
+            descriptor,
+            libc::EVFILT_WRITE,
+            if interest.write {
+                libc::EV_ENABLE
+            } else {
+                libc::EV_DISABLE
+            },
+            0,
+        ));
+        registration.write = interest.write;
+    }
+    if !changes.is_empty() {
+        register_events(kqueue, &changes)?;
+    }
+    Ok(())
 }
 
 fn request_cancellation(
@@ -930,15 +1211,30 @@ fn timeout_until(deadline: Option<Instant>) -> Option<Duration> {
     deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
 }
 
+struct SessionDrainState<'a> {
+    decoder: &'a mut FrameDecoder,
+    lifecycle: &'a mut LauncherLifecycle,
+    observation: &'a mut SessionObservation,
+    grant_send: &'a mut GrantSendState,
+    roots: &'a mut NamespaceRoots,
+}
+
 fn drain_session(
     session: &mut UnixStream,
     grant_socket: &mut UnixDatagram,
-    decoder: &mut FrameDecoder,
-    lifecycle: &mut LauncherLifecycle,
-    observation: &mut SessionObservation,
-    grant_send: &mut GrantSendState,
-    roots: &mut NamespaceRoots,
+    worker_pid: libc::pid_t,
+    state: SessionDrainState<'_>,
+    #[cfg(feature = "elevated-bootstrap-probe")] mut guest: Option<&mut ElevatedGuestSupervisor>,
 ) -> Result<bool, LauncherError> {
+    #[cfg(not(feature = "elevated-bootstrap-probe"))]
+    let _ = worker_pid;
+    let SessionDrainState {
+        decoder,
+        lifecycle,
+        observation,
+        grant_send,
+        roots,
+    } = state;
     let mut buffer = [0_u8; 4096];
     loop {
         match session.read(&mut buffer) {
@@ -990,10 +1286,24 @@ fn drain_session(
                         Message::GrantsAccepted { .. } => {
                             if !lifecycle.is_cancelled() {
                                 grant_send.acknowledge()?;
+                                #[cfg(feature = "elevated-bootstrap-probe")]
+                                if let Some(guest) = guest.as_deref_mut() {
+                                    guest.activate(
+                                        grant_socket,
+                                        worker_pid,
+                                        session,
+                                        observation.namespace.as_ref(),
+                                    )?;
+                                }
                                 let proceed = lifecycle
                                     .proceed()
                                     .map_err(|_| LauncherError::SessionProtocol)?;
                                 write_frame(session, proceed)?;
+                                #[cfg(feature = "elevated-bootstrap-probe")]
+                                if guest.is_none() {
+                                    shutdown_grants(grant_socket);
+                                }
+                                #[cfg(not(feature = "elevated-bootstrap-probe"))]
                                 shutdown_grants(grant_socket);
                             }
                         }
@@ -1001,6 +1311,16 @@ fn drain_session(
                         Message::Ready(readiness) => {
                             if observation.readiness.replace(readiness).is_some() {
                                 return Err(LauncherError::SessionProtocol);
+                            }
+                            #[cfg(feature = "elevated-bootstrap-probe")]
+                            if let Some(guest) = guest.as_deref_mut() {
+                                guest.observe_readiness(
+                                    readiness,
+                                    grant_socket,
+                                    worker_pid,
+                                    session,
+                                    observation.namespace.as_ref(),
+                                )?;
                             }
                         }
                         Message::Terminal {
@@ -1163,8 +1483,8 @@ fn sync_grant_write_event(
     kqueue: RawFd,
     grant_fd: usize,
     state: &mut GrantSendState,
+    should_enable: bool,
 ) -> Result<(), LauncherError> {
-    let should_enable = state.requires_write_event();
     if should_enable == state.event_enabled {
         return Ok(());
     }
@@ -1267,13 +1587,13 @@ fn wait_events(
         None => None,
     };
     loop {
-        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 7];
+        let mut events = [MaybeUninit::<libc::kevent>::uninit(); 16];
         let timeout = deadline
             .map(|deadline| duration_timespec(deadline.saturating_duration_since(Instant::now())));
         let timeout_ptr = timeout
             .as_ref()
             .map_or(ptr::null(), |value| value as *const libc::timespec);
-        // SAFETY: `events` provides room for four values. The optional timespec
+        // SAFETY: `events` provides room for every fixed registration. The optional timespec
         // remains live, and the kernel initializes exactly the positive count.
         let count = unsafe {
             libc::kevent(
@@ -1281,7 +1601,7 @@ fn wait_events(
                 ptr::null(),
                 0,
                 events.as_mut_ptr().cast(),
-                7,
+                16,
                 timeout_ptr,
             )
         };

@@ -7,6 +7,8 @@ pub mod block_control;
 pub mod bookmark;
 pub mod grant_registry;
 pub mod grant_transport;
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub mod guest_evidence;
 pub mod runtime;
 #[cfg(feature = "elevated-bootstrap-probe")]
 pub mod runtime_authority;

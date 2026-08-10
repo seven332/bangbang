@@ -330,6 +330,10 @@ mod platform {
         GrantedFile, StagedGrantBatch,
     };
     use bangbang_session::macos::grant_transport::receive_grant;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    use bangbang_session::macos::guest_evidence::{
+        guest_evidence_transport_is_empty, receive_guest_evidence, send_guest_evidence,
+    };
     use bangbang_session::macos::runtime::{
         RuntimeError, SnapshotStagingKind, SnapshotStagingName, SnapshotStagingOwnershipRecord,
         WorkerNamespace, WorkerSocketNamespace,
@@ -357,6 +361,13 @@ mod platform {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     const VHOST_USER_BROKER_TIMEOUT: Duration = Duration::from_secs(2);
     const BLOCK_CONTROL_BROKER_TIMEOUT: Duration = Duration::from_secs(2);
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    const GUEST_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(5);
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn guest_success_oracle_is_exact(bytes: &[u8]) -> bool {
+        bangbang_session::elevated_probe::classify_guest_serial_transcript(bytes)
+            == bangbang_session::elevated_probe::GuestSerialTranscript::Success
+    }
     #[cfg(feature = "grant-integration-probe")]
     const GRANT_DELAY_PROBE: &str = "--bangbang-internal-grant-delay-v1";
     #[cfg(feature = "grant-integration-probe")]
@@ -871,6 +882,16 @@ mod platform {
                 .unwrap_or(false)
         }
 
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn is_exactly_empty(&self) -> Result<bool, ContainedSessionError> {
+            self.registry
+                .lock()
+                .map_err(|_| ContainedSessionError)?
+                .as_ref()
+                .map(ConnectedStreamGrantRegistry::is_empty)
+                .ok_or(ContainedSessionError)
+        }
+
         pub(crate) fn validates(&self, reference: &Path) -> Result<(), GrantClaimError> {
             let id = grant_reference_id(reference)?.ok_or(GrantClaimError)?;
             let registry = self.registry.lock().map_err(|_| GrantClaimError)?;
@@ -1279,6 +1300,88 @@ mod platform {
                 .lock()
                 .map(|registry| registry.is_some())
                 .unwrap_or(false)
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn validate_elevated_guest_initial(
+            &self,
+            workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        ) -> Result<(), ContainedSessionError> {
+            use bangbang_session::elevated_probe::{
+                GUEST_CONFIG_GRANT_ID, GUEST_INITRD_GRANT_ID, GUEST_KERNEL_GRANT_ID,
+                GUEST_LOGGER_GRANT_ID, GUEST_METRICS_GRANT_ID, GUEST_ROOTFS_GRANT_ID,
+                GUEST_SERIAL_GRANT_ID, RuntimeWorkload,
+            };
+
+            let mut requests = Vec::with_capacity(match workload {
+                RuntimeWorkload::GuestNoApi => 7,
+                RuntimeWorkload::GuestApi => 6,
+                RuntimeWorkload::RepresentativeGrants => return Err(ContainedSessionError),
+            });
+            let mut push = |id: &str, role: ResourceRole, access: GrantAccess| {
+                requests.push((
+                    GrantId::parse(id).map_err(|_| ContainedSessionError)?,
+                    role,
+                    access,
+                    GrantObjectKind::RegularFile,
+                ));
+                Ok::<(), ContainedSessionError>(())
+            };
+            if workload == RuntimeWorkload::GuestNoApi {
+                push(
+                    GUEST_CONFIG_GRANT_ID,
+                    ResourceRole::StartupConfig,
+                    GrantAccess::ReadOnly,
+                )?;
+            }
+            push(
+                GUEST_KERNEL_GRANT_ID,
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+            )?;
+            push(
+                GUEST_INITRD_GRANT_ID,
+                ResourceRole::InitrdImage,
+                GrantAccess::ReadOnly,
+            )?;
+            push(
+                GUEST_ROOTFS_GRANT_ID,
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+            )?;
+            push(
+                GUEST_LOGGER_GRANT_ID,
+                ResourceRole::LoggerSink,
+                GrantAccess::WriteOnly,
+            )?;
+            push(
+                GUEST_METRICS_GRANT_ID,
+                ResourceRole::MetricsSink,
+                GrantAccess::WriteOnly,
+            )?;
+            push(
+                GUEST_SERIAL_GRANT_ID,
+                ResourceRole::SerialSink,
+                GrantAccess::WriteOnly,
+            )?;
+
+            let registry = self.registry.lock().map_err(|_| ContainedSessionError)?;
+            let registry = registry.as_ref().ok_or(ContainedSessionError)?;
+            if registry.len() != requests.len() || registry.inspect_exact_files(&requests).is_err()
+            {
+                return Err(ContainedSessionError);
+            }
+            Ok(())
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn is_exactly_empty(&self) -> Result<bool, ContainedSessionError> {
+            self.registry
+                .lock()
+                .map_err(|_| ContainedSessionError)?
+                .as_ref()
+                .map(FileGrantRegistry::is_empty)
+                .ok_or(ContainedSessionError)
         }
 
         pub(crate) fn claim_read_only_file(
@@ -1980,6 +2083,72 @@ mod platform {
                 .try_borrow()
                 .map(|registry| registry.is_some())
                 .unwrap_or(false)
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn validate_elevated_guest_initial(
+            &self,
+            workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        ) -> Result<(), ContainedSessionError> {
+            use bangbang_session::elevated_probe::{GUEST_API_DIRECTORY_GRANT_ID, RuntimeWorkload};
+
+            if !self
+                .retained_snapshot
+                .try_borrow()
+                .map_err(|_| ContainedSessionError)?
+                .is_empty()
+                || !self
+                    .retained_vhost
+                    .try_borrow()
+                    .map_err(|_| ContainedSessionError)?
+                    .is_empty()
+            {
+                return Err(ContainedSessionError);
+            }
+            let registry = self
+                .registry
+                .try_borrow()
+                .map_err(|_| ContainedSessionError)?;
+            let registry = registry.as_ref().ok_or(ContainedSessionError)?;
+            match workload {
+                RuntimeWorkload::GuestNoApi if registry.is_empty() => Ok(()),
+                RuntimeWorkload::GuestApi if registry.len() == 1 => {
+                    let request = [(
+                        GrantId::parse(GUEST_API_DIRECTORY_GRANT_ID)
+                            .map_err(|_| ContainedSessionError)?,
+                        ResourceRole::ApiSocketDirectory,
+                        GrantAccess::CreateChildren,
+                    )];
+                    registry
+                        .inspect_exact_directories(&request)
+                        .map(|_| ())
+                        .map_err(|_| ContainedSessionError)
+                }
+                RuntimeWorkload::RepresentativeGrants
+                | RuntimeWorkload::GuestNoApi
+                | RuntimeWorkload::GuestApi => Err(ContainedSessionError),
+            }
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn is_exactly_empty(&self) -> Result<bool, ContainedSessionError> {
+            let registry = self
+                .registry
+                .try_borrow()
+                .map_err(|_| ContainedSessionError)?;
+            Ok(registry
+                .as_ref()
+                .is_some_and(DirectoryGrantRegistry::is_empty)
+                && self
+                    .retained_snapshot
+                    .try_borrow()
+                    .map_err(|_| ContainedSessionError)?
+                    .is_empty()
+                && self
+                    .retained_vhost
+                    .try_borrow()
+                    .map_err(|_| ContainedSessionError)?
+                    .is_empty())
         }
 
         pub(crate) fn validates_vhost_user_lease(
@@ -3530,6 +3699,381 @@ mod platform {
         Ok(value)
     }
 
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GuestEvidenceStep {
+        ResourceClaim,
+        HvfCreate,
+        HvfCreated,
+        GuestShutdown,
+        Complete,
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    struct GuestEvidenceState {
+        socket: UnixDatagram,
+        mode: bangbang_session::elevated_probe::ProbeMode,
+        fault: bangbang_session::elevated_probe::RuntimeFault,
+        target_uid: u32,
+        target_gid: u32,
+        nonce: SessionId,
+        session: SessionId,
+        parent: libc::pid_t,
+        stream_fd: RawFd,
+        namespace: Arc<Mutex<Option<WorkerNamespace>>>,
+        file_grants: GrantAuthority,
+        directory_authority_consumed: bool,
+        step: GuestEvidenceStep,
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[derive(Clone)]
+    pub(crate) struct GuestEvidenceAuthority {
+        state: Arc<Mutex<Option<GuestEvidenceState>>>,
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    impl std::fmt::Debug for GuestEvidenceAuthority {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("GuestEvidenceAuthority(<redacted>)")
+        }
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    impl GuestEvidenceAuthority {
+        fn new(
+            socket: UnixDatagram,
+            bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+            session: SessionId,
+            parent: libc::pid_t,
+            stream_fd: RawFd,
+            namespace: Arc<Mutex<Option<WorkerNamespace>>>,
+            file_grants: GrantAuthority,
+        ) -> Result<Self, ContainedSessionError> {
+            if !matches!(
+                bootstrap.mode().runtime_workload(),
+                Some(
+                    bangbang_session::elevated_probe::RuntimeWorkload::GuestNoApi
+                        | bangbang_session::elevated_probe::RuntimeWorkload::GuestApi
+                )
+            ) || session.is_pre_session()
+                || !guest_evidence_transport_is_empty(&socket)
+            {
+                return Err(ContainedSessionError);
+            }
+            Ok(Self {
+                state: Arc::new(Mutex::new(Some(GuestEvidenceState {
+                    socket,
+                    mode: bootstrap.mode(),
+                    fault: bootstrap.fault(),
+                    target_uid: bootstrap.target_uid(),
+                    target_gid: bootstrap.target_gid(),
+                    nonce: bootstrap.nonce(),
+                    session,
+                    parent,
+                    stream_fd,
+                    namespace,
+                    file_grants,
+                    directory_authority_consumed: false,
+                    step: GuestEvidenceStep::ResourceClaim,
+                }))),
+            })
+        }
+
+        fn workload(
+            &self,
+        ) -> Result<bangbang_session::elevated_probe::RuntimeWorkload, ContainedSessionError>
+        {
+            self.state
+                .lock()
+                .map_err(|_| ContainedSessionError)?
+                .as_ref()
+                .and_then(|state| state.mode.runtime_workload())
+                .ok_or(ContainedSessionError)
+        }
+
+        pub(crate) fn before_first_guest_resource_claim(
+            &self,
+        ) -> Result<(), ContainedSessionError> {
+            self.exchange(
+                GuestEvidenceStep::ResourceClaim,
+                bangbang_session::elevated_probe::GuestEvidencePhase::ResourceClaim,
+                bangbang_session::elevated_probe::RuntimeFault::GuestResourceWitness,
+                GuestEvidenceStep::HvfCreate,
+            )
+        }
+
+        fn confirm_directory_authority_consumed(
+            &self,
+            expected_workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        ) -> Result<(), ContainedSessionError> {
+            let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+            let state = locked.as_mut().ok_or(ContainedSessionError)?;
+            if state.step != GuestEvidenceStep::HvfCreate
+                || state.mode.runtime_workload() != Some(expected_workload)
+                || state.directory_authority_consumed
+            {
+                return Err(ContainedSessionError);
+            }
+            state.directory_authority_consumed = true;
+            Ok(())
+        }
+
+        pub(crate) fn before_hvf_create(&self) -> Result<(), ContainedSessionError> {
+            {
+                let locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+                let state = locked.as_ref().ok_or(ContainedSessionError)?;
+                if !state.directory_authority_consumed || !state.file_grants.is_exactly_empty()? {
+                    return Err(ContainedSessionError);
+                }
+            }
+            self.exchange(
+                GuestEvidenceStep::HvfCreate,
+                bangbang_session::elevated_probe::GuestEvidencePhase::HvfCreate,
+                bangbang_session::elevated_probe::RuntimeFault::GuestHvfWitness,
+                GuestEvidenceStep::HvfCreated,
+            )?;
+            self.reject_fault(bangbang_session::elevated_probe::RuntimeFault::GuestHvfCreate)
+        }
+
+        fn reject_fault(
+            &self,
+            fault: bangbang_session::elevated_probe::RuntimeFault,
+        ) -> Result<(), ContainedSessionError> {
+            let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+            if locked.as_ref().is_some_and(|state| state.fault == fault) {
+                if let Some(state) = locked.take() {
+                    let _ = state.socket.shutdown(std::net::Shutdown::Both);
+                }
+                Err(ContainedSessionError)
+            } else if locked.is_some() {
+                Ok(())
+            } else {
+                Err(ContainedSessionError)
+            }
+        }
+
+        fn exchange(
+            &self,
+            expected_step: GuestEvidenceStep,
+            phase: bangbang_session::elevated_probe::GuestEvidencePhase,
+            fault: bangbang_session::elevated_probe::RuntimeFault,
+            next_step: GuestEvidenceStep,
+        ) -> Result<(), ContainedSessionError> {
+            let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+            let Some(mut state) = locked.take() else {
+                return Err(ContainedSessionError);
+            };
+            let result = (|| {
+                if state.step != expected_step || state.fault == fault {
+                    return Err(ContainedSessionError);
+                }
+                validate_guest_evidence_worker(&state)?;
+                let request =
+                    bangbang_session::elevated_probe::GuestEvidenceRecord::worker_request(
+                        state.mode,
+                        phase,
+                        state.nonce,
+                        state.session,
+                    )
+                    .map_err(|_| ContainedSessionError)?;
+                state
+                    .socket
+                    .set_write_timeout(Some(GUEST_EVIDENCE_TIMEOUT))
+                    .map_err(|_| ContainedSessionError)?;
+                loop {
+                    match send_guest_evidence(&state.socket, request) {
+                        Ok(()) => break,
+                        Err(bangbang_session::macos::grant_transport::GrantTransportError::Io(
+                            io::ErrorKind::Interrupted,
+                        )) => {}
+                        Err(_) => return Err(ContainedSessionError),
+                    }
+                }
+                state
+                    .socket
+                    .set_read_timeout(Some(GUEST_EVIDENCE_TIMEOUT))
+                    .map_err(|_| ContainedSessionError)?;
+                let acknowledgment = loop {
+                    match receive_guest_evidence(&state.socket) {
+                        Ok(record) => break record,
+                        Err(bangbang_session::macos::grant_transport::GrantTransportError::Io(
+                            io::ErrorKind::Interrupted,
+                        )) => {}
+                        Err(_) => return Err(ContainedSessionError),
+                    }
+                };
+                if !acknowledgment.matches_expected(
+                    state.mode,
+                    phase,
+                    bangbang_session::elevated_probe::GuestEvidenceKind::Ack,
+                    bangbang_session::elevated_probe::CredentialRole::Launcher,
+                    state.nonce,
+                    state.session,
+                ) || !guest_evidence_transport_is_empty(&state.socket)
+                {
+                    return Err(ContainedSessionError);
+                }
+                validate_guest_evidence_worker(&state)?;
+                state.step = next_step;
+                Ok(())
+            })();
+            if result.is_ok() {
+                *locked = Some(state);
+            } else {
+                let _ = state.socket.shutdown(std::net::Shutdown::Both);
+            }
+            result
+        }
+
+        pub(crate) fn report_hvf_created(&self) -> Result<(), ContainedSessionError> {
+            self.report(
+                GuestEvidenceStep::HvfCreated,
+                bangbang_session::elevated_probe::GuestEvidencePhase::HvfCreated,
+                GuestEvidenceStep::GuestShutdown,
+            )?;
+            if self.has_fault(bangbang_session::elevated_probe::RuntimeFault::GuestEndpointDeath)? {
+                // SAFETY: `raise` targets the current process with the fixed
+                // uncatchable stop signal used by the external death matrix.
+                if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+                    self.invalidate();
+                    return Err(ContainedSessionError);
+                }
+            }
+            self.reject_fault(bangbang_session::elevated_probe::RuntimeFault::GuestExecution)
+        }
+
+        pub(crate) fn finish_guest(
+            &self,
+            serial_oracle: &[u8],
+        ) -> Result<(), ContainedSessionError> {
+            use bangbang_session::elevated_probe::RuntimeFault;
+
+            if self.has_fault(RuntimeFault::GuestOracle)? {
+                self.invalidate();
+                return Err(ContainedSessionError);
+            }
+            if !guest_success_oracle_is_exact(serial_oracle) {
+                self.invalidate();
+                return Err(ContainedSessionError);
+            }
+            if self.has_fault(RuntimeFault::GuestPoweroff)? {
+                self.invalidate();
+                return Err(ContainedSessionError);
+            }
+            self.report(
+                GuestEvidenceStep::GuestShutdown,
+                bangbang_session::elevated_probe::GuestEvidencePhase::GuestShutdown,
+                GuestEvidenceStep::Complete,
+            )
+        }
+
+        fn has_fault(
+            &self,
+            fault: bangbang_session::elevated_probe::RuntimeFault,
+        ) -> Result<bool, ContainedSessionError> {
+            self.state
+                .lock()
+                .map_err(|_| ContainedSessionError)?
+                .as_ref()
+                .map(|state| state.fault == fault)
+                .ok_or(ContainedSessionError)
+        }
+
+        fn report(
+            &self,
+            expected_step: GuestEvidenceStep,
+            phase: bangbang_session::elevated_probe::GuestEvidencePhase,
+            next_step: GuestEvidenceStep,
+        ) -> Result<(), ContainedSessionError> {
+            let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+            let Some(mut state) = locked.take() else {
+                return Err(ContainedSessionError);
+            };
+            let result = (|| {
+                if state.step != expected_step {
+                    return Err(ContainedSessionError);
+                }
+                validate_guest_evidence_worker(&state)?;
+                let report = bangbang_session::elevated_probe::GuestEvidenceRecord::worker_report(
+                    state.mode,
+                    phase,
+                    state.nonce,
+                    state.session,
+                )
+                .map_err(|_| ContainedSessionError)?;
+                state
+                    .socket
+                    .set_write_timeout(Some(GUEST_EVIDENCE_TIMEOUT))
+                    .map_err(|_| ContainedSessionError)?;
+                loop {
+                    match send_guest_evidence(&state.socket, report) {
+                        Ok(()) => break,
+                        Err(bangbang_session::macos::grant_transport::GrantTransportError::Io(
+                            io::ErrorKind::Interrupted,
+                        )) => {}
+                        Err(_) => return Err(ContainedSessionError),
+                    }
+                }
+                state.step = next_step;
+                Ok(())
+            })();
+            if result.is_ok() {
+                *locked = Some(state);
+            } else {
+                let _ = state.socket.shutdown(std::net::Shutdown::Both);
+            }
+            result
+        }
+
+        fn is_complete(&self) -> bool {
+            self.state.lock().ok().is_some_and(|locked| {
+                locked.as_ref().is_some_and(|state| {
+                    state.step == GuestEvidenceStep::Complete
+                        && guest_evidence_transport_is_empty(&state.socket)
+                })
+            })
+        }
+
+        fn invalidate(&self) {
+            let mut locked = match self.state.lock() {
+                Ok(locked) => locked,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(state) = locked.take() {
+                let _ = state.socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn validate_guest_evidence_worker(
+        state: &GuestEvidenceState,
+    ) -> Result<(), ContainedSessionError> {
+        // SAFETY: Parent lookup has no pointer or ownership contract.
+        let parent = unsafe { libc::getppid() };
+        if parent != state.parent
+            || verify_peer_pid(state.stream_fd, state.parent).is_err()
+            || verify_peer_pid(state.socket.as_raw_fd(), state.parent).is_err()
+            || bangbang_session::elevated_credential::attest_current_process(
+                state.mode,
+                state.target_uid,
+                state.target_gid,
+            )
+            .is_err()
+        {
+            return Err(ContainedSessionError);
+        }
+        state
+            .namespace
+            .lock()
+            .map_err(|_| ContainedSessionError)?
+            .as_ref()
+            .ok_or(ContainedSessionError)?
+            .verify_live()
+            .map_err(|_| ContainedSessionError)
+    }
+
     pub(crate) struct ContainedSession {
         stream: UnixStream,
         lifecycle: Arc<Mutex<WorkerLifecycle>>,
@@ -3549,6 +4093,8 @@ mod platform {
         policy: WorkerPolicy,
         #[cfg(feature = "elevated-bootstrap-probe")]
         runtime_fault: bangbang_session::elevated_probe::RuntimeFault,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        guest_evidence: Option<GuestEvidenceAuthority>,
         started: bool,
         closed: bool,
     }
@@ -3699,6 +4245,30 @@ mod platform {
             match self {
                 Self::Ordinary => bangbang_session::elevated_probe::RuntimeFault::None,
                 Self::Elevated { bootstrap, .. } => bootstrap.fault(),
+            }
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn guest_bootstrap(
+            &self,
+        ) -> Option<(
+            bangbang_session::elevated_probe::ProbeBootstrap,
+            libc::pid_t,
+        )> {
+            match self {
+                Self::Elevated {
+                    bootstrap, parent, ..
+                } if matches!(
+                    bootstrap.mode().runtime_workload(),
+                    Some(
+                        bangbang_session::elevated_probe::RuntimeWorkload::GuestNoApi
+                            | bangbang_session::elevated_probe::RuntimeWorkload::GuestApi
+                    )
+                ) =>
+                {
+                    Some((*bootstrap, *parent))
+                }
+                Self::Ordinary | Self::Elevated { .. } => None,
             }
         }
     }
@@ -3931,6 +4501,12 @@ mod platform {
             )?;
             let (mut grants, cancelled) = match grant_outcome {
                 GrantPhaseOutcome::Committed(committed) => {
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    if source.has_fault(
+                        bangbang_session::elevated_probe::RuntimeFault::GuestGrantAccepted,
+                    ) {
+                        return Err(ContainedSessionError.into());
+                    }
                     let accepted = lifecycle
                         .grants_accepted(
                             committed.batch,
@@ -3939,6 +4515,13 @@ mod platform {
                         )
                         .map_err(|_| ContainedSessionError)?;
                     write_frame(&mut stream, accepted)?;
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    if source.has_fault(
+                        bangbang_session::elevated_probe::RuntimeFault::GuestTransportContamination,
+                    ) && grant_socket.send(&[]).ok() != Some(0)
+                    {
+                        return Err(ContainedSessionError.into());
+                    }
                     (committed.registry, false)
                 }
                 GrantPhaseOutcome::Cancelled => (GrantRegistry::default(), true),
@@ -3964,6 +4547,16 @@ mod platform {
                     _ => return Err(ContainedSessionError.into()),
                 }
             };
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let guest_bootstrap = source.guest_bootstrap();
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let guest_socket = if started && guest_bootstrap.is_some() {
+                Some(grant_socket)
+            } else {
+                drop(grant_socket);
+                None
+            };
+            #[cfg(not(feature = "elevated-bootstrap-probe"))]
             drop(grant_socket);
             stream
                 .set_read_timeout(None)
@@ -3992,6 +4585,22 @@ mod platform {
             let runtime_fault = source.fault();
             let lifecycle = Arc::new(Mutex::new(lifecycle));
             let namespace = Arc::new(Mutex::new(Some(namespace)));
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let guest_evidence = match (guest_bootstrap, guest_socket) {
+                (Some((bootstrap, expected_parent)), Some(socket)) => {
+                    Some(GuestEvidenceAuthority::new(
+                        socket,
+                        bootstrap,
+                        session,
+                        expected_parent,
+                        stream.as_raw_fd(),
+                        Arc::clone(&namespace),
+                        file_grants.clone(),
+                    )?)
+                }
+                (None, None) => None,
+                (Some(_), None) | (None, Some(_)) => return Err(ContainedSessionError.into()),
+            };
             let (wakeup_reader, mut wakeup_writer) =
                 UnixStream::pair().map_err(|_| ContainedSessionError)?;
             let reader = if started {
@@ -4038,6 +4647,8 @@ mod platform {
                 policy,
                 #[cfg(feature = "elevated-bootstrap-probe")]
                 runtime_fault,
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                guest_evidence,
                 started,
                 closed: false,
             }))
@@ -4069,6 +4680,45 @@ mod platform {
 
         pub(crate) fn grant_authority(&self) -> Option<GrantAuthority> {
             self.started.then(|| self.grants.clone())
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        pub(crate) fn guest_evidence_authority(&self) -> Option<GuestEvidenceAuthority> {
+            self.started.then(|| self.guest_evidence.clone()).flatten()
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        pub(crate) fn before_first_guest_resource_claim(
+            &self,
+        ) -> Result<(), ContainedSessionError> {
+            let Some(authority) = &self.guest_evidence else {
+                return Ok(());
+            };
+            let workload = authority.workload()?;
+            self.grants.validate_elevated_guest_initial(workload)?;
+            self.directory_grants
+                .validate_elevated_guest_initial(workload)?;
+            if !self.pager_grants.is_exactly_empty()? {
+                return Err(ContainedSessionError);
+            }
+            authority.before_first_guest_resource_claim()?;
+            if workload == bangbang_session::elevated_probe::RuntimeWorkload::GuestNoApi {
+                authority.confirm_directory_authority_consumed(workload)?;
+            }
+            Ok(())
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        pub(crate) fn after_guest_api_directory_claim(&self) -> Result<(), ContainedSessionError> {
+            let Some(authority) = &self.guest_evidence else {
+                return Ok(());
+            };
+            if !self.directory_grants.is_exactly_empty()? {
+                return Err(ContainedSessionError);
+            }
+            authority.confirm_directory_authority_consumed(
+                bangbang_session::elevated_probe::RuntimeWorkload::GuestApi,
+            )
         }
 
         pub(crate) fn pager_grant_authority(&self) -> Option<PagerGrantAuthority> {
@@ -4213,6 +4863,17 @@ mod platform {
                 self.close();
                 return Err(ContainedSessionError);
             }
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if category == TerminalCategory::Success
+                && self.guest_evidence.as_ref().is_some_and(|authority| {
+                    self.runtime_fault
+                        == bangbang_session::elevated_probe::RuntimeFault::GuestTerminalEvidence
+                        || !authority.is_complete()
+                })
+            {
+                self.close();
+                return Err(ContainedSessionError);
+            }
             let terminal_result = if self.started {
                 let frame = self
                     .lifecycle
@@ -4240,6 +4901,10 @@ mod platform {
             self.socket_broker.invalidate();
             self.vhost_user_broker.invalidate();
             self.restore_generations.invalidate();
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if let Some(authority) = &self.guest_evidence {
+                authority.invalidate();
+            }
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
             if let Some(reader) = self.reader.take() {
                 let _ = reader.join();
@@ -4624,6 +5289,7 @@ mod platform {
         use std::rc::Rc;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Barrier};
+
         use std::thread;
         use std::time::{Duration, Instant};
 
@@ -4655,6 +5321,25 @@ mod platform {
         };
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        #[test]
+        fn elevated_guest_oracle_accepts_only_the_one_complete_success_record() {
+            assert!(super::guest_success_oracle_is_exact(
+                b"BANGBANG_ROOTFS_WORKFLOW_OK\r\n[    0.026251] reboot: Power down\r\n"
+            ));
+            for rejected in [
+                b"".as_slice(),
+                b"BANGBANG_ROOTFS_WORKFLOW_FAIL\r\n[    0.026251] reboot: Power down\r\n"
+                    .as_slice(),
+                b"BANGBANG_ROOTFS_WORKFLOW_OK".as_slice(),
+                b"BANGBANG_ROOTFS_WORKFLOW_OK\r\n".as_slice(),
+                b"BANGBANG_ROOTFS_WORKFLOW_OK\r\n[    0.026251] reboot: Power down\r\nextra"
+                    .as_slice(),
+            ] {
+                assert!(!super::guest_success_oracle_is_exact(rejected));
+            }
+        }
 
         #[cfg(feature = "elevated-bootstrap-probe")]
         #[test]
@@ -5914,6 +6599,154 @@ mod platform {
                 .registry
         }
 
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn elevated_guest_file_authority(
+            workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        ) -> (GrantAuthority, TestDirectory) {
+            use bangbang_session::elevated_probe::{
+                GUEST_CONFIG_GRANT_ID, GUEST_INITRD_GRANT_ID, GUEST_KERNEL_GRANT_ID,
+                GUEST_LOGGER_GRANT_ID, GUEST_METRICS_GRANT_ID, GUEST_ROOTFS_GRANT_ID,
+                GUEST_SERIAL_GRANT_ID, RuntimeWorkload,
+            };
+
+            let directory = TestDirectory::new();
+            let mut specs = Vec::new();
+            if workload == RuntimeWorkload::GuestNoApi {
+                specs.push((
+                    GUEST_CONFIG_GRANT_ID,
+                    ResourceRole::StartupConfig,
+                    GrantAccess::ReadOnly,
+                    "config",
+                ));
+            }
+            specs.extend([
+                (
+                    GUEST_KERNEL_GRANT_ID,
+                    ResourceRole::KernelImage,
+                    GrantAccess::ReadOnly,
+                    "kernel",
+                ),
+                (
+                    GUEST_INITRD_GRANT_ID,
+                    ResourceRole::InitrdImage,
+                    GrantAccess::ReadOnly,
+                    "initrd",
+                ),
+                (
+                    GUEST_ROOTFS_GRANT_ID,
+                    ResourceRole::DriveBacking,
+                    GrantAccess::ReadOnly,
+                    "rootfs",
+                ),
+                (
+                    GUEST_LOGGER_GRANT_ID,
+                    ResourceRole::LoggerSink,
+                    GrantAccess::WriteOnly,
+                    "logger",
+                ),
+                (
+                    GUEST_METRICS_GRANT_ID,
+                    ResourceRole::MetricsSink,
+                    GrantAccess::WriteOnly,
+                    "metrics",
+                ),
+                (
+                    GUEST_SERIAL_GRANT_ID,
+                    ResourceRole::SerialSink,
+                    GrantAccess::WriteOnly,
+                    "serial",
+                ),
+            ]);
+            let paths = specs
+                .iter()
+                .map(|(_, _, access, name)| {
+                    let path = directory.path().join(name);
+                    fs::write(&path, name.as_bytes()).expect("guest grant fixture should write");
+                    fs::set_permissions(
+                        &path,
+                        fs::Permissions::from_mode(if *access == GrantAccess::ReadOnly {
+                            0o400
+                        } else {
+                            0o600
+                        }),
+                    )
+                    .expect("guest grant fixture mode should set");
+                    path
+                })
+                .collect::<Vec<_>>();
+            let grants = specs
+                .iter()
+                .zip(&paths)
+                .map(|((id, role, access, _), path)| (*id, *role, *access, path.as_path()))
+                .collect::<Vec<_>>();
+            let mut registry = snapshot_storage_file_registry(&grants);
+            (
+                GrantAuthority::new(registry.take_file_registry()),
+                directory,
+            )
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn consume_elevated_guest_file_authority(
+            authority: &GrantAuthority,
+            workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        ) {
+            use bangbang_session::elevated_probe::{
+                GUEST_CONFIG_GRANT_ID, GUEST_INITRD_GRANT_ID, GUEST_KERNEL_GRANT_ID,
+                GUEST_LOGGER_GRANT_ID, GUEST_METRICS_GRANT_ID, GUEST_ROOTFS_GRANT_ID,
+                GUEST_SERIAL_GRANT_ID, RuntimeWorkload,
+            };
+
+            let reference = |id: &str| PathBuf::from(format!("bangbang-grant:{id}"));
+            if workload == RuntimeWorkload::GuestNoApi {
+                assert!(
+                    authority
+                        .claim_read_only_file(
+                            &reference(GUEST_CONFIG_GRANT_ID),
+                            ResourceRole::StartupConfig,
+                        )
+                        .expect("config grant should claim")
+                        .is_some()
+                );
+            }
+            for (id, role) in [
+                (GUEST_KERNEL_GRANT_ID, ResourceRole::KernelImage),
+                (GUEST_INITRD_GRANT_ID, ResourceRole::InitrdImage),
+            ] {
+                assert!(
+                    authority
+                        .claim_read_only_file(&reference(id), role)
+                        .expect("boot grant should claim")
+                        .is_some()
+                );
+            }
+            let mut rootfs = authority
+                .prepare_drive_backing_claim(
+                    &reference(GUEST_ROOTFS_GRANT_ID),
+                    GrantAccess::ReadOnly,
+                )
+                .expect("rootfs grant should prepare")
+                .expect("rootfs reference should be granted");
+            drop(
+                rootfs
+                    .take_backing(true)
+                    .expect("rootfs grant should expose one backing"),
+            );
+            rootfs.commit();
+            for (id, role) in [
+                (GUEST_LOGGER_GRANT_ID, ResourceRole::LoggerSink),
+                (GUEST_METRICS_GRANT_ID, ResourceRole::MetricsSink),
+                (GUEST_SERIAL_GRANT_ID, ResourceRole::SerialSink),
+            ] {
+                assert!(
+                    authority
+                        .claim_file(&reference(id), role, GrantAccess::WriteOnly)
+                        .expect("output grant should claim")
+                        .is_some()
+                );
+            }
+        }
+
         fn directory_registry(id: &str, role: ResourceRole) -> (GrantRegistry, TestDirectory) {
             let directory = TestDirectory::new();
             let bookmark = create_implicit_bookmark(directory.path(), true)
@@ -6297,6 +7130,83 @@ mod platform {
                     )
                     .expect("ordinary path remains outside grant authority")
                     .is_none()
+            );
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        #[test]
+        fn elevated_guest_worker_authorities_require_exact_initial_and_consumed_sets() {
+            use bangbang_session::elevated_probe::{GUEST_API_DIRECTORY_GRANT_ID, RuntimeWorkload};
+
+            for workload in [RuntimeWorkload::GuestNoApi, RuntimeWorkload::GuestApi] {
+                let (authority, _files) = elevated_guest_file_authority(workload);
+                authority
+                    .validate_elevated_guest_initial(workload)
+                    .expect("exact guest file authority should validate");
+                let other = if workload == RuntimeWorkload::GuestNoApi {
+                    RuntimeWorkload::GuestApi
+                } else {
+                    RuntimeWorkload::GuestNoApi
+                };
+                assert!(authority.validate_elevated_guest_initial(other).is_err());
+                assert!(
+                    authority
+                        .validate_elevated_guest_initial(RuntimeWorkload::RepresentativeGrants)
+                        .is_err()
+                );
+                consume_elevated_guest_file_authority(&authority, workload);
+                assert!(
+                    authority
+                        .is_exactly_empty()
+                        .expect("consumed authority should remain active")
+                );
+                assert!(authority.validate_elevated_guest_initial(workload).is_err());
+            }
+
+            let empty_directories = DirectoryGrantAuthority::new(DirectoryGrantRegistry::default());
+            empty_directories
+                .validate_elevated_guest_initial(RuntimeWorkload::GuestNoApi)
+                .expect("no-API must require no directory authority");
+            assert!(
+                empty_directories
+                    .validate_elevated_guest_initial(RuntimeWorkload::GuestApi)
+                    .is_err()
+            );
+
+            let (mut registry, _api_directory) = directory_registry(
+                GUEST_API_DIRECTORY_GRANT_ID,
+                ResourceRole::ApiSocketDirectory,
+            );
+            let api_directories = DirectoryGrantAuthority::new(registry.take_directory_registry());
+            api_directories
+                .validate_elevated_guest_initial(RuntimeWorkload::GuestApi)
+                .expect("API must require the one exact directory authority");
+            assert!(
+                api_directories
+                    .validate_elevated_guest_initial(RuntimeWorkload::GuestNoApi)
+                    .is_err()
+            );
+            let reference = PathBuf::from(format!(
+                "bangbang-grant:{GUEST_API_DIRECTORY_GRANT_ID}/evidence-api.sock"
+            ));
+            let _claim = api_directories
+                .claim_socket_directory(&reference, ResourceRole::ApiSocketDirectory)
+                .expect("API directory claim should validate")
+                .expect("API directory reference should be granted");
+            assert!(
+                api_directories
+                    .is_exactly_empty()
+                    .expect("consumed API authority should remain active")
+            );
+
+            let (mut wrong_registry, _wrong_directory) =
+                directory_registry("wrong-api-directory", ResourceRole::ApiSocketDirectory);
+            let wrong_directories =
+                DirectoryGrantAuthority::new(wrong_registry.take_directory_registry());
+            assert!(
+                wrong_directories
+                    .validate_elevated_guest_initial(RuntimeWorkload::GuestApi)
+                    .is_err()
             );
         }
 
@@ -7305,6 +8215,8 @@ mod platform {
 
 #[cfg(all(target_os = "macos", any(test, feature = "grant-integration-probe")))]
 pub(crate) use platform::ContainedSnapshotRestoreErrorKind;
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+pub(crate) use platform::GuestEvidenceAuthority;
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
     PagerGrantAuthority, PreparedDriveBackingClaim, PreparedFileGrantClaim,

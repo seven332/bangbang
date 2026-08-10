@@ -232,24 +232,17 @@ fn transition_with<O: CredentialOps>(
     target_uid: u32,
     target_gid: u32,
 ) -> Result<CredentialTransition, CredentialFailureValue> {
-    let retains_root = match mode {
-        ProbeMode::CredentialRetainRoot | ProbeMode::RuntimeRetainRoot => true,
-        ProbeMode::CredentialDrop
-        | ProbeMode::CredentialUnmapped
-        | ProbeMode::RuntimeDrop
-        | ProbeMode::RuntimeUnmapped => false,
-        ProbeMode::CredentialControl => target_uid == 0 && target_gid == 0,
-        _ => {
-            return Err(CredentialFailureValue::new(
-                CredentialStep::InitialIdentity,
-                ProbeErrorCategory::InvalidInput,
-                CredentialPrefix::None,
-                CredentialSelfState::new(
-                    CredentialIdentityClass::Other,
-                    CredentialGroupClass::Other,
-                ),
-            ));
-        }
+    let retains_root = if mode == ProbeMode::CredentialControl {
+        target_uid == 0 && target_gid == 0
+    } else if mode.is_credential_pair() {
+        mode.retains_root()
+    } else {
+        return Err(CredentialFailureValue::new(
+            CredentialStep::InitialIdentity,
+            ProbeErrorCategory::InvalidInput,
+            CredentialPrefix::None,
+            CredentialSelfState::new(CredentialIdentityClass::Other, CredentialGroupClass::Other),
+        ));
     };
     if !mode.accepts_target(target_uid, target_gid) {
         return Err(CredentialFailureValue::new(

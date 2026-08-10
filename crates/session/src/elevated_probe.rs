@@ -24,8 +24,111 @@ pub const CREDENTIAL_DATAGRAM_BYTES: usize = 48;
 pub const CONTINUATION_ACK_BYTES: usize = 48;
 /// Encoded launcher-created runtime-session authority length.
 pub const RUNTIME_SESSION_AUTHORITY_BYTES: usize = 120;
+/// Encoded post-grant guest-evidence record length.
+pub const GUEST_EVIDENCE_RECORD_BYTES: usize = 96;
+/// Exact no-API startup-config grant ID.
+pub const GUEST_CONFIG_GRANT_ID: &str = "evidence-guest-config";
+/// Exact guest kernel grant ID.
+pub const GUEST_KERNEL_GRANT_ID: &str = "evidence-guest-kernel";
+/// Exact guest initrd grant ID.
+pub const GUEST_INITRD_GRANT_ID: &str = "evidence-guest-initrd";
+/// Exact read-only root-drive grant ID.
+pub const GUEST_ROOTFS_GRANT_ID: &str = "evidence-guest-rootfs";
+/// Exact logger-output grant ID.
+pub const GUEST_LOGGER_GRANT_ID: &str = "evidence-guest-logger";
+/// Exact metrics-output grant ID.
+pub const GUEST_METRICS_GRANT_ID: &str = "evidence-guest-metrics";
+/// Exact serial-output grant ID.
+pub const GUEST_SERIAL_GRANT_ID: &str = "evidence-guest-serial";
+/// Exact API socket-directory grant ID.
+pub const GUEST_API_DIRECTORY_GRANT_ID: &str = "evidence-guest-api";
+/// Exact bounded API socket child.
+pub const GUEST_API_SOCKET_CHILD: &str = "evidence-api.sock";
+/// Exact contained no-API config-file reference.
+pub const GUEST_CONFIG_REFERENCE: &str = "bangbang-grant:evidence-guest-config";
+/// Exact contained guest kernel reference.
+pub const GUEST_KERNEL_REFERENCE: &str = "bangbang-grant:evidence-guest-kernel";
+/// Exact contained guest initrd reference.
+pub const GUEST_INITRD_REFERENCE: &str = "bangbang-grant:evidence-guest-initrd";
+/// Exact contained read-only root-drive reference.
+pub const GUEST_ROOTFS_REFERENCE: &str = "bangbang-grant:evidence-guest-rootfs";
+/// Exact contained logger-output reference.
+pub const GUEST_LOGGER_REFERENCE: &str = "bangbang-grant:evidence-guest-logger";
+/// Exact contained metrics-output reference.
+pub const GUEST_METRICS_REFERENCE: &str = "bangbang-grant:evidence-guest-metrics";
+/// Exact contained serial-output reference.
+pub const GUEST_SERIAL_REFERENCE: &str = "bangbang-grant:evidence-guest-serial";
+/// Exact contained API socket reference.
+pub const GUEST_API_SOCKET_REFERENCE: &str = "bangbang-grant:evidence-guest-api/evidence-api.sock";
+/// Exact canonical guest boot arguments.
+pub const GUEST_BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 quiet loglevel=1 rdinit=/rootfs-poweroff-init";
+/// Maximum byte length of either closed guest serial terminal transcript.
+pub const MAX_GUEST_SERIAL_TRANSCRIPT_BYTES: usize = 67;
 /// Private worker exit used to report the measured target namespace denial.
 pub const RUNTIME_NAMESPACE_PERMISSION_EXIT_CODE: u8 = 3;
+
+const GUEST_SUCCESS_SERIAL_LINE: &[u8] = b"BANGBANG_ROOTFS_WORKFLOW_OK\r\n";
+const GUEST_FAILURE_SERIAL_LINE: &[u8] = b"BANGBANG_ROOTFS_WORKFLOW_FAIL\r\n";
+const GUEST_POWEROFF_SERIAL_SUFFIX: &[u8] = b"] reboot: Power down\r\n";
+const GUEST_POWEROFF_TIMESTAMP_BYTES: usize = 12;
+
+/// Closed outcome extracted from the complete pinned guest serial transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestSerialTranscript {
+    /// The exact success record was followed by canonical kernel poweroff.
+    Success,
+    /// The exact failure record was followed by canonical kernel poweroff.
+    Failure,
+    /// The transcript was missing, truncated, duplicated, or otherwise noncanonical.
+    Invalid,
+}
+
+/// Classifies the complete ttyS0 transcript emitted by the pinned guest workflow.
+#[must_use]
+pub fn classify_guest_serial_transcript(bytes: &[u8]) -> GuestSerialTranscript {
+    let (outcome, tail) = if let Some(tail) = bytes.strip_prefix(GUEST_SUCCESS_SERIAL_LINE) {
+        (GuestSerialTranscript::Success, tail)
+    } else if let Some(tail) = bytes.strip_prefix(GUEST_FAILURE_SERIAL_LINE) {
+        (GuestSerialTranscript::Failure, tail)
+    } else {
+        return GuestSerialTranscript::Invalid;
+    };
+    if canonical_guest_poweroff_tail(tail) {
+        outcome
+    } else {
+        GuestSerialTranscript::Invalid
+    }
+}
+
+fn canonical_guest_poweroff_tail(bytes: &[u8]) -> bool {
+    let Some(timestamp) = bytes
+        .strip_prefix(b"[")
+        .and_then(|tail| tail.strip_suffix(GUEST_POWEROFF_SERIAL_SUFFIX))
+    else {
+        return false;
+    };
+    if timestamp.len() != GUEST_POWEROFF_TIMESTAMP_BYTES || timestamp.get(5) != Some(&b'.') {
+        return false;
+    }
+    let Some(whole) = timestamp.get(..5) else {
+        return false;
+    };
+    let Some(first_digit) = whole.iter().position(u8::is_ascii_digit) else {
+        return false;
+    };
+    let (Some(spaces), Some(digits), Some(fractional)) = (
+        whole.get(..first_digit),
+        whole.get(first_digit..),
+        timestamp.get(6..),
+    ) else {
+        return false;
+    };
+    spaces.iter().all(|byte| *byte == b' ')
+        && digits.iter().all(u8::is_ascii_digit)
+        && (digits.len() == 1 || digits.first() != Some(&b'0'))
+        && fractional.iter().all(u8::is_ascii_digit)
+}
 
 const VERSION: u16 = 2;
 const BOOTSTRAP_MAGIC: [u8; 4] = *b"BBE2";
@@ -36,6 +139,8 @@ const CREDENTIAL_DATAGRAM_MAGIC: [u8; 4] = *b"BBG1";
 const CONTINUATION_ACK_MAGIC: [u8; 4] = *b"BBA1";
 const RUNTIME_SESSION_AUTHORITY_MAGIC: [u8; 4] = *b"BBN1";
 const RUNTIME_SESSION_AUTHORITY_VERSION: u16 = 1;
+const GUEST_EVIDENCE_MAGIC: [u8; 4] = *b"BBW1";
+const GUEST_EVIDENCE_VERSION: u16 = 1;
 const RUNTIME_WORKER_FAILURE_EXIT_BASE: u8 = 64;
 
 /// Exact evidence mode selected by the explicit root wrapper.
@@ -68,6 +173,48 @@ pub enum ProbeMode {
     RuntimeRetainRoot = 12,
     /// Use the SDK-maximum unmapped identity, then attempt the explicit runtime.
     RuntimeUnmapped = 13,
+    /// Drop both endpoints, then boot the closed no-API guest workload.
+    GuestNoApiDrop = 14,
+    /// Retain exact root, then boot the closed no-API guest workload.
+    GuestNoApiRetainRoot = 15,
+    /// Use the SDK-maximum unmapped identity for the no-API guest workload.
+    GuestNoApiUnmapped = 16,
+    /// Drop both endpoints, then drive the closed API guest workload.
+    GuestApiDrop = 17,
+    /// Retain exact root, then drive the closed API guest workload.
+    GuestApiRetainRoot = 18,
+    /// Use the SDK-maximum unmapped identity for the API guest workload.
+    GuestApiUnmapped = 19,
+}
+
+/// Closed credential class shared by paired evidence modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialClass {
+    /// One mapped, nonzero uid and gid.
+    Mapped,
+    /// Exact real, effective, and saved uid/gid zero without mutation.
+    RetainRoot,
+    /// The SDK-maximum deliberately unmapped numeric identity.
+    MaximumUnmapped,
+}
+
+/// Closed runtime workload selected after the credential exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeWorkload {
+    /// Existing representative grant and lifecycle evidence.
+    RepresentativeGrants,
+    /// Canonical config-file guest startup without an API socket.
+    GuestNoApi,
+    /// Canonical API-driven guest startup.
+    GuestApi,
+}
+
+impl RuntimeWorkload {
+    /// Returns whether this workload boots one of the closed real guests.
+    #[must_use]
+    pub const fn is_guest(self) -> bool {
+        matches!(self, Self::GuestNoApi | Self::GuestApi)
+    }
 }
 
 impl ProbeMode {
@@ -87,6 +234,12 @@ impl ProbeMode {
             "runtime-drop" => Self::RuntimeDrop,
             "runtime-retain-root" => Self::RuntimeRetainRoot,
             "runtime-unmapped" => Self::RuntimeUnmapped,
+            "guest-no-api-drop" => Self::GuestNoApiDrop,
+            "guest-no-api-retain-root" => Self::GuestNoApiRetainRoot,
+            "guest-no-api-unmapped" => Self::GuestNoApiUnmapped,
+            "guest-api-drop" => Self::GuestApiDrop,
+            "guest-api-retain-root" => Self::GuestApiRetainRoot,
+            "guest-api-unmapped" => Self::GuestApiUnmapped,
             _ => return None,
         };
         mode.accepts_target(uid, gid).then_some(mode)
@@ -109,54 +262,86 @@ impl ProbeMode {
             Self::RuntimeDrop => "runtime-drop",
             Self::RuntimeRetainRoot => "runtime-retain-root",
             Self::RuntimeUnmapped => "runtime-unmapped",
+            Self::GuestNoApiDrop => "guest-no-api-drop",
+            Self::GuestNoApiRetainRoot => "guest-no-api-retain-root",
+            Self::GuestNoApiUnmapped => "guest-no-api-unmapped",
+            Self::GuestApiDrop => "guest-api-drop",
+            Self::GuestApiRetainRoot => "guest-api-retain-root",
+            Self::GuestApiUnmapped => "guest-api-unmapped",
+        }
+    }
+
+    /// Returns the closed credential class for paired evidence modes.
+    #[must_use]
+    pub const fn credential_class(self) -> Option<CredentialClass> {
+        match self {
+            Self::CredentialDrop
+            | Self::RuntimeDrop
+            | Self::GuestNoApiDrop
+            | Self::GuestApiDrop => Some(CredentialClass::Mapped),
+            Self::CredentialRetainRoot
+            | Self::RuntimeRetainRoot
+            | Self::GuestNoApiRetainRoot
+            | Self::GuestApiRetainRoot => Some(CredentialClass::RetainRoot),
+            Self::CredentialUnmapped
+            | Self::RuntimeUnmapped
+            | Self::GuestNoApiUnmapped
+            | Self::GuestApiUnmapped => Some(CredentialClass::MaximumUnmapped),
+            _ => None,
+        }
+    }
+
+    /// Returns the closed runtime workload, if this mode continues into lifecycle v5.
+    #[must_use]
+    pub const fn runtime_workload(self) -> Option<RuntimeWorkload> {
+        match self {
+            Self::RuntimeDrop | Self::RuntimeRetainRoot | Self::RuntimeUnmapped => {
+                Some(RuntimeWorkload::RepresentativeGrants)
+            }
+            Self::GuestNoApiDrop | Self::GuestNoApiRetainRoot | Self::GuestNoApiUnmapped => {
+                Some(RuntimeWorkload::GuestNoApi)
+            }
+            Self::GuestApiDrop | Self::GuestApiRetainRoot | Self::GuestApiUnmapped => {
+                Some(RuntimeWorkload::GuestApi)
+            }
+            _ => None,
         }
     }
 
     /// Returns whether this mode admits the exact target category.
     #[must_use]
     pub const fn accepts_target(self, uid: u32, gid: u32) -> bool {
-        match self {
-            Self::Drop | Self::UnmappedSyscall | Self::CredentialDrop | Self::RuntimeDrop => {
-                uid != 0 && gid != 0
-            }
-            Self::CredentialUnmapped | Self::RuntimeUnmapped => {
-                uid == 2_147_483_647 && gid == 2_147_483_647
-            }
-            Self::RetainRoot | Self::Control | Self::HvfControl | Self::InheritedRoot => {
-                uid == 0 && gid == 0
-            }
-            Self::CredentialRetainRoot | Self::RuntimeRetainRoot => uid == 0 && gid == 0,
-            Self::CredentialControl => (uid == 0) == (gid == 0),
+        match self.credential_class() {
+            Some(CredentialClass::Mapped) => uid != 0 && gid != 0,
+            Some(CredentialClass::RetainRoot) => uid == 0 && gid == 0,
+            Some(CredentialClass::MaximumUnmapped) => uid == 2_147_483_647 && gid == 2_147_483_647,
+            None => match self {
+                Self::Drop | Self::UnmappedSyscall => uid != 0 && gid != 0,
+                Self::RetainRoot | Self::Control | Self::HvfControl | Self::InheritedRoot => {
+                    uid == 0 && gid == 0
+                }
+                Self::CredentialControl => (uid == 0) == (gid == 0),
+                _ => false,
+            },
         }
     }
 
     /// Returns whether this mode runs the paired no-chroot credential protocol.
     #[must_use]
     pub const fn is_credential_pair(self) -> bool {
-        matches!(
-            self,
-            Self::CredentialDrop
-                | Self::CredentialRetainRoot
-                | Self::CredentialUnmapped
-                | Self::RuntimeDrop
-                | Self::RuntimeRetainRoot
-                | Self::RuntimeUnmapped
-        )
+        self.credential_class().is_some()
     }
 
-    /// Returns whether the credential exchange must hand the same transports to lifecycle v6.
+    /// Returns whether the credential exchange must hand the same transports to lifecycle v5.
     #[must_use]
     pub const fn continues_runtime(self) -> bool {
-        matches!(
-            self,
-            Self::RuntimeDrop | Self::RuntimeRetainRoot | Self::RuntimeUnmapped
-        )
+        self.runtime_workload().is_some()
     }
 
     /// Returns whether this mode retains exact root without credential mutation.
     #[must_use]
     pub const fn retains_root(self) -> bool {
-        matches!(self, Self::CredentialRetainRoot | Self::RuntimeRetainRoot)
+        matches!(self.credential_class(), Some(CredentialClass::RetainRoot))
     }
 
     fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
@@ -174,6 +359,12 @@ impl ProbeMode {
             11 => Ok(Self::RuntimeDrop),
             12 => Ok(Self::RuntimeRetainRoot),
             13 => Ok(Self::RuntimeUnmapped),
+            14 => Ok(Self::GuestNoApiDrop),
+            15 => Ok(Self::GuestNoApiRetainRoot),
+            16 => Ok(Self::GuestNoApiUnmapped),
+            17 => Ok(Self::GuestApiDrop),
+            18 => Ok(Self::GuestApiRetainRoot),
+            19 => Ok(Self::GuestApiUnmapped),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -249,6 +440,46 @@ pub enum ProbeStage {
     RuntimeSessionEnter = 32,
     /// Publish and independently validate Prepared for the adopted session.
     LifecyclePrepared = 33,
+    /// Validate the exact evidence-only guest argv and grant contract.
+    GuestGrantContract = 34,
+    /// Revalidate both endpoints immediately before the first guest resource claim.
+    GuestResourceWitness = 35,
+    /// Publish and validate the exact API socket child.
+    ApiSocketPublication = 36,
+    /// Configure the exact logger output through the API.
+    ApiLoggerConfiguration = 37,
+    /// Configure the exact metrics output through the API.
+    ApiMetricsConfiguration = 38,
+    /// Configure the exact serial output through the API.
+    ApiSerialConfiguration = 39,
+    /// Configure the closed guest machine shape through the API.
+    ApiMachineConfiguration = 40,
+    /// Configure the exact boot resources through the API.
+    ApiBootConfiguration = 41,
+    /// Configure the exact read-only root drive through the API.
+    ApiDriveConfiguration = 42,
+    /// Issue the single closed InstanceStart action.
+    ApiInstanceStart = 43,
+    /// Apply the exact canonical config-file startup.
+    NoApiStartup = 44,
+    /// Revalidate both endpoints immediately before real HVF creation.
+    GuestHvfWitness = 45,
+    /// Construct the real guest HVF session.
+    GuestHvfCreate = 46,
+    /// Execute the canonical guest workload.
+    GuestExecution = 47,
+    /// Observe the exact guest success oracle.
+    GuestOracle = 48,
+    /// Observe the canonical guest poweroff path.
+    GuestPoweroff = 49,
+    /// Stop on the bounded guest deadline.
+    GuestTimeout = 50,
+    /// Stop on premature launcher or worker endpoint death.
+    GuestEndpointDeath = 51,
+    /// Validate all terminal guest evidence before lifecycle completion.
+    GuestTerminalEvidence = 52,
+    /// Clean every guest output, socket, and session object.
+    GuestCleanup = 53,
 }
 
 impl ProbeStage {
@@ -289,6 +520,26 @@ impl ProbeStage {
             Self::RuntimeSessionLock => "runtime-session-lock",
             Self::RuntimeSessionEnter => "runtime-session-enter",
             Self::LifecyclePrepared => "lifecycle-prepared",
+            Self::GuestGrantContract => "guest-grant-contract",
+            Self::GuestResourceWitness => "guest-resource-witness",
+            Self::ApiSocketPublication => "api-socket-publication",
+            Self::ApiLoggerConfiguration => "api-logger-configuration",
+            Self::ApiMetricsConfiguration => "api-metrics-configuration",
+            Self::ApiSerialConfiguration => "api-serial-configuration",
+            Self::ApiMachineConfiguration => "api-machine-configuration",
+            Self::ApiBootConfiguration => "api-boot-configuration",
+            Self::ApiDriveConfiguration => "api-drive-configuration",
+            Self::ApiInstanceStart => "api-instance-start",
+            Self::NoApiStartup => "no-api-startup",
+            Self::GuestHvfWitness => "guest-hvf-witness",
+            Self::GuestHvfCreate => "guest-hvf-create",
+            Self::GuestExecution => "guest-execution",
+            Self::GuestOracle => "guest-oracle",
+            Self::GuestPoweroff => "guest-poweroff",
+            Self::GuestTimeout => "guest-timeout",
+            Self::GuestEndpointDeath => "guest-endpoint-death",
+            Self::GuestTerminalEvidence => "guest-terminal-evidence",
+            Self::GuestCleanup => "guest-cleanup",
         }
     }
 
@@ -327,6 +578,26 @@ impl ProbeStage {
             31 => Ok(Self::RuntimeSessionLock),
             32 => Ok(Self::RuntimeSessionEnter),
             33 => Ok(Self::LifecyclePrepared),
+            34 => Ok(Self::GuestGrantContract),
+            35 => Ok(Self::GuestResourceWitness),
+            36 => Ok(Self::ApiSocketPublication),
+            37 => Ok(Self::ApiLoggerConfiguration),
+            38 => Ok(Self::ApiMetricsConfiguration),
+            39 => Ok(Self::ApiSerialConfiguration),
+            40 => Ok(Self::ApiMachineConfiguration),
+            41 => Ok(Self::ApiBootConfiguration),
+            42 => Ok(Self::ApiDriveConfiguration),
+            43 => Ok(Self::ApiInstanceStart),
+            44 => Ok(Self::NoApiStartup),
+            45 => Ok(Self::GuestHvfWitness),
+            46 => Ok(Self::GuestHvfCreate),
+            47 => Ok(Self::GuestExecution),
+            48 => Ok(Self::GuestOracle),
+            49 => Ok(Self::GuestPoweroff),
+            50 => Ok(Self::GuestTimeout),
+            51 => Ok(Self::GuestEndpointDeath),
+            52 => Ok(Self::GuestTerminalEvidence),
+            53 => Ok(Self::GuestCleanup),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -367,6 +638,50 @@ pub enum RuntimeFault {
     SessionEnter = 13,
     /// Stop before the worker publishes Prepared for the adopted session.
     Prepared = 14,
+    /// Stop while validating the exact guest grant contract.
+    GuestGrantContract = 15,
+    /// Stop at the first guest-resource witness.
+    GuestResourceWitness = 16,
+    /// Stop while publishing the API socket.
+    ApiSocketPublication = 17,
+    /// Stop while configuring the API logger.
+    ApiLoggerConfiguration = 18,
+    /// Stop while configuring API metrics.
+    ApiMetricsConfiguration = 19,
+    /// Stop while configuring API serial output.
+    ApiSerialConfiguration = 20,
+    /// Stop while configuring the API machine shape.
+    ApiMachineConfiguration = 21,
+    /// Stop while configuring API boot resources.
+    ApiBootConfiguration = 22,
+    /// Stop while configuring the API root drive.
+    ApiDriveConfiguration = 23,
+    /// Stop while issuing the API start action.
+    ApiInstanceStart = 24,
+    /// Stop while applying the no-API startup config.
+    NoApiStartup = 25,
+    /// Stop at the pre-HVF guest witness.
+    GuestHvfWitness = 26,
+    /// Stop while constructing the real HVF session.
+    GuestHvfCreate = 27,
+    /// Stop while the guest is executing.
+    GuestExecution = 28,
+    /// Stop while validating the guest success oracle.
+    GuestOracle = 29,
+    /// Stop while validating guest poweroff.
+    GuestPoweroff = 30,
+    /// Force the bounded guest timeout path.
+    GuestTimeout = 31,
+    /// Stop after HVF creation for explicit endpoint-death orchestration.
+    GuestEndpointDeath = 32,
+    /// Stop while validating terminal guest evidence.
+    GuestTerminalEvidence = 33,
+    /// Stop while cleaning guest-owned objects.
+    GuestCleanup = 34,
+    /// Stop after the complete boot-grant batch is accepted by the worker.
+    GuestGrantAccepted = 35,
+    /// Inject one descriptor-free datagram outside the guest witness protocol.
+    GuestTransportContamination = 36,
 }
 
 impl RuntimeFault {
@@ -388,6 +703,28 @@ impl RuntimeFault {
             "session-lock" => Some(Self::SessionLock),
             "session-enter" => Some(Self::SessionEnter),
             "prepared" => Some(Self::Prepared),
+            "guest-grant-contract" => Some(Self::GuestGrantContract),
+            "guest-resource-witness" => Some(Self::GuestResourceWitness),
+            "api-socket-publication" => Some(Self::ApiSocketPublication),
+            "api-logger-configuration" => Some(Self::ApiLoggerConfiguration),
+            "api-metrics-configuration" => Some(Self::ApiMetricsConfiguration),
+            "api-serial-configuration" => Some(Self::ApiSerialConfiguration),
+            "api-machine-configuration" => Some(Self::ApiMachineConfiguration),
+            "api-boot-configuration" => Some(Self::ApiBootConfiguration),
+            "api-drive-configuration" => Some(Self::ApiDriveConfiguration),
+            "api-instance-start" => Some(Self::ApiInstanceStart),
+            "no-api-startup" => Some(Self::NoApiStartup),
+            "guest-hvf-witness" => Some(Self::GuestHvfWitness),
+            "guest-hvf-create" => Some(Self::GuestHvfCreate),
+            "guest-execution" => Some(Self::GuestExecution),
+            "guest-oracle" => Some(Self::GuestOracle),
+            "guest-poweroff" => Some(Self::GuestPoweroff),
+            "guest-timeout" => Some(Self::GuestTimeout),
+            "guest-endpoint-death" => Some(Self::GuestEndpointDeath),
+            "guest-terminal-evidence" => Some(Self::GuestTerminalEvidence),
+            "guest-cleanup" => Some(Self::GuestCleanup),
+            "guest-grant-accepted" => Some(Self::GuestGrantAccepted),
+            "guest-transport-contamination" => Some(Self::GuestTransportContamination),
             _ => None,
         }
     }
@@ -409,6 +746,28 @@ impl RuntimeFault {
             12 => Ok(Self::SessionLock),
             13 => Ok(Self::SessionEnter),
             14 => Ok(Self::Prepared),
+            15 => Ok(Self::GuestGrantContract),
+            16 => Ok(Self::GuestResourceWitness),
+            17 => Ok(Self::ApiSocketPublication),
+            18 => Ok(Self::ApiLoggerConfiguration),
+            19 => Ok(Self::ApiMetricsConfiguration),
+            20 => Ok(Self::ApiSerialConfiguration),
+            21 => Ok(Self::ApiMachineConfiguration),
+            22 => Ok(Self::ApiBootConfiguration),
+            23 => Ok(Self::ApiDriveConfiguration),
+            24 => Ok(Self::ApiInstanceStart),
+            25 => Ok(Self::NoApiStartup),
+            26 => Ok(Self::GuestHvfWitness),
+            27 => Ok(Self::GuestHvfCreate),
+            28 => Ok(Self::GuestExecution),
+            29 => Ok(Self::GuestOracle),
+            30 => Ok(Self::GuestPoweroff),
+            31 => Ok(Self::GuestTimeout),
+            32 => Ok(Self::GuestEndpointDeath),
+            33 => Ok(Self::GuestTerminalEvidence),
+            34 => Ok(Self::GuestCleanup),
+            35 => Ok(Self::GuestGrantAccepted),
+            36 => Ok(Self::GuestTransportContamination),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -432,6 +791,72 @@ impl RuntimeFault {
             Self::SessionLock => "session-lock",
             Self::SessionEnter => "session-enter",
             Self::Prepared => "prepared",
+            Self::GuestGrantContract => "guest-grant-contract",
+            Self::GuestResourceWitness => "guest-resource-witness",
+            Self::ApiSocketPublication => "api-socket-publication",
+            Self::ApiLoggerConfiguration => "api-logger-configuration",
+            Self::ApiMetricsConfiguration => "api-metrics-configuration",
+            Self::ApiSerialConfiguration => "api-serial-configuration",
+            Self::ApiMachineConfiguration => "api-machine-configuration",
+            Self::ApiBootConfiguration => "api-boot-configuration",
+            Self::ApiDriveConfiguration => "api-drive-configuration",
+            Self::ApiInstanceStart => "api-instance-start",
+            Self::NoApiStartup => "no-api-startup",
+            Self::GuestHvfWitness => "guest-hvf-witness",
+            Self::GuestHvfCreate => "guest-hvf-create",
+            Self::GuestExecution => "guest-execution",
+            Self::GuestOracle => "guest-oracle",
+            Self::GuestPoweroff => "guest-poweroff",
+            Self::GuestTimeout => "guest-timeout",
+            Self::GuestEndpointDeath => "guest-endpoint-death",
+            Self::GuestTerminalEvidence => "guest-terminal-evidence",
+            Self::GuestCleanup => "guest-cleanup",
+            Self::GuestGrantAccepted => "guest-grant-accepted",
+            Self::GuestTransportContamination => "guest-transport-contamination",
+        }
+    }
+
+    /// Returns the exact value-free stage forced by this fault.
+    #[must_use]
+    pub const fn stage(self) -> Option<ProbeStage> {
+        match self {
+            Self::None => None,
+            Self::PreAck => Some(ProbeStage::ContinuationAck),
+            Self::PostAck => Some(ProbeStage::LifecycleHello),
+            Self::Namespace => Some(ProbeStage::RuntimeNamespace),
+            Self::GrantTransfer => Some(ProbeStage::GrantTransfer),
+            Self::Proceed => Some(ProbeStage::LifecycleProceed),
+            Self::Terminal => Some(ProbeStage::LifecycleTerminal),
+            Self::SessionCreate => Some(ProbeStage::RuntimeSessionCreate),
+            Self::SessionOpen => Some(ProbeStage::RuntimeSessionOpen),
+            Self::AuthoritySend => Some(ProbeStage::RuntimeAuthoritySend),
+            Self::AuthorityReceive => Some(ProbeStage::RuntimeAuthorityReceive),
+            Self::AuthorityValidate => Some(ProbeStage::RuntimeAuthorityValidate),
+            Self::SessionLock => Some(ProbeStage::RuntimeSessionLock),
+            Self::SessionEnter => Some(ProbeStage::RuntimeSessionEnter),
+            Self::Prepared => Some(ProbeStage::LifecyclePrepared),
+            Self::GuestGrantContract => Some(ProbeStage::GuestGrantContract),
+            Self::GuestResourceWitness => Some(ProbeStage::GuestResourceWitness),
+            Self::ApiSocketPublication => Some(ProbeStage::ApiSocketPublication),
+            Self::ApiLoggerConfiguration => Some(ProbeStage::ApiLoggerConfiguration),
+            Self::ApiMetricsConfiguration => Some(ProbeStage::ApiMetricsConfiguration),
+            Self::ApiSerialConfiguration => Some(ProbeStage::ApiSerialConfiguration),
+            Self::ApiMachineConfiguration => Some(ProbeStage::ApiMachineConfiguration),
+            Self::ApiBootConfiguration => Some(ProbeStage::ApiBootConfiguration),
+            Self::ApiDriveConfiguration => Some(ProbeStage::ApiDriveConfiguration),
+            Self::ApiInstanceStart => Some(ProbeStage::ApiInstanceStart),
+            Self::NoApiStartup => Some(ProbeStage::NoApiStartup),
+            Self::GuestHvfWitness => Some(ProbeStage::GuestHvfWitness),
+            Self::GuestHvfCreate => Some(ProbeStage::GuestHvfCreate),
+            Self::GuestExecution => Some(ProbeStage::GuestExecution),
+            Self::GuestOracle => Some(ProbeStage::GuestOracle),
+            Self::GuestPoweroff => Some(ProbeStage::GuestPoweroff),
+            Self::GuestTimeout => Some(ProbeStage::GuestTimeout),
+            Self::GuestEndpointDeath => Some(ProbeStage::GuestEndpointDeath),
+            Self::GuestTerminalEvidence => Some(ProbeStage::GuestTerminalEvidence),
+            Self::GuestCleanup => Some(ProbeStage::GuestCleanup),
+            Self::GuestGrantAccepted => Some(ProbeStage::GrantAccepted),
+            Self::GuestTransportContamination => Some(ProbeStage::GuestResourceWitness),
         }
     }
 }
@@ -453,6 +878,12 @@ pub enum RuntimeResultClass {
     GrantBoundary,
     /// The ordinary lifecycle stopped after committed grants.
     LifecycleBoundary,
+    /// API socket publication or one closed API request stopped progress.
+    ApiBoundary,
+    /// The late witness or real HVF construction stopped progress.
+    HvfBoundary,
+    /// Guest execution, oracle, poweroff, terminal evidence, or cleanup failed.
+    GuestBoundary,
 }
 
 impl RuntimeResultClass {
@@ -467,6 +898,9 @@ impl RuntimeResultClass {
             Self::NamespaceBoundary => "namespace-boundary",
             Self::GrantBoundary => "grant-boundary",
             Self::LifecycleBoundary => "lifecycle-boundary",
+            Self::ApiBoundary => "api-boundary",
+            Self::HvfBoundary => "hvf-boundary",
+            Self::GuestBoundary => "guest-boundary",
         }
     }
 }
@@ -774,7 +1208,7 @@ impl fmt::Debug for CredentialDatagramProof {
     }
 }
 
-/// Exact single-use handoff from the credential exchange to lifecycle v6.
+/// Exact single-use handoff from the credential exchange to lifecycle v5.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ContinuationAck {
     mode: ProbeMode,
@@ -1029,6 +1463,278 @@ impl RuntimeSessionAuthority {
 impl fmt::Debug for RuntimeSessionAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RuntimeSessionAuthority(<redacted>)")
+    }
+}
+
+/// Exact phase in the post-grant guest evidence exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GuestEvidencePhase {
+    /// Worker is about to claim its first guest resource authority.
+    ResourceClaim = 1,
+    /// Worker is about to construct the real HVF guest session.
+    HvfCreate = 2,
+    /// Worker has successfully constructed the real HVF guest session.
+    HvfCreated = 3,
+    /// Worker observed canonical guest shutdown after the success oracle.
+    GuestShutdown = 4,
+}
+
+impl GuestEvidencePhase {
+    const fn sequence(self) -> u32 {
+        self as u32
+    }
+
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            1 => Ok(Self::ResourceClaim),
+            2 => Ok(Self::HvfCreate),
+            3 => Ok(Self::HvfCreated),
+            4 => Ok(Self::GuestShutdown),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// Direction and purpose of one guest-evidence record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GuestEvidenceKind {
+    /// Worker requests one exact late revalidation barrier.
+    Request = 1,
+    /// Launcher acknowledges one exact request after revalidation.
+    Ack = 2,
+    /// Worker reports one exact value-free milestone.
+    Report = 3,
+}
+
+impl GuestEvidenceKind {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            1 => Ok(Self::Request),
+            2 => Ok(Self::Ack),
+            3 => Ok(Self::Report),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// Canonical post-grant record carried by the already authenticated grant datagram.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GuestEvidenceRecord {
+    mode: ProbeMode,
+    phase: GuestEvidencePhase,
+    kind: GuestEvidenceKind,
+    role: CredentialRole,
+    sequence: u32,
+    nonce: SessionId,
+    session: SessionId,
+}
+
+impl GuestEvidenceRecord {
+    /// Constructs a worker request for one of the two late witness barriers.
+    pub fn worker_request(
+        mode: ProbeMode,
+        phase: GuestEvidencePhase,
+        nonce: SessionId,
+        session: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            phase,
+            GuestEvidenceKind::Request,
+            CredentialRole::Worker,
+            nonce,
+            session,
+        )
+    }
+
+    /// Constructs the launcher's exact acknowledgment for one late witness barrier.
+    pub fn launcher_ack(
+        mode: ProbeMode,
+        phase: GuestEvidencePhase,
+        nonce: SessionId,
+        session: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            phase,
+            GuestEvidenceKind::Ack,
+            CredentialRole::Launcher,
+            nonce,
+            session,
+        )
+    }
+
+    /// Constructs one value-free worker milestone report.
+    pub fn worker_report(
+        mode: ProbeMode,
+        phase: GuestEvidencePhase,
+        nonce: SessionId,
+        session: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            phase,
+            GuestEvidenceKind::Report,
+            CredentialRole::Worker,
+            nonce,
+            session,
+        )
+    }
+
+    fn new(
+        mode: ProbeMode,
+        phase: GuestEvidencePhase,
+        kind: GuestEvidenceKind,
+        role: CredentialRole,
+        nonce: SessionId,
+        session: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        if !matches!(
+            mode.runtime_workload(),
+            Some(RuntimeWorkload::GuestNoApi | RuntimeWorkload::GuestApi)
+        ) || nonce.is_pre_session()
+            || session.is_pre_session()
+        {
+            return Err(ProbeProtocolError);
+        }
+        let valid_shape = matches!(
+            (phase, kind, role),
+            (
+                GuestEvidencePhase::ResourceClaim | GuestEvidencePhase::HvfCreate,
+                GuestEvidenceKind::Request,
+                CredentialRole::Worker
+            ) | (
+                GuestEvidencePhase::ResourceClaim | GuestEvidencePhase::HvfCreate,
+                GuestEvidenceKind::Ack,
+                CredentialRole::Launcher
+            ) | (
+                GuestEvidencePhase::HvfCreated | GuestEvidencePhase::GuestShutdown,
+                GuestEvidenceKind::Report,
+                CredentialRole::Worker
+            )
+        );
+        if !valid_shape {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            mode,
+            phase,
+            kind,
+            role,
+            sequence: phase.sequence(),
+            nonce,
+            session,
+        })
+    }
+
+    /// Returns the selected guest mode.
+    #[must_use]
+    pub const fn mode(self) -> ProbeMode {
+        self.mode
+    }
+
+    /// Returns the exact exchange phase.
+    #[must_use]
+    pub const fn phase(self) -> GuestEvidencePhase {
+        self.phase
+    }
+
+    /// Returns the exact record kind.
+    #[must_use]
+    pub const fn kind(self) -> GuestEvidenceKind {
+        self.kind
+    }
+
+    /// Returns the exact sender role.
+    #[must_use]
+    pub const fn role(self) -> CredentialRole {
+        self.role
+    }
+
+    /// Returns the canonical monotonic sequence number.
+    #[must_use]
+    pub const fn sequence(self) -> u32 {
+        self.sequence
+    }
+
+    /// Returns the bootstrap nonce.
+    #[must_use]
+    pub const fn nonce(self) -> SessionId {
+        self.nonce
+    }
+
+    /// Returns the lifecycle session.
+    #[must_use]
+    pub const fn session(self) -> SessionId {
+        self.session
+    }
+
+    /// Returns whether every binding and state-machine field is exact.
+    #[must_use]
+    pub fn matches_expected(
+        self,
+        mode: ProbeMode,
+        phase: GuestEvidencePhase,
+        kind: GuestEvidenceKind,
+        role: CredentialRole,
+        nonce: SessionId,
+        session: SessionId,
+    ) -> bool {
+        self.mode == mode
+            && self.phase == phase
+            && self.kind == kind
+            && self.role == role
+            && self.sequence == phase.sequence()
+            && self.nonce == nonce
+            && self.session == session
+    }
+
+    /// Encodes the fixed canonical record.
+    #[must_use]
+    pub fn encode(self) -> [u8; GUEST_EVIDENCE_RECORD_BYTES] {
+        let mut bytes = [0_u8; GUEST_EVIDENCE_RECORD_BYTES];
+        bytes[0..4].copy_from_slice(&GUEST_EVIDENCE_MAGIC);
+        bytes[4..6].copy_from_slice(&GUEST_EVIDENCE_VERSION.to_be_bytes());
+        bytes[6] = self.mode as u8;
+        bytes[7] = self.phase as u8;
+        bytes[8] = self.kind as u8;
+        bytes[9] = self.role as u8;
+        bytes[12..16].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[16..48].copy_from_slice(self.nonce.as_bytes());
+        bytes[48..80].copy_from_slice(self.session.as_bytes());
+        bytes
+    }
+
+    /// Decodes and validates one exact canonical record.
+    pub fn decode(bytes: &[u8; GUEST_EVIDENCE_RECORD_BYTES]) -> Result<Self, ProbeProtocolError> {
+        if bytes[0..4] != GUEST_EVIDENCE_MAGIC
+            || bytes[4..6] != GUEST_EVIDENCE_VERSION.to_be_bytes()
+            || bytes[10..12] != [0; 2]
+            || bytes[80..96] != [0; 16]
+        {
+            return Err(ProbeProtocolError);
+        }
+        let phase = GuestEvidencePhase::from_byte(bytes[7])?;
+        let record = Self::new(
+            ProbeMode::from_byte(bytes[6])?,
+            phase,
+            GuestEvidenceKind::from_byte(bytes[8])?,
+            CredentialRole::from_byte(bytes[9])?,
+            SessionId::from_bytes(array(bytes, 16)?),
+            SessionId::from_bytes(array(bytes, 48)?),
+        )?;
+        if u32::from_be_bytes(array(bytes, 12)?) != phase.sequence() || record.encode() != *bytes {
+            return Err(ProbeProtocolError);
+        }
+        Ok(record)
+    }
+}
+
+impl fmt::Debug for GuestEvidenceRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GuestEvidenceRecord(<redacted>)")
     }
 }
 
@@ -2346,6 +3052,75 @@ mod tests {
             ProbeMode::parse("runtime-unmapped", 2_147_483_647, 2_147_483_647),
             Some(ProbeMode::RuntimeUnmapped)
         );
+        for (name, mode, uid, gid, credential, workload) in [
+            (
+                "guest-no-api-drop",
+                ProbeMode::GuestNoApiDrop,
+                501,
+                20,
+                CredentialClass::Mapped,
+                RuntimeWorkload::GuestNoApi,
+            ),
+            (
+                "guest-no-api-retain-root",
+                ProbeMode::GuestNoApiRetainRoot,
+                0,
+                0,
+                CredentialClass::RetainRoot,
+                RuntimeWorkload::GuestNoApi,
+            ),
+            (
+                "guest-no-api-unmapped",
+                ProbeMode::GuestNoApiUnmapped,
+                2_147_483_647,
+                2_147_483_647,
+                CredentialClass::MaximumUnmapped,
+                RuntimeWorkload::GuestNoApi,
+            ),
+            (
+                "guest-api-drop",
+                ProbeMode::GuestApiDrop,
+                501,
+                20,
+                CredentialClass::Mapped,
+                RuntimeWorkload::GuestApi,
+            ),
+            (
+                "guest-api-retain-root",
+                ProbeMode::GuestApiRetainRoot,
+                0,
+                0,
+                CredentialClass::RetainRoot,
+                RuntimeWorkload::GuestApi,
+            ),
+            (
+                "guest-api-unmapped",
+                ProbeMode::GuestApiUnmapped,
+                2_147_483_647,
+                2_147_483_647,
+                CredentialClass::MaximumUnmapped,
+                RuntimeWorkload::GuestApi,
+            ),
+        ] {
+            assert_eq!(ProbeMode::parse(name, uid, gid), Some(mode));
+            assert_eq!(mode.name(), name);
+            assert_eq!(mode.credential_class(), Some(credential));
+            assert_eq!(mode.runtime_workload(), Some(workload));
+            assert!(workload.is_guest());
+            assert!(mode.is_credential_pair());
+            assert!(mode.continues_runtime());
+            assert_eq!(
+                mode.retains_root(),
+                credential == CredentialClass::RetainRoot
+            );
+        }
+        assert_eq!(
+            ProbeMode::RuntimeDrop.runtime_workload(),
+            Some(RuntimeWorkload::RepresentativeGrants)
+        );
+        assert!(!RuntimeWorkload::RepresentativeGrants.is_guest());
+        assert_eq!(ProbeMode::Drop.credential_class(), None);
+        assert_eq!(ProbeMode::CredentialDrop.runtime_workload(), None);
         assert_eq!(ProbeMode::parse("unknown", 501, 20), None);
     }
 
@@ -2386,6 +3161,26 @@ mod tests {
             ProbeStage::RuntimeSessionLock,
             ProbeStage::RuntimeSessionEnter,
             ProbeStage::LifecyclePrepared,
+            ProbeStage::GuestGrantContract,
+            ProbeStage::GuestResourceWitness,
+            ProbeStage::ApiSocketPublication,
+            ProbeStage::ApiLoggerConfiguration,
+            ProbeStage::ApiMetricsConfiguration,
+            ProbeStage::ApiSerialConfiguration,
+            ProbeStage::ApiMachineConfiguration,
+            ProbeStage::ApiBootConfiguration,
+            ProbeStage::ApiDriveConfiguration,
+            ProbeStage::ApiInstanceStart,
+            ProbeStage::NoApiStartup,
+            ProbeStage::GuestHvfWitness,
+            ProbeStage::GuestHvfCreate,
+            ProbeStage::GuestExecution,
+            ProbeStage::GuestOracle,
+            ProbeStage::GuestPoweroff,
+            ProbeStage::GuestTimeout,
+            ProbeStage::GuestEndpointDeath,
+            ProbeStage::GuestTerminalEvidence,
+            ProbeStage::GuestCleanup,
         ] {
             let result = ProbeResult::failure(
                 ProbeMode::InheritedRoot,
@@ -2413,6 +3208,12 @@ mod tests {
             (ProbeMode::RuntimeDrop, 501, 20),
             (ProbeMode::RuntimeRetainRoot, 0, 0),
             (ProbeMode::RuntimeUnmapped, 2_147_483_647, 2_147_483_647),
+            (ProbeMode::GuestNoApiDrop, 501, 20),
+            (ProbeMode::GuestNoApiRetainRoot, 0, 0),
+            (ProbeMode::GuestNoApiUnmapped, 2_147_483_647, 2_147_483_647),
+            (ProbeMode::GuestApiDrop, 501, 20),
+            (ProbeMode::GuestApiRetainRoot, 0, 0),
+            (ProbeMode::GuestApiUnmapped, 2_147_483_647, 2_147_483_647),
         ] {
             let bootstrap = ProbeBootstrap::new(
                 mode,
@@ -2457,13 +3258,75 @@ mod tests {
             (RuntimeFault::SessionLock, 12, "session-lock"),
             (RuntimeFault::SessionEnter, 13, "session-enter"),
             (RuntimeFault::Prepared, 14, "prepared"),
+            (RuntimeFault::GuestGrantContract, 15, "guest-grant-contract"),
+            (
+                RuntimeFault::GuestResourceWitness,
+                16,
+                "guest-resource-witness",
+            ),
+            (
+                RuntimeFault::ApiSocketPublication,
+                17,
+                "api-socket-publication",
+            ),
+            (
+                RuntimeFault::ApiLoggerConfiguration,
+                18,
+                "api-logger-configuration",
+            ),
+            (
+                RuntimeFault::ApiMetricsConfiguration,
+                19,
+                "api-metrics-configuration",
+            ),
+            (
+                RuntimeFault::ApiSerialConfiguration,
+                20,
+                "api-serial-configuration",
+            ),
+            (
+                RuntimeFault::ApiMachineConfiguration,
+                21,
+                "api-machine-configuration",
+            ),
+            (
+                RuntimeFault::ApiBootConfiguration,
+                22,
+                "api-boot-configuration",
+            ),
+            (
+                RuntimeFault::ApiDriveConfiguration,
+                23,
+                "api-drive-configuration",
+            ),
+            (RuntimeFault::ApiInstanceStart, 24, "api-instance-start"),
+            (RuntimeFault::NoApiStartup, 25, "no-api-startup"),
+            (RuntimeFault::GuestHvfWitness, 26, "guest-hvf-witness"),
+            (RuntimeFault::GuestHvfCreate, 27, "guest-hvf-create"),
+            (RuntimeFault::GuestExecution, 28, "guest-execution"),
+            (RuntimeFault::GuestOracle, 29, "guest-oracle"),
+            (RuntimeFault::GuestPoweroff, 30, "guest-poweroff"),
+            (RuntimeFault::GuestTimeout, 31, "guest-timeout"),
+            (RuntimeFault::GuestEndpointDeath, 32, "guest-endpoint-death"),
+            (
+                RuntimeFault::GuestTerminalEvidence,
+                33,
+                "guest-terminal-evidence",
+            ),
+            (RuntimeFault::GuestCleanup, 34, "guest-cleanup"),
+            (RuntimeFault::GuestGrantAccepted, 35, "guest-grant-accepted"),
+            (
+                RuntimeFault::GuestTransportContamination,
+                36,
+                "guest-transport-contamination",
+            ),
         ] {
             assert_eq!(RuntimeFault::parse(name), Some(fault));
             assert_eq!(RuntimeFault::from_byte(byte), Ok(fault));
             assert_eq!(fault.name(), name);
         }
         assert_eq!(RuntimeFault::parse("unknown"), None);
-        assert_eq!(RuntimeFault::from_byte(15), Err(ProbeProtocolError));
+        assert_eq!(RuntimeFault::from_byte(37), Err(ProbeProtocolError));
 
         for (result, name) in [
             (RuntimeResultClass::Complete, "complete"),
@@ -2479,6 +3342,9 @@ mod tests {
             (RuntimeResultClass::NamespaceBoundary, "namespace-boundary"),
             (RuntimeResultClass::GrantBoundary, "grant-boundary"),
             (RuntimeResultClass::LifecycleBoundary, "lifecycle-boundary"),
+            (RuntimeResultClass::ApiBoundary, "api-boundary"),
+            (RuntimeResultClass::HvfBoundary, "hvf-boundary"),
+            (RuntimeResultClass::GuestBoundary, "guest-boundary"),
         ] {
             assert_eq!(result.name(), name);
         }
@@ -2662,6 +3528,176 @@ mod tests {
     }
 
     #[test]
+    fn guest_evidence_records_are_canonical_ordered_bound_and_redacted() {
+        let nonce = SessionId::from_bytes([0x91; 32]);
+        let session = SessionId::from_bytes([0x92; 32]);
+        for mode in [ProbeMode::GuestNoApiDrop, ProbeMode::GuestApiRetainRoot] {
+            let records = [
+                GuestEvidenceRecord::worker_request(
+                    mode,
+                    GuestEvidencePhase::ResourceClaim,
+                    nonce,
+                    session,
+                )
+                .expect("resource request should construct"),
+                GuestEvidenceRecord::launcher_ack(
+                    mode,
+                    GuestEvidencePhase::ResourceClaim,
+                    nonce,
+                    session,
+                )
+                .expect("resource acknowledgment should construct"),
+                GuestEvidenceRecord::worker_request(
+                    mode,
+                    GuestEvidencePhase::HvfCreate,
+                    nonce,
+                    session,
+                )
+                .expect("HVF request should construct"),
+                GuestEvidenceRecord::launcher_ack(
+                    mode,
+                    GuestEvidencePhase::HvfCreate,
+                    nonce,
+                    session,
+                )
+                .expect("HVF acknowledgment should construct"),
+                GuestEvidenceRecord::worker_report(
+                    mode,
+                    GuestEvidencePhase::HvfCreated,
+                    nonce,
+                    session,
+                )
+                .expect("HVF report should construct"),
+                GuestEvidenceRecord::worker_report(
+                    mode,
+                    GuestEvidencePhase::GuestShutdown,
+                    nonce,
+                    session,
+                )
+                .expect("shutdown report should construct"),
+            ];
+            for record in records {
+                let encoded = record.encode();
+                assert_eq!(encoded.len(), GUEST_EVIDENCE_RECORD_BYTES);
+                assert_eq!(GuestEvidenceRecord::decode(&encoded), Ok(record));
+                assert_eq!(record.mode(), mode);
+                assert_eq!(record.sequence(), record.phase() as u32);
+                assert_eq!(record.nonce(), nonce);
+                assert_eq!(record.session(), session);
+                assert!(record.matches_expected(
+                    mode,
+                    record.phase(),
+                    record.kind(),
+                    record.role(),
+                    nonce,
+                    session,
+                ));
+                assert_eq!(format!("{record:?}"), "GuestEvidenceRecord(<redacted>)");
+                for index in 0..encoded.len() {
+                    let mut malformed = encoded;
+                    malformed[index] ^= 1;
+                    if let Ok(decoded) = GuestEvidenceRecord::decode(&malformed) {
+                        assert_ne!(decoded, record);
+                        assert!(!decoded.matches_expected(
+                            record.mode(),
+                            record.phase(),
+                            record.kind(),
+                            record.role(),
+                            record.nonce(),
+                            record.session(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let request = GuestEvidenceRecord::worker_request(
+            ProbeMode::GuestApiDrop,
+            GuestEvidencePhase::ResourceClaim,
+            nonce,
+            session,
+        )
+        .expect("request should construct");
+        assert!(!request.matches_expected(
+            ProbeMode::GuestNoApiDrop,
+            GuestEvidencePhase::ResourceClaim,
+            GuestEvidenceKind::Request,
+            CredentialRole::Worker,
+            nonce,
+            session,
+        ));
+        assert!(!request.matches_expected(
+            ProbeMode::GuestApiDrop,
+            GuestEvidencePhase::HvfCreate,
+            GuestEvidenceKind::Request,
+            CredentialRole::Worker,
+            nonce,
+            session,
+        ));
+        assert!(!request.matches_expected(
+            ProbeMode::GuestApiDrop,
+            GuestEvidencePhase::ResourceClaim,
+            GuestEvidenceKind::Request,
+            CredentialRole::Worker,
+            SessionId::from_bytes([0x93; 32]),
+            session,
+        ));
+        assert!(!request.matches_expected(
+            ProbeMode::GuestApiDrop,
+            GuestEvidencePhase::ResourceClaim,
+            GuestEvidenceKind::Request,
+            CredentialRole::Worker,
+            nonce,
+            SessionId::from_bytes([0x94; 32]),
+        ));
+        assert!(
+            GuestEvidenceRecord::worker_request(
+                ProbeMode::RuntimeDrop,
+                GuestEvidencePhase::ResourceClaim,
+                nonce,
+                session,
+            )
+            .is_err()
+        );
+        assert!(
+            GuestEvidenceRecord::worker_request(
+                ProbeMode::GuestApiDrop,
+                GuestEvidencePhase::HvfCreated,
+                nonce,
+                session,
+            )
+            .is_err()
+        );
+        assert!(
+            GuestEvidenceRecord::launcher_ack(
+                ProbeMode::GuestApiDrop,
+                GuestEvidencePhase::GuestShutdown,
+                nonce,
+                session,
+            )
+            .is_err()
+        );
+        assert!(
+            GuestEvidenceRecord::worker_report(
+                ProbeMode::GuestApiDrop,
+                GuestEvidencePhase::ResourceClaim,
+                nonce,
+                session,
+            )
+            .is_err()
+        );
+        assert!(
+            GuestEvidenceRecord::worker_report(
+                ProbeMode::GuestApiDrop,
+                GuestEvidencePhase::GuestShutdown,
+                SessionId::pre_session(),
+                session,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn runtime_worker_failure_exit_range_is_closed_and_exact() {
         let stages = [
             ProbeStage::RuntimeAuthorityReceive,
@@ -2715,6 +3751,12 @@ mod tests {
             ProbeMode::RuntimeDrop,
             ProbeMode::RuntimeRetainRoot,
             ProbeMode::RuntimeUnmapped,
+            ProbeMode::GuestNoApiDrop,
+            ProbeMode::GuestNoApiRetainRoot,
+            ProbeMode::GuestNoApiUnmapped,
+            ProbeMode::GuestApiDrop,
+            ProbeMode::GuestApiRetainRoot,
+            ProbeMode::GuestApiUnmapped,
         ] {
             let ack = ContinuationAck::launcher(mode, nonce).expect("new mode should acknowledge");
             let encoded = ack.encode();

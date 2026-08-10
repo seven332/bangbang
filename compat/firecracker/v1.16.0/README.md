@@ -124,7 +124,7 @@ reviewed delta.
 | [Specification benchmark](specification-benchmark-contract.md) | Terminal three-row reference interpretation, strict signed collector/report/comparison, real FIFO loss/replay evidence, optional fixture boundary, and exact performance nonclaims |
 | [Wave 7 aggregate](observability-tools-specification-contract.md#wave-7-aggregate-certification) | Terminal 93-row parent distribution, exact design/device API/release/tool/MMIO ledgers, and explicit #1351/#1373/#1378/Wave 8 handoffs |
 | [Wave 8 platform-feasible certification](wave8-certification-contract.md) | Final seven-domain/21-pair interaction authority, four current platform-mechanism reviews, one exact successor transition, and its retained external outcomes |
-| [Elevated macOS bootstrap evidence](elevated-bootstrap-evidence.md) | Same-host root + HVF signed evidence that exact-root `fchdir` succeeds while mandatory App Sandbox rejects public `chroot`, with an unsandboxed control and exact cleanup |
+| [Elevated macOS bootstrap evidence](elevated-bootstrap-evidence.md) | Same-host signed evidence for the chroot boundary, three-class permanent credential/session/grant continuation, real no-API HVF completion, the contained API publication boundary, and exact cleanup |
 
 ## Dispositions
 

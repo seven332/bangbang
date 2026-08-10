@@ -126,9 +126,12 @@ if [[ "$bundle" != /* || "$(/usr/bin/basename "$bundle")" != "Bangbang.app" || !
   echo "invalid evidence bundle" >&2
   exit 2
 fi
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 launcher="$bundle/Contents/MacOS/bangbang"
 worker_bundle="$bundle/Contents/Helpers/BangbangWorker.app"
 worker="$worker_bundle/Contents/MacOS/bangbang-worker"
+worker_resources="$worker_bundle/Contents/Resources"
+guest_sidecar="${bundle}.elevated-guest-sidecar"
 marker="$worker_bundle/Contents/Resources/elevated-bootstrap-probe.enabled"
 grant_marker="$worker_bundle/Contents/Resources/grant-integration-probe.enabled"
 runtime_marker="$worker_bundle/Contents/Resources/target-runtime-grant-probe.enabled"
@@ -138,6 +141,16 @@ for entry in "$launcher" "$worker" "$marker" "$grant_marker" "$runtime_marker"; 
     exit 1
   fi
 done
+if [[ ! -d "$guest_sidecar" || -L "$guest_sidecar" ]] \
+  || ! /usr/bin/python3 "$repo_root/scripts/elevated_guest_evidence.py" verify \
+    --directory "$worker_resources" \
+    --kind bundle >/dev/null \
+  || ! /usr/bin/python3 "$repo_root/scripts/elevated_guest_evidence.py" verify \
+    --directory "$guest_sidecar" \
+    --kind sidecar >/dev/null; then
+  echo "bangbang elevated bootstrap proof: guest evidence resources invalid" >&2
+  exit 1
+fi
 
 if [[ "$(/usr/bin/uname -m)" != "arm64" ]]; then
   echo "bangbang elevated bootstrap proof: Apple Silicon required" >&2
@@ -259,6 +272,11 @@ bundle_files=(
   "Contents/Helpers/BangbangWorker.app/Contents/Resources/elevated-bootstrap-probe.enabled"
   "Contents/Helpers/BangbangWorker.app/Contents/Resources/grant-integration-probe.enabled"
   "Contents/Helpers/BangbangWorker.app/Contents/Resources/target-runtime-grant-probe.enabled"
+  "Contents/Helpers/BangbangWorker.app/Contents/Resources/elevated-guest-evidence.enabled"
+  "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-kernel"
+  "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-rootfs"
+  "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-initrd"
+  "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-no-api.json"
   "Contents/Helpers/BangbangWorker.app/Contents/Info.plist"
   "Contents/Info.plist"
 )
@@ -282,6 +300,11 @@ is_staged_relative() {
       | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/elevated-bootstrap-probe.enabled" \
       | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/grant-integration-probe.enabled" \
       | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/target-runtime-grant-probe.enabled" \
+      | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/elevated-guest-evidence.enabled" \
+      | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-kernel" \
+      | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-rootfs" \
+      | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-initrd" \
+      | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-no-api.json" \
       | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/Info.plist" \
       | "Bangbang.app/Contents/Info.plist" \
       | "usr" \
@@ -373,8 +396,15 @@ stage_inherited_root() {
         ;;
       "Contents/Helpers/BangbangWorker.app/Contents/Resources/elevated-bootstrap-probe.enabled" \
         | "Contents/Helpers/BangbangWorker.app/Contents/Resources/grant-integration-probe.enabled" \
-        | "Contents/Helpers/BangbangWorker.app/Contents/Resources/target-runtime-grant-probe.enabled")
+        | "Contents/Helpers/BangbangWorker.app/Contents/Resources/target-runtime-grant-probe.enabled" \
+        | "Contents/Helpers/BangbangWorker.app/Contents/Resources/elevated-guest-evidence.enabled")
         mode=0600
+        ;;
+      "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-kernel" \
+        | "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-rootfs" \
+        | "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-initrd" \
+        | "Contents/Helpers/BangbangWorker.app/Contents/Resources/evidence-guest-no-api.json")
+        mode=0400
         ;;
     esac
     stage_file "$root" "$ledger" "$bundle/$relative" "Bangbang.app/$relative" "$mode"
@@ -422,7 +452,7 @@ validate_staged_root() {
     seen="${seen}${relative}|"
     lines+=("$relative"$'\t'"$identity"$'\t'"$kind")
   done < "$ledger"
-  if [[ "${#lines[@]}" -ne 22 ]]; then
+  if [[ "${#lines[@]}" -ne 27 ]]; then
     return 1
   fi
 
@@ -449,7 +479,7 @@ validate_staged_root() {
 
   local count
   count="$(/usr/bin/find -x "$root" -mindepth 1 -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  if [[ "$count" != "22" ]] \
+  if [[ "$count" != "27" ]] \
     || ! validate_source_bundle_shape \
     || ! /usr/bin/cmp -s /usr/lib/dyld "$root/usr/lib/dyld" \
     || ! /usr/bin/codesign --verify --strict "$root/usr/lib/dyld" >/dev/null 2>&1 \
@@ -1713,6 +1743,18 @@ fi
 /bin/unlink "$workspace/inherited-case-a"
 /bin/unlink "$workspace/inherited-case-b"
 
+guest_matrix_output="$(/usr/bin/python3 "$repo_root/scripts/elevated_guest_matrix.py" \
+  --launcher "$launcher" \
+  --resources "$worker_resources" \
+  --sidecar "$guest_sidecar" \
+  --target-uid "$target_uid" \
+  --target-gid "$target_gid")"
+expected_guest_matrix="guest-matrix: api-mapped=blocked-api-publication api-retained-root=blocked-api-publication-no-drop api-unmapped=blocked-api-publication no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=no-api-isolated-api-blocked faults=no-api-reachable-complete-api-later-ineligible deaths=worker-first-launcher-first tamper=rejected adoption-replacement=no-api-preopened-api-ineligible cleanup=exact"
+if [[ "$guest_matrix_output" != "$expected_guest_matrix" ]]; then
+  echo "bangbang elevated bootstrap proof: guest matrix output invalid" >&2
+  exit 1
+fi
+
 socket_residue=0
 for path in \
   "$probe_root" \
@@ -1745,7 +1787,7 @@ root_residue="$(/usr/bin/find /private/var/root -maxdepth 1 \
   \( -name 'bangbang-elevated-probe.*' -o -name 'bangbang-elevated-work.*' \) \
   -print 2>/dev/null | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
 runtime_workspace_residue="$(/usr/bin/find /private/tmp -maxdepth 1 \
-  -name 'bangbang-elevated-runtime.*' \
+  \( -name 'bangbang-elevated-runtime.*' -o -name 'bangbang-elevated-guest.*' \) \
   -print 2>/dev/null | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
 launcher_residue="$({ /usr/bin/pgrep -x bangbang-launcher 2>/dev/null || true; } \
   | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
@@ -1759,6 +1801,7 @@ if [[ "$socket_residue" -ne 0 || "$root_residue" -ne 0 \
 fi
 
 echo "result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=complete runtime-retained-root=complete-no-drop runtime-unmapped=complete authority=consumed lock=independent grants=committed lifecycle=terminal controls=complete cleanup=exact"
+echo "$guest_matrix_output"
 echo "observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact"
 echo "residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero"
-echo "nonclaims: api-no-api-real-guest=unmeasured daemon-crash=unmeasured post-drop-guest-hvf=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal"
+echo "nonclaims: daemon-crash=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal"

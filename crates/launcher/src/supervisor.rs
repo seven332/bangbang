@@ -118,8 +118,21 @@ where
         let mut launch = launch;
         #[cfg(feature = "elevated-bootstrap-probe")]
         if let Some(elevated_probe) = elevated_probe {
+            let mut guest_contract = match elevated_probe
+                .validate_runtime_contract(&launch.worker_args, &launch.grants)
+            {
+                Ok(contract) => contract,
+                Err(error) if elevated_probe.mode().continues_runtime() => {
+                    return Err(error);
+                }
+                Err(_) => None,
+            };
+            if elevated_probe.stop_after_adoption()? {
+                guest_contract = elevated_probe
+                    .validate_runtime_contract(&launch.worker_args, &launch.grants)?;
+            }
             elevated_probe.prepend_worker_activation(&mut launch.worker_args)?;
-            return launch_elevated_prepared(&layout, launch, elevated_probe);
+            return launch_elevated_prepared(&layout, launch, elevated_probe, guest_contract);
         }
         launch_prepared(&layout, launch, None)
     }
@@ -136,6 +149,7 @@ fn launch_elevated_prepared(
     layout: &BundleLayout,
     mut launch: crate::launch_policy::PreparedLaunch,
     mut elevated_probe: crate::elevated_probe::Config,
+    guest_contract: Option<crate::grant_manifest::ElevatedGuestContract>,
 ) -> Result<LauncherExit, LauncherError> {
     let bootstrap = elevated_probe.bootstrap()?;
     if elevated_probe.mode() == bangbang_session::elevated_probe::ProbeMode::InheritedRoot {
@@ -147,6 +161,7 @@ fn launch_elevated_prepared(
             .with_identity(bootstrap.target_uid(), bootstrap.target_gid());
         Some(ElevatedRuntimeLaunch {
             root: elevated_probe.take_runtime_root()?,
+            guest_contract,
         })
     } else {
         None
@@ -167,6 +182,7 @@ fn launch_elevated_prepared(
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 struct ElevatedRuntimeLaunch {
     root: bangbang_session::macos::runtime::ExplicitRuntimeRoot,
+    guest_contract: Option<crate::grant_manifest::ElevatedGuestContract>,
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -872,13 +888,14 @@ fn continue_runtime_session(
 ) -> Result<LauncherExit, LauncherError> {
     const RUNTIME_LAUNCHER_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-v2-runtime-drop-runtime-retain-root-runtime-unmapped-status: elevated runtime-BBA1-BBN1-launcher-created-session";
     const RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+    const GUEST_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-guest-launcher-boundaries-v1-guest-no-api-drop-guest-no-api-retain-root-guest-no-api-unmapped-guest-api-drop-guest-api-retain-root-guest-api-unmapped-BBW1-guest-resource-witness-guest-grant-accepted-guest-transport-contamination-guest-hvf-witness-guest-terminal-evidence-api-instance-start-bangbang-grant:evidence-guest-kernel-bangbang-grant:evidence-guest-serial";
 
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
     use bangbang_session::elevated_probe::{
         ContinuationAck, ProbeErrorCategory, ProbeStage, RuntimeFault, RuntimeSessionAuthority,
-        RuntimeWorkerFailure,
+        RuntimeWorkerFailure, RuntimeWorkload,
     };
     use bangbang_session::macos::runtime::{PreparedLauncherSession, RuntimeError};
     use bangbang_session::macos::runtime_authority::send_runtime_session_authority;
@@ -886,11 +903,33 @@ fn continue_runtime_session(
 
     std::hint::black_box(RUNTIME_LAUNCHER_ARTIFACT);
     std::hint::black_box(RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT);
+    std::hint::black_box(GUEST_LAUNCHER_BOUNDARY_ARTIFACT);
     let blocked = |stage, category| {
         Ok(elevated_runtime_blocked(
             bootstrap, &semantics, stage, category,
         ))
     };
+    let contract_valid = match (bootstrap.mode().runtime_workload(), runtime.guest_contract) {
+        (Some(RuntimeWorkload::RepresentativeGrants), None) => true,
+        (Some(RuntimeWorkload::GuestNoApi), Some(contract)) => {
+            contract.workload() == RuntimeWorkload::GuestNoApi && contract.api_anchor().is_none()
+        }
+        (Some(RuntimeWorkload::GuestApi), Some(contract)) => {
+            contract.workload() == RuntimeWorkload::GuestApi && contract.api_anchor().is_some()
+        }
+        _ => false,
+    };
+    if !contract_valid {
+        let _ = credential_wait_for_exit(&mut spawned, 1);
+        return blocked(
+            ProbeStage::GuestGrantContract,
+            ProbeErrorCategory::InvalidInput,
+        );
+    }
+    if bootstrap.fault() == RuntimeFault::GuestGrantContract {
+        let _ = credential_wait_for_exit(&mut spawned, 1);
+        return blocked(ProbeStage::GuestGrantContract, ProbeErrorCategory::Other);
+    }
     if bootstrap.fault() == RuntimeFault::PreAck {
         let _ = credential_wait_for_exit(&mut spawned, 1);
         return blocked(ProbeStage::ContinuationAck, ProbeErrorCategory::Other);
@@ -1086,6 +1125,18 @@ fn continue_runtime_session(
             return blocked(ProbeStage::LifecycleHello, ProbeErrorCategory::InvalidInput);
         }
     };
+    let (guest, guest_failure) = match runtime.guest_contract {
+        Some(contract) => {
+            let (guest, failure) = crate::macos::elevated_guest::ElevatedGuestSupervisor::new(
+                bootstrap,
+                contract,
+                launch.worker_profile.clone(),
+                session_id,
+            )?;
+            (Some(guest), Some(failure))
+        }
+        None => (None, None),
+    };
     let status = match crate::macos::supervise::wait_session_with_preopened_namespace(
         &mut spawned.worker,
         &mut spawned.session,
@@ -1101,31 +1152,26 @@ fn continue_runtime_session(
         crate::macos::supervise::PreopenedSessionStart::new(
             handles.take().ok_or(LauncherError::RuntimeNamespace)?,
             start,
+            guest,
         ),
     ) {
         Ok(status) => status,
         Err(error) => {
-            let stage = match bootstrap.fault() {
-                RuntimeFault::Namespace => ProbeStage::RuntimeNamespace,
-                RuntimeFault::GrantTransfer => ProbeStage::GrantTransfer,
-                RuntimeFault::Proceed => ProbeStage::LifecycleProceed,
-                RuntimeFault::Terminal => ProbeStage::LifecycleTerminal,
-                RuntimeFault::SessionEnter => ProbeStage::RuntimeSessionEnter,
-                RuntimeFault::Prepared => ProbeStage::LifecyclePrepared,
-                RuntimeFault::SessionCreate => ProbeStage::RuntimeSessionCreate,
-                RuntimeFault::SessionOpen => ProbeStage::RuntimeSessionOpen,
-                RuntimeFault::AuthoritySend => ProbeStage::RuntimeAuthoritySend,
-                RuntimeFault::AuthorityReceive => ProbeStage::RuntimeAuthorityReceive,
-                RuntimeFault::AuthorityValidate => ProbeStage::RuntimeAuthorityValidate,
-                RuntimeFault::SessionLock => ProbeStage::RuntimeSessionLock,
-                RuntimeFault::None | RuntimeFault::PreAck | RuntimeFault::PostAck => match error {
-                    LauncherError::RuntimeNamespace => ProbeStage::RuntimeNamespace,
-                    LauncherError::GrantProtocol | LauncherError::GrantPreparation => {
-                        ProbeStage::GrantAccepted
-                    }
-                    _ => ProbeStage::LifecycleTerminal,
-                },
-            };
+            if let Some(failure) = guest_failure
+                .as_ref()
+                .and_then(crate::macos::elevated_guest::ElevatedGuestFailureHandle::failure)
+                && (bootstrap.fault() == RuntimeFault::None
+                    || bootstrap.fault().stage() == Some(failure.stage()))
+            {
+                return blocked(failure.stage(), failure.category());
+            }
+            let stage = bootstrap.fault().stage().unwrap_or(match error {
+                LauncherError::RuntimeNamespace => ProbeStage::RuntimeNamespace,
+                LauncherError::GrantProtocol | LauncherError::GrantPreparation => {
+                    ProbeStage::GrantAccepted
+                }
+                _ => ProbeStage::LifecycleTerminal,
+            });
             return blocked(stage, probe_error_category(&error));
         }
     };
@@ -1140,34 +1186,32 @@ fn continue_runtime_session(
         );
     }
     if bootstrap.fault() != RuntimeFault::None || exit.code() != 0 {
-        let stage = match bootstrap.fault() {
-            RuntimeFault::Namespace => ProbeStage::RuntimeNamespace,
-            RuntimeFault::GrantTransfer => ProbeStage::GrantTransfer,
-            RuntimeFault::Proceed => ProbeStage::LifecycleProceed,
-            RuntimeFault::Terminal => ProbeStage::LifecycleTerminal,
-            RuntimeFault::SessionCreate => ProbeStage::RuntimeSessionCreate,
-            RuntimeFault::SessionOpen => ProbeStage::RuntimeSessionOpen,
-            RuntimeFault::AuthoritySend => ProbeStage::RuntimeAuthoritySend,
-            RuntimeFault::AuthorityReceive => ProbeStage::RuntimeAuthorityReceive,
-            RuntimeFault::AuthorityValidate => ProbeStage::RuntimeAuthorityValidate,
-            RuntimeFault::SessionLock => ProbeStage::RuntimeSessionLock,
-            RuntimeFault::SessionEnter => ProbeStage::RuntimeSessionEnter,
-            RuntimeFault::Prepared => ProbeStage::LifecyclePrepared,
-            RuntimeFault::None | RuntimeFault::PreAck | RuntimeFault::PostAck => {
-                ProbeStage::LifecycleTerminal
-            }
-        };
+        let stage = bootstrap
+            .fault()
+            .stage()
+            .unwrap_or(ProbeStage::LifecycleTerminal);
         return blocked(stage, ProbeErrorCategory::Other);
     }
+    let guest_completion = match bootstrap.mode().runtime_workload() {
+        Some(RuntimeWorkload::RepresentativeGrants) => "",
+        Some(RuntimeWorkload::GuestNoApi) => {
+            " resources=consumed workload=no-api api=absent hvf=created guest=oracle-poweroff"
+        }
+        Some(RuntimeWorkload::GuestApi) => {
+            " resources=consumed workload=api api=complete hvf=created guest=oracle-poweroff"
+        }
+        None => return Err(LauncherError::InvalidLaunchPolicy),
+    };
     println!(
-        "status: elevated runtime {} complete result={} stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={} namespace=launcher-created-target-owned authority=consumed lock=independent grants=committed lifecycle=terminal cleanup=complete",
+        "status: elevated runtime {} complete result={} stream-eid={} stream-cred={} stream-pid=exact datagram-cred={} datagram-token={} datagram-pid={} namespace=launcher-created-target-owned authority=consumed lock=independent grants=committed{} lifecycle=terminal cleanup=complete",
         bootstrap.mode().name(),
         bangbang_session::elevated_probe::RuntimeResultClass::Complete.name(),
         semantics.stream_eid,
         semantics.stream_cred,
         semantics.datagram_cred,
         semantics.datagram_token,
-        semantics.datagram_pid
+        semantics.datagram_pid,
+        guest_completion,
     );
     Ok(exit)
 }
@@ -1534,11 +1578,31 @@ fn elevated_runtime_blocked(
         | ProbeStage::RuntimeSessionLock
         | ProbeStage::RuntimeSessionEnter
         | ProbeStage::LifecyclePrepared => RuntimeResultClass::NamespaceBoundary,
-        ProbeStage::GrantTransfer | ProbeStage::GrantAccepted => RuntimeResultClass::GrantBoundary,
+        ProbeStage::GrantTransfer
+        | ProbeStage::GrantAccepted
+        | ProbeStage::GuestGrantContract
+        | ProbeStage::GuestResourceWitness => RuntimeResultClass::GrantBoundary,
         ProbeStage::LifecycleHello
         | ProbeStage::LifecycleProceed
         | ProbeStage::LifecycleTerminal
         | ProbeStage::RuntimeCleanup => RuntimeResultClass::LifecycleBoundary,
+        ProbeStage::ApiSocketPublication
+        | ProbeStage::ApiLoggerConfiguration
+        | ProbeStage::ApiMetricsConfiguration
+        | ProbeStage::ApiSerialConfiguration
+        | ProbeStage::ApiMachineConfiguration
+        | ProbeStage::ApiBootConfiguration
+        | ProbeStage::ApiDriveConfiguration
+        | ProbeStage::ApiInstanceStart => RuntimeResultClass::ApiBoundary,
+        ProbeStage::GuestHvfWitness | ProbeStage::GuestHvfCreate => RuntimeResultClass::HvfBoundary,
+        ProbeStage::NoApiStartup
+        | ProbeStage::GuestExecution
+        | ProbeStage::GuestOracle
+        | ProbeStage::GuestPoweroff
+        | ProbeStage::GuestTimeout
+        | ProbeStage::GuestEndpointDeath
+        | ProbeStage::GuestTerminalEvidence
+        | ProbeStage::GuestCleanup => RuntimeResultClass::GuestBoundary,
         ProbeStage::InitialIdentity | ProbeStage::LiveIdentity => {
             RuntimeResultClass::IdentityBoundary
         }
