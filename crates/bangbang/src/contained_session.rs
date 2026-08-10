@@ -425,6 +425,8 @@ mod platform {
         AuthorityValidate,
         SessionEnter,
         Prepared,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        NamespaceRetirement,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3716,6 +3718,42 @@ mod platform {
     }
 
     #[cfg(feature = "elevated-bootstrap-probe")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GuestEndpointDeathPoint {
+        NoApiReadiness,
+        ApiHvfCreated,
+        Other,
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    const fn should_stop_for_guest_endpoint_death(
+        fault: bangbang_session::elevated_probe::RuntimeFault,
+        daemonized: bool,
+        point: GuestEndpointDeathPoint,
+    ) -> bool {
+        !daemonized
+            && matches!(
+                point,
+                GuestEndpointDeathPoint::NoApiReadiness | GuestEndpointDeathPoint::ApiHvfCreated
+            )
+            && matches!(
+                fault,
+                bangbang_session::elevated_probe::RuntimeFault::GuestEndpointDeath
+            )
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn stop_for_guest_endpoint_death() -> Result<(), ContainedSessionError> {
+        // SAFETY: `raise` targets the current process with the fixed
+        // uncatchable stop signal used by the external death matrix.
+        if unsafe { libc::raise(libc::SIGSTOP) } == 0 {
+            Ok(())
+        } else {
+            Err(ContainedSessionError)
+        }
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
     struct GuestEvidenceState {
         socket: UnixDatagram,
         mode: bangbang_session::elevated_probe::ProbeMode,
@@ -3728,6 +3766,7 @@ mod platform {
         stream_fd: RawFd,
         namespace: Arc<Mutex<Option<WorkerNamespace>>>,
         file_grants: GrantAuthority,
+        daemonized: bool,
         directory_authority_consumed: bool,
         step: GuestEvidenceStep,
     }
@@ -3739,6 +3778,18 @@ mod platform {
     }
 
     #[cfg(feature = "elevated-bootstrap-probe")]
+    struct GuestEvidenceStart {
+        socket: UnixDatagram,
+        bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
+        session: SessionId,
+        parent: libc::pid_t,
+        stream_fd: RawFd,
+        namespace: Arc<Mutex<Option<WorkerNamespace>>>,
+        file_grants: GrantAuthority,
+        daemonized: bool,
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
     impl std::fmt::Debug for GuestEvidenceAuthority {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("GuestEvidenceAuthority(<redacted>)")
@@ -3747,15 +3798,17 @@ mod platform {
 
     #[cfg(feature = "elevated-bootstrap-probe")]
     impl GuestEvidenceAuthority {
-        fn new(
-            socket: UnixDatagram,
-            bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
-            session: SessionId,
-            parent: libc::pid_t,
-            stream_fd: RawFd,
-            namespace: Arc<Mutex<Option<WorkerNamespace>>>,
-            file_grants: GrantAuthority,
-        ) -> Result<Self, ContainedSessionError> {
+        fn new(start: GuestEvidenceStart) -> Result<Self, ContainedSessionError> {
+            let GuestEvidenceStart {
+                socket,
+                bootstrap,
+                session,
+                parent,
+                stream_fd,
+                namespace,
+                file_grants,
+                daemonized,
+            } = start;
             if !matches!(
                 bootstrap.mode().runtime_workload(),
                 Some(
@@ -3780,6 +3833,7 @@ mod platform {
                     stream_fd,
                     namespace,
                     file_grants,
+                    daemonized,
                     directory_authority_consumed: false,
                     step: GuestEvidenceStep::ResourceClaim,
                 }))),
@@ -4069,13 +4123,23 @@ mod platform {
                 bangbang_session::elevated_probe::GuestEvidencePhase::HvfCreated,
                 GuestEvidenceStep::GuestShutdown,
             )?;
-            if self.has_fault(bangbang_session::elevated_probe::RuntimeFault::GuestEndpointDeath)? {
-                // SAFETY: `raise` targets the current process with the fixed
-                // uncatchable stop signal used by the external death matrix.
-                if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
-                    self.invalidate();
-                    return Err(ContainedSessionError);
-                }
+            let stop_for_endpoint_death = {
+                let locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+                let state = locked.as_ref().ok_or(ContainedSessionError)?;
+                should_stop_for_guest_endpoint_death(
+                    state.fault,
+                    state.daemonized,
+                    if state.mode.runtime_workload()
+                        == Some(bangbang_session::elevated_probe::RuntimeWorkload::GuestApi)
+                    {
+                        GuestEndpointDeathPoint::ApiHvfCreated
+                    } else {
+                        GuestEndpointDeathPoint::Other
+                    },
+                )
+            };
+            if stop_for_endpoint_death {
+                stop_for_guest_endpoint_death()?;
             }
             self.reject_fault(bangbang_session::elevated_probe::RuntimeFault::GuestExecution)
         }
@@ -4284,6 +4348,11 @@ mod platform {
     }
 
     impl BootstrapSource {
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        fn uses_retired_namespace(&self, policy: WorkerPolicy) -> bool {
+            policy.is_daemonized() && matches!(self, Self::Elevated { .. })
+        }
+
         fn verify_peer(
             &self,
             stream: &UnixStream,
@@ -4378,6 +4447,9 @@ mod platform {
                     }
                     RuntimeBootstrapStage::SessionEnter => ProbeStage::RuntimeSessionEnter,
                     RuntimeBootstrapStage::Prepared => ProbeStage::LifecyclePrepared,
+                    RuntimeBootstrapStage::NamespaceRetirement => {
+                        ProbeStage::RuntimeNamespaceRetirement
+                    }
                 };
                 let category = match category {
                     RuntimeBootstrapCategory::InvalidInput => ProbeErrorCategory::InvalidInput,
@@ -4596,6 +4668,10 @@ mod platform {
             install_worker_policy(policy, parent)?;
             let namespace = source.take_namespace(session)?;
             #[cfg(feature = "elevated-bootstrap-probe")]
+            let mut namespace = namespace;
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let retire_namespace = source.uses_retired_namespace(policy);
+            #[cfg(feature = "elevated-bootstrap-probe")]
             if source.has_fault(bangbang_session::elevated_probe::RuntimeFault::SessionEnter) {
                 return Err(source.runtime_failure(
                     RuntimeBootstrapStage::SessionEnter,
@@ -4609,7 +4685,15 @@ mod platform {
                 )
             })?;
             let identity = namespace.identity();
-            let socket_namespace = Rc::new(namespace.socket_namespace().map_err(|error| {
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let socket_namespace = namespace.socket_namespace_with_policy(if retire_namespace {
+                bangbang_session::macos::runtime::NamespaceRecordPolicy::RetiredRecordFree
+            } else {
+                bangbang_session::macos::runtime::NamespaceRecordPolicy::Linked
+            });
+            #[cfg(not(feature = "elevated-bootstrap-probe"))]
+            let socket_namespace = namespace.socket_namespace();
+            let socket_namespace = Rc::new(socket_namespace.map_err(|error| {
                 source.runtime_failure(
                     RuntimeBootstrapStage::Prepared,
                     RuntimeBootstrapCategory::Namespace(error),
@@ -4660,9 +4744,17 @@ mod platform {
                 &mut decoder,
                 &mut lifecycle,
                 &grant_socket,
-                session,
-                handshake_deadline()?,
-                receive_grants,
+                GrantReceiveOptions {
+                    session,
+                    deadline: handshake_deadline()?,
+                    receive_grants,
+                },
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                retire_namespace.then_some(RetiredNamespaceGrant {
+                    namespace: &mut namespace,
+                    source: &source,
+                    record_namespace: socket_namespace.as_ref(),
+                }),
             )?;
             let (mut grants, cancelled) = match grant_outcome {
                 GrantPhaseOutcome::Committed(committed) => {
@@ -4753,15 +4845,16 @@ mod platform {
             #[cfg(feature = "elevated-bootstrap-probe")]
             let guest_evidence = match (guest_bootstrap, guest_socket) {
                 (Some((bootstrap, expected_parent)), Some(socket)) => {
-                    Some(GuestEvidenceAuthority::new(
+                    Some(GuestEvidenceAuthority::new(GuestEvidenceStart {
                         socket,
                         bootstrap,
                         session,
-                        expected_parent,
-                        stream.as_raw_fd(),
-                        Arc::clone(&namespace),
-                        file_grants.clone(),
-                    )?)
+                        parent: expected_parent,
+                        stream_fd: stream.as_raw_fd(),
+                        namespace: Arc::clone(&namespace),
+                        file_grants: file_grants.clone(),
+                        daemonized: policy.is_daemonized(),
+                    })?)
                 }
                 (None, None) => None,
                 (Some(_), None) | (None, Some(_)) => return Err(ContainedSessionError.into()),
@@ -5032,7 +5125,20 @@ mod platform {
                 .map_err(|_| ContainedSessionError)?
                 .ready(readiness)
                 .map_err(|_| ContainedSessionError)?;
-            write_frame(&mut self.stream, frame)
+            write_frame(&mut self.stream, frame)?;
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if should_stop_for_guest_endpoint_death(
+                self.runtime_fault,
+                self.policy.is_daemonized(),
+                if readiness == Readiness::NoApi {
+                    GuestEndpointDeathPoint::NoApiReadiness
+                } else {
+                    GuestEndpointDeathPoint::Other
+                },
+            ) {
+                stop_for_guest_endpoint_death()?;
+            }
+            Ok(())
         }
 
         pub(crate) fn finish(
@@ -5229,21 +5335,36 @@ mod platform {
         Cancelled,
     }
 
+    struct GrantReceiveOptions {
+        session: SessionId,
+        deadline: Instant,
+        receive_grants: bool,
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    struct RetiredNamespaceGrant<'a> {
+        namespace: &'a mut WorkerNamespace,
+        source: &'a BootstrapSource,
+        record_namespace: &'a WorkerSocketNamespace,
+    }
+
     fn receive_grant_batch(
         stream: &mut UnixStream,
         decoder: &mut FrameDecoder,
         lifecycle: &mut WorkerLifecycle,
         grant_socket: &UnixDatagram,
-        session: bangbang_session::SessionId,
-        deadline: Instant,
-        receive_grants: bool,
-    ) -> Result<GrantPhaseOutcome, ContainedSessionError> {
-        let mut staged = StagedGrantBatch::new(session);
+        options: GrantReceiveOptions,
+        #[cfg(feature = "elevated-bootstrap-probe")] retirement: Option<RetiredNamespaceGrant<'_>>,
+    ) -> Result<GrantPhaseOutcome, ContainedBootstrapError> {
+        let mut staged = StagedGrantBatch::new(options.session);
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        let mut retirement = retirement;
         loop {
             if let Some(frame) = decoder.next_frame().map_err(|_| ContainedSessionError)? {
-                return receive_grant_control(lifecycle, frame);
+                return Ok(receive_grant_control(lifecycle, frame)?);
             }
-            let remaining = deadline
+            let remaining = options
+                .deadline
                 .checked_duration_since(Instant::now())
                 .filter(|remaining| !remaining.is_zero())
                 .ok_or(ContainedSessionError)?;
@@ -5257,7 +5378,11 @@ mod platform {
                 },
                 libc::pollfd {
                     fd: grant_socket.as_raw_fd(),
-                    events: if receive_grants { libc::POLLIN } else { 0 },
+                    events: if options.receive_grants {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                     revents: 0,
                 },
             ];
@@ -5274,22 +5399,75 @@ mod platform {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(ContainedSessionError);
+                return Err(ContainedSessionError.into());
             }
             if result == 0 {
-                return Err(ContainedSessionError);
+                return Err(ContainedSessionError.into());
             }
             if descriptors
                 .first()
                 .is_some_and(|descriptor| descriptor.revents & libc::POLLIN != 0)
             {
-                let frame = read_frame(stream, decoder, deadline)?;
-                return receive_grant_control(lifecycle, frame);
+                let frame = read_frame(stream, decoder, options.deadline)?;
+                return Ok(receive_grant_control(lifecycle, frame)?);
             }
             if descriptors
                 .get(1)
                 .is_some_and(|descriptor| descriptor.revents & libc::POLLIN != 0)
             {
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                if let Some(retirement) = retirement.take() {
+                    let RetiredNamespaceGrant {
+                        namespace,
+                        source,
+                        record_namespace,
+                    } = retirement;
+                    namespace.observe_retired().map_err(|error| {
+                        source.runtime_failure(
+                            RuntimeBootstrapStage::NamespaceRetirement,
+                            RuntimeBootstrapCategory::Namespace(error),
+                        )
+                    })?;
+                    if source.has_fault(
+                        bangbang_session::elevated_probe::RuntimeFault::NamespaceRetireObserve,
+                    ) {
+                        return Err(source.runtime_failure(
+                            RuntimeBootstrapStage::NamespaceRetirement,
+                            RuntimeBootstrapCategory::Other,
+                        ));
+                    }
+                    if source.has_fault(
+                        bangbang_session::elevated_probe::RuntimeFault::NamespaceRecordWrite,
+                    ) {
+                        let record = bangbang_session::macos::runtime::SocketOwnershipRecord::new(
+                            ResourceRole::ApiSocketDirectory,
+                            bangbang_session::SocketChild::parse("forbidden.sock").map_err(
+                                |_| {
+                                    source.runtime_failure(
+                                        RuntimeBootstrapStage::NamespaceRetirement,
+                                        RuntimeBootstrapCategory::InvalidInput,
+                                    )
+                                },
+                            )?,
+                            namespace.identity().object_identity(),
+                        )
+                        .map_err(|error| {
+                            source.runtime_failure(
+                                RuntimeBootstrapStage::NamespaceRetirement,
+                                RuntimeBootstrapCategory::Namespace(error),
+                            )
+                        })?;
+                        let category = match record_namespace.write_socket_record(&record) {
+                            Err(RuntimeError::InvalidEntry) => RuntimeBootstrapCategory::Other,
+                            Err(error) => RuntimeBootstrapCategory::Namespace(error),
+                            Ok(()) => RuntimeBootstrapCategory::InvalidInput,
+                        };
+                        return Err(source.runtime_failure(
+                            RuntimeBootstrapStage::NamespaceRetirement,
+                            category,
+                        ));
+                    }
+                }
                 let received = receive_grant(grant_socket).map_err(|_| ContainedSessionError)?;
                 if let Some(committed) =
                     staged.accept(received).map_err(|_| ContainedSessionError)?
@@ -5302,7 +5480,7 @@ mod platform {
                 .iter()
                 .any(|descriptor| descriptor.revents & invalid != 0)
             {
-                return Err(ContainedSessionError);
+                return Err(ContainedSessionError.into());
             }
         }
     }
@@ -5451,15 +5629,16 @@ mod platform {
         }
     }
 
+    #[cfg(all(test, feature = "elevated-bootstrap-probe"))]
+    pub(crate) use tests::api_directory_authority_for_test;
     #[cfg(test)]
     pub(crate) use tests::{
         TestContainedRestoreAuthority, TestDirectory as TestVhostDirectory,
-        api_directory_authority_for_test, contained_restore_authority_for_test,
-        contained_restore_authority_with_grants_for_test, empty_grant_authority_for_vhost_test,
-        file_grant_authority_for_test, root_file_grant_authority_for_test,
-        snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
-        snapshot_storage_grant_authority_for_test, vhost_directory_authority_for_test,
-        vsock_directory_authority_for_test,
+        contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
+        empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
+        root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
+        snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
+        vhost_directory_authority_for_test, vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -5507,6 +5686,41 @@ mod platform {
         };
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        #[test]
+        fn guest_endpoint_death_uses_workload_specific_foreground_stop_points() {
+            use bangbang_session::elevated_probe::RuntimeFault;
+
+            use super::{GuestEndpointDeathPoint, should_stop_for_guest_endpoint_death};
+
+            assert!(should_stop_for_guest_endpoint_death(
+                RuntimeFault::GuestEndpointDeath,
+                false,
+                GuestEndpointDeathPoint::NoApiReadiness,
+            ));
+            assert!(should_stop_for_guest_endpoint_death(
+                RuntimeFault::GuestEndpointDeath,
+                false,
+                GuestEndpointDeathPoint::ApiHvfCreated,
+            ));
+            for point in [
+                GuestEndpointDeathPoint::NoApiReadiness,
+                GuestEndpointDeathPoint::ApiHvfCreated,
+                GuestEndpointDeathPoint::Other,
+            ] {
+                assert!(!should_stop_for_guest_endpoint_death(
+                    RuntimeFault::GuestEndpointDeath,
+                    true,
+                    point,
+                ));
+                assert!(!should_stop_for_guest_endpoint_death(
+                    RuntimeFault::None,
+                    false,
+                    point,
+                ));
+            }
+        }
 
         #[cfg(feature = "elevated-bootstrap-probe")]
         #[test]
@@ -7086,6 +7300,7 @@ mod platform {
             )
         }
 
+        #[cfg(feature = "elevated-bootstrap-probe")]
         pub(crate) fn api_directory_authority_for_test() -> (DirectoryGrantAuthority, TestDirectory)
         {
             let (mut registry, directory) = directory_registry(
@@ -8415,6 +8630,8 @@ mod platform {
 pub(crate) use platform::ContainedSnapshotRestoreErrorKind;
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 pub(crate) use platform::GuestEvidenceAuthority;
+#[cfg(all(test, target_os = "macos", feature = "elevated-bootstrap-probe"))]
+pub(crate) use platform::api_directory_authority_for_test;
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
     PagerGrantAuthority, PreparedDriveBackingClaim, PreparedFileGrantClaim,
@@ -8431,10 +8648,9 @@ pub(crate) use platform::{
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
     ContainedSnapshotRestoreDriveRequest, TestContainedRestoreAuthority, TestVhostDirectory,
-    api_directory_authority_for_test, contained_restore_authority_for_test,
-    contained_restore_authority_with_grants_for_test, empty_grant_authority_for_vhost_test,
-    file_grant_authority_for_test, root_file_grant_authority_for_test,
-    snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
-    snapshot_storage_grant_authority_for_test, vhost_directory_authority_for_test,
-    vsock_directory_authority_for_test,
+    contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
+    empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
+    root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
+    snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
+    vhost_directory_authority_for_test, vsock_directory_authority_for_test,
 };

@@ -97,8 +97,16 @@ continuation_record="BBA1"
 runtime_authority_record="BBN1"
 grant_activation="--bangbang-internal-grant-probe-v1"
 grant_runtime_case="target-runtime"
-runtime_launcher_boundary_artifact="bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
-runtime_worker_boundary_artifact="bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
+runtime_launcher_boundary_artifact="bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary-namespace-retire-before-unlink-namespace-retire-after-unlink-namespace-retire-observe-runtime-namespace-retirement-retired-record-free-namespace-record-write"
+runtime_worker_boundary_artifact="bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary-namespace-retire-before-unlink-namespace-retire-after-unlink-namespace-retire-observe-runtime-namespace-retirement-retired-record-free-namespace-record-write"
+namespace_retirement_markers=(
+  namespace-retire-before-unlink
+  namespace-retire-after-unlink
+  namespace-retire-observe
+  runtime-namespace-retirement
+  retired-record-free
+  namespace-record-write
+)
 api_listener_launcher_boundary_artifact="bangbang-elevated-api-listener-launcher-v2-BBL1-request-bind-transfer-adoption-final-child-one-right-retained-exact-post-reap-cleanup"
 api_listener_worker_boundary_artifact="bangbang-elevated-api-listener-worker-v2-BBL1-request-ack-adoption-record-free-exact-owner-readiness"
 guest_no_api_drop_mode="guest-no-api-drop"
@@ -117,6 +125,37 @@ guest_api_start="api-instance-start"
 guest_kernel_reference="bangbang-grant:evidence-guest-kernel"
 guest_serial_reference="bangbang-grant:evidence-guest-serial"
 guest_adoption_barrier="--bangbang-internal-post-adoption-stop-v1"
+daemon_protocol="BBD1"
+daemon_environment="BANGBANG_INTERNAL_ELEVATED_DAEMON_V1"
+daemon_barrier_activation="--bangbang-internal-daemon-barrier-v1"
+daemon_fault_activation="--bangbang-internal-daemon-fault-v1"
+daemon_launcher_artifact="bangbang-elevated-daemon-launcher-v1-BBD1-exact-root-worker-supervisor-parent-transition-session-ready-parent-loss-exit-watch-parent-before-transition-ack-child-after-transition-ack-parent-after-ready-post-ack-watch-parent-after-ack-daemon-namespace-retirement"
+daemon_isolation_markers=(
+  parent-before-transition-ack
+  child-after-transition-ack
+  parent-after-ready
+  post-ack-watch
+  parent-after-ack
+  daemon-namespace-retirement
+  root-adoption
+  transition-witness
+  transition-self
+  transition-processes
+  transition-credentials
+  transition-topology
+  transition-code
+  transition-start
+  transition-protocol
+  transition-parent-peer
+  transition-parent-code
+  transition-parent-credentials
+  transition-parent-start
+  transition-transport
+  transition-ack
+  session-bind
+  ready-send
+  ready-ack
+)
 guest_isolation_markers=(
   guest-no-api-drop
   guest-no-api-retain-root
@@ -204,6 +243,7 @@ probe_markers=(
   "$grant_runtime_case"
   "$runtime_launcher_boundary_artifact"
   "$runtime_worker_boundary_artifact"
+  "${namespace_retirement_markers[@]}"
   "$api_listener_launcher_boundary_artifact"
   "$api_listener_worker_boundary_artifact"
   "$guest_no_api_drop_mode"
@@ -222,6 +262,12 @@ probe_markers=(
   "$guest_kernel_reference"
   "$guest_serial_reference"
   "$guest_adoption_barrier"
+  "$daemon_protocol"
+  "$daemon_environment"
+  "$daemon_barrier_activation"
+  "$daemon_fault_activation"
+  "$daemon_launcher_artifact"
+  "${daemon_isolation_markers[@]}"
   "${guest_isolation_markers[@]}"
 )
 for artifact in "$launcher_bin" "$worker_bin"; do
@@ -270,7 +316,8 @@ for marker_value in \
   "$runtime_status" \
   "$continuation_record" \
   "$runtime_authority_record" \
-  "$runtime_launcher_boundary_artifact"; do
+  "$runtime_launcher_boundary_artifact" \
+  "${namespace_retirement_markers[@]}"; do
   if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$launcher_bin"; then
     echo "evidence launcher is missing the runtime continuation boundary" >&2
     exit 1
@@ -304,6 +351,22 @@ if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$guest_adoption_barrier" "$launcher_bin
   exit 1
 fi
 for marker_value in \
+  "$daemon_protocol" \
+  "$daemon_environment" \
+  "$daemon_barrier_activation" \
+  "$daemon_fault_activation" \
+  "$daemon_launcher_artifact" \
+  "${daemon_isolation_markers[@]}"; do
+  if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$launcher_bin"; then
+    echo "evidence launcher is missing the elevated daemon boundary" >&2
+    exit 1
+  fi
+  if LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$worker_bin"; then
+    echo "evidence worker unexpectedly contains elevated daemon code" >&2
+    exit 1
+  fi
+done
+for marker_value in \
   "$ready_activation" \
   "$credential_drop_mode" \
   "$credential_record" \
@@ -323,7 +386,8 @@ for marker_value in \
   "$runtime_authority_record" \
   "$grant_activation" \
   "$grant_runtime_case" \
-  "$runtime_worker_boundary_artifact"; do
+  "$runtime_worker_boundary_artifact" \
+  "${namespace_retirement_markers[@]}"; do
   if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$worker_bin"; then
     echo "evidence worker is missing the runtime continuation boundary" >&2
     exit 1

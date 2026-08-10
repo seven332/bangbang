@@ -3,8 +3,8 @@
 This contract records the #1373 direct-worker result, the #1884 inherited-root
 follow-up, the #1885 no-chroot credential-transition result, the #1889 / #1891
 target-owned runtime continuation results, and the #1893 post-transition guest
-result plus the #1895 / #1897 launcher-created API-listener results beneath
-#1371.
+result, the #1895 / #1897 launcher-created API-listener results, and the #1900
+retired feature-daemon result beneath #1371.
 Together they test public chroot orderings, numeric
 credential bootstrap, same-process continuation into the ordinary production
 lifecycle, and real guest execution against Bangbang's mandatory worker
@@ -31,7 +31,9 @@ The evidence bundle keeps the production layout and identity split:
   The normal signed bundle dynamically rejects the historical, credential,
   runtime, guest, and grant-probe internal argv. The scan also excludes the
   dedicated `BBL1` listener handoff and both role-specific listener evidence
-  markers from normal launcher and worker artifacts.
+  markers, the independent `BBD1` elevated-daemon handoff, daemon retirement
+  barriers/faults, and their role-specific evidence markers from normal
+  launcher and worker artifacts.
 
 The root wrapper never invokes `sudo`. It requires exact real/effective
 uid/gid zero, accepts explicit numeric target uid/gid values, runs with a
@@ -138,6 +140,30 @@ output alone is not sufficient. Each new API stream verifies the live worker
 PID before sending and carries that immutable connected-stream fact through
 the close-delimited response.
 
+#1900 composes that guest path with only the feature-enabled `--daemonize`
+re-exec. The original launcher spawns the validated outer image with default-
+close file actions, `SETSID`, `/dev/null` standard streams, an independent
+fixed-fd `BBD1` control stream, and the exact retained root at worker authority
+fd 8. The daemon supervisor transitions first with its worker, authenticates
+their code, credentials, starts, and topology, then the original parent makes
+its irreversible transition and is revalidated before acknowledging. The
+ordinary lifecycle stream, grant datagram, and `BBN1` session authority remain
+independent of `BBD1`; the original parent prints the daemon PID and detaches
+only after the daemon reports readiness and receives an exact acknowledgment.
+
+For this feature-daemon shape only, `Prepared` first binds the independently
+opened session descriptions and proves the worker lock. Before the first grant
+is sent, the launcher validates that the canonical directory is empty and
+exact, unlinks that exact name, and validates absence while retaining its open
+description. The worker then independently proves that its fd, cwd, lock, and
+identity still name the same directory and that the canonical name is absent.
+The retired namespace is record-free: API uses the already transferred `BBL1`
+listener, and every other workload object is grant-backed or already open.
+Ordinary foreground and ordinary daemon sessions remain linked and record-
+bearing. A retired-session failure closes the transports and gives the exact
+worker the existing bounded exit grace before reap; neither the root wrapper
+nor a later process removes a product session name.
+
 Each runtime case uses a mode-0700 root and a separate bounded workspace with a
 root-owned traversal-only ancestry and exact target-owned fixtures. A root-owned
 ledger binds the workspace, its input, output, create-children directory,
@@ -199,14 +225,21 @@ root authority. The complete matrix produced these results:
 | two concurrent #1897 API guests | distinct mapped-target roots, sessions, anchors, sockets, outputs, launchers, and workers | both completed independently through canonical API configuration and real guest shutdown |
 | #1897 closed API faults and endpoint death | every API fault plus pre-readiness and post-HVF worker-first and launcher-first death | every first-failure boundary remained exact; surviving cleanup completed without leaving process, root, workspace, or socket residue |
 | #1897 transferred-listener replacement | both pre-readiness endpoint-death orders with a target-owned same-name replacement | the surviving worker and launcher cleanup owners each preserved the replacement and the evidence ledger then removed it exactly |
+| #1900 retired feature daemon, real API and no-API guest | mapped ordinary, uid/gid-zero retained-root, and SDK-maximum unmapped targets | authenticated three-process transition, `BBD1` detach, exact namespace retirement before grants, real HVF guest completion, and record-free cleanup completed for all six cases |
+| #1900 retirement faults and replacement | before-unlink, after-unlink, worker-observation, and ready-send boundaries plus a same-name replacement after retirement | every first-failure boundary was reachable; the replacement was preserved and both exact retired handles exited without recreating or removing its name |
+| #1900 daemon endpoint and signal convergence | worker-first and launcher-first death for API and no-API, SIGINT and SIGTERM to the supervisor, and SIGHUP to the worker | exact raw statuses, bounded surviving-end cleanup, and zero process/object residue completed |
+| #1900 concurrent retired daemons | one no-API daemon killed at the launcher while one API daemon continued | the peer completed its real guest independently; neither daemon depended on wrapper-side product-session cleanup |
 
 Focused negative cases reject a group-writable root and a symlink root. The
 staged manifest also rejects a writable, missing, symlinked, or inode-replaced
 loader, a missing nested worker, and an unexpected entry before worker
 activation. Every successful, blocked, rejected, repeated, and concurrent case
 leaves no process, root, workspace, or named-socket residue. The launcher-first
-death case removes only the pre-recorded empty target session after both signed
-endpoints are gone; an identity replacement is preserved and fails the proof.
+foreground death case removes only the pre-recorded empty target session after
+both signed endpoints are gone; an identity replacement is preserved and fails
+the proof. In the #1900 daemon cases the canonical session name is already
+absent before the parent reports the daemon PID, and neither the wrapper nor a
+post-exit recovery path removes it.
 Nonempty-root cleanup preflights all 27 ledger entries before removing any,
 then uses only reverse exact `unlink`/`rmdir`;
 root cleanup rechecks device, inode, owner, group, and mode and refuses to
@@ -255,7 +288,14 @@ complete three times through readiness, canonical HTTP configuration, real
 HVF, the guest oracle, poweroff, terminal ownership, and cleanup. Two mapped
 API guests complete concurrently. Every API fault is reachable; both endpoint-
 death orders pass before readiness and after HVF; and both cleanup owners
-preserve same-name replacements. Daemon/crash convergence remains unmeasured.
+preserve same-name replacements. #1900 then keeps the same guest prefix and
+exercises the feature daemon. All six identity/workload combinations complete
+after exact pre-grant namespace retirement. All four retirement faults are
+reachable; worker-first and launcher-first death converge for API and no-API;
+SIGINT, SIGTERM, and worker SIGHUP converge; a post-retirement same-name
+replacement is preserved; and a surviving API daemon completes while a
+concurrent no-API launcher is killed. The only remaining death nonclaim is
+simultaneous uncatchable loss of both signed endpoints.
 
 After those results were established, the checked harness remained at the
 evidence boundary: it contains no credential-changing product path. If a
@@ -274,7 +314,7 @@ adds pre-readiness/post-HVF death in both endpoint orders plus replacement-safe
 cleanup by both listener owners. Exact object state and the final residue scan
 remained clean. #1891 is the separately
 challenged launcher-created-session authority result; it is not a hidden
-fallback in #1889. #1885, #1889, #1891, #1893, #1895, and #1897 are evidence
+fallback in #1889. #1885, #1889, #1891, #1893, #1895, #1897, and #1900 are evidence
 results; product uid/gid behavior still requires the parent-selected
 continuation.
 
@@ -324,8 +364,12 @@ record create as that cause and proves record-free transferred-listener
 ownership through canonical API configuration and a real guest for all three
 identities, without changing the helper topology, signing roles, entitlements,
 or public sandbox policy. Every API connection still verifies the live worker
-PID before sending. Daemon/crash convergence, public policy, and aggregate
-jailer behavior remain unmeasured. This evidence does not weaken App Sandbox,
+PID before sending. #1900 additionally proves feature-daemon detach, exact
+pre-grant namespace retirement, and the measured single-endpoint, signal, and
+concurrency convergence above without a service, privileged helper, new
+entitlement, persistent observer, or result file. Simultaneous uncatchable
+death of both signed endpoints, restart/reconnect, public uid/gid launch policy,
+and aggregate jailer behavior remain unmeasured. This evidence does not weaken App Sandbox,
 use a private extension API, or treat a different topology as equivalent. It
 also does not prove that a larger fixed in-root Darwin dependency set or a
 materially different security model cannot work; nor does it claim Linux
@@ -359,8 +403,8 @@ runtime results, observations, residue, and nonclaim classes:
 
 ```text
 result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=complete runtime-retained-root=complete-no-drop runtime-unmapped=complete authority=consumed lock=independent grants=committed lifecycle=terminal controls=complete cleanup=exact
-guest-matrix: api-mapped=complete api-retained-root=complete-no-drop api-unmapped=complete no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=api-no-api-complete faults=all-reachable deaths=no-api-post-worker-first-launcher-first-api-pre-post-worker-first-launcher-first tamper=rejected-both-workloads adoption-replacement=no-api-complete-api-rejected-at-grant socket-replacement=both-cleanup-owners-preserve cleanup=exact
+guest-matrix: api-mapped=complete api-retained-root=complete-no-drop api-unmapped=complete no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=api-no-api-complete faults=all-reachable deaths=no-api-post-worker-first-launcher-first-api-pre-post-worker-first-launcher-first tamper=rejected-both-workloads adoption-replacement=no-api-complete-api-rejected-at-grant socket-replacement=both-cleanup-owners-preserve daemon=api-no-api-all-identities-retired daemon-faults=retirement-all-reachable daemon-deaths=api-no-api-worker-first-launcher-first daemon-signals=int-term-hup daemon-replacement=preserved daemon-concurrency=peer-survives-launcher-kill cleanup=exact-no-product-session-teardown
 observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact
 residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero
-nonclaims: daemon-crash=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal
+nonclaims: simultaneous-uncatchable-death=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal
 ```

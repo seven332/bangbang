@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -80,6 +82,33 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
             session.rmdir()
             displaced.rmdir()
 
+    def test_retired_root_validation_never_removes_a_link_or_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root"
+            root.mkdir(mode=0o700)
+            root.chmod(0o700)
+            fixture = object.__new__(matrix.Fixture)
+            fixture.root = root
+            fixture.uid = os.getuid()
+            fixture.gid = os.getgid()
+            fixture.root_identity = matrix.ObjectIdentity.capture(root)
+
+            fixture.validate_retired_runtime_root()
+            canonical = root / f"{matrix.SESSION_PREFIX}{'a' * 64}"
+            canonical.mkdir(mode=0o700)
+            with self.assertRaises(matrix.MatrixError):
+                fixture.validate_retired_runtime_root()
+            self.assertTrue(canonical.is_dir())
+            canonical.rmdir()
+
+            replacement = root / f"{matrix.SESSION_PREFIX}{'b' * 64}"
+            replacement.mkdir(mode=0o700)
+            identity = matrix.ObjectIdentity.capture(replacement)
+            with self.assertRaises(matrix.MatrixError):
+                fixture.validate_retired_runtime_root()
+            self.assertEqual(matrix.ObjectIdentity.capture(replacement), identity)
+            replacement.rmdir()
+
     def test_six_modes_bind_workload_identity_and_closed_credentials(self) -> None:
         self.assertEqual(len(matrix.MODE_CASES), 6)
         self.assertEqual(
@@ -147,6 +176,15 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
         )
 
     def test_fault_matrix_covers_every_new_closed_stage(self) -> None:
+        self.assertEqual(
+            matrix.DAEMON_RETIREMENT_FAULTS,
+            (
+                "namespace-retire-before-unlink",
+                "namespace-retire-after-unlink",
+                "namespace-retire-observe",
+                "namespace-record-write",
+            ),
+        )
         self.assertEqual(
             [fault.fault for fault in matrix.FAULT_CASES],
             [
@@ -271,6 +309,178 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
                 adoption_barrier=True,
             )
 
+    def test_daemon_command_is_exact_and_controls_are_closed(self) -> None:
+        fixture = object.__new__(matrix.Fixture)
+        fixture.root = Path("/private/var/root/bangbang-elevated-probe.A1b2C3d4")
+        fixture.workspace = Path("/private/tmp/bangbang-elevated-guest.A1b2C3d4")
+        fixture.case = matrix.mode_for("api")
+        fixture.uid = 501
+        fixture.gid = 20
+        launcher = Path("/sealed/Bangbang.app/Contents/MacOS/bangbang")
+
+        command = fixture.command(
+            launcher,
+            daemonize=True,
+            daemon_barrier="post-ack-watch",
+        )
+        barrier = command.index(matrix.DAEMON_BARRIER_OPTION)
+        jailer = command.index(matrix.JAILER_ACTIVATION)
+        manifest = command.index("--bangbang-grant-manifest")
+        self.assertEqual(command[barrier + 1 : barrier + 3], ["post-ack-watch", "--"])
+        self.assertLess(barrier, jailer)
+        self.assertEqual(
+            command[jailer : jailer + 11],
+            [
+                matrix.JAILER_ACTIVATION,
+                "--id",
+                "evidence-A1b2C3d4",
+                "--exec-file",
+                "/sealed/Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/MacOS/bangbang-worker",
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--daemonize",
+                "--",
+            ],
+        )
+        self.assertLess(jailer, manifest)
+        self.assertEqual(command[-2:], matrix.worker_args("api"))
+
+        watched = fixture.command(
+            launcher,
+            fault="guest-endpoint-death",
+            daemonize=True,
+            daemon_barrier="post-ack-watch",
+        )
+        self.assertLess(watched.index("--fault"), watched.index(matrix.DAEMON_BARRIER_OPTION))
+        retirement = fixture.command(
+            launcher,
+            daemonize=True,
+            daemon_barrier=matrix.DAEMON_NAMESPACE_RETIREMENT_BARRIER,
+        )
+        retirement_barrier = retirement.index(matrix.DAEMON_BARRIER_OPTION)
+        self.assertEqual(
+            retirement[retirement_barrier + 1 : retirement_barrier + 3],
+            ["daemon-namespace-retirement", "--"],
+        )
+        with self.assertRaises(matrix.MatrixError):
+            fixture.command(launcher, daemon_barrier="post-ack-watch")
+        with self.assertRaises(matrix.MatrixError):
+            fixture.command(
+                launcher,
+                fault="guest-oracle",
+                daemonize=True,
+                daemon_barrier="post-ack-watch",
+            )
+
+    def test_daemon_pid_reader_accepts_bounded_output_before_pid(self) -> None:
+        long_line = "x" * 417
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys;"
+                    f"sys.stdout.write({long_line!r}+'\\n');"
+                    "sys.stdout.write('bangbang daemon pid: 42\\n');"
+                    "sys.stdout.flush()"
+                ),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            pid_line, preceding = matrix.read_daemon_pid_line(process)
+            self.assertEqual(pid_line, b"bangbang daemon pid: 42\n")
+            self.assertEqual(preceding, long_line.encode("ascii") + b"\n")
+            self.assertEqual(process.wait(timeout=1), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+
+    def test_daemon_pid_reader_deadline_is_not_blocked_by_partial_line(self) -> None:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time;sys.stdout.write('x');sys.stdout.flush();time.sleep(2)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            with (
+                mock.patch.object(matrix, "BARRIER_TIMEOUT_SECONDS", 0.05),
+                self.assertRaisesRegex(matrix.MatrixError, "daemon-parent-pid-timeout"),
+            ):
+                matrix.read_daemon_pid_line(process)
+            self.assertIsNone(process.poll())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+
+    def test_daemon_death_actions_use_exact_signal_order_and_raw_status(self) -> None:
+        self.assertEqual(matrix.WORKER_SIGHUP_EXIT_CODE, 156)
+        self.assertEqual(matrix.WORKER_NAMESPACE_REPLACEMENT_EXIT_CODE, 80)
+        fixture = mock.Mock()
+        daemon = mock.Mock()
+        daemon.supervisor.pid = 11
+        daemon.worker.pid = 22
+        launcher = Path("/sealed/Bangbang.app/Contents/MacOS/bangbang")
+
+        with (
+            mock.patch.object(matrix, "start_stopped_daemon", return_value=daemon),
+            mock.patch.object(matrix.os, "kill") as kill,
+            mock.patch.object(matrix, "wait_for_exact_process_exit"),
+        ):
+            daemon.wait.return_value = {22: signal.SIGKILL, 11: 3 << 8}
+            matrix.assert_daemon_endpoint_death(launcher, fixture, "worker")
+            self.assertEqual(
+                kill.call_args_list,
+                [mock.call(22, signal.SIGKILL), mock.call(11, signal.SIGCONT)],
+            )
+
+            kill.reset_mock()
+            daemon.wait.return_value = {11: signal.SIGKILL, 22: 1 << 8}
+            matrix.assert_daemon_endpoint_death(launcher, fixture, "launcher")
+            self.assertEqual(
+                kill.call_args_list,
+                [mock.call(11, signal.SIGKILL), mock.call(22, signal.SIGCONT)],
+            )
+
+    def test_exact_process_exit_treats_pid_reuse_as_exit(self) -> None:
+        def identity(start_seconds: int) -> matrix.ProcessIdentity:
+            return matrix.ProcessIdentity(
+                pid=42,
+                parent_pid=1,
+                process_group=42,
+                session=42,
+                uid=501,
+                gid=20,
+                real_uid=501,
+                real_gid=20,
+                saved_uid=501,
+                saved_gid=20,
+                start_seconds=start_seconds,
+                start_microseconds=7,
+                executable=Path("/sealed/bangbang"),
+            )
+
+        original = identity(1)
+        replacement = identity(2)
+        with (
+            mock.patch.object(matrix, "_pid_exists", return_value=True),
+            mock.patch.object(matrix, "capture_process", return_value=replacement),
+        ):
+            matrix.wait_for_exact_process_exit(original)
+
     def test_sidecar_replacement_restores_the_original_inode_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sidecar = Path(directory)
@@ -364,6 +574,12 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
             "socket-replacement=both-cleanup-owners-preserve",
             wrapper,
         )
+        self.assertIn("daemon=api-no-api-all-identities-retired", wrapper)
+        self.assertIn(
+            "cleanup=exact-no-product-session-teardown",
+            wrapper,
+        )
+        self.assertIn("simultaneous-uncatchable-death=unmeasured", wrapper)
 
 
 if __name__ == "__main__":

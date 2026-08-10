@@ -108,8 +108,24 @@ transferred listener uses an exact record-free worker guard, while the launcher
 retains an independent exact post-reap guard. All three identity classes now
 complete canonical API configuration and real guest/HVF execution, including
 concurrency, every closed API fault, both endpoint-death orders, and
-replacement-safe cleanup by both owners. This does not establish public uid/gid
-policy or daemon/crash convergence.
+replacement-safe cleanup by both owners. #1900 additionally re-executes the
+feature-enabled outer launcher as a detached supervisor over an independent
+authenticated `BBD1` channel and passes the exact root at fd 8. The supervisor
+and worker transition before the original parent; the parent then transitions
+and is revalidated before readiness acknowledgment and detach. After
+`Prepared`, the supervisor proves the worker lock, unlinks the exact empty
+canonical session before the first grant, and both endpoints validate that the
+name remains absent while their fd/cwd/lock identities remain exact. This
+retired feature namespace is record-free; ordinary foreground and daemon
+namespaces remain linked and record-bearing.
+
+All mapped, retained-root/no-drop, and SDK-maximum unmapped API/no-API daemon
+cases complete. The matrix reaches every retirement fault, both single-endpoint
+death orders for both workloads, supervisor SIGINT/SIGTERM, worker SIGHUP,
+same-name replacement preservation, and concurrent peer survival. The wrapper
+does not perform product-session teardown. This does not establish public
+uid/gid policy, restart/reconnect, or simultaneous uncatchable two-endpoint
+death convergence.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -269,7 +285,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 
 | Area | Current status | Review expectation |
 | --- | --- | --- |
-| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; disabled evidence completes numeric credential continuation, launcher-created target-session adoption, representative grants, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate the feature-only evidence with product uid/gid support, configurable chroot, or Linux isolation parity. |
+| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; disabled evidence completes numeric credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate the feature-only evidence with product uid/gid support, configurable chroot, or Linux isolation parity. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
@@ -530,7 +546,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
-| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption, representative grants, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep product uid/gid pending the remaining real-guest and daemon/resilience evidence; keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
+| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep product uid/gid pending #1371's cumulative Challenge and inventory disposition; keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
@@ -3590,16 +3606,41 @@ pass; and both exact cleanup owners preserve same-name replacements. Every new
 API stream verifies the live worker PID before sending and retains that
 immutable connected-stream fact through the close-delimited response. No
 helper, signing role, entitlement, bookmark, broker, private sandbox authority,
-or public policy changed. Daemon/crash convergence remains unmeasured. The
-complete evidence, exact cleanup rules, reproduction command, and future-OS
-nonclaim are in the checked
+or public policy changed.
+
+#1900 composes this path with the feature-only daemon re-exec. Default-close
+spawn transfers only `/dev/null` standard streams, the independent fixed-fd
+`BBD1` handoff, and exact fd-8 root authority before `SETSID`. The daemon
+supervisor and worker transition first; the original launcher transitions and
+is revalidated before it acknowledges readiness, emits the daemon PID, and
+detaches. `BBD1` remains independent of the lifecycle, grant, `BBN1`, and
+`BBL1` channels.
+
+For that feature-daemon shape only, the supervisor validates `Prepared` and
+the independent worker lock, then exact-unlinks the empty canonical session
+before sending the first grant. The worker independently observes that the
+name is absent while its fd, cwd, lock, and namespace identity remain exact.
+The retired namespace rejects all ownership records and uses only already-open
+or grant-backed objects. Linked foreground and ordinary product daemon
+behavior is unchanged. On error, transport closure and the existing bounded
+exit grace let the exact worker report its natural status before reap; no root
+wrapper or persistent observer removes the retired name.
+
+The measured daemon matrix completes API and no-API under all three identity
+classes, all four retirement failures, worker-first and launcher-first death,
+supervisor SIGINT/SIGTERM, worker SIGHUP, same-name replacement preservation,
+and concurrent peer survival. It adds no service, setuid helper, entitlement,
+result file, or persistent observer. Simultaneous uncatchable death of both
+signed endpoints, restart/reconnect, and public uid/gid policy remain
+nonclaims. The complete evidence, exact cleanup rules, reproduction command,
+and future-OS nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 The six rows remain audit outcomes until #1371 challenges the controlled result
 and remaining credible alternatives per ID and an inventory transition lands.
 The evidence harness is test-only and statically absent from normal launcher
-and worker builds; it is not a root service, public jailer mode, daemon, setuid
-helper, or ambient path authority.
+and worker builds; its daemon path is not a root service, public jailer/daemon
+mode, setuid helper, or ambient path authority.
 
 ## Current Non-Goals
 

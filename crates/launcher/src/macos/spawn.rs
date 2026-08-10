@@ -19,6 +19,10 @@ const MIN_TRANSPORT_FD: RawFd = 10;
 pub(crate) const DAEMON_HANDOFF_FD: RawFd = 6;
 pub(crate) const DAEMON_ENV_KEY: &str = "BANGBANG_INTERNAL_DAEMON_V1";
 pub(crate) const DAEMON_ENV_VALUE: &str = "1";
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) const ELEVATED_DAEMON_ENV_KEY: &str = "BANGBANG_INTERNAL_ELEVATED_DAEMON_V1";
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) const ELEVATED_DAEMON_ENV_VALUE: &str = "1";
 const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
 
 unsafe extern "C" {
@@ -340,6 +344,30 @@ pub(crate) fn spawn_daemon_suspended(
     executable: &Path,
     args: Vec<OsString>,
 ) -> Result<(OwnedWorker, UnixStream), LauncherError> {
+    spawn_daemon_suspended_inner(executable, args, None)
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn spawn_elevated_daemon_suspended(
+    executable: &Path,
+    args: Vec<OsString>,
+    root: RawFd,
+) -> Result<(OwnedWorker, UnixStream), LauncherError> {
+    if root < 0 {
+        return Err(LauncherError::DaemonHandoff);
+    }
+    spawn_daemon_suspended_inner(executable, args, Some(root))
+}
+
+fn spawn_daemon_suspended_inner(
+    executable: &Path,
+    args: Vec<OsString>,
+    elevated_root: Option<RawFd>,
+) -> Result<(OwnedWorker, UnixStream), LauncherError> {
+    #[cfg(not(feature = "elevated-bootstrap-probe"))]
+    if elevated_root.is_some() {
+        return Err(LauncherError::DaemonHandoff);
+    }
     let (parent, child) =
         UnixStream::pair().map_err(|error| LauncherError::SessionSetup(error.kind()))?;
     let parent = duplicate_stream_at_or_above(parent, MIN_TRANSPORT_FD)?;
@@ -358,13 +386,29 @@ pub(crate) fn spawn_daemon_suspended(
     // SAFETY: `null_fd` is a fresh successful descriptor owned by this scope.
     let null_fd = unsafe { OwnedFd::from_raw_fd(null_fd) };
     let null_fd = duplicate_fd_at_or_above(null_fd.as_raw_fd(), MIN_TRANSPORT_FD)?;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    let elevated_root = elevated_root
+        .map(|root| duplicate_fd_at_or_above(root, MIN_TRANSPORT_FD))
+        .transpose()?;
 
     let executable = cstring(executable.as_os_str()).map_err(|_| LauncherError::DaemonHandoff)?;
     let argv = argv(&executable, args)?;
-    let env = vec![
-        CString::new(format!("{DAEMON_ENV_KEY}={DAEMON_ENV_VALUE}"))
+    let daemon_marker = CString::new(format!("{DAEMON_ENV_KEY}={DAEMON_ENV_VALUE}"))
+        .map_err(|_| LauncherError::DaemonHandoff)?;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    let env = if elevated_root.is_some() {
+        vec![
+            daemon_marker,
+            CString::new(format!(
+                "{ELEVATED_DAEMON_ENV_KEY}={ELEVATED_DAEMON_ENV_VALUE}"
+            ))
             .map_err(|_| LauncherError::DaemonHandoff)?,
-    ];
+        ]
+    } else {
+        vec![daemon_marker]
+    };
+    #[cfg(not(feature = "elevated-bootstrap-probe"))]
+    let env = vec![daemon_marker];
     let argv_pointers = pointer_array(&argv);
     let env_pointers = pointer_array(&env);
     let mut attributes = SpawnAttributes::new()?;
@@ -376,6 +420,14 @@ pub(crate) fn spawn_daemon_suspended(
     actions.duplicate(child.as_raw_fd(), DAEMON_HANDOFF_FD)?;
     if child.as_raw_fd() != DAEMON_HANDOFF_FD {
         actions.close(child.as_raw_fd())?;
+    }
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    if let Some(root) = elevated_root.as_ref() {
+        let fixed = bangbang_session::elevated_probe::ROOT_FD;
+        actions.duplicate(root.as_raw_fd(), fixed)?;
+        if root.as_raw_fd() != fixed {
+            actions.close(root.as_raw_fd())?;
+        }
     }
     actions.close(null_fd.as_raw_fd())?;
 

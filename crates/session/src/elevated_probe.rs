@@ -222,6 +222,14 @@ impl RuntimeWorkload {
     pub const fn is_guest(self) -> bool {
         matches!(self, Self::GuestNoApi | Self::GuestApi)
     }
+
+    /// Returns whether the closed workload needs no session-internal ownership record.
+    #[must_use]
+    pub const fn supports_retired_record_free_namespace(self) -> bool {
+        match self {
+            Self::RepresentativeGrants | Self::GuestNoApi | Self::GuestApi => true,
+        }
+    }
 }
 
 impl ProbeMode {
@@ -495,6 +503,8 @@ pub enum ProbeStage {
     ApiListenerTransfer = 56,
     /// Adopt and validate the transferred API listener in the worker.
     ApiListenerAdoption = 57,
+    /// Retire and independently observe the exact daemon session name.
+    RuntimeNamespaceRetirement = 58,
 }
 
 impl ProbeStage {
@@ -559,6 +569,7 @@ impl ProbeStage {
             Self::ApiListenerBind => "api-listener-bind",
             Self::ApiListenerTransfer => "api-listener-transfer",
             Self::ApiListenerAdoption => "api-listener-adoption",
+            Self::RuntimeNamespaceRetirement => "runtime-namespace-retirement",
         }
     }
 
@@ -621,6 +632,7 @@ impl ProbeStage {
             55 => Ok(Self::ApiListenerBind),
             56 => Ok(Self::ApiListenerTransfer),
             57 => Ok(Self::ApiListenerAdoption),
+            58 => Ok(Self::RuntimeNamespaceRetirement),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -715,6 +727,14 @@ pub enum RuntimeFault {
     ApiListenerAdoption = 40,
     /// Stop after exact listener adoption and before API readiness.
     ApiListenerEndpointDeath = 41,
+    /// Stop after launcher validation and before exact namespace unlink.
+    NamespaceRetireBeforeUnlink = 42,
+    /// Stop after exact unlink and before grant publication begins.
+    NamespaceRetireAfterUnlink = 43,
+    /// Stop after the worker observes retirement and before receiving a grant.
+    NamespaceRetireObserve = 44,
+    /// Attempt one forbidden ownership-record write after retirement observation.
+    NamespaceRecordWrite = 45,
 }
 
 impl RuntimeFault {
@@ -763,6 +783,10 @@ impl RuntimeFault {
             "api-listener-transfer" => Some(Self::ApiListenerTransfer),
             "api-listener-adoption" => Some(Self::ApiListenerAdoption),
             "api-listener-endpoint-death" => Some(Self::ApiListenerEndpointDeath),
+            "namespace-retire-before-unlink" => Some(Self::NamespaceRetireBeforeUnlink),
+            "namespace-retire-after-unlink" => Some(Self::NamespaceRetireAfterUnlink),
+            "namespace-retire-observe" => Some(Self::NamespaceRetireObserve),
+            "namespace-record-write" => Some(Self::NamespaceRecordWrite),
             _ => None,
         }
     }
@@ -811,6 +835,10 @@ impl RuntimeFault {
             39 => Ok(Self::ApiListenerTransfer),
             40 => Ok(Self::ApiListenerAdoption),
             41 => Ok(Self::ApiListenerEndpointDeath),
+            42 => Ok(Self::NamespaceRetireBeforeUnlink),
+            43 => Ok(Self::NamespaceRetireAfterUnlink),
+            44 => Ok(Self::NamespaceRetireObserve),
+            45 => Ok(Self::NamespaceRecordWrite),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -861,6 +889,10 @@ impl RuntimeFault {
             Self::ApiListenerTransfer => "api-listener-transfer",
             Self::ApiListenerAdoption => "api-listener-adoption",
             Self::ApiListenerEndpointDeath => "api-listener-endpoint-death",
+            Self::NamespaceRetireBeforeUnlink => "namespace-retire-before-unlink",
+            Self::NamespaceRetireAfterUnlink => "namespace-retire-after-unlink",
+            Self::NamespaceRetireObserve => "namespace-retire-observe",
+            Self::NamespaceRecordWrite => "namespace-record-write",
         }
     }
 
@@ -910,6 +942,10 @@ impl RuntimeFault {
             Self::ApiListenerTransfer => Some(ProbeStage::ApiListenerTransfer),
             Self::ApiListenerAdoption => Some(ProbeStage::ApiListenerAdoption),
             Self::ApiListenerEndpointDeath => Some(ProbeStage::ApiListenerAdoption),
+            Self::NamespaceRetireBeforeUnlink
+            | Self::NamespaceRetireAfterUnlink
+            | Self::NamespaceRetireObserve
+            | Self::NamespaceRecordWrite => Some(ProbeStage::RuntimeNamespaceRetirement),
         }
     }
 }
@@ -1059,6 +1095,7 @@ const fn runtime_worker_stage_index(stage: ProbeStage) -> Option<u8> {
         ProbeStage::RuntimeSessionLock => Some(2),
         ProbeStage::RuntimeSessionEnter => Some(3),
         ProbeStage::LifecyclePrepared => Some(4),
+        ProbeStage::RuntimeNamespaceRetirement => Some(5),
         _ => None,
     }
 }
@@ -1070,6 +1107,7 @@ const fn runtime_worker_stage(index: u8) -> Option<ProbeStage> {
         2 => Some(ProbeStage::RuntimeSessionLock),
         3 => Some(ProbeStage::RuntimeSessionEnter),
         4 => Some(ProbeStage::LifecyclePrepared),
+        5 => Some(ProbeStage::RuntimeNamespaceRetirement),
         _ => None,
     }
 }
@@ -3418,6 +3456,13 @@ mod tests {
             Some(RuntimeWorkload::RepresentativeGrants)
         );
         assert!(!RuntimeWorkload::RepresentativeGrants.is_guest());
+        for workload in [
+            RuntimeWorkload::RepresentativeGrants,
+            RuntimeWorkload::GuestNoApi,
+            RuntimeWorkload::GuestApi,
+        ] {
+            assert!(workload.supports_retired_record_free_namespace());
+        }
         assert_eq!(ProbeMode::Drop.credential_class(), None);
         assert_eq!(ProbeMode::CredentialDrop.runtime_workload(), None);
         assert_eq!(ProbeMode::parse("unknown", 501, 20), None);
@@ -3484,6 +3529,7 @@ mod tests {
             ProbeStage::ApiListenerBind,
             ProbeStage::ApiListenerTransfer,
             ProbeStage::ApiListenerAdoption,
+            ProbeStage::RuntimeNamespaceRetirement,
         ] {
             let result = ProbeResult::failure(
                 ProbeMode::InheritedRoot,
@@ -3640,13 +3686,33 @@ mod tests {
                 41,
                 "api-listener-endpoint-death",
             ),
+            (
+                RuntimeFault::NamespaceRetireBeforeUnlink,
+                42,
+                "namespace-retire-before-unlink",
+            ),
+            (
+                RuntimeFault::NamespaceRetireAfterUnlink,
+                43,
+                "namespace-retire-after-unlink",
+            ),
+            (
+                RuntimeFault::NamespaceRetireObserve,
+                44,
+                "namespace-retire-observe",
+            ),
+            (
+                RuntimeFault::NamespaceRecordWrite,
+                45,
+                "namespace-record-write",
+            ),
         ] {
             assert_eq!(RuntimeFault::parse(name), Some(fault));
             assert_eq!(RuntimeFault::from_byte(byte), Ok(fault));
             assert_eq!(fault.name(), name);
         }
         assert_eq!(RuntimeFault::parse("unknown"), None);
-        assert_eq!(RuntimeFault::from_byte(42), Err(ProbeProtocolError));
+        assert_eq!(RuntimeFault::from_byte(46), Err(ProbeProtocolError));
 
         for (result, name) in [
             (RuntimeResultClass::Complete, "complete"),
@@ -4154,6 +4220,7 @@ mod tests {
             ProbeStage::RuntimeSessionLock,
             ProbeStage::RuntimeSessionEnter,
             ProbeStage::LifecyclePrepared,
+            ProbeStage::RuntimeNamespaceRetirement,
         ];
         let categories = [
             ProbeErrorCategory::PermissionDenied,
@@ -4188,7 +4255,7 @@ mod tests {
             Err(ProbeProtocolError)
         );
         assert_eq!(
-            RuntimeWorkerFailure::from_exit_code(RUNTIME_WORKER_FAILURE_EXIT_BASE + 15),
+            RuntimeWorkerFailure::from_exit_code(RUNTIME_WORKER_FAILURE_EXIT_BASE + 18),
             Err(ProbeProtocolError)
         );
     }

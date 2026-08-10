@@ -24,6 +24,8 @@ mod package_options;
 mod provisioning_profile;
 mod supervisor;
 
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+pub use error::ElevatedDaemonStage;
 pub use error::{JailerIsolationArgument, LauncherError, PackageError};
 pub use layout::{
     BundleLayout, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME, OUTER_BUNDLE_NAME,

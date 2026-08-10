@@ -231,10 +231,30 @@ impl fmt::Debug for SnapshotStagingOwnershipRecord {
     }
 }
 
+/// Whether a worker namespace may persist ownership records beneath its
+/// linked session name.
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceRecordPolicy {
+    /// The ordinary linked namespace supports the existing record protocol.
+    Linked,
+    /// A feature-daemon namespace is retired before grants and remains record-free.
+    RetiredRecordFree,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamespacePublication {
+    Linked,
+    Retired,
+}
+
 /// Worker-side duplicate of the locked private namespace directory.
 pub struct WorkerSocketNamespace {
     directory: OwnedFd,
     identity: NamespaceIdentity,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    record_policy: NamespaceRecordPolicy,
 }
 
 impl fmt::Debug for WorkerSocketNamespace {
@@ -260,6 +280,8 @@ impl WorkerSocketNamespace {
         Ok(Self {
             directory,
             identity,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            record_policy: NamespaceRecordPolicy::Linked,
         })
     }
 
@@ -268,6 +290,8 @@ impl WorkerSocketNamespace {
         Ok(Self {
             directory: duplicate_fd(self.directory.as_raw_fd())?,
             identity: self.identity,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            record_policy: self.record_policy,
         })
     }
 
@@ -285,11 +309,13 @@ impl WorkerSocketNamespace {
 
     /// Exclusively writes one fixed ownership record before publication.
     pub fn write_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
+        self.require_record_support()?;
         write_socket_record(self.anchor_fd(), record)
     }
 
     /// Removes only the exact current ownership record.
     pub fn clear_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
+        self.require_record_support()?;
         clear_socket_record(self.anchor_fd(), record)
     }
 
@@ -298,6 +324,7 @@ impl WorkerSocketNamespace {
         &self,
         record: &SnapshotStagingOwnershipRecord,
     ) -> Result<(), RuntimeError> {
+        self.require_record_support()?;
         write_snapshot_record(self.anchor_fd(), record)
     }
 
@@ -306,7 +333,16 @@ impl WorkerSocketNamespace {
         &self,
         record: &SnapshotStagingOwnershipRecord,
     ) -> Result<(), RuntimeError> {
+        self.require_record_support()?;
         clear_snapshot_record(self.anchor_fd(), record)
+    }
+
+    fn require_record_support(&self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        if self.record_policy == NamespaceRecordPolicy::RetiredRecordFree {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        Ok(())
     }
 }
 
@@ -749,6 +785,7 @@ impl PreopenedLauncherNamespace {
             name: self.name,
             identity: self.identity,
             owner: self.owner,
+            publication: NamespacePublication::Linked,
             cleaned: false,
         })
     }
@@ -777,6 +814,7 @@ impl PreopenedLauncherNamespace {
             name: self.name,
             identity: self.identity,
             owner: self.owner,
+            publication: NamespacePublication::Linked,
             cleaned: false,
         }))
     }
@@ -847,6 +885,7 @@ impl ValidatedWorkerNamespace {
             name: self.name,
             identity: self.identity,
             owner: self.owner,
+            publication: NamespacePublication::Linked,
             cleaned: false,
         })
     }
@@ -859,6 +898,8 @@ pub struct WorkerNamespace {
     name: CString,
     identity: NamespaceIdentity,
     owner: DirectoryOwner,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    publication: NamespacePublication,
     cleaned: bool,
 }
 
@@ -933,6 +974,8 @@ impl WorkerNamespace {
             name,
             identity,
             owner,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            publication: NamespacePublication::Linked,
             cleaned: false,
         })
     }
@@ -948,6 +991,21 @@ impl WorkerNamespace {
         Ok(WorkerSocketNamespace {
             directory: duplicate_fd(self.directory.as_raw_fd())?,
             identity: self.identity,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            record_policy: NamespaceRecordPolicy::Linked,
+        })
+    }
+
+    /// Duplicates this namespace with an explicit feature-probe record policy.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn socket_namespace_with_policy(
+        &self,
+        record_policy: NamespaceRecordPolicy,
+    ) -> Result<WorkerSocketNamespace, RuntimeError> {
+        Ok(WorkerSocketNamespace {
+            directory: duplicate_fd(self.directory.as_raw_fd())?,
+            identity: self.identity,
+            record_policy,
         })
     }
 
@@ -972,15 +1030,55 @@ impl WorkerNamespace {
     /// Revalidates the linked namespace while this lock-owning authority remains live.
     #[cfg(feature = "elevated-bootstrap-probe")]
     pub fn verify_live(&self) -> Result<(), RuntimeError> {
-        validate_preopened_namespace(
+        match self.publication {
+            NamespacePublication::Linked => validate_preopened_namespace(
+                self.root.as_raw_fd(),
+                self.directory.as_raw_fd(),
+                &self.name,
+                self.identity,
+                self.owner,
+                false,
+            )?,
+            NamespacePublication::Retired => validate_retired_namespace(
+                self.root.as_raw_fd(),
+                self.directory.as_raw_fd(),
+                &self.name,
+                self.identity,
+                self.owner,
+                false,
+            )?,
+        }
+        self.verify_current_directory()
+    }
+
+    /// Observes that the launcher retired the exact canonical session name.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn observe_retired(&mut self) -> Result<(), RuntimeError> {
+        let current = current_directory_identity(self.owner)?;
+        self.observe_retired_with_current_directory(current)
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn observe_retired_with_current_directory(
+        &mut self,
+        current: NamespaceIdentity,
+    ) -> Result<(), RuntimeError> {
+        if self.publication != NamespacePublication::Linked {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        validate_retired_namespace(
             self.root.as_raw_fd(),
             self.directory.as_raw_fd(),
             &self.name,
             self.identity,
             self.owner,
-            false,
+            true,
         )?;
-        self.verify_current_directory()
+        if current != self.identity {
+            return Err(RuntimeError::InvalidEntry);
+        }
+        self.publication = NamespacePublication::Retired;
+        Ok(())
     }
 
     /// Removes only the same empty namespace inode.
@@ -988,6 +1086,25 @@ impl WorkerNamespace {
         if self.cleaned {
             return Ok(());
         }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        match self.publication {
+            NamespacePublication::Linked => cleanup_exact(
+                self.root.as_raw_fd(),
+                self.directory.as_raw_fd(),
+                &self.name,
+                self.identity,
+                self.owner,
+            )?,
+            NamespacePublication::Retired => validate_retired_namespace(
+                self.root.as_raw_fd(),
+                self.directory.as_raw_fd(),
+                &self.name,
+                self.identity,
+                self.owner,
+                true,
+            )?,
+        }
+        #[cfg(not(feature = "elevated-bootstrap-probe"))]
         cleanup_exact(
             self.root.as_raw_fd(),
             self.directory.as_raw_fd(),
@@ -1038,6 +1155,8 @@ pub struct LauncherNamespace {
     name: CString,
     identity: NamespaceIdentity,
     owner: DirectoryOwner,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    publication: NamespacePublication,
     cleaned: bool,
 }
 
@@ -1055,19 +1174,70 @@ impl LauncherNamespace {
     /// Revalidates the exact linked namespace and proves the worker lock remains held.
     #[cfg(feature = "elevated-bootstrap-probe")]
     pub fn verify_worker_lock(&self) -> Result<(), RuntimeError> {
+        match self.publication {
+            NamespacePublication::Linked => validate_preopened_namespace(
+                self.root.as_raw_fd(),
+                self.directory.as_raw_fd(),
+                &self.name,
+                self.identity,
+                self.owner,
+                false,
+            )?,
+            NamespacePublication::Retired => validate_retired_namespace(
+                self.root.as_raw_fd(),
+                self.directory.as_raw_fd(),
+                &self.name,
+                self.identity,
+                self.owner,
+                false,
+            )?,
+        }
+        if try_lock_exclusive(self.directory.as_raw_fd())? {
+            unlock(self.directory.as_raw_fd());
+            return Err(RuntimeError::InvalidEntry);
+        }
+        Ok(())
+    }
+
+    /// Retires the exact empty canonical name while the worker lock is live.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn retire_linked(&mut self) -> Result<(), RuntimeError> {
+        if self.publication != NamespacePublication::Linked {
+            return Err(RuntimeError::InvalidEntry);
+        }
         validate_preopened_namespace(
             self.root.as_raw_fd(),
             self.directory.as_raw_fd(),
             &self.name,
             self.identity,
             self.owner,
-            false,
+            true,
         )?;
         if try_lock_exclusive(self.directory.as_raw_fd())? {
             unlock(self.directory.as_raw_fd());
             return Err(RuntimeError::InvalidEntry);
         }
-        Ok(())
+        // SAFETY: the retained root and canonical name identify the exact empty
+        // directory validated above. Any syscall failure is fail-closed.
+        if unsafe {
+            libc::unlinkat(
+                self.root.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(RuntimeError::Filesystem(io::Error::last_os_error().kind()));
+        }
+        self.publication = NamespacePublication::Retired;
+        validate_retired_namespace(
+            self.root.as_raw_fd(),
+            self.directory.as_raw_fd(),
+            &self.name,
+            self.identity,
+            self.owner,
+            true,
+        )
     }
 
     /// Independently derives and validates the worker-created namespace.
@@ -1112,6 +1282,8 @@ impl LauncherNamespace {
             name,
             identity: actual,
             owner,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            publication: NamespacePublication::Linked,
             cleaned: false,
         })
     }
@@ -1165,6 +1337,8 @@ impl LauncherNamespace {
             name,
             identity,
             owner,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            publication: NamespacePublication::Linked,
             cleaned: false,
         }))
     }
@@ -1172,6 +1346,23 @@ impl LauncherNamespace {
     /// Removes only the same empty entry after the worker lock is released.
     pub fn cleanup(&mut self) -> Result<(), RuntimeError> {
         if self.cleaned {
+            return Ok(());
+        }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        if self.publication == NamespacePublication::Retired {
+            validate_retired_namespace(
+                self.root.as_raw_fd(),
+                self.directory.as_raw_fd(),
+                &self.name,
+                self.identity,
+                self.owner,
+                true,
+            )?;
+            if !try_lock_exclusive(self.directory.as_raw_fd())? {
+                return Err(RuntimeError::InvalidEntry);
+            }
+            unlock(self.directory.as_raw_fd());
+            self.cleaned = true;
             return Ok(());
         }
         if path_missing(self.root.as_raw_fd(), &self.name)? {
@@ -1799,6 +1990,25 @@ fn validate_preopened_namespace(
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_retired_namespace(
+    root: RawFd,
+    directory: RawFd,
+    name: &CStr,
+    expected: NamespaceIdentity,
+    owner: DirectoryOwner,
+    require_empty: bool,
+) -> Result<(), RuntimeError> {
+    validate_linked_directory_owned(root, owner)?;
+    if validate_directory_owned(directory, owner)? != expected
+        || identity_at(root, name)?.is_some()
+        || (require_empty && !directory_is_empty(directory)?)
+    {
+        return Err(RuntimeError::InvalidEntry);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
 fn cleanup_created_session_after_error(
     root: RawFd,
     name: &CStr,
@@ -2313,6 +2523,268 @@ mod tests {
 
     #[cfg(feature = "elevated-bootstrap-probe")]
     #[test]
+    fn live_locked_session_retires_once_and_finishes_without_a_linked_name() {
+        let root = TestRoot::new();
+        let session = SessionId::from_bytes([0xa1; 32]);
+        let worker_root = explicit_test_root(&root);
+        let prepared = PreparedLauncherSession::create(explicit_test_root(&root), session)
+            .expect("launcher session should prepare");
+        let identity = prepared.identity();
+        let (transfer, mut handles) = prepared.into_publication();
+        let mut worker = WorkerNamespace::adopt_from_explicit_root(
+            worker_root,
+            transfer,
+            session,
+            identity.object_identity(),
+        )
+        .expect("worker should adopt and lock the session");
+        let mut launcher = handles
+            .validate_live(session, identity)
+            .expect("launcher should validate the live lock");
+
+        launcher
+            .retire_linked()
+            .expect("launcher should retire the exact empty name");
+        assert_eq!(launcher.retire_linked(), Err(RuntimeError::InvalidEntry));
+        launcher
+            .verify_worker_lock()
+            .expect("retired handle should retain the live worker-lock proof");
+        assert_eq!(
+            worker.observe_retired_with_current_directory(NamespaceIdentity {
+                device: identity.device,
+                inode: identity.inode.wrapping_add(1),
+            }),
+            Err(RuntimeError::InvalidEntry),
+            "wrong cwd identity must not advance worker state"
+        );
+        worker
+            .observe_retired_with_current_directory(identity)
+            .expect("worker should observe the exact retired inode");
+        assert_eq!(
+            worker.observe_retired_with_current_directory(identity),
+            Err(RuntimeError::InvalidEntry),
+            "worker retirement observation is single-use"
+        );
+        let name = session_name(session).expect("name should derive");
+        assert!(
+            !root
+                .path()
+                .join(OsStr::from_bytes(name.as_bytes()))
+                .exists(),
+            "retirement must remove the canonical name"
+        );
+        assert_eq!(launcher.cleanup(), Err(RuntimeError::InvalidEntry));
+
+        worker.cleaned = true;
+        drop(worker);
+        launcher
+            .cleanup()
+            .expect("retired cleanup should validate absence after lock release");
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn retirement_rejects_missing_populated_unlocked_and_replaced_names() {
+        let missing_root = TestRoot::new();
+        let missing_session = SessionId::from_bytes([0xa2; 32]);
+        let worker_root = explicit_test_root(&missing_root);
+        let prepared =
+            PreparedLauncherSession::create(explicit_test_root(&missing_root), missing_session)
+                .expect("missing fixture should prepare");
+        let identity = prepared.identity();
+        let (transfer, mut handles) = prepared.into_publication();
+        let mut worker = WorkerNamespace::adopt_from_explicit_root(
+            worker_root,
+            transfer,
+            missing_session,
+            identity.object_identity(),
+        )
+        .expect("missing fixture worker should lock");
+        let mut launcher = handles
+            .validate_live(missing_session, identity)
+            .expect("missing fixture launcher should validate");
+        let missing_name = session_name(missing_session).expect("name should derive");
+        fs::remove_dir(
+            missing_root
+                .path()
+                .join(OsStr::from_bytes(missing_name.as_bytes())),
+        )
+        .expect("fixture should remove the linked name");
+        assert_eq!(
+            launcher.retire_linked(),
+            Err(RuntimeError::InvalidEntry),
+            "an already-missing name is not a successful retirement"
+        );
+        worker.cleaned = true;
+        launcher.cleaned = true;
+        drop(worker);
+        drop(launcher);
+
+        let populated_root = TestRoot::new();
+        let populated_session = SessionId::from_bytes([0xa3; 32]);
+        let populated_worker_root = explicit_test_root(&populated_root);
+        let prepared =
+            PreparedLauncherSession::create(explicit_test_root(&populated_root), populated_session)
+                .expect("populated fixture should prepare");
+        let identity = prepared.identity();
+        let (transfer, mut handles) = prepared.into_publication();
+        let mut worker = WorkerNamespace::adopt_from_explicit_root(
+            populated_worker_root,
+            transfer,
+            populated_session,
+            identity.object_identity(),
+        )
+        .expect("populated fixture worker should lock");
+        let mut launcher = handles
+            .validate_live(populated_session, identity)
+            .expect("populated fixture launcher should validate");
+        fs::write(
+            populated_root
+                .path()
+                .join(OsStr::from_bytes(
+                    session_name(populated_session)
+                        .expect("name should derive")
+                        .as_bytes(),
+                ))
+                .join("unexpected"),
+            b"preserve",
+        )
+        .expect("unexpected entry should write");
+        assert_eq!(launcher.retire_linked(), Err(RuntimeError::InvalidEntry));
+        worker.cleaned = true;
+        launcher.cleaned = true;
+        drop(worker);
+        drop(launcher);
+
+        let unlocked_root = TestRoot::new();
+        let unlocked_session = SessionId::from_bytes([0xa4; 32]);
+        let unlocked_worker_root = explicit_test_root(&unlocked_root);
+        let prepared =
+            PreparedLauncherSession::create(explicit_test_root(&unlocked_root), unlocked_session)
+                .expect("unlocked fixture should prepare");
+        let identity = prepared.identity();
+        let (transfer, mut handles) = prepared.into_publication();
+        let mut worker = WorkerNamespace::adopt_from_explicit_root(
+            unlocked_worker_root,
+            transfer,
+            unlocked_session,
+            identity.object_identity(),
+        )
+        .expect("unlocked fixture worker should lock");
+        let mut launcher = handles
+            .validate_live(unlocked_session, identity)
+            .expect("unlocked fixture launcher should validate");
+        worker.cleaned = true;
+        drop(worker);
+        assert_eq!(launcher.retire_linked(), Err(RuntimeError::InvalidEntry));
+
+        let replacement_root = TestRoot::new();
+        let replacement_session = SessionId::from_bytes([0xa5; 32]);
+        let replacement_worker_root = explicit_test_root(&replacement_root);
+        let prepared = PreparedLauncherSession::create(
+            explicit_test_root(&replacement_root),
+            replacement_session,
+        )
+        .expect("replacement fixture should prepare");
+        let identity = prepared.identity();
+        let (transfer, mut handles) = prepared.into_publication();
+        let mut worker = WorkerNamespace::adopt_from_explicit_root(
+            replacement_worker_root,
+            transfer,
+            replacement_session,
+            identity.object_identity(),
+        )
+        .expect("replacement fixture worker should lock");
+        let mut launcher = handles
+            .validate_live(replacement_session, identity)
+            .expect("replacement fixture launcher should validate");
+        launcher
+            .retire_linked()
+            .expect("replacement fixture should retire");
+        let replacement_name = session_name(replacement_session).expect("name should derive");
+        let replacement_path = replacement_root
+            .path()
+            .join(OsStr::from_bytes(replacement_name.as_bytes()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&replacement_path)
+            .expect("replacement name should create");
+        assert_eq!(
+            worker.observe_retired_with_current_directory(identity),
+            Err(RuntimeError::InvalidEntry),
+            "worker must reject a canonical-name replacement"
+        );
+        worker.cleaned = true;
+        drop(worker);
+        assert_eq!(launcher.cleanup(), Err(RuntimeError::InvalidEntry));
+        launcher.cleaned = true;
+        drop(launcher);
+        assert!(
+            replacement_path.is_dir(),
+            "replacement must remain untouched"
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn retired_record_policy_rejects_every_record_before_a_syscall() {
+        let root = TestRoot::new();
+        let session = SessionId::from_bytes([0xa6; 32]);
+        let worker = WorkerNamespace::create_from_explicit_root(explicit_test_root(&root), session)
+            .expect("record-free fixture should create");
+        let namespace = worker
+            .socket_namespace_with_policy(NamespaceRecordPolicy::RetiredRecordFree)
+            .expect("record-free namespace should duplicate");
+        let socket = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("api.sock").expect("socket child should parse"),
+            ObjectIdentity {
+                device: 11,
+                inode: 13,
+            },
+        )
+        .expect("socket record should construct");
+        let snapshot = SnapshotStagingOwnershipRecord::new(
+            SnapshotStagingKind::State,
+            ObjectIdentity {
+                device: 17,
+                inode: 19,
+            },
+            SnapshotStagingName::parse(
+                SnapshotStagingKind::State,
+                ".bangbang-snapshot-state-0123456789abcdef0123456789abcdef",
+            )
+            .expect("snapshot name should parse"),
+            ObjectIdentity {
+                device: 23,
+                inode: 29,
+            },
+        );
+
+        assert_eq!(
+            namespace.write_socket_record(&socket),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
+            namespace.clear_socket_record(&socket),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
+            namespace.write_snapshot_staging_record(&snapshot),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
+            namespace.clear_snapshot_staging_record(&snapshot),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert!(
+            directory_is_empty(namespace.anchor_fd()).expect("namespace should inspect"),
+            "record rejection must happen before filesystem mutation"
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
     fn unpublished_and_post_exit_recovery_use_only_preopened_handles() {
         let root = TestRoot::new();
         let unpublished_session = SessionId::from_bytes([0x93; 32]);
@@ -2807,6 +3279,8 @@ mod tests {
             name,
             identity,
             owner: DirectoryOwner::current_user(),
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            publication: NamespacePublication::Linked,
             cleaned: false,
         };
 

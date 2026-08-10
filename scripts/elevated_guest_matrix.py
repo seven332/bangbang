@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Run the explicit-root post-drop API/no-API guest evidence matrix."""
+"""Run foreground and retired-daemon explicit-root guest evidence."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 import secrets
+import select
 import signal
 import stat
 import subprocess
@@ -26,7 +28,14 @@ UNMAPPED_ID = 2_147_483_647
 PROCESS_TIMEOUT_SECONDS = 45
 BARRIER_TIMEOUT_SECONDS = 10
 MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_OUTPUT_LINE_BYTES = 4 * 1024
+WORKER_SIGHUP_EXIT_CODE = 156
+WORKER_NAMESPACE_REPLACEMENT_EXIT_CODE = 80
 ADOPTION_BARRIER_OPTION = "--bangbang-internal-post-adoption-stop-v1"
+DAEMON_BARRIER_OPTION = "--bangbang-internal-daemon-barrier-v1"
+DAEMON_FAULT_OPTION = "--bangbang-internal-daemon-fault-v1"
+DAEMON_NAMESPACE_RETIREMENT_BARRIER = "daemon-namespace-retirement"
+JAILER_ACTIVATION = "--bangbang-jailer-v1"
 REPLACEMENT_BYTES = b"invalid-adoption-replacement\n"
 API_SOCKET_CHILD = "evidence-api.sock"
 API_DISPLACED_SOCKET_CHILD = ".displaced-evidence-api.sock"
@@ -35,6 +44,9 @@ ROOT_PARENT = Path("/private/var/root")
 ROOT_PREFIX = "bangbang-elevated-probe."
 SESSION_PREFIX = "session-"
 SESSION_ID_HEX_BYTES = 64
+PROC_PIDTBSDINFO = 3
+PROC_PIDPATHINFO_MAXSIZE = 4096
+NOTE_EXITSTATUS = 0x04000000
 RESOURCE_NAMES = {
     "config": "evidence-guest-no-api.json",
     "kernel": "evidence-guest-kernel",
@@ -59,6 +71,63 @@ class MatrixError(RuntimeError):
 
 def _fail(message: str) -> NoReturn:
     raise MatrixError(message)
+
+
+class ProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("xstatus", ctypes.c_uint32),
+        ("pid", ctypes.c_uint32),
+        ("ppid", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("ruid", ctypes.c_uint32),
+        ("rgid", ctypes.c_uint32),
+        ("svuid", ctypes.c_uint32),
+        ("svgid", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("command", ctypes.c_char * 16),
+        ("name", ctypes.c_char * 32),
+        ("nfiles", ctypes.c_uint32),
+        ("pgid", ctypes.c_uint32),
+        ("pjobc", ctypes.c_uint32),
+        ("terminal_device", ctypes.c_uint32),
+        ("terminal_pgid", ctypes.c_uint32),
+        ("nice", ctypes.c_int32),
+        ("start_seconds", ctypes.c_uint64),
+        ("start_microseconds", ctypes.c_uint64),
+    ]
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    parent_pid: int
+    process_group: int
+    session: int
+    uid: int
+    gid: int
+    real_uid: int
+    real_gid: int
+    saved_uid: int
+    saved_gid: int
+    start_seconds: int
+    start_microseconds: int
+    executable: Path
+
+    def same_start(self, other: "ProcessIdentity") -> bool:
+        return (
+            self.pid,
+            self.start_seconds,
+            self.start_microseconds,
+            self.executable,
+        ) == (
+            other.pid,
+            other.start_seconds,
+            other.start_microseconds,
+            other.executable,
+        )
 
 
 @dataclass(frozen=True)
@@ -179,6 +248,13 @@ FAULT_CASES = (
     FaultCase("guest-cleanup", "guest-cleanup", "guest-boundary", "api"),
 )
 
+DAEMON_RETIREMENT_FAULTS = (
+    "namespace-retire-before-unlink",
+    "namespace-retire-after-unlink",
+    "namespace-retire-observe",
+    "namespace-record-write",
+)
+
 MATRIX_SUMMARY = (
     "guest-matrix: api-mapped=complete api-retained-root=complete-no-drop "
     "api-unmapped=complete no-api-mapped=complete "
@@ -188,7 +264,13 @@ MATRIX_SUMMARY = (
     "api-pre-post-worker-first-launcher-first "
     "tamper=rejected-both-workloads "
     "adoption-replacement=no-api-complete-api-rejected-at-grant "
-    "socket-replacement=both-cleanup-owners-preserve cleanup=exact"
+    "socket-replacement=both-cleanup-owners-preserve "
+    "daemon=api-no-api-all-identities-retired "
+    "daemon-faults=retirement-all-reachable "
+    "daemon-deaths=api-no-api-worker-first-launcher-first "
+    "daemon-signals=int-term-hup daemon-replacement=preserved "
+    "daemon-concurrency=peer-survives-launcher-kill "
+    "cleanup=exact-no-product-session-teardown"
 )
 
 API_PREOPENED_REPLACEMENT_BOUNDARY = FaultCase(
@@ -454,9 +536,25 @@ class Fixture:
         launcher: Path,
         fault: str | None = None,
         adoption_barrier: bool = False,
+        daemonize: bool = False,
+        daemon_barrier: str | None = None,
+        daemon_fault: str | None = None,
     ) -> list[str]:
-        if fault is not None and adoption_barrier:
+        if adoption_barrier and (
+            fault is not None
+            or daemonize
+            or daemon_barrier is not None
+            or daemon_fault is not None
+        ):
             _fail("incompatible-process-options")
+        if (daemon_barrier is not None or daemon_fault is not None) and not daemonize:
+            _fail("daemon-control-without-daemon")
+        if daemon_fault is not None and (fault is not None or daemon_barrier is not None):
+            _fail("incompatible-daemon-options")
+        if fault is not None and daemon_barrier is not None and not (
+            fault == "guest-endpoint-death" and daemon_barrier == "post-ack-watch"
+        ):
+            _fail("incompatible-daemon-options")
         arguments = [
             os.fspath(launcher),
             "--bangbang-internal-elevated-bootstrap-probe-v2",
@@ -473,9 +571,37 @@ class Fixture:
             arguments.extend(("--fault", fault))
         if adoption_barrier:
             arguments.append(ADOPTION_BARRIER_OPTION)
+        if daemon_barrier is not None:
+            arguments.extend((DAEMON_BARRIER_OPTION, daemon_barrier))
+        if daemon_fault is not None:
+            arguments.extend((DAEMON_FAULT_OPTION, daemon_fault))
+        arguments.append("--")
+        if daemonize:
+            worker = (
+                launcher.parent.parent
+                / "Helpers"
+                / "BangbangWorker.app"
+                / "Contents"
+                / "MacOS"
+                / "bangbang-worker"
+            )
+            arguments.extend(
+                (
+                    JAILER_ACTIVATION,
+                    "--id",
+                    f"evidence-{self.root.name[-8:]}",
+                    "--exec-file",
+                    os.fspath(worker),
+                    "--uid",
+                    "0",
+                    "--gid",
+                    "0",
+                    "--daemonize",
+                    "--",
+                )
+            )
         arguments.extend(
             (
-                "--",
                 "--bangbang-grant-manifest",
                 os.fspath(self.workspace / "grant-manifest.json"),
                 "--",
@@ -691,15 +817,7 @@ class Fixture:
                 _fail("fault-output-bound")
 
     def capture_runtime_session(self) -> tuple[Path, ObjectIdentity]:
-        root = ObjectIdentity.capture(self.root)
-        if (
-            root.device != self.root_identity.device
-            or root.inode != self.root_identity.inode
-            or root.uid != self.uid
-            or root.gid != self.gid
-            or root.mode != 0o700
-        ):
-            _fail("runtime-root-identity")
+        self.validate_runtime_root()
         entries = list(self.root.iterdir())
         if len(entries) != 1:
             _fail("runtime-session-ledger")
@@ -722,6 +840,22 @@ class Fixture:
         ):
             _fail("runtime-session-identity")
         return session, identity
+
+    def validate_runtime_root(self) -> None:
+        root = ObjectIdentity.capture(self.root)
+        if (
+            root.device != self.root_identity.device
+            or root.inode != self.root_identity.inode
+            or root.uid != self.uid
+            or root.gid != self.gid
+            or root.mode != 0o700
+        ):
+            _fail("runtime-root-identity")
+
+    def validate_retired_runtime_root(self) -> None:
+        self.validate_runtime_root()
+        if any(self.root.iterdir()):
+            _fail("retired-runtime-session-residue")
 
     def cleanup_runtime_session(
         self,
@@ -1034,6 +1168,739 @@ def _process_table() -> list[tuple[int, int, str]]:
     return rows
 
 
+def _libproc() -> ctypes.CDLL:
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError as error:
+        raise MatrixError("process-info-library") from error
+    library.proc_pidinfo.argtypes = (
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    )
+    library.proc_pidinfo.restype = ctypes.c_int
+    library.proc_pidpath.argtypes = (
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    library.proc_pidpath.restype = ctypes.c_int
+    return library
+
+
+def capture_process(pid: int) -> ProcessIdentity:
+    if pid <= 1 or pid > 0x7FFF_FFFF:
+        _fail("process-identity-pid")
+    library = _libproc()
+    info = ProcBsdInfo()
+    size = ctypes.sizeof(info)
+    result = library.proc_pidinfo(
+        pid,
+        PROC_PIDTBSDINFO,
+        0,
+        ctypes.byref(info),
+        size,
+    )
+    if result != size:
+        _fail("process-identity-info")
+    path_buffer = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
+    path_length = library.proc_pidpath(
+        pid,
+        path_buffer,
+        PROC_PIDPATHINFO_MAXSIZE,
+    )
+    if path_length <= 0 or path_length >= PROC_PIDPATHINFO_MAXSIZE:
+        _fail("process-identity-path")
+    try:
+        executable = Path(path_buffer.raw[:path_length].decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise MatrixError("process-identity-path-encoding") from error
+    session = os.getsid(pid)
+    values = (
+        int(info.pid),
+        int(info.ppid),
+        int(info.pgid),
+        session,
+        int(info.uid),
+        int(info.gid),
+        int(info.ruid),
+        int(info.rgid),
+        int(info.svuid),
+        int(info.svgid),
+        int(info.start_seconds),
+        int(info.start_microseconds),
+    )
+    if (
+        values[0] != pid
+        or values[1] <= 0
+        or values[2] <= 0
+        or values[3] <= 0
+        or values[10] <= 0
+        or values[11] < 0
+        or values[11] >= 1_000_000
+        or not executable.is_absolute()
+    ):
+        _fail("process-identity-shape")
+    return ProcessIdentity(*values, executable)
+
+
+def expected_worker(launcher: Path) -> Path:
+    return (
+        launcher.parent.parent
+        / "Helpers"
+        / "BangbangWorker.app"
+        / "Contents"
+        / "MacOS"
+        / "bangbang-worker"
+    )
+
+
+def validate_daemon_topology(
+    supervisor: ProcessIdentity,
+    worker: ProcessIdentity,
+    launcher: Path,
+    fixture: Fixture,
+    parent: ProcessIdentity | None = None,
+) -> None:
+    expected_ids = (fixture.uid, fixture.gid)
+    supervisor_ids = (
+        supervisor.uid,
+        supervisor.gid,
+        supervisor.real_uid,
+        supervisor.real_gid,
+        supervisor.saved_uid,
+        supervisor.saved_gid,
+    )
+    worker_ids = (
+        worker.uid,
+        worker.gid,
+        worker.real_uid,
+        worker.real_gid,
+        worker.saved_uid,
+        worker.saved_gid,
+    )
+    if (
+        supervisor.process_group != supervisor.pid
+        or supervisor.session != supervisor.pid
+        or supervisor.executable != launcher
+        or (parent is not None and supervisor.parent_pid != parent.pid)
+        or worker.parent_pid != supervisor.pid
+        or worker.process_group != supervisor.pid
+        or worker.session != supervisor.pid
+        or worker.executable != expected_worker(launcher)
+        or supervisor_ids != expected_ids * 3
+        or worker_ids != expected_ids * 3
+    ):
+        _fail("daemon-process-topology")
+    if parent is not None:
+        parent_ids = (
+            parent.uid,
+            parent.gid,
+            parent.real_uid,
+            parent.real_gid,
+            parent.saved_uid,
+            parent.saved_gid,
+        )
+        if parent.executable != launcher or parent_ids != expected_ids * 3:
+            _fail("daemon-parent-identity")
+
+
+def wait_for_stopped_daemon(
+    supervisor_pid: int,
+    launcher: Path,
+    fixture: Fixture,
+    parent: ProcessIdentity | None = None,
+) -> tuple[ProcessIdentity, ProcessIdentity]:
+    deadline = time.monotonic() + BARRIER_TIMEOUT_SECONDS
+    observed_worker: int | None = None
+    while time.monotonic() < deadline:
+        rows = _process_table()
+        supervisors = [row for row in rows if row[0] == supervisor_pid]
+        children = [row for row in rows if row[1] == supervisor_pid]
+        if len(supervisors) > 1 or len(children) > 1:
+            _fail("daemon-stop-topology")
+        if supervisors and children:
+            worker_pid = children[0][0]
+            if observed_worker is not None and observed_worker != worker_pid:
+                _fail("daemon-stop-worker-swap")
+            observed_worker = worker_pid
+            if "T" in supervisors[0][2] and "T" in children[0][2]:
+                supervisor = capture_process(supervisor_pid)
+                worker = capture_process(worker_pid)
+                validate_daemon_topology(supervisor, worker, launcher, fixture, parent)
+                return supervisor, worker
+        time.sleep(0.01)
+    _fail("daemon-stop-timeout")
+
+
+def parse_daemon_pid(output: bytes) -> int:
+    decoded = _decode_output(output)
+    prefix = "bangbang daemon pid: "
+    if not decoded.startswith(prefix) or not decoded.endswith("\n") or decoded.count("\n") != 1:
+        _fail("daemon-pid-output")
+    value = decoded[len(prefix) : -1]
+    if not value.isascii() or not value.isdigit() or value.startswith("0"):
+        _fail("daemon-pid-shape")
+    pid = int(value)
+    if pid <= 1 or pid > 0x7FFF_FFFF:
+        _fail("daemon-pid-range")
+    return pid
+
+
+class ProcessExitWatch:
+    def __init__(self, processes: tuple[ProcessIdentity, ...]) -> None:
+        if len(processes) == 0 or len({process.pid for process in processes}) != len(processes):
+            _fail("exit-watch-ledger")
+        self.processes = {process.pid: process for process in processes}
+        self.queue = select.kqueue()
+        changes = [
+            select.kevent(
+                process.pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT | NOTE_EXITSTATUS,
+            )
+            for process in processes
+        ]
+        try:
+            events = self.queue.control(changes, 0, 0)
+        except OSError as error:
+            self.queue.close()
+            raise MatrixError("exit-watch-register") from error
+        if events:
+            self.queue.close()
+            _fail("exit-watch-register-event")
+
+    def wait(self) -> dict[int, int]:
+        if self.queue is None:
+            _fail("exit-watch-closed")
+        deadline = time.monotonic() + PROCESS_TIMEOUT_SECONDS
+        statuses: dict[int, int] = {}
+        while len(statuses) != len(self.processes):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _fail("exit-watch-timeout")
+            events = self.queue.control(None, len(self.processes), remaining)
+            if not events:
+                _fail("exit-watch-timeout")
+            for event in events:
+                pid = int(event.ident)
+                if (
+                    event.filter != select.KQ_FILTER_PROC
+                    or pid not in self.processes
+                    or pid in statuses
+                    or event.fflags & select.KQ_NOTE_EXIT == 0
+                    or event.fflags & NOTE_EXITSTATUS == 0
+                    or event.data < 0
+                    or event.data > 0xFFFF
+                ):
+                    _fail("exit-watch-event")
+                statuses[pid] = int(event.data)
+        return statuses
+
+    def close(self) -> None:
+        if self.queue is not None:
+            self.queue.close()
+            self.queue = None
+
+
+@dataclass
+class StoppedDaemon:
+    parent: subprocess.Popen[bytes]
+    parent_identity: ProcessIdentity
+    supervisor: ProcessIdentity
+    worker: ProcessIdentity
+    watch: ProcessExitWatch
+    fixture: Fixture
+    observed_parent_output: bytes
+
+    def resume(self) -> None:
+        try:
+            os.kill(self.worker.pid, signal.SIGCONT)
+            os.kill(self.supervisor.pid, signal.SIGCONT)
+        except ProcessLookupError as error:
+            raise MatrixError("daemon-resume-process") from error
+
+    def wait(self) -> dict[int, int]:
+        try:
+            statuses = self.watch.wait()
+        finally:
+            self.watch.close()
+        wait_for_daemon_parent_detach(
+            self.parent,
+            self.fixture,
+            self.observed_parent_output,
+        )
+        return statuses
+
+    def cleanup(self) -> None:
+        self.watch.close()
+        for process in (self.worker, self.supervisor):
+            signal_exact_process_if_live(process, signal.SIGKILL)
+        if self.parent.poll() is None:
+            self.parent.kill()
+        try:
+            self.parent.wait(timeout=BARRIER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.parent.kill()
+            self.parent.wait()
+        for process in (self.worker, self.supervisor):
+            try:
+                wait_for_exact_process_exit(process)
+            except MatrixError:
+                pass
+
+
+def validate_daemon_output_prefix(output: bytes, fixture: Fixture) -> None:
+    decoded = _decode_output(output)
+    validate_redacted(decoded, fixture)
+    if not expected_success_output(fixture.case).encode("utf-8").startswith(output):
+        _fail("daemon-output-prefix")
+
+
+def wait_for_daemon_parent_detach(
+    parent: subprocess.Popen[bytes],
+    fixture: Fixture,
+    observed_output: bytes,
+) -> None:
+    try:
+        output, _ = parent.communicate(timeout=BARRIER_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise MatrixError("daemon-parent-detach-timeout") from error
+    if parent.returncode != 0:
+        _fail("daemon-parent-detach-result")
+    validate_daemon_output_prefix(observed_output + output, fixture)
+
+
+def read_daemon_pid_line(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
+    stdout = process.stdout
+    if stdout is None:
+        _fail("daemon-parent-output")
+    deadline = time.monotonic() + BARRIER_TIMEOUT_SECONDS
+    pending = bytearray()
+    observed_output = bytearray()
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([stdout], [], [], min(0.1, deadline - time.monotonic()))
+        if ready:
+            try:
+                chunk = os.read(stdout.fileno(), MAX_OUTPUT_LINE_BYTES)
+            except OSError as error:
+                raise MatrixError("daemon-parent-output") from error
+            if not chunk:
+                _fail("daemon-parent-exited-before-pid")
+            pending.extend(chunk)
+            if len(observed_output) + len(pending) > MAX_OUTPUT_BYTES:
+                _fail("daemon-parent-output-bound")
+            while b"\n" in pending:
+                end = pending.index(b"\n") + 1
+                line = bytes(pending[:end])
+                del pending[:end]
+                if len(line) > MAX_OUTPUT_LINE_BYTES:
+                    _fail("daemon-parent-output-shape")
+                if line.startswith(b"bangbang daemon pid: "):
+                    observed_output.extend(pending)
+                    return line, bytes(observed_output)
+                observed_output.extend(line)
+            if len(pending) >= MAX_OUTPUT_LINE_BYTES:
+                _fail("daemon-parent-output-shape")
+        elif process.poll() is not None:
+            _fail("daemon-parent-exited-before-pid")
+    _fail("daemon-parent-pid-timeout")
+
+
+def wait_for_namespace_retirement_stop(
+    parent: subprocess.Popen[bytes],
+    launcher: Path,
+    fixture: Fixture,
+    expect_linked: bool,
+    expected_supervisor: ProcessIdentity | None = None,
+) -> tuple[ProcessIdentity, ProcessIdentity, ProcessIdentity, list[Path]]:
+    deadline = time.monotonic() + BARRIER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if parent.poll() is not None:
+            _fail("namespace-retirement-parent-exit")
+        rows = _process_table()
+        supervisors = [row for row in rows if row[1] == parent.pid]
+        if expected_supervisor is not None:
+            supervisors = [
+                row for row in supervisors if row[0] == expected_supervisor.pid
+            ]
+        if len(supervisors) > 1:
+            _fail("namespace-retirement-supervisor-ledger")
+        if supervisors:
+            supervisor_row = supervisors[0]
+            workers = [row for row in rows if row[1] == supervisor_row[0]]
+            if len(workers) > 1:
+                _fail("namespace-retirement-worker-ledger")
+            if workers and "T" in supervisor_row[2]:
+                entries = list(fixture.root.iterdir())
+                correct_ledger = (expect_linked and len(entries) == 1) or (
+                    not expect_linked and not entries
+                )
+                if correct_ledger:
+                    parent_identity = capture_process(parent.pid)
+                    supervisor = capture_process(supervisor_row[0])
+                    worker = capture_process(workers[0][0])
+                    validate_daemon_topology(
+                        supervisor,
+                        worker,
+                        launcher,
+                        fixture,
+                        parent_identity,
+                    )
+                    if expected_supervisor is not None and not supervisor.same_start(
+                        expected_supervisor
+                    ):
+                        _fail("namespace-retirement-supervisor-reuse")
+                    return parent_identity, supervisor, worker, entries
+        time.sleep(0.01)
+    _fail("namespace-retirement-stop-timeout")
+
+
+def assert_daemon_namespace_replacement(
+    launcher: Path,
+    fixture: Fixture,
+) -> None:
+    parent = subprocess.Popen(
+        fixture.command(
+            launcher,
+            daemonize=True,
+            daemon_barrier=DAEMON_NAMESPACE_RETIREMENT_BARRIER,
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={"HOME": "/var/root", "PATH": "/usr/bin:/bin"},
+    )
+    replacement: Path | None = None
+    replacement_identity: ObjectIdentity | None = None
+    watch: ProcessExitWatch | None = None
+    supervisor: ProcessIdentity | None = None
+    worker: ProcessIdentity | None = None
+    later_supervisor: ProcessIdentity | None = None
+    later_worker: ProcessIdentity | None = None
+    try:
+        parent_identity, supervisor, worker, entries = wait_for_namespace_retirement_stop(
+            parent,
+            launcher,
+            fixture,
+            True,
+        )
+        canonical = entries[0]
+        suffix = canonical.name.removeprefix(SESSION_PREFIX)
+        original = ObjectIdentity.capture(canonical)
+        if (
+            not canonical.name.startswith(SESSION_PREFIX)
+            or len(suffix) != SESSION_ID_HEX_BYTES
+            or any(character not in "0123456789abcdef" for character in suffix)
+            or original.uid != fixture.uid
+            or original.gid != fixture.gid
+            or original.mode != 0o700
+            or original.links != 2
+        ):
+            _fail("namespace-retirement-linked-shape")
+        os.kill(supervisor.pid, signal.SIGCONT)
+        later_parent, later_supervisor, later_worker, _ = wait_for_namespace_retirement_stop(
+            parent,
+            launcher,
+            fixture,
+            False,
+            supervisor,
+        )
+        if not later_parent.same_start(parent_identity) or not later_worker.same_start(worker):
+            _fail("namespace-retirement-process-reuse")
+        replacement = fixture.root / canonical.name
+        replacement.mkdir(mode=0o700)
+        os.chown(replacement, fixture.uid, fixture.gid)
+        replacement.chmod(0o700)
+        replacement_identity = ObjectIdentity.capture(replacement)
+        watch = ProcessExitWatch((later_supervisor, later_worker))
+        os.kill(later_supervisor.pid, signal.SIGCONT)
+        statuses = watch.wait()
+        watch.close()
+        watch = None
+        try:
+            output, _ = parent.communicate(timeout=BARRIER_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise MatrixError("namespace-retirement-parent-timeout") from error
+        decoded = _decode_output(output)
+        validate_redacted(decoded, fixture)
+        if (
+            statuses
+            != {
+                later_supervisor.pid: 3 << 8,
+                later_worker.pid: WORKER_NAMESPACE_REPLACEMENT_EXIT_CODE << 8,
+            }
+            or parent.returncode != 1
+            or decoded
+            != "bangbang launcher: elevated daemon handoff failed stage=ready-send\n"
+        ):
+            _fail("namespace-retirement-replacement-result")
+        if (
+            list(fixture.root.iterdir()) != [replacement]
+            or ObjectIdentity.capture(replacement) != replacement_identity
+            or any(replacement.iterdir())
+        ):
+            _fail("namespace-retirement-replacement-preservation")
+        wait_for_exact_process_exit(later_worker)
+        wait_for_exact_process_exit(later_supervisor)
+        replacement.rmdir()
+        replacement = None
+        fixture.validate_retired_runtime_root()
+        fixture.validate_fault_outputs()
+    finally:
+        if watch is not None:
+            watch.close()
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        for process in (later_worker, later_supervisor, worker, supervisor):
+            if process is not None:
+                signal_exact_process_if_live(process, signal.SIGKILL)
+        if replacement is not None and replacement.exists():
+            if ObjectIdentity.capture(replacement) != replacement_identity:
+                _fail("namespace-retirement-replacement-cleanup-identity")
+            replacement.rmdir()
+
+
+def start_stopped_daemon(
+    launcher: Path,
+    fixture: Fixture,
+    fault: str | None = None,
+) -> StoppedDaemon:
+    parent = subprocess.Popen(
+        fixture.command(
+            launcher,
+            fault=fault,
+            daemonize=True,
+            daemon_barrier="post-ack-watch",
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={"HOME": "/var/root", "PATH": "/usr/bin:/bin"},
+    )
+    supervisor: ProcessIdentity | None = None
+    worker: ProcessIdentity | None = None
+    watch: ProcessExitWatch | None = None
+    try:
+        output, observed_parent_output = read_daemon_pid_line(parent)
+        validate_daemon_output_prefix(observed_parent_output, fixture)
+        validate_redacted(_decode_output(output), fixture)
+        supervisor_pid = parse_daemon_pid(output)
+        parent_identity = capture_process(parent.pid)
+        supervisor, worker = wait_for_stopped_daemon(
+            supervisor_pid,
+            launcher,
+            fixture,
+            parent_identity,
+        )
+        watch = ProcessExitWatch((supervisor, worker))
+        return StoppedDaemon(
+            parent,
+            parent_identity,
+            supervisor,
+            worker,
+            watch,
+            fixture,
+            observed_parent_output,
+        )
+    except BaseException:
+        if watch is not None:
+            watch.close()
+        for process in (worker, supervisor):
+            if process is not None:
+                signal_exact_process_if_live(process, signal.SIGKILL)
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        raise
+
+
+def wait_for_exact_process_exit(process: ProcessIdentity) -> None:
+    deadline = time.monotonic() + BARRIER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not _pid_exists(process.pid):
+            return
+        try:
+            current = capture_process(process.pid)
+        except MatrixError:
+            if not _pid_exists(process.pid):
+                return
+            raise
+        if not current.same_start(process):
+            return
+        time.sleep(0.01)
+    _fail("exact-process-exit-timeout")
+
+
+def signal_exact_process_if_live(
+    process: ProcessIdentity,
+    signal_number: int,
+) -> None:
+    try:
+        current = capture_process(process.pid)
+    except MatrixError:
+        return
+    if not current.same_start(process):
+        return
+    try:
+        os.kill(process.pid, signal_number)
+    except ProcessLookupError:
+        pass
+
+
+def assert_daemon_success(launcher: Path, fixture: Fixture) -> None:
+    daemon = start_stopped_daemon(launcher, fixture)
+    try:
+        fixture.validate_retired_runtime_root()
+        daemon.resume()
+        statuses = daemon.wait()
+        if statuses != {daemon.supervisor.pid: 0, daemon.worker.pid: 0}:
+            _fail("daemon-success-status")
+        wait_for_exact_process_exit(daemon.worker)
+        wait_for_exact_process_exit(daemon.supervisor)
+        fixture.validate_retired_runtime_root()
+        fixture.validate_success_outputs()
+    finally:
+        daemon.cleanup()
+
+
+def assert_daemon_retirement_fault(
+    launcher: Path,
+    fixture: Fixture,
+    fault: str,
+) -> None:
+    if fault not in DAEMON_RETIREMENT_FAULTS:
+        _fail("daemon-retirement-fault")
+    status, raw_output = run_process(
+        fixture.command(launcher, fault=fault, daemonize=True)
+    )
+    output = _decode_output(raw_output)
+    validate_redacted(output, fixture)
+    if (
+        status != 1
+        or output
+        != "bangbang launcher: elevated daemon handoff failed stage=ready-send\n"
+    ):
+        _fail("daemon-retirement-fault-result")
+    fixture.validate_retired_runtime_root()
+    fixture.validate_fault_outputs()
+
+
+def assert_daemon_endpoint_death(
+    launcher: Path,
+    fixture: Fixture,
+    first: str,
+) -> None:
+    daemon = start_stopped_daemon(launcher, fixture, "guest-endpoint-death")
+    try:
+        fixture.validate_retired_runtime_root()
+        if first == "worker":
+            os.kill(daemon.worker.pid, signal.SIGKILL)
+            os.kill(daemon.supervisor.pid, signal.SIGCONT)
+            expected = {daemon.worker.pid: signal.SIGKILL, daemon.supervisor.pid: 3 << 8}
+        elif first == "launcher":
+            os.kill(daemon.supervisor.pid, signal.SIGKILL)
+            os.kill(daemon.worker.pid, signal.SIGCONT)
+            expected = {daemon.supervisor.pid: signal.SIGKILL, daemon.worker.pid: 1 << 8}
+        else:
+            _fail("daemon-death-order")
+        statuses = daemon.wait()
+        if statuses != expected:
+            _fail("daemon-death-status")
+        wait_for_exact_process_exit(daemon.worker)
+        wait_for_exact_process_exit(daemon.supervisor)
+        fixture.validate_retired_runtime_root()
+        fixture.validate_fault_outputs()
+    finally:
+        daemon.cleanup()
+
+
+def assert_daemon_signal(
+    launcher: Path,
+    fixture: Fixture,
+    target: str,
+    signal_number: int,
+) -> None:
+    daemon = start_stopped_daemon(launcher, fixture, "guest-endpoint-death")
+    try:
+        fixture.validate_retired_runtime_root()
+        if target == "supervisor" and signal_number in (signal.SIGINT, signal.SIGTERM):
+            os.kill(daemon.supervisor.pid, signal_number)
+            expected = {daemon.supervisor.pid: 3 << 8, daemon.worker.pid: 1 << 8}
+        elif target == "worker" and signal_number == signal.SIGHUP:
+            os.kill(daemon.worker.pid, signal_number)
+            expected = {
+                daemon.supervisor.pid: 3 << 8,
+                daemon.worker.pid: WORKER_SIGHUP_EXIT_CODE << 8,
+            }
+        else:
+            _fail("daemon-signal-case")
+        daemon.resume()
+        statuses = daemon.wait()
+        if statuses != expected:
+            _fail("daemon-signal-status")
+        wait_for_exact_process_exit(daemon.worker)
+        wait_for_exact_process_exit(daemon.supervisor)
+        fixture.validate_retired_runtime_root()
+        fixture.validate_fault_outputs()
+    finally:
+        daemon.cleanup()
+
+
+def run_daemon_concurrent_survival(
+    launcher: Path,
+    killed_fixture: Fixture,
+    surviving_fixture: Fixture,
+) -> None:
+    killed = start_stopped_daemon(launcher, killed_fixture, "guest-endpoint-death")
+    surviving: StoppedDaemon | None = None
+    try:
+        surviving = start_stopped_daemon(launcher, surviving_fixture)
+        killed_fixture.validate_retired_runtime_root()
+        surviving_fixture.validate_retired_runtime_root()
+        if len(
+            {
+                killed.supervisor.pid,
+                killed.worker.pid,
+                surviving.supervisor.pid,
+                surviving.worker.pid,
+            }
+        ) != 4:
+            _fail("daemon-concurrency-process-ledger")
+        os.kill(killed.supervisor.pid, signal.SIGKILL)
+        os.kill(killed.worker.pid, signal.SIGCONT)
+        surviving.resume()
+        killed_statuses = killed.wait()
+        surviving_statuses = surviving.wait()
+        if killed_statuses != {
+            killed.supervisor.pid: signal.SIGKILL,
+            killed.worker.pid: 1 << 8,
+        } or surviving_statuses != {
+            surviving.supervisor.pid: 0,
+            surviving.worker.pid: 0,
+        }:
+            _fail("daemon-concurrency-status")
+        for process in (
+            killed.worker,
+            killed.supervisor,
+            surviving.worker,
+            surviving.supervisor,
+        ):
+            wait_for_exact_process_exit(process)
+        killed_fixture.validate_retired_runtime_root()
+        surviving_fixture.validate_retired_runtime_root()
+        killed_fixture.validate_fault_outputs()
+        surviving_fixture.validate_success_outputs()
+    finally:
+        killed.cleanup()
+        if surviving is not None:
+            surviving.cleanup()
+
+
 def wait_for_stopped_worker(process: subprocess.Popen[bytes]) -> int:
     deadline = time.monotonic() + BARRIER_TIMEOUT_SECONDS
     observed: int | None = None
@@ -1342,6 +2209,81 @@ def run_matrix(
                 assert_success(launcher, fixture)
                 verify_resources(resources, resource_ledger)
                 fixture.cleanup()
+        for case in MODE_CASES:
+            fixture = Fixture(resources, case, target_uid, target_gid)
+            live.append(fixture)
+            assert_daemon_success(launcher, fixture)
+            verify_resources(resources, resource_ledger)
+            fixture.cleanup()
+        for fault in DAEMON_RETIREMENT_FAULTS:
+            fixture = Fixture(
+                resources,
+                mode_for("no-api"),
+                target_uid,
+                target_gid,
+            )
+            live.append(fixture)
+            assert_daemon_retirement_fault(launcher, fixture, fault)
+            verify_resources(resources, resource_ledger)
+            fixture.cleanup()
+        for workload in ("no-api", "api"):
+            for first in ("worker", "launcher"):
+                fixture = Fixture(
+                    resources,
+                    mode_for(workload),
+                    target_uid,
+                    target_gid,
+                )
+                live.append(fixture)
+                assert_daemon_endpoint_death(launcher, fixture, first)
+                verify_resources(resources, resource_ledger)
+                fixture.cleanup()
+        for target, signal_number in (
+            ("supervisor", signal.SIGINT),
+            ("supervisor", signal.SIGTERM),
+            ("worker", signal.SIGHUP),
+        ):
+            fixture = Fixture(
+                resources,
+                mode_for("no-api"),
+                target_uid,
+                target_gid,
+            )
+            live.append(fixture)
+            assert_daemon_signal(launcher, fixture, target, signal_number)
+            verify_resources(resources, resource_ledger)
+            fixture.cleanup()
+        replacement_fixture = Fixture(
+            resources,
+            mode_for("no-api"),
+            target_uid,
+            target_gid,
+        )
+        live.append(replacement_fixture)
+        assert_daemon_namespace_replacement(launcher, replacement_fixture)
+        verify_resources(resources, resource_ledger)
+        replacement_fixture.cleanup()
+        killed_fixture = Fixture(
+            resources,
+            mode_for("no-api"),
+            target_uid,
+            target_gid,
+        )
+        surviving_fixture = Fixture(
+            resources,
+            mode_for("api"),
+            target_uid,
+            target_gid,
+        )
+        live.extend((killed_fixture, surviving_fixture))
+        run_daemon_concurrent_survival(
+            launcher,
+            killed_fixture,
+            surviving_fixture,
+        )
+        verify_resources(resources, resource_ledger)
+        killed_fixture.cleanup()
+        surviving_fixture.cleanup()
         for workload in ("no-api", "api"):
             fixtures = [
                 Fixture(resources, mode_for(workload), target_uid, target_gid)

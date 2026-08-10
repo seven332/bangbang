@@ -230,6 +230,15 @@ pub(crate) enum NotifierEvent {
     ParentLost,
 }
 
+pub(crate) trait SessionNotifier {
+    fn as_raw_fd(&self) -> Result<libc::c_int, LauncherError>;
+    fn deadline(&self) -> Option<Instant>;
+    fn is_awaiting_ready(&self) -> bool;
+    fn notify_ready(&mut self, supervisor_pid: libc::pid_t) -> Result<(), LauncherError>;
+    fn drain(&mut self) -> Result<NotifierEvent, LauncherError>;
+    fn close_transport(&mut self);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NotifierState {
     AwaitReady,
@@ -419,6 +428,32 @@ impl DaemonNotifier {
         if let Some(stream) = self.stream.take() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
+    }
+}
+
+impl SessionNotifier for DaemonNotifier {
+    fn as_raw_fd(&self) -> Result<libc::c_int, LauncherError> {
+        Self::as_raw_fd(self)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        Self::deadline(self)
+    }
+
+    fn is_awaiting_ready(&self) -> bool {
+        Self::is_awaiting_ready(self)
+    }
+
+    fn notify_ready(&mut self, supervisor_pid: libc::pid_t) -> Result<(), LauncherError> {
+        Self::notify_ready(self, supervisor_pid)
+    }
+
+    fn drain(&mut self) -> Result<NotifierEvent, LauncherError> {
+        Self::drain(self)
+    }
+
+    fn close_transport(&mut self) {
+        Self::close_transport(self);
     }
 }
 
@@ -619,6 +654,8 @@ impl FailureCategory {
             | LauncherError::VhostUserBroker
             | LauncherError::BlockControlBroker => Self::Session,
             LauncherError::WorkerPolicy | LauncherError::RuntimeNamespace => Self::Runtime,
+            #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+            LauncherError::ElevatedDaemonHandoff(_) => Self::Other,
             LauncherError::SignalSetup(_)
             | LauncherError::DaemonHandoff
             | LauncherError::WorkerWait(_)
@@ -773,6 +810,61 @@ mod tests {
             assert!(!debug.contains("1234567891"));
             assert!(!debug.contains("1234567893"));
             assert!(!debug.contains("42"));
+        }
+    }
+
+    #[test]
+    fn ordinary_handoff_frames_keep_their_golden_bytes() {
+        let cases = [
+            (
+                HandoffFrame {
+                    sequence: 0,
+                    message: HandoffMessage::Hello,
+                },
+                "42424831000100010000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                HandoffFrame {
+                    sequence: 0,
+                    message: HandoffMessage::Start {
+                        monotonic_us: 0x0102_0304_0506_0708,
+                        parent_cpu_us: 0x1112_1314_1516_1718,
+                    },
+                },
+                "42424831000100020000000000000000010203040506070811121314151617180000000000000000",
+            ),
+            (
+                HandoffFrame {
+                    sequence: 1,
+                    message: HandoffMessage::Ready { supervisor_pid: 42 },
+                },
+                "424248310001000300000000000000010000002a0000000000000000000000000000000000000000",
+            ),
+            (
+                HandoffFrame {
+                    sequence: 1,
+                    message: HandoffMessage::Ack { supervisor_pid: 42 },
+                },
+                "424248310001000400000000000000010000002a0000000000000000000000000000000000000000",
+            ),
+            (
+                HandoffFrame {
+                    sequence: 1,
+                    message: HandoffMessage::Failed {
+                        category: FailureCategory::Session,
+                    },
+                },
+                "42424831000100050000000000000001050000000000000000000000000000000000000000000000",
+            ),
+        ];
+        for (frame, expected) in cases {
+            let actual = encode_frame(frame).expect("ordinary frame should encode");
+            let encoded = actual
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(encoded, expected);
+            assert_eq!(decode_frame(&actual), Ok(frame));
         }
     }
 
