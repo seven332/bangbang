@@ -359,6 +359,12 @@ fn run(
             .with_snapshot_capture_cancellation(snapshot_cancellation.clone())
             .with_grant_authority(grant_authority.clone())
             .with_vmnet_authority(vmnet_authority);
+            #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+            let vmm = vmm.with_guest_evidence_authority(
+                contained
+                    .as_ref()
+                    .and_then(ContainedSession::guest_evidence_authority),
+            );
             let signal_metrics = vmm.process_signal_metrics();
             #[cfg(target_os = "macos")]
             let mut vmm = vmm
@@ -410,6 +416,15 @@ fn run(
                     fatal_signal_handlers =
                         Some(FatalSignalHandlers::install(signal_metrics.clone())?);
                     sigpipe_signal_handler = Some(SigpipeSignalHandler::install(signal_metrics)?);
+                    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+                    if no_api
+                        && config_file.is_some()
+                        && let Some(session) = contained.as_ref()
+                    {
+                        session
+                            .before_first_guest_resource_claim()
+                            .map_err(|_| ProcessError::ContainedSession)?;
+                    }
                     if apply_startup_config_file_with_cancel(
                         &mut vmm,
                         config_file.as_deref(),
@@ -455,6 +470,12 @@ fn run(
 
                         #[cfg(target_os = "macos")]
                         let (_anchored_api_guard, server) = {
+                            #[cfg(feature = "elevated-bootstrap-probe")]
+                            if let Some(session) = contained.as_ref() {
+                                session
+                                    .before_first_guest_resource_claim()
+                                    .map_err(|_| ProcessError::ContainedSession)?;
+                            }
                             let claim = contained
                                 .as_ref()
                                 .and_then(ContainedSession::directory_grant_authority)
@@ -467,6 +488,12 @@ fn run(
                                 .transpose()
                                 .map_err(|_| ProcessError::ContainedSession)?
                                 .flatten();
+                            #[cfg(feature = "elevated-bootstrap-probe")]
+                            if let Some(session) = contained.as_ref() {
+                                session
+                                    .after_guest_api_directory_claim()
+                                    .map_err(|_| ProcessError::ContainedSession)?;
+                            }
                             match claim {
                                 Some(claim) => {
                                     let namespace = contained
@@ -539,6 +566,11 @@ fn run(
                         result.and_then(|()| contained_wakeup_result(contained))
                     })()
                 })();
+                #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+                let result = result.and_then(|()| {
+                    vmm.finish_elevated_guest()
+                        .map_err(|_| ProcessError::ContainedSession)
+                });
                 let category = process_terminal_category(&result, contained.as_ref());
                 finish_process_with_terminal_observability(&mut vmm, result, category)
             }));

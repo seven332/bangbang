@@ -30,6 +30,7 @@ const CREDENTIAL_WORKER_ARTIFACT: &str =
     "bangbang-elevated-credential-worker-v1-credential-drop-BBC1-BBG1-restore-groups";
 const RUNTIME_WORKER_ARTIFACT: &str = "bangbang-elevated-runtime-worker-v2-runtime-drop-runtime-retain-root-runtime-unmapped-BBA1-BBN1-adopted-session---bangbang-internal-grant-probe-v1-target-runtime";
 const RUNTIME_WORKER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+const GUEST_WORKER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-guest-worker-boundaries-v1-guest-no-api-drop-guest-no-api-retain-root-guest-no-api-unmapped-guest-api-drop-guest-api-retain-root-guest-api-unmapped-BBW1-guest-resource-witness-guest-grant-accepted-guest-transport-contamination-guest-hvf-witness-guest-terminal-evidence-bangbang-grant:evidence-guest-kernel-bangbang-grant:evidence-guest-serial";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProbeError {
@@ -161,6 +162,7 @@ fn run_credential_pair(
     std::hint::black_box(CREDENTIAL_WORKER_ARTIFACT);
     std::hint::black_box(RUNTIME_WORKER_ARTIFACT);
     std::hint::black_box(RUNTIME_WORKER_BOUNDARY_ARTIFACT);
+    std::hint::black_box(GUEST_WORKER_BOUNDARY_ARTIFACT);
     if stream.set_read_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(CREDENTIAL_TIMEOUT)).is_err()
     {
@@ -781,7 +783,13 @@ fn execute(config: ProbeBootstrap) -> Result<(), ProbeError> {
         | bangbang_session::elevated_probe::ProbeMode::CredentialControl
         | bangbang_session::elevated_probe::ProbeMode::RuntimeDrop
         | bangbang_session::elevated_probe::ProbeMode::RuntimeRetainRoot
-        | bangbang_session::elevated_probe::ProbeMode::RuntimeUnmapped => {
+        | bangbang_session::elevated_probe::ProbeMode::RuntimeUnmapped
+        | bangbang_session::elevated_probe::ProbeMode::GuestNoApiDrop
+        | bangbang_session::elevated_probe::ProbeMode::GuestNoApiRetainRoot
+        | bangbang_session::elevated_probe::ProbeMode::GuestNoApiUnmapped
+        | bangbang_session::elevated_probe::ProbeMode::GuestApiDrop
+        | bangbang_session::elevated_probe::ProbeMode::GuestApiRetainRoot
+        | bangbang_session::elevated_probe::ProbeMode::GuestApiUnmapped => {
             return Err(invalid(ProbeStage::InitialIdentity));
         }
     }

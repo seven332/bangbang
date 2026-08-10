@@ -6,10 +6,12 @@ use std::path::{Component, Path, PathBuf};
 
 use bangbang_session::elevated_probe::{
     LAUNCHER_ACTIVATION, ProbeBootstrap, ProbeErrorCategory, ProbeMode, ProbeStage, RuntimeFault,
-    WORKER_ACTIVATION,
+    RuntimeWorkload, WORKER_ACTIVATION,
 };
 use bangbang_session::macos::runtime::ExplicitRuntimeRoot;
 use bangbang_session::{ObjectIdentity, SessionId};
+
+use crate::grant_manifest::{ElevatedGuestContract, PreparedGrantBatch};
 
 use crate::{BundleLayout, LauncherError};
 
@@ -18,6 +20,7 @@ const TARGET_UID_OPTION: &str = "--target-uid";
 const TARGET_GID_OPTION: &str = "--target-gid";
 const MODE_OPTION: &str = "--mode";
 const FAULT_OPTION: &str = "--fault";
+const ADOPTION_BARRIER_OPTION: &str = "--bangbang-internal-post-adoption-stop-v1";
 const DELIMITER: &str = "--";
 const MAX_ROOT_PATH_BYTES: usize = 1024;
 const ROOT_CHILD_PREFIX: &str = "bangbang-elevated-probe.";
@@ -43,6 +46,7 @@ pub(crate) struct Config {
     target_gid: u32,
     mode: ProbeMode,
     fault: RuntimeFault,
+    adoption_barrier: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -87,21 +91,13 @@ impl Config {
             .and_then(|value| value.to_str())
             .and_then(|value| ProbeMode::parse(value, target_uid, target_gid))
             .ok_or(LauncherError::InvalidLaunchPolicy)?;
-        let (fault, delimiter) = if args.get(9) == Some(&OsString::from(DELIMITER)) {
-            (RuntimeFault::None, 9)
-        } else if mode.continues_runtime()
-            && args.get(9) == Some(&OsString::from(FAULT_OPTION))
-            && args.get(11) == Some(&OsString::from(DELIMITER))
-        {
-            let fault = args
-                .get(10)
-                .and_then(|value| value.to_str())
-                .and_then(RuntimeFault::parse)
-                .ok_or(LauncherError::InvalidLaunchPolicy)?;
-            (fault, 11)
-        } else {
-            return Err(LauncherError::InvalidLaunchPolicy);
-        };
+        let (fault, adoption_barrier, tail_delimiter) = parse_runtime_options(
+            args.get(9..).ok_or(LauncherError::InvalidLaunchPolicy)?,
+            mode,
+        )?;
+        let delimiter = 9_usize
+            .checked_add(tail_delimiter)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
         if !mode.continues_runtime() && fault != RuntimeFault::None {
             return Err(LauncherError::InvalidLaunchPolicy);
         }
@@ -148,6 +144,7 @@ impl Config {
                 target_gid,
                 mode,
                 fault,
+                adoption_barrier,
             }),
             args.into_iter().skip(delimiter + 1).collect(),
         ))
@@ -162,6 +159,59 @@ impl Config {
         }
         worker_args.insert(0, OsString::from(WORKER_ACTIVATION));
         Ok(())
+    }
+
+    pub(crate) fn validate_runtime_contract(
+        &self,
+        worker_args: &[OsString],
+        grants: &PreparedGrantBatch,
+    ) -> Result<Option<ElevatedGuestContract>, LauncherError> {
+        use bangbang_session::elevated_probe::{
+            GUEST_API_SOCKET_REFERENCE, GUEST_CONFIG_REFERENCE, RuntimeWorkload,
+        };
+
+        let workload = self
+            .mode
+            .runtime_workload()
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        let exact_args: &[&str] = match workload {
+            RuntimeWorkload::RepresentativeGrants => {
+                &["--bangbang-internal-grant-probe-v1", "target-runtime"]
+            }
+            RuntimeWorkload::GuestNoApi => &["--config-file", GUEST_CONFIG_REFERENCE, "--no-api"],
+            RuntimeWorkload::GuestApi => &["--api-sock", GUEST_API_SOCKET_REFERENCE],
+        };
+        if worker_args.len() != exact_args.len()
+            || worker_args
+                .iter()
+                .zip(exact_args)
+                .any(|(actual, expected)| actual != OsStr::new(expected))
+        {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        grants.validate_elevated_runtime_contract(workload, self.target_uid, self.target_gid)
+    }
+
+    pub(crate) fn stop_after_adoption(&self) -> Result<bool, LauncherError> {
+        if !self.adoption_barrier {
+            return Ok(false);
+        }
+        if self.fault != RuntimeFault::None
+            || self
+                .mode
+                .runtime_workload()
+                .is_none_or(|workload| !workload.is_guest())
+        {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        // SAFETY: `SIGSTOP` has fixed kernel semantics and takes no pointer.
+        // This feature-only launcher is still single-threaded and has not
+        // spawned its worker. The exact-root certifier resumes this same PID
+        // only after adversarially replacing the already adopted pathnames.
+        if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+            return Err(LauncherError::SessionProtocol);
+        }
+        Ok(true)
     }
 
     pub(crate) fn root_fd(&self) -> RawFd {
@@ -395,6 +445,35 @@ fn parse_u32(value: Option<&OsString>) -> Result<u32, LauncherError> {
         .ok_or(LauncherError::InvalidLaunchPolicy)
 }
 
+fn parse_runtime_options(
+    args: &[OsString],
+    mode: ProbeMode,
+) -> Result<(RuntimeFault, bool, usize), LauncherError> {
+    if args.first() == Some(&OsString::from(DELIMITER)) {
+        return Ok((RuntimeFault::None, false, 0));
+    }
+    if mode.continues_runtime()
+        && args.first() == Some(&OsString::from(FAULT_OPTION))
+        && args.get(2) == Some(&OsString::from(DELIMITER))
+    {
+        let fault = args
+            .get(1)
+            .and_then(|value| value.to_str())
+            .and_then(RuntimeFault::parse)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        return Ok((fault, false, 2));
+    }
+    if mode
+        .runtime_workload()
+        .is_some_and(RuntimeWorkload::is_guest)
+        && args.first() == Some(&OsString::from(ADOPTION_BARRIER_OPTION))
+        && args.get(1) == Some(&OsString::from(DELIMITER))
+    {
+        return Ok((RuntimeFault::None, true, 1));
+    }
+    Err(LauncherError::InvalidLaunchPolicy)
+}
+
 fn validate_initial_root() -> Result<(), LauncherError> {
     // SAFETY: Credential getters have no pointer or ownership contract.
     let identities = unsafe {
@@ -586,6 +665,7 @@ mod tests {
             target_gid: 1_234_567_893,
             mode: ProbeMode::Drop,
             fault: RuntimeFault::None,
+            adoption_barrier: false,
         };
         let output = format!("{config:?}");
         assert_eq!(output, "ElevatedProbeConfig(<redacted>)");
@@ -629,6 +709,35 @@ mod tests {
                 Err(LauncherError::InvalidLaunchPolicy)
             );
         }
+    }
+
+    #[test]
+    fn post_adoption_stop_is_closed_to_unfaulted_guest_modes() {
+        let barrier = vec![
+            OsString::from(ADOPTION_BARRIER_OPTION),
+            OsString::from(DELIMITER),
+            OsString::from("worker-argument"),
+        ];
+        for mode in [ProbeMode::GuestNoApiDrop, ProbeMode::GuestApiDrop] {
+            assert_eq!(
+                parse_runtime_options(&barrier, mode),
+                Ok((RuntimeFault::None, true, 1))
+            );
+        }
+        assert_eq!(
+            parse_runtime_options(&barrier, ProbeMode::RuntimeDrop),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+        let fault_then_barrier = vec![
+            OsString::from(FAULT_OPTION),
+            OsString::from("guest-oracle"),
+            OsString::from(ADOPTION_BARRIER_OPTION),
+            OsString::from(DELIMITER),
+        ];
+        assert_eq!(
+            parse_runtime_options(&fault_then_barrier, ProbeMode::GuestNoApiDrop),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
     }
 
     #[test]

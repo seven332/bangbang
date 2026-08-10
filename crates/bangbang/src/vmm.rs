@@ -184,6 +184,8 @@ use bangbang_runtime::pmem::{
     PmemUpdate, PmemUpdateError, PmemUpdateInput,
 };
 use bangbang_runtime::rtc::RtcMmioLayout;
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+use bangbang_runtime::serial::SerialOutput;
 use bangbang_runtime::serial::{
     CaptureReadySerialState, SerialConfig, SerialConfigError, SerialConfigInput, SerialMmioDevice,
     SerialOutputFile, SerialStdio, SerialStdioInput, SerialStdioRestoration,
@@ -320,6 +322,8 @@ use bangbang_session::{GrantAccess, GrantId, ResourceRole, SessionId, VmnetAutho
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
 #[cfg(target_os = "macos")]
 use crate::contained_session::ContainedSnapshotRestoreAuthority;
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+use crate::contained_session::GuestEvidenceAuthority;
 #[cfg(target_os = "macos")]
 use crate::contained_session::{
     ClaimedSocketDirectory, ClaimedVhostUserSocket, DirectoryGrantAuthority, PagerGrantAuthority,
@@ -5797,6 +5801,30 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         self.starter.process_serial_stdio = true;
         self
     }
+
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    pub(crate) fn with_guest_evidence_authority(
+        mut self,
+        authority: Option<GuestEvidenceAuthority>,
+    ) -> Self {
+        self.starter.guest_evidence = authority;
+        self
+    }
+
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    pub(crate) fn finish_elevated_guest(
+        &self,
+    ) -> Result<(), crate::contained_session::ContainedSessionError> {
+        let Some(authority) = &self.starter.guest_evidence else {
+            return Ok(());
+        };
+        let oracle = self
+            .starter
+            .serial_output
+            .bytes()
+            .map_err(|_| crate::contained_session::ContainedSessionError)?;
+        authority.finish_guest(&oracle)
+    }
 }
 
 impl<S> ProcessVmm<S>
@@ -10909,6 +10937,23 @@ pub(crate) struct HvfInstanceStartExecutor {
     process_serial_stdio: bool,
     serial_output: SharedSerialOutputBuffer,
     active_serial_output: Option<SharedSerialOutput>,
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    guest_evidence: Option<GuestEvidenceAuthority>,
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+#[derive(Debug)]
+struct GuestEvidenceSerialOutput {
+    output: SerialOutputFile,
+    evidence: SharedSerialOutputBuffer,
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+impl SerialOutput for GuestEvidenceSerialOutput {
+    fn write_byte(&mut self, byte: u8) -> Result<(), bangbang_runtime::serial::SerialOutputError> {
+        self.output.write_byte(byte)?;
+        self.evidence.write_byte(byte)
+    }
 }
 
 impl HvfInstanceStartExecutor {
@@ -11032,10 +11077,22 @@ impl HvfInstanceStartExecutor {
             controller.serial_config().serial_out_path(),
             provided_output,
         ) {
-            (Some(_), Some(output)) => Ok(SharedSerialOutput::with_rate_limiter(
-                output,
-                controller.serial_config().rate_limiter(),
-            )),
+            (Some(_), Some(output)) => {
+                #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+                if self.guest_evidence.is_some() {
+                    return Ok(SharedSerialOutput::with_rate_limiter(
+                        GuestEvidenceSerialOutput {
+                            output,
+                            evidence: self.serial_output.clone(),
+                        },
+                        controller.serial_config().rate_limiter(),
+                    ));
+                }
+                Ok(SharedSerialOutput::with_rate_limiter(
+                    output,
+                    controller.serial_config().rate_limiter(),
+                ))
+            }
             (Some(path), None) => Ok(SharedSerialOutput::with_rate_limiter(
                 SerialOutputFile::open(path)?,
                 controller.serial_config().rate_limiter(),
@@ -15588,6 +15645,14 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             )?;
         startup_resources =
             startup_resources.with_network_device_profiles(packet_io.device_profiles());
+        #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+        if let Some(authority) = &self.guest_evidence {
+            authority.before_hvf_create().map_err(|_| {
+                InstanceStartError::terminal(BackendError::Hypervisor(
+                    "elevated guest HVF witness failed".to_owned(),
+                ))
+            })?;
+        }
         let session = match OwnedHvfArm64BootSession::new_with_startup_resources(
             controller,
             boot_session_config,
@@ -15607,6 +15672,15 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 ));
             }
         };
+        #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+        if let Some(authority) = &self.guest_evidence
+            && authority.report_hvf_created().is_err()
+        {
+            drop(session);
+            return Err(InstanceStartError::terminal(BackendError::Hypervisor(
+                "elevated guest HVF report failed".to_owned(),
+            )));
+        }
         let session = ProcessHvfBootSession::new_with_vmnet_authority(
             session,
             packet_io,

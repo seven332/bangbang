@@ -109,6 +109,52 @@ const ELEVATED_RUNTIME_AUTHORITY_RECORD: &[u8] = b"BBN1";
 const ELEVATED_RUNTIME_GRANT_CASE: &[u8] = b"target-runtime";
 const ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
 const ELEVATED_RUNTIME_WORKER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+const ELEVATED_GUEST_MARKERS: &[&[u8]] = &[
+    b"guest-no-api-drop",
+    b"guest-no-api-retain-root",
+    b"guest-no-api-unmapped",
+    b"guest-api-drop",
+    b"guest-api-retain-root",
+    b"guest-api-unmapped",
+    b"BBW1",
+    b"guest-grant-contract",
+    b"guest-grant-accepted",
+    b"guest-transport-contamination",
+    b"guest-resource-witness",
+    b"api-socket-publication",
+    b"api-logger-configuration",
+    b"api-metrics-configuration",
+    b"api-serial-configuration",
+    b"api-machine-configuration",
+    b"api-boot-configuration",
+    b"api-drive-configuration",
+    b"api-instance-start",
+    b"no-api-startup",
+    b"guest-hvf-witness",
+    b"guest-hvf-create",
+    b"guest-execution",
+    b"guest-oracle",
+    b"guest-poweroff",
+    b"guest-timeout",
+    b"guest-endpoint-death",
+    b"guest-terminal-evidence",
+    b"guest-cleanup",
+    b"api-boundary",
+    b"hvf-boundary",
+    b"guest-boundary",
+    b"evidence-guest-config",
+    b"evidence-guest-kernel",
+    b"evidence-guest-initrd",
+    b"evidence-guest-rootfs",
+    b"evidence-guest-logger",
+    b"evidence-guest-metrics",
+    b"evidence-guest-serial",
+    b"evidence-guest-api",
+    b"BANGBANG_ROOTFS_WORKFLOW_OK",
+    b"--bangbang-internal-post-adoption-stop-v1",
+    b"resources=consumed workload=no-api",
+    b"resources=consumed workload=api",
+];
 const ELEVATED_PROBE_MARKER: &str = "elevated-bootstrap-probe.enabled";
 const ELEVATED_RUNTIME_MARKER: &str = "target-runtime-grant-probe.enabled";
 const GRANT_PROBE_OUTSIDE: &str = "bangbang-grant-probe-outside";
@@ -13098,7 +13144,10 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_RUNTIME_GRANT_CASE,
             ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
             ELEVATED_RUNTIME_WORKER_BOUNDARIES,
-        ] {
+        ]
+        .into_iter()
+        .chain(ELEVATED_GUEST_MARKERS.iter().copied())
+        {
             assert!(
                 !artifact
                     .windows(marker.len())
@@ -13143,7 +13192,10 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_RUNTIME_GRANT_CASE,
             ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
             ELEVATED_RUNTIME_WORKER_BOUNDARIES,
-        ] {
+        ]
+        .into_iter()
+        .chain(ELEVATED_GUEST_MARKERS.iter().copied())
+        {
             assert!(
                 !diagnostics
                     .windows(marker.len())

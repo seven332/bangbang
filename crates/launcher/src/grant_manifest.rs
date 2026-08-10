@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::OpenOptions;
+#[cfg(feature = "elevated-bootstrap-probe")]
+use std::io;
 use std::io::Read;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -225,15 +227,22 @@ fn parse_access(value: &str) -> Result<GrantAccess, LauncherError> {
 struct PreparedRecord {
     record: GrantRecord,
     descriptor: Option<OwnedFd>,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    evidence_readback: Option<OwnedFd>,
 }
 
 impl std::fmt::Debug for PreparedRecord {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PreparedRecord")
+        let mut debug = formatter.debug_struct("PreparedRecord");
+        debug
             .field("record", &self.record)
-            .field("descriptor", &self.descriptor.as_ref().map(|_| "<owned>"))
-            .finish()
+            .field("descriptor", &self.descriptor.as_ref().map(|_| "<owned>"));
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        debug.field(
+            "evidence_readback",
+            &self.evidence_readback.as_ref().map(|_| "<owned>"),
+        );
+        debug.finish()
     }
 }
 
@@ -242,6 +251,41 @@ pub(crate) struct PreparedGrantBatch {
     batch: BatchId,
     grant_count: u16,
     records: Vec<PreparedRecord>,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Clone, Copy)]
+pub(crate) struct ElevatedGuestContract {
+    workload: bangbang_session::elevated_probe::RuntimeWorkload,
+    api_anchor: Option<SocketDirectoryAnchor>,
+    serial_evidence_descriptor: RawFd,
+    serial_evidence_identity: ObjectIdentity,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl std::fmt::Debug for ElevatedGuestContract {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ElevatedGuestContract(<redacted>)")
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl ElevatedGuestContract {
+    pub(crate) const fn workload(self) -> bangbang_session::elevated_probe::RuntimeWorkload {
+        self.workload
+    }
+
+    pub(crate) const fn api_anchor(self) -> Option<SocketDirectoryAnchor> {
+        self.api_anchor
+    }
+
+    pub(crate) const fn serial_evidence_descriptor(self) -> RawFd {
+        self.serial_evidence_descriptor
+    }
+
+    pub(crate) const fn serial_evidence_identity(self) -> ObjectIdentity {
+        self.serial_evidence_identity
+    }
 }
 
 /// Borrowed exact anchor metadata for one socket-directory grant.
@@ -393,6 +437,14 @@ impl PreparedGrantBatch {
             } else {
                 open_resource(&grant)?
             };
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            let evidence_readback = if grant.role == ResourceRole::SerialSink
+                && grant.access == GrantAccess::WriteOnly
+            {
+                Some(open_evidence_readback(&grant, prepared.identity)?)
+            } else {
+                None
+            };
             if !identities.insert(prepared.identity) {
                 return Err(LauncherError::GrantPreparation);
             }
@@ -426,6 +478,8 @@ impl PreparedGrantBatch {
                         fragment_count,
                     },
                     descriptor: Some(prepared.descriptor),
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    evidence_readback,
                 });
                 for (index, fragment) in bookmark.chunks(chunk_bytes).enumerate() {
                     let offset = index
@@ -439,6 +493,8 @@ impl PreparedGrantBatch {
                             bytes: fragment.to_vec(),
                         },
                         descriptor: None,
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        evidence_readback: None,
                     });
                 }
             } else if grant.role == ResourceRole::SnapshotPagerStream {
@@ -455,6 +511,8 @@ impl PreparedGrantBatch {
                         peer: prepared.peer.ok_or(LauncherError::GrantPreparation)?,
                     },
                     descriptor: Some(prepared.descriptor),
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    evidence_readback,
                 });
             } else {
                 records.push(PreparedRecord {
@@ -468,6 +526,8 @@ impl PreparedGrantBatch {
                         block_device: prepared.block_device,
                     },
                     descriptor: Some(prepared.descriptor),
+                    #[cfg(feature = "elevated-bootstrap-probe")]
+                    evidence_readback,
                 });
             }
         }
@@ -486,6 +546,8 @@ impl PreparedGrantBatch {
                     bookmark_bytes,
                 },
                 descriptor: None,
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                evidence_readback: None,
             },
         );
         records.push(PreparedRecord {
@@ -495,6 +557,8 @@ impl PreparedGrantBatch {
                 bookmark_bytes,
             },
             descriptor: None,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            evidence_readback: None,
         });
         Ok(Self {
             batch,
@@ -514,6 +578,349 @@ impl PreparedGrantBatch {
 
     pub(crate) fn grant_count(&self) -> u16 {
         self.grant_count
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub(crate) fn validate_elevated_runtime_contract(
+        &self,
+        workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        target_uid: u32,
+        target_gid: u32,
+    ) -> Result<Option<ElevatedGuestContract>, LauncherError> {
+        self.validate_elevated_runtime_contract_inner(workload, target_uid, target_gid, true)
+    }
+
+    #[cfg(all(feature = "elevated-bootstrap-probe", test))]
+    fn validate_elevated_runtime_contract_for_test(
+        &self,
+        workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        target_uid: u32,
+        target_gid: u32,
+    ) -> Result<Option<ElevatedGuestContract>, LauncherError> {
+        self.validate_elevated_runtime_contract_inner(workload, target_uid, target_gid, false)
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn validate_elevated_runtime_contract_inner(
+        &self,
+        workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        target_uid: u32,
+        target_gid: u32,
+        validate_resource_seals: bool,
+    ) -> Result<Option<ElevatedGuestContract>, LauncherError> {
+        use bangbang_session::elevated_probe::{
+            GUEST_API_DIRECTORY_GRANT_ID, GUEST_CONFIG_GRANT_ID, GUEST_INITRD_GRANT_ID,
+            GUEST_KERNEL_GRANT_ID, GUEST_LOGGER_GRANT_ID, GUEST_METRICS_GRANT_ID,
+            GUEST_ROOTFS_GRANT_ID, GUEST_SERIAL_GRANT_ID, RuntimeWorkload,
+        };
+
+        const CONFIG_SEAL: ElevatedResourceSeal = ElevatedResourceSeal::new(
+            655,
+            [
+                0x19, 0x6f, 0xc8, 0xe9, 0x22, 0xc2, 0x20, 0x81, 0x7f, 0x2d, 0x30, 0x97, 0xb2, 0x5d,
+                0xe2, 0x43, 0xe3, 0xfd, 0xcf, 0xd6, 0xe1, 0xe5, 0xb7, 0xaf, 0x22, 0x33, 0x71, 0xe3,
+                0x53, 0x10, 0x96, 0xa6,
+            ],
+        );
+        const KERNEL_SEAL: ElevatedResourceSeal = ElevatedResourceSeal::new(
+            17_111_552,
+            [
+                0xe3, 0x54, 0x4b, 0x10, 0x60, 0x3a, 0xcb, 0xf3, 0xdb, 0x49, 0x2c, 0xb5, 0x2e, 0x00,
+                0x0d, 0x22, 0xba, 0x20, 0x2c, 0xb4, 0xb6, 0x3b, 0x9a, 0xdd, 0x02, 0x75, 0x65, 0x68,
+                0x3e, 0x11, 0xc5, 0x91,
+            ],
+        );
+        const INITRD_SEAL: ElevatedResourceSeal = ElevatedResourceSeal::new(
+            54_272,
+            [
+                0x10, 0x57, 0x07, 0x9b, 0x07, 0x24, 0x52, 0xa7, 0x62, 0x39, 0x61, 0x13, 0x86, 0x7e,
+                0xbc, 0x5a, 0xfa, 0x69, 0x9a, 0x0b, 0x5c, 0x31, 0x21, 0xe2, 0x89, 0x70, 0xec, 0xad,
+                0xd4, 0xba, 0x11, 0xd0,
+            ],
+        );
+        const ROOTFS_SEAL: ElevatedResourceSeal = ElevatedResourceSeal::new(
+            105_332_736,
+            [
+                0x0e, 0xfb, 0x6a, 0x3f, 0xf2, 0x98, 0x2b, 0xaa, 0x6c, 0xa7, 0xe3, 0xd9, 0x40, 0x96,
+                0x65, 0x16, 0xba, 0x7d, 0xdd, 0x2d, 0xf5, 0xde, 0xb3, 0xe6, 0xc2, 0x16, 0x1d, 0x36,
+                0x9a, 0x15, 0xd6, 0x08,
+            ],
+        );
+
+        const REPRESENTATIVE: &[ElevatedGrantSpec] = &[
+            ElevatedGrantSpec::file(
+                "probe-read-target-runtime",
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+            ),
+            ElevatedGrantSpec::file(
+                "probe-write-target-runtime",
+                ResourceRole::LoggerSink,
+                GrantAccess::WriteOnly,
+            ),
+            ElevatedGrantSpec::directory(
+                "probe-dir-target-runtime",
+                ResourceRole::ApiSocketDirectory,
+                GrantAccess::CreateChildren,
+            ),
+        ];
+        const NO_API: &[ElevatedGrantSpec] = &[
+            ElevatedGrantSpec::sealed_file(
+                GUEST_CONFIG_GRANT_ID,
+                ResourceRole::StartupConfig,
+                GrantAccess::ReadOnly,
+                CONFIG_SEAL,
+            ),
+            ElevatedGrantSpec::sealed_file(
+                GUEST_KERNEL_GRANT_ID,
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+                KERNEL_SEAL,
+            ),
+            ElevatedGrantSpec::sealed_file(
+                GUEST_INITRD_GRANT_ID,
+                ResourceRole::InitrdImage,
+                GrantAccess::ReadOnly,
+                INITRD_SEAL,
+            ),
+            ElevatedGrantSpec::sealed_file(
+                GUEST_ROOTFS_GRANT_ID,
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+                ROOTFS_SEAL,
+            ),
+            ElevatedGrantSpec::file(
+                GUEST_LOGGER_GRANT_ID,
+                ResourceRole::LoggerSink,
+                GrantAccess::WriteOnly,
+            ),
+            ElevatedGrantSpec::file(
+                GUEST_METRICS_GRANT_ID,
+                ResourceRole::MetricsSink,
+                GrantAccess::WriteOnly,
+            ),
+            ElevatedGrantSpec::file(
+                GUEST_SERIAL_GRANT_ID,
+                ResourceRole::SerialSink,
+                GrantAccess::WriteOnly,
+            ),
+        ];
+        const API: &[ElevatedGrantSpec] = &[
+            ElevatedGrantSpec::directory(
+                GUEST_API_DIRECTORY_GRANT_ID,
+                ResourceRole::ApiSocketDirectory,
+                GrantAccess::CreateChildren,
+            ),
+            ElevatedGrantSpec::sealed_file(
+                GUEST_KERNEL_GRANT_ID,
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+                KERNEL_SEAL,
+            ),
+            ElevatedGrantSpec::sealed_file(
+                GUEST_INITRD_GRANT_ID,
+                ResourceRole::InitrdImage,
+                GrantAccess::ReadOnly,
+                INITRD_SEAL,
+            ),
+            ElevatedGrantSpec::sealed_file(
+                GUEST_ROOTFS_GRANT_ID,
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+                ROOTFS_SEAL,
+            ),
+            ElevatedGrantSpec::file(
+                GUEST_LOGGER_GRANT_ID,
+                ResourceRole::LoggerSink,
+                GrantAccess::WriteOnly,
+            ),
+            ElevatedGrantSpec::file(
+                GUEST_METRICS_GRANT_ID,
+                ResourceRole::MetricsSink,
+                GrantAccess::WriteOnly,
+            ),
+            ElevatedGrantSpec::file(
+                GUEST_SERIAL_GRANT_ID,
+                ResourceRole::SerialSink,
+                GrantAccess::WriteOnly,
+            ),
+        ];
+
+        let (specs, strict_guest) = match workload {
+            RuntimeWorkload::RepresentativeGrants => (REPRESENTATIVE, false),
+            RuntimeWorkload::GuestNoApi => (NO_API, true),
+            RuntimeWorkload::GuestApi => (API, true),
+        };
+        self.validate_elevated_specs(
+            specs,
+            strict_guest,
+            validate_resource_seals,
+            target_uid,
+            target_gid,
+        )?;
+        if workload == RuntimeWorkload::RepresentativeGrants {
+            return Ok(None);
+        }
+        let (serial_evidence_descriptor, serial_evidence_identity) = self
+            .elevated_evidence_readback(GUEST_SERIAL_GRANT_ID)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        if self
+            .records
+            .iter()
+            .filter(|prepared| prepared.evidence_readback.is_some())
+            .count()
+            != 1
+        {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        let api_anchor = if workload == RuntimeWorkload::GuestApi {
+            Some(
+                self.socket_directory_anchor(ResourceRole::ApiSocketDirectory)
+                    .ok_or(LauncherError::InvalidLaunchPolicy)?,
+            )
+        } else {
+            if self
+                .socket_directory_anchor(ResourceRole::ApiSocketDirectory)
+                .is_some()
+            {
+                return Err(LauncherError::InvalidLaunchPolicy);
+            }
+            None
+        };
+        Ok(Some(ElevatedGuestContract {
+            workload,
+            api_anchor,
+            serial_evidence_descriptor,
+            serial_evidence_identity,
+        }))
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn elevated_evidence_readback(&self, expected_id: &str) -> Option<(RawFd, ObjectIdentity)> {
+        let expected_id = GrantId::parse(expected_id).ok()?;
+        self.records.iter().find_map(|prepared| {
+            let GrantRecord::Descriptor {
+                id,
+                role: ResourceRole::SerialSink,
+                access: GrantAccess::WriteOnly,
+                kind: GrantObjectKind::RegularFile,
+                identity,
+                block_device: None,
+                ..
+            } = &prepared.record
+            else {
+                return None;
+            };
+            if id != &expected_id {
+                return None;
+            }
+            Some((prepared.evidence_readback.as_ref()?.as_raw_fd(), *identity))
+        })
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn validate_elevated_specs(
+        &self,
+        specs: &[ElevatedGrantSpec],
+        strict_guest: bool,
+        validate_resource_seals: bool,
+        target_uid: u32,
+        target_gid: u32,
+    ) -> Result<(), LauncherError> {
+        if usize::from(self.grant_count) != specs.len() {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        let semantic_records = self
+            .records
+            .iter()
+            .filter(|prepared| {
+                matches!(
+                    prepared.record,
+                    GrantRecord::Descriptor { .. }
+                        | GrantRecord::ConnectedStream { .. }
+                        | GrantRecord::ScopedDirectory { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        if semantic_records.len() != specs.len() {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        for spec in specs {
+            let expected_id =
+                GrantId::parse(spec.id).map_err(|_| LauncherError::InvalidLaunchPolicy)?;
+            let prepared = semantic_records
+                .iter()
+                .copied()
+                .find(|prepared| match &prepared.record {
+                    GrantRecord::Descriptor { id, .. }
+                    | GrantRecord::ConnectedStream { id, .. }
+                    | GrantRecord::ScopedDirectory { id, .. } => id == &expected_id,
+                    GrantRecord::Begin { .. }
+                    | GrantRecord::BookmarkFragment { .. }
+                    | GrantRecord::Commit { .. } => false,
+                })
+                .ok_or(LauncherError::InvalidLaunchPolicy)?;
+            match (&prepared.record, spec.kind) {
+                (
+                    GrantRecord::Descriptor {
+                        role,
+                        access,
+                        kind: GrantObjectKind::RegularFile,
+                        identity,
+                        status_flags,
+                        block_device: None,
+                        ..
+                    },
+                    ElevatedGrantKind::File,
+                ) if *role == spec.role && *access == spec.access => {
+                    let descriptor = prepared
+                        .descriptor
+                        .as_ref()
+                        .ok_or(LauncherError::InvalidLaunchPolicy)?;
+                    validate_elevated_regular_file(
+                        descriptor.as_raw_fd(),
+                        *identity,
+                        *status_flags,
+                        ElevatedRegularFilePolicy {
+                            access: spec.access,
+                            strict_guest,
+                            seal: validate_resource_seals.then_some(spec.seal).flatten(),
+                            target_uid,
+                            target_gid,
+                        },
+                    )?;
+                }
+                (
+                    GrantRecord::ScopedDirectory {
+                        role,
+                        access,
+                        identity,
+                        bookmark_bytes,
+                        fragment_count,
+                        ..
+                    },
+                    ElevatedGrantKind::Directory,
+                ) if *role == spec.role
+                    && *access == spec.access
+                    && *bookmark_bytes > 0
+                    && *fragment_count > 0 =>
+                {
+                    let descriptor = prepared
+                        .descriptor
+                        .as_ref()
+                        .ok_or(LauncherError::InvalidLaunchPolicy)?;
+                    validate_elevated_directory(
+                        descriptor.as_raw_fd(),
+                        *identity,
+                        strict_guest,
+                        target_uid,
+                        target_gid,
+                    )?;
+                }
+                _ => return Err(LauncherError::InvalidLaunchPolicy),
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn final_sequence(&self) -> u64 {
@@ -649,6 +1056,226 @@ impl PreparedGrantBatch {
     }
 }
 
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Clone, Copy)]
+enum ElevatedGrantKind {
+    File,
+    Directory,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Clone, Copy)]
+struct ElevatedResourceSeal {
+    size_bytes: u64,
+    sha256: [u8; 32],
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl ElevatedResourceSeal {
+    const fn new(size_bytes: u64, sha256: [u8; 32]) -> Self {
+        Self { size_bytes, sha256 }
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Clone, Copy)]
+struct ElevatedGrantSpec {
+    id: &'static str,
+    role: ResourceRole,
+    access: GrantAccess,
+    kind: ElevatedGrantKind,
+    seal: Option<ElevatedResourceSeal>,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Clone, Copy)]
+struct ElevatedRegularFilePolicy {
+    access: GrantAccess,
+    strict_guest: bool,
+    seal: Option<ElevatedResourceSeal>,
+    target_uid: u32,
+    target_gid: u32,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl ElevatedGrantSpec {
+    const fn file(id: &'static str, role: ResourceRole, access: GrantAccess) -> Self {
+        Self {
+            id,
+            role,
+            access,
+            kind: ElevatedGrantKind::File,
+            seal: None,
+        }
+    }
+
+    const fn sealed_file(
+        id: &'static str,
+        role: ResourceRole,
+        access: GrantAccess,
+        seal: ElevatedResourceSeal,
+    ) -> Self {
+        Self {
+            id,
+            role,
+            access,
+            kind: ElevatedGrantKind::File,
+            seal: Some(seal),
+        }
+    }
+
+    const fn directory(id: &'static str, role: ResourceRole, access: GrantAccess) -> Self {
+        Self {
+            id,
+            role,
+            access,
+            kind: ElevatedGrantKind::Directory,
+            seal: None,
+        }
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_elevated_regular_file(
+    descriptor: RawFd,
+    expected_identity: ObjectIdentity,
+    expected_status_flags: u32,
+    policy: ElevatedRegularFilePolicy,
+) -> Result<(), LauncherError> {
+    let stat = descriptor_stat(descriptor)?;
+    let status = libc::c_int::try_from(expected_status_flags)
+        .ok()
+        .and_then(bangbang_session::macos::normalized_regular_file_status_flags);
+    let expected_access = u32::try_from(match policy.access {
+        GrantAccess::ReadOnly => libc::O_RDONLY,
+        GrantAccess::WriteOnly => libc::O_WRONLY,
+        GrantAccess::ReadWrite => libc::O_RDWR,
+        GrantAccess::CreateChildren | GrantAccess::ConnectChildren => {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+    })
+    .map_err(|_| LauncherError::InvalidLaunchPolicy)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || normalized_stat_identity(&stat) != expected_identity
+        || status != Some(expected_access)
+    {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    if policy.strict_guest {
+        let expected_mode = if policy.access == GrantAccess::ReadOnly {
+            0o400
+        } else {
+            0o600
+        };
+        // Immutable evidence inputs are sealed bundle resources prepared by
+        // one ordinary builder and reused unchanged across mapped, retained-
+        // root, and unmapped identities. Their authority is the exact opened
+        // identity plus read-only status, mode, and singleton link. Writable
+        // outputs remain owned by the transitioned target identity.
+        if stat.st_mode & 0o7777 != expected_mode
+            || stat.st_nlink != 1
+            || (policy.access != GrantAccess::ReadOnly
+                && (stat.st_uid != policy.target_uid || stat.st_gid != policy.target_gid))
+        {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+    }
+    if let Some(seal) = policy.seal {
+        validate_elevated_resource_seal(descriptor, expected_identity, seal)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_elevated_resource_seal(
+    descriptor: RawFd,
+    expected_identity: ObjectIdentity,
+    seal: ElevatedResourceSeal,
+) -> Result<(), LauncherError> {
+    use sha2::{Digest, Sha256};
+
+    let initial = descriptor_stat(descriptor)?;
+    if normalized_stat_identity(&initial) != expected_identity
+        || u64::try_from(initial.st_size).ok() != Some(seal.size_bytes)
+    {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    while offset < seal.size_bytes {
+        let remaining = seal.size_bytes - offset;
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| LauncherError::InvalidLaunchPolicy)?;
+        let file_offset =
+            libc::off_t::try_from(offset).map_err(|_| LauncherError::InvalidLaunchPolicy)?;
+        // SAFETY: The bounded prefix of `buffer` is writable and the borrowed
+        // descriptor remains open for the complete pre-transition validation.
+        let destination = buffer
+            .get_mut(..requested)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        // SAFETY: The bounded destination is writable and the borrowed
+        // descriptor remains open for the complete pre-transition validation.
+        let read = unsafe {
+            libc::pread(
+                descriptor,
+                destination.as_mut_ptr().cast(),
+                requested,
+                file_offset,
+            )
+        };
+        if read > 0 {
+            let read = usize::try_from(read).map_err(|_| LauncherError::InvalidLaunchPolicy)?;
+            digest.update(
+                buffer
+                    .get(..read)
+                    .ok_or(LauncherError::InvalidLaunchPolicy)?,
+            );
+            offset = offset
+                .checked_add(u64::try_from(read).map_err(|_| LauncherError::InvalidLaunchPolicy)?)
+                .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        } else if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+    }
+    let final_stat = descriptor_stat(descriptor)?;
+    let actual: [u8; 32] = digest.finalize().into();
+    if normalized_stat_identity(&final_stat) != expected_identity
+        || u64::try_from(final_stat.st_size).ok() != Some(seal.size_bytes)
+        || actual != seal.sha256
+    {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_elevated_directory(
+    descriptor: RawFd,
+    expected_identity: ObjectIdentity,
+    strict_guest: bool,
+    target_uid: u32,
+    target_gid: u32,
+) -> Result<(), LauncherError> {
+    let stat = descriptor_stat(descriptor)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || normalized_stat_identity(&stat) != expected_identity
+    {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    if strict_guest
+        && (stat.st_uid != target_uid
+            || stat.st_gid != target_gid
+            || stat.st_mode & 0o7777 != 0o700
+            || stat.st_nlink < 2)
+    {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    Ok(())
+}
+
 /// One borrowed outbound record. The owning batch must remain live while sent.
 pub(crate) struct OutboundGrant {
     pub(crate) frame: GrantFrame,
@@ -771,6 +1398,31 @@ fn open_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherErro
         block_device,
         peer: None,
     })
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn open_evidence_readback(
+    grant: &ManifestGrant,
+    expected_identity: ObjectIdentity,
+) -> Result<OwnedFd, LauncherError> {
+    let read_grant = ManifestGrant {
+        id: grant.id.clone(),
+        role: ResourceRole::KernelImage,
+        access: GrantAccess::ReadOnly,
+        source: grant.source.clone(),
+    };
+    let prepared = open_resource(&read_grant)?;
+    let flags = libc::c_int::try_from(prepared.status_flags)
+        .map_err(|_| LauncherError::GrantPreparation)?;
+    let read_only = u32::try_from(libc::O_RDONLY).map_err(|_| LauncherError::GrantPreparation)?;
+    if prepared.kind != GrantObjectKind::RegularFile
+        || prepared.identity != expected_identity
+        || prepared.block_device.is_some()
+        || bangbang_session::macos::normalized_regular_file_status_flags(flags) != Some(read_only)
+    {
+        return Err(LauncherError::GrantPreparation);
+    }
+    Ok(prepared.descriptor)
 }
 
 fn connect_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherError> {
@@ -922,6 +1574,14 @@ fn descriptor_stat(descriptor: RawFd) -> Result<libc::stat, LauncherError> {
     Ok(unsafe { stat.assume_init() })
 }
 
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn normalized_stat_identity(stat: &libc::stat) -> ObjectIdentity {
+    ObjectIdentity {
+        device: normalized_device(stat.st_dev),
+        inode: stat.st_ino,
+    }
+}
+
 fn normalized_device(device: libc::dev_t) -> u64 {
     u64::from(u32::from_ne_bytes(device.to_ne_bytes()))
 }
@@ -951,7 +1611,7 @@ mod tests {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -995,6 +1655,302 @@ mod tests {
             access,
             source,
         }
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn elevated_guest_batch(
+        root: &TestDir,
+        workload: bangbang_session::elevated_probe::RuntimeWorkload,
+        wrong_kernel_id: bool,
+    ) -> PreparedGrantBatch {
+        use bangbang_session::elevated_probe::{
+            GUEST_API_DIRECTORY_GRANT_ID, GUEST_CONFIG_GRANT_ID, GUEST_INITRD_GRANT_ID,
+            GUEST_KERNEL_GRANT_ID, GUEST_LOGGER_GRANT_ID, GUEST_METRICS_GRANT_ID,
+            GUEST_ROOTFS_GRANT_ID, GUEST_SERIAL_GRANT_ID, RuntimeWorkload,
+        };
+
+        let file = |name: &str, mode: u32| {
+            let path = root.path().join(name);
+            fs::write(&path, name.as_bytes()).expect("guest fixture should write");
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("guest fixture mode should set");
+            path
+        };
+        let kernel_id = if wrong_kernel_id {
+            "evidence-guest-wrong-kernel"
+        } else {
+            GUEST_KERNEL_GRANT_ID
+        };
+        let mut grants = Vec::new();
+        match workload {
+            RuntimeWorkload::GuestNoApi => grants.push(manifest_grant(
+                GUEST_CONFIG_GRANT_ID,
+                ResourceRole::StartupConfig,
+                GrantAccess::ReadOnly,
+                file("config", 0o400),
+            )),
+            RuntimeWorkload::GuestApi => {
+                let directory = root.path().join("api");
+                fs::create_dir(&directory).expect("API fixture should create");
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                    .expect("API fixture mode should set");
+                grants.push(manifest_grant(
+                    GUEST_API_DIRECTORY_GRANT_ID,
+                    ResourceRole::ApiSocketDirectory,
+                    GrantAccess::CreateChildren,
+                    directory,
+                ));
+            }
+            RuntimeWorkload::RepresentativeGrants => {
+                panic!("guest fixture requires a guest workload")
+            }
+        }
+        grants.extend([
+            manifest_grant(
+                kernel_id,
+                ResourceRole::KernelImage,
+                GrantAccess::ReadOnly,
+                file("kernel", 0o400),
+            ),
+            manifest_grant(
+                GUEST_INITRD_GRANT_ID,
+                ResourceRole::InitrdImage,
+                GrantAccess::ReadOnly,
+                file("initrd", 0o400),
+            ),
+            manifest_grant(
+                GUEST_ROOTFS_GRANT_ID,
+                ResourceRole::DriveBacking,
+                GrantAccess::ReadOnly,
+                file("rootfs", 0o400),
+            ),
+            manifest_grant(
+                GUEST_LOGGER_GRANT_ID,
+                ResourceRole::LoggerSink,
+                GrantAccess::WriteOnly,
+                file("logger", 0o600),
+            ),
+            manifest_grant(
+                GUEST_METRICS_GRANT_ID,
+                ResourceRole::MetricsSink,
+                GrantAccess::WriteOnly,
+                file("metrics", 0o600),
+            ),
+            manifest_grant(
+                GUEST_SERIAL_GRANT_ID,
+                ResourceRole::SerialSink,
+                GrantAccess::WriteOnly,
+                file("serial", 0o600),
+            ),
+        ]);
+        PreparedGrantBatch::prepare(grants).expect("guest grants should prepare")
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn elevated_guest_record_mut<'a>(
+        batch: &'a mut PreparedGrantBatch,
+        expected_id: &str,
+    ) -> &'a mut PreparedRecord {
+        let expected_id = GrantId::parse(expected_id).expect("guest grant ID should parse");
+        batch
+            .records
+            .iter_mut()
+            .find(|prepared| match &prepared.record {
+                GrantRecord::Descriptor { id, .. }
+                | GrantRecord::ConnectedStream { id, .. }
+                | GrantRecord::ScopedDirectory { id, .. } => id == &expected_id,
+                GrantRecord::Begin { .. }
+                | GrantRecord::BookmarkFragment { .. }
+                | GrantRecord::Commit { .. } => false,
+            })
+            .expect("guest semantic grant should exist")
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn assert_elevated_guest_mutation_rejected(
+        context: &str,
+        mutate: impl FnOnce(&mut PreparedGrantBatch),
+    ) {
+        use bangbang_session::elevated_probe::RuntimeWorkload;
+
+        let root = TestDir::new();
+        let mut batch = elevated_guest_batch(&root, RuntimeWorkload::GuestNoApi, false);
+        mutate(&mut batch);
+        // SAFETY: Effective identity calls have no pointer or ownership contract.
+        let uid = unsafe { libc::geteuid() };
+        // SAFETY: Effective identity calls have no pointer or ownership contract.
+        let gid = unsafe { libc::getegid() };
+        assert!(
+            batch
+                .validate_elevated_runtime_contract_for_test(RuntimeWorkload::GuestNoApi, uid, gid,)
+                .is_err(),
+            "{context} must fail before transition"
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn elevated_guest_contract_is_exact_rootless_and_redacted() {
+        use bangbang_session::elevated_probe::RuntimeWorkload;
+
+        // SAFETY: Effective identity calls have no pointer or ownership contract.
+        let uid = unsafe { libc::geteuid() };
+        // SAFETY: Effective identity calls have no pointer or ownership contract.
+        let gid = unsafe { libc::getegid() };
+        for workload in [RuntimeWorkload::GuestNoApi, RuntimeWorkload::GuestApi] {
+            let root = TestDir::new();
+            let batch = elevated_guest_batch(&root, workload, false);
+            let contract = batch
+                .validate_elevated_runtime_contract_for_test(workload, uid, gid)
+                .expect("ordinary-user guest contract should validate")
+                .expect("guest workload should retain a contract");
+            assert_eq!(contract.workload(), workload);
+            assert_eq!(
+                contract.api_anchor().is_some(),
+                workload == RuntimeWorkload::GuestApi
+            );
+            let serial_evidence = contract.serial_evidence_descriptor();
+            let serial_stat = descriptor_stat(serial_evidence)
+                .expect("serial evidence descriptor should remain live");
+            assert_eq!(
+                normalized_stat_identity(&serial_stat),
+                contract.serial_evidence_identity()
+            );
+            // SAFETY: both fcntl operations inspect the live contract descriptor.
+            let status = unsafe { libc::fcntl(serial_evidence, libc::F_GETFL) };
+            // SAFETY: F_GETFD has no pointer or ownership contract.
+            let descriptor_flags = unsafe { libc::fcntl(serial_evidence, libc::F_GETFD) };
+            assert_eq!(status & libc::O_ACCMODE, libc::O_RDONLY);
+            assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+            assert_eq!(format!("{contract:?}"), "ElevatedGuestContract(<redacted>)");
+        }
+
+        let wrong_root = TestDir::new();
+        let wrong = elevated_guest_batch(&wrong_root, RuntimeWorkload::GuestNoApi, true);
+        assert!(
+            wrong
+                .validate_elevated_runtime_contract_for_test(RuntimeWorkload::GuestNoApi, uid, gid)
+                .is_err(),
+            "a substituted grant ID must fail before transition"
+        );
+        let owner_root = TestDir::new();
+        let owner = elevated_guest_batch(&owner_root, RuntimeWorkload::GuestNoApi, false);
+        assert!(
+            owner
+                .validate_elevated_runtime_contract_for_test(
+                    RuntimeWorkload::GuestNoApi,
+                    uid.wrapping_add(1),
+                    gid,
+                )
+                .is_err(),
+            "the contract must bind ordinary-user ownership"
+        );
+        let workload_root = TestDir::new();
+        let workload = elevated_guest_batch(&workload_root, RuntimeWorkload::GuestNoApi, false);
+        assert!(
+            workload
+                .validate_elevated_runtime_contract_for_test(RuntimeWorkload::GuestApi, uid, gid,)
+                .is_err(),
+            "the contract must bind its exact workload"
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn elevated_guest_contract_rejects_hostile_record_shapes() {
+        use bangbang_session::elevated_probe::{GUEST_INITRD_GRANT_ID, GUEST_KERNEL_GRANT_ID};
+
+        assert_elevated_guest_mutation_rejected("missing grant", |batch| {
+            let expected = GrantId::parse(GUEST_INITRD_GRANT_ID).expect("grant ID should parse");
+            let index = batch
+                .records
+                .iter()
+                .position(|prepared| {
+                    matches!(&prepared.record, GrantRecord::Descriptor { id, .. } if id == &expected)
+                })
+                .expect("initrd grant should exist");
+            drop(batch.records.remove(index));
+        });
+        assert_elevated_guest_mutation_rejected("extra grant", |batch| {
+            let record = elevated_guest_record_mut(batch, GUEST_KERNEL_GRANT_ID)
+                .record
+                .clone();
+            let index = batch.records.len() - 1;
+            batch.records.insert(
+                index,
+                PreparedRecord {
+                    record,
+                    descriptor: None,
+                    evidence_readback: None,
+                },
+            );
+        });
+        assert_elevated_guest_mutation_rejected("duplicate grant ID", |batch| {
+            let record = &mut elevated_guest_record_mut(batch, GUEST_INITRD_GRANT_ID).record;
+            let GrantRecord::Descriptor { id, .. } = record else {
+                panic!("initrd grant should be descriptor-backed");
+            };
+            *id = GrantId::parse(GUEST_KERNEL_GRANT_ID).expect("grant ID should parse");
+        });
+        assert_elevated_guest_mutation_rejected("wrong grant role", |batch| {
+            let record = &mut elevated_guest_record_mut(batch, GUEST_KERNEL_GRANT_ID).record;
+            let GrantRecord::Descriptor { role, .. } = record else {
+                panic!("kernel grant should be descriptor-backed");
+            };
+            *role = ResourceRole::InitrdImage;
+        });
+        assert_elevated_guest_mutation_rejected("wrong grant access", |batch| {
+            let record = &mut elevated_guest_record_mut(batch, GUEST_KERNEL_GRANT_ID).record;
+            let GrantRecord::Descriptor { access, .. } = record else {
+                panic!("kernel grant should be descriptor-backed");
+            };
+            *access = GrantAccess::ReadWrite;
+        });
+        assert_elevated_guest_mutation_rejected("wrong grant kind", |batch| {
+            let record = &mut elevated_guest_record_mut(batch, GUEST_KERNEL_GRANT_ID).record;
+            let GrantRecord::Descriptor { kind, .. } = record else {
+                panic!("kernel grant should be descriptor-backed");
+            };
+            *kind = GrantObjectKind::Directory;
+        });
+        assert_elevated_guest_mutation_rejected("wrong descriptor flags", |batch| {
+            let record = &mut elevated_guest_record_mut(batch, GUEST_KERNEL_GRANT_ID).record;
+            let GrantRecord::Descriptor { status_flags, .. } = record else {
+                panic!("kernel grant should be descriptor-backed");
+            };
+            *status_flags = u32::try_from(libc::O_RDWR).expect("status flags should fit");
+        });
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn elevated_resource_seal_rejects_same_inode_content_and_size_mutation() {
+        use sha2::{Digest, Sha256};
+
+        let root = TestDir::new();
+        let path = root.path().join("sealed-input");
+        fs::write(&path, b"fixed").expect("sealed fixture should write");
+        let descriptor = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .expect("sealed fixture should open");
+        let stat = descriptor_stat(descriptor.as_raw_fd()).expect("fixture should stat");
+        let identity = normalized_stat_identity(&stat);
+        let seal = ElevatedResourceSeal::new(5, Sha256::digest(b"fixed").into());
+        validate_elevated_resource_seal(descriptor.as_raw_fd(), identity, seal)
+            .expect("exact size and digest should validate");
+
+        fs::write(&path, b"fazed").expect("same-size mutation should write");
+        assert!(
+            validate_elevated_resource_seal(descriptor.as_raw_fd(), identity, seal).is_err(),
+            "same-inode content replacement must fail"
+        );
+        fs::write(&path, b"fixed!").expect("size mutation should write");
+        assert!(
+            validate_elevated_resource_seal(descriptor.as_raw_fd(), identity, seal).is_err(),
+            "same-inode size replacement must fail"
+        );
     }
 
     #[test]

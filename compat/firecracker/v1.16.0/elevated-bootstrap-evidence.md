@@ -1,12 +1,13 @@
 # Elevated macOS Bootstrap Evidence
 
 This contract records the #1373 direct-worker result, the #1884 inherited-root
-follow-up, the #1885 no-chroot credential-transition result, and the #1889 / #1891
-target-owned runtime continuation results beneath #1371. Together they test
-public chroot orderings, numeric credential bootstrap, and same-process
-continuation into the ordinary production lifecycle against Bangbang's
-mandatory worker boundary. They do not add a public root mode, accept jailer
-uid/gid/chroot options, or change a capability disposition by themselves.
+follow-up, the #1885 no-chroot credential-transition result, the #1889 / #1891
+target-owned runtime continuation results, and the #1893 post-transition guest
+result beneath #1371. Together they test public chroot orderings, numeric
+credential bootstrap, same-process continuation into the ordinary production
+lifecycle, and real guest execution against Bangbang's mandatory worker
+boundary. They do not add a public root mode, accept jailer uid/gid/chroot
+options, or change a capability disposition by themselves.
 
 ## Exact test boundary
 
@@ -23,9 +24,10 @@ The evidence bundle keeps the production layout and identity split:
   grant consumer additionally requires `grant-integration-probe`. A normal
   `--no-default-features` build is checked for absence of launcher-owned worker
   activation, ready/status records, credential and runtime modes/phases/steps,
-  the `BBA1` continuation, `BBN1` session authority, grant activation, boundary vocabulary, and all
-  evidence marker resources. The normal signed bundle dynamically rejects the
-  historical, credential, runtime, and grant-probe internal argv.
+  the `BBA1` continuation, `BBN1` session authority, guest evidence channel,
+  grant activation, boundary vocabulary, and all evidence marker resources.
+  The normal signed bundle dynamically rejects the historical, credential,
+  runtime, guest, and grant-probe internal argv.
 
 The root wrapper never invokes `sudo`. It requires exact real/effective
 uid/gid zero, accepts explicit numeric target uid/gid values, runs with a
@@ -99,6 +101,24 @@ Feature-only closed fault points cover acknowledgment, session creation/open,
 authority send/receive/validation, lock, enter, `Prepared`, grant, proceed, and
 terminal boundaries without changing lifecycle v5 or normal bundle behavior.
 
+The six guest modes append API and no-API workloads for mapped, retained-root,
+and SDK-maximum unmapped identities without changing that prefix. The same
+authenticated grant datagram carries two closed late reattestation barriers
+before the first guest resource claim and before HVF creation, followed by
+value-free HVF-created and guest-shutdown reports. Immutable kernel, initrd,
+rootfs, and no-API configuration artifacts are prepared and verified as the
+ordinary user, sealed into the evidence bundle, and only reverified and opened
+by exact identity under root. The root wrapper never downloads, repairs, or
+builds guest inputs.
+
+No-API consumes the canonical config and boot/output grants through the normal
+startup path. API uses the normal contained API directory grant and signed
+descriptor-relative binder, while the transitioned launcher owns the bounded
+HTTP state machine. Guest success requires the exact serial oracle, guest
+poweroff, ordered logger evidence, bounded metrics, lifecycle terminal,
+replacement-safe authority cleanup, and zero residue; launcher output alone is
+not sufficient.
+
 Each runtime case uses a mode-0700 root and a separate bounded workspace with a
 root-owned traversal-only ancestry and exact target-owned fixtures. A root-owned
 ledger binds the workspace, its input, output, create-children directory,
@@ -125,7 +145,7 @@ checked result.
 
 ## Capable-host result
 
-The final evidence shape was executed on 2026-08-09 on Apple Silicon with
+The final evidence shape was executed on 2026-08-10 on Apple Silicon with
 macOS 26.5.2, macOS SDK 26.5, and `kern.hv_support=1`, under explicit operator
 root authority. The complete matrix produced these results:
 
@@ -149,14 +169,21 @@ root authority. The complete matrix produced these results:
 | same fixed pair continued in place | uid/gid-zero retained-root, repeated three times | the identical authority/grant/lifecycle/cleanup path completed with explicit no-drop semantics |
 | same fixed pair continued in place | SDK-maximum unmapped numeric target, repeated three times | both live code/profile revalidations and the complete authority/grant/lifecycle/cleanup path completed without an account lookup or identity-check bypass |
 | two concurrent runtime-continuation pairs | distinct exact roots and workspaces | both mapped-target pairs completed with distinct sessions and byte-identical bounded result lines |
+| same fixed pair, real no-API guest | mapped ordinary target, retained-root no-drop, and SDK-maximum unmapped target, each repeated three times | both late reattestations, exact boot/output grants, real HVF creation, the fixed guest oracle, guest-requested poweroff, ordinary terminal ownership, and cleanup completed |
+| two concurrent real no-API guests | distinct mapped-target roots, sessions, artifacts, outputs, launchers, and workers | both completed independently with no API socket publication |
+| same fixed pair, contained API guest | mapped ordinary and SDK-maximum unmapped targets, each repeated three times | stopped at `api-socket-publication` / `other`: App Sandbox reinitialization rejected the post-transition binder before application entry |
+| same fixed pair, contained API guest | uid/gid-zero retained-root, repeated three times | stopped at the same value-free API boundary: the reinitialized App Sandbox denied creation of the descriptor-rooted staging socket |
+| two concurrent contained API attempts | distinct mapped-target roots, sessions, and API authorities | both returned the same `api-socket-publication` boundary and cleaned exactly |
 
 Focused negative cases reject a group-writable root and a symlink root. The
 staged manifest also rejects a writable, missing, symlinked, or inode-replaced
 loader, a missing nested worker, and an unexpected entry before worker
-activation. Every successful, rejected, repeated, and concurrent case leaves no
-process, root, workspace, or named-socket residue. Nonempty-root cleanup
-preflights all 22 ledger
-entries before removing any, then uses only reverse exact `unlink`/`rmdir`;
+activation. Every successful, blocked, rejected, repeated, and concurrent case
+leaves no process, root, workspace, or named-socket residue. The launcher-first
+death case removes only the pre-recorded empty target session after both signed
+endpoints are gone; an identity replacement is preserved and fails the proof.
+Nonempty-root cleanup preflights all 27 ledger entries before removing any,
+then uses only reverse exact `unlink`/`rmdir`;
 root cleanup rechecks device, inode, owner, group, and mode and refuses to
 remove a replacement.
 
@@ -176,8 +203,15 @@ application endpoints, completed the exact acknowledgment, and reached the
 private pre-`Hello` `BBN1` adoption gate for all three runtime identity classes.
 Each class then completed exact `Start`/`Prepared` binding, representative typed
 grant commitment and consumption, `Proceed`/`Starting`/terminal ownership, and
-exact session recovery/cleanup. API/no-API real guests, daemon/crash
-convergence, and post-transition guest HVF remain unmeasured.
+exact session recovery/cleanup. #1893 then kept that exact prefix and measured
+real guests. All three no-API identity classes completed late resource/HVF
+reattestation, exact grant-backed guest startup, real HVF creation, the closed
+guest oracle, guest-requested poweroff, terminal ownership, and cleanup. All
+three API classes stopped earlier at `api-socket-publication`: mapped and
+unmapped binder images failed during App Sandbox container initialization,
+while retained-root reached the binder but App Sandbox denied creation of its
+descriptor-rooted staging socket. No API configuration request or API-started
+guest ran after that boundary. Daemon/crash convergence remains unmeasured.
 
 After those results were established, the checked harness remained at the
 evidence boundary: it contains no credential-changing product path. If a
@@ -186,12 +220,15 @@ future platform permits the direct sandboxed `chroot`, that branch reports
 entry, it must pass exact root, sandbox-denial, and HVF checks before success.
 Either changed result forces fresh implementation research and Challenge. The
 harness leaves the normal peer verifier and public launch policy unchanged.
-All enabled runtime fault cases reached their exact closed boundary, including
-the launcher-create/open and authority-send paths, worker receive/validate/
-lock/enter/`Prepared` exits, and the grant/proceed/terminal paths. Exact object
-state and the final residue scan remained clean. #1891 is the separately
+All reachable runtime and no-API guest fault cases reached their exact closed
+boundary, including the launcher-create/open and authority-send paths, worker
+receive/validate/lock/enter/`Prepared` exits, grant/proceed/terminal paths, late
+reattestation, HVF creation, guest execution/oracle/poweroff, endpoint death,
+and cleanup. API configuration faults after publication are ineligible because
+the measured platform boundary occurs first. Exact object state and the final
+residue scan remained clean. #1891 is the separately
 challenged launcher-created-session authority result; it is not a hidden
-fallback in #1889. #1885, #1889, and #1891 are evidence results; product
+fallback in #1889. #1885, #1889, #1891, and #1893 are evidence results; product
 uid/gid behavior still requires the parent-selected continuation.
 
 ## Supported conclusion and nonclaims
@@ -228,30 +265,39 @@ through exact acknowledgment, launcher-created session authority, worker
 adoption, the representative grant workload, and ordinary terminal cleanup for
 mapped, retained-root, and SDK-maximum unmapped numeric identities on the
 measured host. This establishes that narrow feature-only process/resource
-composition; it does not establish API/no-API real guests, daemon/crash
-convergence, real guest/HVF work after transition, public policy, or aggregate
-jailer behavior. It also does not prove that a larger fixed in-root Darwin
-dependency set or a materially different security model cannot work; nor does it claim
+composition. It now also establishes real no-API guest/HVF execution after the
+transition for all three identities. The contained API path is independently
+blocked before socket publication by App Sandbox reinitialization and write
+policy, so it establishes neither API configuration nor an API-started guest.
+Avoiding that boundary would require a separately challenged signing/helper or
+sandbox-authority model; this evidence does not weaken App Sandbox, use a
+private extension API, or treat a different topology as equivalent. Daemon/
+crash convergence, public policy, and aggregate jailer behavior remain
+unmeasured. It also does not prove that a larger fixed in-root Darwin dependency
+set or a materially different security model cannot work; nor does it claim
 Linux mount/PID/user namespace parity, notarized distribution, or behavior
 beyond the recorded OS/SDK. A changed platform result requires rerunning the
 wrapper and a fresh ID-by-ID Challenge.
 
 ## Reproduction
 
-Build the statically isolated evidence bundle as an ordinary user:
+Build the statically isolated evidence bundle as an ordinary user at an absent
+path whose ancestry is traversable by every selected numeric identity. A fresh
+directory beneath `/private/tmp` is the recommended capable-host location:
 
 ```sh
 scripts/build-elevated-bootstrap-probe.sh \
-  --output /absolute/absent/path/Bangbang.app
+  --output /private/tmp/bangbang-evidence/Bangbang.app
 ```
 
 Capture target values before elevation, then explicitly run the root wrapper
-through the native administrator authorization dialog (substitute the captured
-numeric values and absolute paths):
+through `sudo` (substitute the captured numeric values and absolute paths):
 
 ```sh
-/usr/bin/osascript -e \
-  'do shell script "/bin/bash /absolute/repo/scripts/run-elevated-bootstrap-probe.sh --bundle /absolute/absent/path/Bangbang.app --target-uid 501 --target-gid 20" with administrator privileges'
+/usr/bin/sudo -- /bin/bash /absolute/repo/scripts/run-elevated-bootstrap-probe.sh \
+  --bundle /private/tmp/bangbang-evidence/Bangbang.app \
+  --target-uid 501 \
+  --target-gid 20
 ```
 
 The required terminal summary remains value-free and includes credential and
@@ -259,7 +305,8 @@ runtime results, observations, residue, and nonclaim classes:
 
 ```text
 result: inherited-root-worker=blocked stage=worker-bootstrap error=other credential-ordinary=complete credential-retained-root=complete-no-drop credential-unmapped=complete runtime-mapped=complete runtime-retained-root=complete-no-drop runtime-unmapped=complete authority=consumed lock=independent grants=committed lifecycle=terminal controls=complete cleanup=exact
+guest-matrix: api-mapped=blocked-api-publication api-retained-root=blocked-api-publication-no-drop api-unmapped=blocked-api-publication no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=no-api-isolated-api-blocked faults=no-api-reachable-complete-api-later-ineligible deaths=worker-first-launcher-first tamper=rejected adoption-replacement=no-api-preopened-api-ineligible cleanup=exact
 observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact
 residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero
-nonclaims: api-no-api-real-guest=unmeasured daemon-crash=unmeasured post-drop-guest-hvf=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal
+nonclaims: daemon-crash=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal
 ```

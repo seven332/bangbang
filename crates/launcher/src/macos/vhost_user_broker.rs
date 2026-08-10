@@ -210,6 +210,242 @@ pub(crate) enum ScopedConnectError {
     Invalid,
 }
 
+/// Result of beginning one descriptor-relative nonblocking connection.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) enum NonblockingAnchoredConnect {
+    Connected(UnixStream, ObjectIdentity),
+    Pending(PendingAnchoredConnect),
+}
+
+/// In-progress descriptor-relative connection with its exact source identity.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) struct PendingAnchoredConnect {
+    stream: UnixStream,
+    anchor_descriptor: RawFd,
+    anchor_identity: ObjectIdentity,
+    name: CString,
+    source_identity: ObjectIdentity,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl std::fmt::Debug for PendingAnchoredConnect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PendingAnchoredConnect(<redacted>)")
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl PendingAnchoredConnect {
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    pub(crate) const fn source_identity(&self) -> ObjectIdentity {
+        self.source_identity
+    }
+}
+
+/// Starts one exact nonblocking connection without polling the supervising thread.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn begin_anchored_exact_nonblocking(
+    anchor_descriptor: RawFd,
+    anchor_identity: ObjectIdentity,
+    name: &CStr,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> Result<NonblockingAnchoredConnect, ScopedConnectError> {
+    if name.to_bytes().is_empty() || name.to_bytes().contains(&b'/') || expected_mode & !0o777 != 0
+    {
+        return Err(ScopedConnectError::Invalid);
+    }
+    let _cwd_connect = CWD_CONNECT_LOCK
+        .lock()
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let result = (|| {
+        let source_identity = relative_connect_target_identity_with_mode(
+            name,
+            expected_uid,
+            expected_gid,
+            expected_mode,
+        )?;
+        let (address, address_length) = relative_unix_socket_address(name)?;
+        // SAFETY: A successful descriptor is immediately wrapped for unique ownership.
+        let descriptor = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if descriptor < 0 {
+            return Err(ScopedConnectError::Failure(
+                io::Error::last_os_error().kind(),
+            ));
+        }
+        // SAFETY: The fresh descriptor has no other owner.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        set_cloexec(descriptor.as_raw_fd())
+            .map_err(|error| ScopedConnectError::Failure(error.kind()))?;
+        set_nonblocking(descriptor.as_raw_fd())?;
+        let mut interrupted = 0_usize;
+        loop {
+            // SAFETY: Descriptor and fully initialized local address remain live.
+            let result = unsafe {
+                libc::connect(
+                    descriptor.as_raw_fd(),
+                    (&raw const address).cast(),
+                    address_length,
+                )
+            };
+            if result == 0 {
+                let after = relative_connect_target_identity_with_mode(
+                    name,
+                    expected_uid,
+                    expected_gid,
+                    expected_mode,
+                )?;
+                if after != source_identity {
+                    return Err(ScopedConnectError::Rejected);
+                }
+                validate_connected_peer(descriptor.as_raw_fd(), name)?;
+                return Ok(NonblockingAnchoredConnect::Connected(
+                    UnixStream::from(descriptor),
+                    source_identity,
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted
+                && interrupted < CONNECT_INTERRUPTED_RETRY_LIMIT
+            {
+                interrupted += 1;
+                continue;
+            }
+            if matches!(error.raw_os_error(), Some(code) if code == libc::EINPROGRESS || code == libc::EALREADY)
+            {
+                return Ok(NonblockingAnchoredConnect::Pending(
+                    PendingAnchoredConnect {
+                        stream: UnixStream::from(descriptor),
+                        anchor_descriptor,
+                        anchor_identity,
+                        name: name.to_owned(),
+                        source_identity,
+                        expected_uid,
+                        expected_gid,
+                        expected_mode,
+                    },
+                ));
+            }
+            return Err(ScopedConnectError::Failure(error.kind()));
+        }
+    })();
+    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
+    result
+}
+
+/// Completes a writable nonblocking connection and repeats exact pathname validation.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn finish_anchored_exact_nonblocking(
+    pending: PendingAnchoredConnect,
+) -> Result<NonblockingAnchoredConnect, ScopedConnectError> {
+    let socket_error = socket_int_option(pending.stream.as_raw_fd(), libc::SO_ERROR)?;
+    if matches!(socket_error, libc::EINPROGRESS | libc::EALREADY) {
+        return Ok(NonblockingAnchoredConnect::Pending(pending));
+    }
+    if socket_error != 0 {
+        return Err(ScopedConnectError::Failure(
+            io::Error::from_raw_os_error(socket_error).kind(),
+        ));
+    }
+    let _cwd_connect = CWD_CONNECT_LOCK
+        .lock()
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let mut guard = CwdGuard::enter(pending.anchor_descriptor, pending.anchor_identity)
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let result = (|| {
+        let after = relative_connect_target_identity_with_mode(
+            &pending.name,
+            pending.expected_uid,
+            pending.expected_gid,
+            pending.expected_mode,
+        )?;
+        if after != pending.source_identity {
+            return Err(ScopedConnectError::Rejected);
+        }
+        validate_connected_peer(pending.stream.as_raw_fd(), &pending.name)?;
+        Ok(NonblockingAnchoredConnect::Connected(
+            pending.stream,
+            pending.source_identity,
+        ))
+    })();
+    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
+    result
+}
+
+/// Revalidates one exact anchored socket child without opening a connection.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn validate_anchored_socket_child(
+    anchor_descriptor: RawFd,
+    anchor_identity: ObjectIdentity,
+    name: &CStr,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+    expected_identity: ObjectIdentity,
+) -> Result<(), ScopedConnectError> {
+    let _cwd_connect = CWD_CONNECT_LOCK
+        .lock()
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let result =
+        relative_connect_target_identity_with_mode(name, expected_uid, expected_gid, expected_mode)
+            .and_then(|identity| {
+                if identity == expected_identity {
+                    Ok(())
+                } else {
+                    Err(ScopedConnectError::Rejected)
+                }
+            });
+    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
+    result
+}
+
+/// Returns whether one fixed child is absent beneath an exact retained anchor.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn anchored_socket_child_is_absent(
+    anchor_descriptor: RawFd,
+    anchor_identity: ObjectIdentity,
+    name: &CStr,
+) -> Result<bool, ScopedConnectError> {
+    let _cwd_connect = CWD_CONNECT_LOCK
+        .lock()
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
+        .map_err(|_| ScopedConnectError::Invalid)?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: The bounded fixed child and writable stat storage remain valid.
+    let result = unsafe {
+        libc::fstatat(
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    let result = if result == 0 {
+        Ok(false)
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(true)
+        } else {
+            Err(ScopedConnectError::Failure(error.kind()))
+        }
+    };
+    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
+    result
+}
+
 fn connect_scoped(
     anchor: SocketDirectoryAnchor,
     child: &bangbang_session::SocketChild,
@@ -344,6 +580,23 @@ fn descriptor_identity(descriptor: RawFd) -> Result<ObjectIdentity, ScopedConnec
 }
 
 fn relative_connect_target_identity(name: &CStr) -> Result<ObjectIdentity, ScopedConnectError> {
+    relative_connect_target_identity_inner(name, None)
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn relative_connect_target_identity_with_mode(
+    name: &CStr,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> Result<ObjectIdentity, ScopedConnectError> {
+    relative_connect_target_identity_inner(name, Some((expected_uid, expected_gid, expected_mode)))
+}
+
+fn relative_connect_target_identity_inner(
+    name: &CStr,
+    expected_owner_and_mode: Option<(u32, u32, u32)>,
+) -> Result<ObjectIdentity, ScopedConnectError> {
     let mut stat = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: The cwd anchor and bounded name are valid; output is writable.
     if unsafe {
@@ -362,10 +615,14 @@ fn relative_connect_target_identity(name: &CStr) -> Result<ObjectIdentity, Scope
     // SAFETY: Successful fstatat initialized the complete structure.
     let stat = unsafe { stat.assume_init() };
     // SAFETY: geteuid has no pointer or ownership contract.
-    let expected_uid = unsafe { libc::geteuid() };
+    let default_uid = unsafe { libc::geteuid() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
         || stat.st_nlink != 1
-        || stat.st_uid != expected_uid
+        || stat.st_uid
+            != expected_owner_and_mode.map_or(default_uid, |(expected_uid, _, _)| expected_uid)
+        || expected_owner_and_mode.is_some_and(|(_, expected_gid, expected_mode)| {
+            stat.st_gid != expected_gid || u32::from(stat.st_mode & 0o777) != expected_mode
+        })
     {
         return Err(ScopedConnectError::Rejected);
     }
@@ -547,6 +804,8 @@ mod tests {
     use std::fs::{self, File};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::process::Command;
@@ -777,6 +1036,115 @@ mod tests {
             current_directory_identity().expect("cwd after regular target should inspect"),
             unrelated_identity
         );
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        {
+            let api_path = anchor_path.join("api.sock");
+            // SAFETY: These calls have no pointer or ownership contract.
+            let expected_uid = unsafe { libc::geteuid() };
+            // SAFETY: See above.
+            let expected_gid = unsafe { libc::getegid() };
+            // SAFETY: The live test anchor is owned by the current process; the
+            // requested owner is its current effective identity.
+            let chown_result =
+                unsafe { libc::fchown(anchor_file.as_raw_fd(), expected_uid, expected_gid) };
+            assert_eq!(chown_result, 0, "nonblocking anchor owner should set",);
+            let api_listener =
+                UnixListener::bind(&api_path).expect("nonblocking listener should bind");
+            fs::set_permissions(&api_path, fs::Permissions::from_mode(0o600))
+                .expect("nonblocking socket mode should set");
+            let api_metadata = fs::symlink_metadata(&api_path)
+                .expect("nonblocking socket metadata should inspect");
+            assert_eq!(
+                (
+                    api_metadata.uid(),
+                    api_metadata.gid(),
+                    api_metadata.mode() & 0o777,
+                    api_metadata.nlink(),
+                ),
+                (expected_uid, expected_gid, 0o600, 1),
+                "nonblocking socket fixture should have exact target metadata",
+            );
+            assert!(
+                !anchored_socket_child_is_absent(anchor_file.as_raw_fd(), identity, c"api.sock",)
+                    .expect("present anchored child should inspect")
+            );
+            assert!(
+                anchored_socket_child_is_absent(anchor_file.as_raw_fd(), identity, c"absent.sock",)
+                    .expect("absent anchored child should inspect")
+            );
+
+            let mut connection = begin_anchored_exact_nonblocking(
+                anchor_file.as_raw_fd(),
+                identity,
+                c"api.sock",
+                expected_uid,
+                expected_gid,
+                0o600,
+            )
+            .expect("nonblocking anchored connection should begin");
+            let (stream, source_identity) = loop {
+                match connection {
+                    NonblockingAnchoredConnect::Connected(stream, source_identity) => {
+                        break (stream, source_identity);
+                    }
+                    NonblockingAnchoredConnect::Pending(pending) => {
+                        let mut poll_fd = libc::pollfd {
+                            fd: pending.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        // SAFETY: One initialized poll entry remains writable for the call.
+                        assert!(unsafe { libc::poll(&raw mut poll_fd, 1, 1_000) } > 0);
+                        connection = finish_anchored_exact_nonblocking(pending)
+                            .expect("writable anchored connection should finish");
+                    }
+                }
+            };
+            let (_accepted, _) = api_listener
+                .accept()
+                .expect("nonblocking connection should be accepted");
+            validate_anchored_socket_child(
+                anchor_file.as_raw_fd(),
+                identity,
+                c"api.sock",
+                expected_uid,
+                expected_gid,
+                0o600,
+                source_identity,
+            )
+            .expect("unchanged anchored child should revalidate");
+            assert!(matches!(
+                begin_anchored_exact_nonblocking(
+                    anchor_file.as_raw_fd(),
+                    identity,
+                    c"api.sock",
+                    expected_uid.wrapping_add(1),
+                    expected_gid,
+                    0o600,
+                ),
+                Err(ScopedConnectError::Rejected)
+            ));
+            assert_eq!(
+                validate_anchored_socket_child(
+                    anchor_file.as_raw_fd(),
+                    identity,
+                    c"api.sock",
+                    expected_uid,
+                    expected_gid,
+                    0o601,
+                    source_identity,
+                )
+                .expect_err("wrong target mode should fail closed"),
+                ScopedConnectError::Rejected
+            );
+            drop(stream);
+            assert_eq!(
+                current_directory_identity()
+                    .expect("cwd after nonblocking connections should inspect"),
+                unrelated_identity
+            );
+        }
 
         std::env::set_current_dir(&original).expect("original cwd should restore for cleanup");
     }

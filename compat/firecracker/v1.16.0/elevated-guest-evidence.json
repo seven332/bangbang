@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "guest_workflow_audit": "compat/firecracker/v1.16.0/guest-workflow-audit.json",
+  "resources": [
+    {
+      "id": "kernel",
+      "audit_section": "artifacts",
+      "bundle_name": "evidence-guest-kernel",
+      "mode": "0400"
+    },
+    {
+      "id": "rootfs",
+      "audit_section": "artifacts",
+      "bundle_name": "evidence-guest-rootfs",
+      "mode": "0400"
+    },
+    {
+      "id": "guest-boot-initrd",
+      "audit_section": "generated",
+      "bundle_name": "evidence-guest-initrd",
+      "mode": "0400"
+    },
+    {
+      "id": "no-api-config",
+      "source_path": "compat/firecracker/v1.16.0/elevated-guest-no-api.json",
+      "bundle_name": "evidence-guest-no-api.json",
+      "size_bytes": 655,
+      "sha256": "196fc8e922c220817f2d3097b25de243e3fdcfd6e1e5b7af223371e3531096a6",
+      "mode": "0400"
+    }
+  ],
+  "marker": {
+    "bundle_name": "elevated-guest-evidence.enabled",
+    "contents": "test-only\n",
+    "mode": "0600"
+  },
+  "replacement_sidecar_suffix": ".elevated-guest-sidecar"
+}

@@ -969,6 +969,20 @@ impl WorkerNamespace {
         }
     }
 
+    /// Revalidates the linked namespace while this lock-owning authority remains live.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn verify_live(&self) -> Result<(), RuntimeError> {
+        validate_preopened_namespace(
+            self.root.as_raw_fd(),
+            self.directory.as_raw_fd(),
+            &self.name,
+            self.identity,
+            self.owner,
+            false,
+        )?;
+        self.verify_current_directory()
+    }
+
     /// Removes only the same empty namespace inode.
     pub fn cleanup(&mut self) -> Result<(), RuntimeError> {
         if self.cleaned {
@@ -1038,6 +1052,24 @@ impl fmt::Debug for LauncherNamespace {
 }
 
 impl LauncherNamespace {
+    /// Revalidates the exact linked namespace and proves the worker lock remains held.
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    pub fn verify_worker_lock(&self) -> Result<(), RuntimeError> {
+        validate_preopened_namespace(
+            self.root.as_raw_fd(),
+            self.directory.as_raw_fd(),
+            &self.name,
+            self.identity,
+            self.owner,
+            false,
+        )?;
+        if try_lock_exclusive(self.directory.as_raw_fd())? {
+            unlock(self.directory.as_raw_fd());
+            return Err(RuntimeError::InvalidEntry);
+        }
+        Ok(())
+    }
+
     /// Independently derives and validates the worker-created namespace.
     pub fn validate(session: SessionId, expected: NamespaceIdentity) -> Result<Self, RuntimeError> {
         let root_path = launcher_runtime_root()?;

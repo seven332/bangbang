@@ -2,6 +2,8 @@ pub(crate) mod block_control;
 pub(crate) mod block_device;
 pub(crate) mod code_sign;
 pub(crate) mod daemon;
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) mod elevated_guest;
 pub(crate) mod local_socket;
 pub(crate) mod publish;
 pub(crate) mod socket_broker;

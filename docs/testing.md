@@ -2098,8 +2098,9 @@ merged-main OID are checked and recorded by the pull-request workflow.
 
 ## Explicit Elevated Bootstrap Evidence
 
-The #1373 direct-worker, #1884 inherited-root, #1885 no-chroot credential, and
-#1889 / #1891 target-owned runtime-continuation proofs are deliberately
+The #1373 direct-worker, #1884 inherited-root, #1885 no-chroot credential,
+#1889 / #1891 target-owned runtime-continuation, and #1893 post-transition
+guest proofs are deliberately
 separate from `scripts/run-integration-tests.sh`. Normal validation never
 invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
 passing skip.
@@ -2109,11 +2110,12 @@ fail-closed non-root boundary; deterministic unit and process tests cover the
 authority codec and transport, session validation and locking, fault stages,
 and exact recovery without elevation.
 First build the test-only bundle as an ordinary user at an absent absolute
-destination:
+destination whose ancestry is traversable by every selected numeric identity.
+A fresh directory beneath `/private/tmp` is recommended:
 
 ```sh
 scripts/build-elevated-bootstrap-probe.sh \
-  --output /absolute/absent/path/Bangbang.app
+  --output /private/tmp/bangbang-evidence/Bangbang.app
 ```
 
 The build compiles normal launcher and worker artifacts first and verifies that
@@ -2121,17 +2123,20 @@ the V2 probe status, worker activation, Ready, inherited-root, HVF, credential
 and runtime modes, credential phases and restoration steps, `BBA1`
 acknowledgment, `BBN1` session authority, representative grant activation, and complete boundary
 vocabulary are absent. It then builds both ends with disabled-by-default
-evidence features, checks role-specific credential/runtime markers, adds three
-visible test-only resource markers, and uses the normal production packager,
-signature split, entitlements, Hardened Runtime, and inspections.
+evidence features, checks role-specific credential/runtime markers, adds four
+visible test-only resource markers plus the ordinary-user-verified guest
+artifacts, and uses the normal production packager, signature split,
+entitlements, Hardened Runtime, and inspections.
 
 On a capable Apple Silicon host, calculate the explicit numeric target before
-elevation and invoke the wrapper through the native administrator authorization
-dialog (substitute the captured numeric values and absolute paths):
+elevation and invoke the wrapper through `sudo` (substitute the captured
+numeric values and absolute paths):
 
 ```sh
-/usr/bin/osascript -e \
-  'do shell script "/bin/bash /absolute/repo/scripts/run-elevated-bootstrap-probe.sh --bundle /absolute/absent/path/Bangbang.app --target-uid 501 --target-gid 20" with administrator privileges'
+/usr/bin/sudo -- /bin/bash /absolute/repo/scripts/run-elevated-bootstrap-probe.sh \
+  --bundle /private/tmp/bangbang-evidence/Bangbang.app \
+  --target-uid 501 \
+  --target-gid 20
 ```
 
 Do not use `--allow-unsupported` for this proof. Missing exact root, Apple
@@ -2184,6 +2189,19 @@ truncated, missing/extra-descriptor and queued authority records, sender-alias
 closure, wrong identity/nonempty/replaced sessions, independent lock
 descriptions, and recovery after worker release.
 
+The post-transition guest branch appends API and no-API modes for mapped,
+retained-root, and SDK-maximum unmapped identities without changing the
+credential, `BBA1`, `BBN1`, lifecycle, or grant prefix. Guest artifacts must be
+prepared and digest-verified before elevation; the exact-root run only verifies
+and opens the sealed copies. The matrix repeats every identity/workload three
+times, runs two concurrent mapped no-API successes and two concurrent mapped
+API boundary cases, and then exercises every fault still reachable before the
+measured API publication stop. It also checks worker-first and launcher-first
+death, immutable-input tampering, post-adoption pathname replacement, exact
+output ledgers, and final zero residue. Launcher-first cleanup removes only the
+pre-recorded empty session after both signed endpoints have exited and rejects
+an identity replacement.
+
 It reports OS/SDK/architecture and only value-free terminal classes. The
 inherited result remains `worker-bootstrap` / `other`: in-root `posix_spawn`
 returned success but the worker exited before its earliest application record.
@@ -2192,8 +2210,15 @@ no-drop, and SDK-maximum unmapped transitions. All three runtime classes then
 completed acknowledgment, launcher-created session authority, worker adoption,
 the representative grant workload, `Proceed`/`Starting`/terminal ownership,
 and exact cleanup. The SDK-maximum result retained both live-code checks and is
-therefore a changed same-check witness, not a bypass. API/no-API real guests,
-daemon/crash convergence, and post-transition guest HVF remain unmeasured.
+therefore a changed same-check witness, not a bypass. Real no-API guests then
+completed late reattestation, grant-backed startup, HVF creation, the fixed
+guest oracle, guest-requested poweroff, and cleanup for all three identities.
+All three contained API cases stopped at the value-free
+`api-socket-publication` boundary: mapped/unmapped App Sandbox initialization
+failed before binder application entry, while retained-root App Sandbox denied
+the descriptor-rooted staging-socket create. API configuration and later API
+faults are therefore ineligible in this measured shape. Daemon/crash
+convergence remains unmeasured.
 Stream credentials remained
 connection-time snapshots, datagram credentials were unsupported, opaque
 datagram tokens changed only for credential transitions, and live peer PIDs
