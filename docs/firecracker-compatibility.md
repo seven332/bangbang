@@ -1250,11 +1250,15 @@ grant transaction. Mapped, retained-root, and SDK-maximum unmapped cases each
 completed three times, including the unchanged live-code checks, representative
 grant workload, `Proceed`/`Starting`/terminal ownership, and exact cleanup. This
 prefix now also completes exact grant-backed no-API guest/HVF execution, the
-fixed guest oracle, and guest-requested poweroff for all three identities. The
-contained API variants stop at the App Sandbox `api-socket-publication`
-boundary before any HTTP configuration or API-started guest. This is evidence
-for #1371, not a public launch policy or capability disposition; daemon/crash
-convergence and final uid/gid semantics remain unmeasured.
+fixed guest oracle, and guest-requested poweroff for all three identities.
+#1893's ordinary contained API binder stops at the App Sandbox
+`api-socket-publication` boundary. #1895's feature-only transitioned launcher
+instead binds the fixed final listener and transfers exactly one descriptor,
+then the same worker stops in the closed receive/adoption interval reported as
+`api-listener-adoption` / `other` before readiness. This is evidence for #1371,
+not a public launch policy or capability disposition; the exact failing
+operation and sub-cause, daemon/crash convergence, and final uid/gid semantics
+remain unmeasured.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
@@ -2773,21 +2777,29 @@ This does not broaden the supported API/device surface or claim arbitrary
 kernel/distribution boot, production containment, guest networking, artifact
 redistribution/authentication or byte-reproducible ext4.
 
-The separate #1893 exact-root evidence composes the same checked guest inputs
-with the fixed production launcher and mandatory App Sandbox + Hypervisor
-worker after numeric credential transition. Mapped, retained-root no-drop, and
-SDK-maximum unmapped no-API modes all complete the real HVF guest, fixed oracle,
-guest-requested poweroff, and exact cleanup. This is positive post-transition
-guest evidence for the config-file path, not a public uid/gid policy.
+The separate #1893 / #1895 exact-root evidence composes the same checked guest
+inputs with the fixed production launcher and mandatory App Sandbox +
+Hypervisor worker after numeric credential transition. Mapped, retained-root
+no-drop, and SDK-maximum unmapped no-API modes all complete the real HVF guest,
+fixed oracle, guest-requested poweroff, and exact cleanup. This is positive
+post-transition guest evidence for the config-file path, not a public uid/gid
+policy.
 
 The corresponding contained API modes stop earlier at the measured
 `api-socket-publication` boundary. Mapped and unmapped signed binder images fail
 while App Sandbox is reinitialized after the root-originated transition;
 retained-root reaches binder code but App Sandbox denies its descriptor-rooted
 staging-socket create. No HTTP configuration or API-started guest runs in that
-shape. The ordinary rootless API workflow above remains complete, so the
-blocked evidence is specifically the post-transition App Sandbox publication
-composition. Adding a different helper/signing role or private sandbox
+historical #1893 shape. #1895 removes only that binder: the transitioned
+launcher directly binds final `evidence-api.sock` beneath its retained exact
+anchor, transfers exactly one listener descriptor, and releases its alias in
+all three identity classes. The already-running signed worker then stops in the
+stable closed receive/adoption interval reported as `api-listener-adoption` /
+`other` before durable ownership, readiness, HTTP, or HVF. The ordinary
+rootless API workflow above remains complete, so the blocked evidence is
+specifically the post-transition signed worker receive/adoption composition.
+The closed result does not identify its exact failing operation or kernel/
+sandbox sub-cause. Adding a different helper/signing role or private sandbox
 authority is not treated as Firecracker API parity or as an implementation in
 this slice.
 

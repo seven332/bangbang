@@ -3,6 +3,8 @@
 use std::io;
 use std::os::fd::RawFd;
 
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub mod api_listener;
 pub mod block_control;
 pub mod bookmark;
 pub mod grant_registry;

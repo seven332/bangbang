@@ -235,7 +235,7 @@ pub(crate) fn wait_session_with_preopened_namespace(
             .recover_after_worker_exit(lifecycle.session())
             .and_then(|recovered| {
                 recovered.map_or(Ok(()), |mut namespace| {
-                    cleanup_namespace_after_worker(&mut namespace, grants)
+                    cleanup_namespace_after_worker(&mut namespace, grants, None)
                 })
             })
             .map_err(|_| LauncherError::RuntimeNamespace)?;
@@ -292,14 +292,28 @@ fn wait_session_with_roots(
         terminate_session(worker, session, &auxiliary);
     }
 
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    let strict_api_cleanup = guest
+        .as_ref()
+        .and_then(ElevatedGuestSupervisor::cleanup_policy)
+        .map(|policy| StrictSocketCleanupPolicy {
+            anchor_descriptor: policy.anchor_descriptor(),
+            anchor_identity: policy.anchor_identity(),
+            target_uid: policy.target_uid(),
+            target_gid: policy.target_gid(),
+            path_identity: policy.path_identity(),
+        });
+    #[cfg(not(feature = "elevated-bootstrap-probe"))]
+    let strict_api_cleanup = None;
+
     let cleanup = if let Some(namespace) = observation.namespace.as_mut() {
-        cleanup_namespace_after_worker(namespace, grants)
+        cleanup_namespace_after_worker(namespace, grants, strict_api_cleanup)
     } else {
         roots
             .recover_after_worker_exit(session_id)
             .and_then(|recovered| {
                 recovered.map_or(Ok(()), |mut namespace| {
-                    cleanup_namespace_after_worker(&mut namespace, grants)
+                    cleanup_namespace_after_worker(&mut namespace, grants, strict_api_cleanup)
                 })
             })
     }
@@ -381,15 +395,42 @@ impl NamespaceRoots {
     }
 }
 
+#[derive(Clone, Copy)]
+struct StrictSocketCleanupPolicy {
+    anchor_descriptor: RawFd,
+    anchor_identity: bangbang_session::ObjectIdentity,
+    target_uid: u32,
+    target_gid: u32,
+    path_identity: bangbang_session::ObjectIdentity,
+}
+
 fn cleanup_namespace_after_worker(
     namespace: &mut LauncherNamespace,
     grants: &PreparedGrantBatch,
+    strict_api: Option<StrictSocketCleanupPolicy>,
 ) -> Result<(), RuntimeError> {
     for record in namespace.socket_ownership_records()? {
         let anchor = grants
             .socket_directory_anchor(record.role())
             .ok_or(RuntimeError::InvalidEntry)?;
-        unlink_owned_socket(anchor.descriptor(), &record)?;
+        let strict_owner = match (record.role(), strict_api) {
+            (bangbang_session::ResourceRole::ApiSocketDirectory, Some(policy)) => {
+                if anchor.descriptor() != policy.anchor_descriptor
+                    || anchor.identity() != policy.anchor_identity
+                    || record.identity() != policy.path_identity
+                {
+                    return Err(RuntimeError::InvalidEntry);
+                }
+                Some((policy.target_uid, policy.target_gid))
+            }
+            (_, Some(_)) => None,
+            (_, None) => None,
+        };
+        if let Some(owner) = strict_owner {
+            unlink_owned_socket_with_owner(anchor.descriptor(), &record, Some(owner))?;
+        } else {
+            unlink_owned_socket(anchor.descriptor(), &record)?;
+        }
         namespace.unlink_staged_socket(&record)?;
         namespace.clear_socket_record(&record)?;
     }
@@ -407,6 +448,14 @@ fn cleanup_namespace_after_worker(
 fn unlink_owned_socket(
     directory: RawFd,
     record: &SocketOwnershipRecord,
+) -> Result<(), RuntimeError> {
+    unlink_owned_socket_with_owner(directory, record, None)
+}
+
+fn unlink_owned_socket_with_owner(
+    directory: RawFd,
+    record: &SocketOwnershipRecord,
+    strict_owner: Option<(u32, u32)>,
 ) -> Result<(), RuntimeError> {
     let child = CString::new(record.child().as_bytes()).map_err(|_| RuntimeError::InvalidEntry)?;
     let mut stat = MaybeUninit::<libc::stat>::uninit();
@@ -429,15 +478,16 @@ fn unlink_owned_socket(
     }
     // SAFETY: Successful fstatat initialized the complete result.
     let stat = unsafe { stat.assume_init() };
-    // SAFETY: `geteuid` has no pointer or ownership contract.
-    let uid = unsafe { libc::geteuid() };
+    // SAFETY: Effective identity calls have no pointer or ownership contract.
+    let default_uid = unsafe { libc::geteuid() };
     let identity = bangbang_session::ObjectIdentity {
         device: u64::from(u32::from_ne_bytes(stat.st_dev.to_ne_bytes())),
         inode: stat.st_ino,
     };
     if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
         || stat.st_mode & 0o7777 != 0o600
-        || stat.st_uid != uid
+        || stat.st_uid != strict_owner.map_or(default_uid, |(uid, _)| uid)
+        || strict_owner.is_some_and(|(_, gid)| stat.st_gid != gid)
         || stat.st_nlink != 1
         || identity != record.identity()
     {
@@ -969,7 +1019,12 @@ fn wait_session_inner(
             if !grant_send.requires_write_event()
                 && let Some(guest) = guest.as_mut()
             {
-                guest.pump_write(grant_socket)?;
+                guest.pump_write(
+                    grant_socket,
+                    worker.pid(),
+                    session,
+                    observation.namespace.as_ref(),
+                )?;
             }
             let grant_write_required = grant_send.requires_write_event();
             #[cfg(feature = "elevated-bootstrap-probe")]

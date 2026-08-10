@@ -99,6 +99,8 @@ grant_activation="--bangbang-internal-grant-probe-v1"
 grant_runtime_case="target-runtime"
 runtime_launcher_boundary_artifact="bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
 runtime_worker_boundary_artifact="bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary"
+api_listener_launcher_boundary_artifact="bangbang-elevated-api-listener-launcher-v1-BBL1-request-bind-transfer-adoption-final-child-one-right"
+api_listener_worker_boundary_artifact="bangbang-elevated-api-listener-worker-v1-BBL1-request-ack-adoption-record-readiness"
 guest_no_api_drop_mode="guest-no-api-drop"
 guest_no_api_retain_mode="guest-no-api-retain-root"
 guest_no_api_unmapped_mode="guest-no-api-unmapped"
@@ -127,6 +129,10 @@ guest_isolation_markers=(
   guest-grant-accepted
   guest-transport-contamination
   guest-resource-witness
+  api-listener-request
+  api-listener-bind
+  api-listener-transfer
+  api-listener-adoption
   api-socket-publication
   api-logger-configuration
   api-metrics-configuration
@@ -197,6 +203,8 @@ probe_markers=(
   "$grant_runtime_case"
   "$runtime_launcher_boundary_artifact"
   "$runtime_worker_boundary_artifact"
+  "$api_listener_launcher_boundary_artifact"
+  "$api_listener_worker_boundary_artifact"
   "$guest_no_api_drop_mode"
   "$guest_no_api_retain_mode"
   "$guest_no_api_unmapped_mode"
@@ -282,7 +290,8 @@ for marker_value in \
   "$guest_terminal_evidence" \
   "$guest_api_start" \
   "$guest_kernel_reference" \
-  "$guest_serial_reference"; do
+  "$guest_serial_reference" \
+  "$api_listener_launcher_boundary_artifact"; do
   if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$launcher_bin"; then
     echo "evidence launcher is missing the guest continuation boundary" >&2
     exit 1
@@ -333,7 +342,8 @@ for marker_value in \
   "$guest_hvf_witness" \
   "$guest_terminal_evidence" \
   "$guest_kernel_reference" \
-  "$guest_serial_reference"; do
+  "$guest_serial_reference" \
+  "$api_listener_worker_boundary_artifact"; do
   if ! LC_ALL=C /usr/bin/grep -a -F -q -- "$marker_value" "$worker_bin"; then
     echo "evidence worker is missing the guest continuation boundary" >&2
     exit 1

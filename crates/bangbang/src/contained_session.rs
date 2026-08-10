@@ -319,6 +319,10 @@ mod platform {
         SnapshotStagingTracker, SnapshotStagingTrackingError,
     };
     use bangbang_session::ConnectedUnixPeer;
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    use bangbang_session::macos::api_listener::{
+        ReceivedApiListener, receive_api_listener_ack, send_api_listener_request,
+    };
     use bangbang_session::macos::block_control::{
         BlockControlError, BlockControlMessage, BlockControlOperation, BlockControlTarget,
         receive_block_control_message, send_block_control_message,
@@ -3703,6 +3707,8 @@ mod platform {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum GuestEvidenceStep {
         ResourceClaim,
+        ApiListener,
+        ApiListenerReceived,
         HvfCreate,
         HvfCreated,
         GuestShutdown,
@@ -3795,11 +3801,22 @@ mod platform {
         pub(crate) fn before_first_guest_resource_claim(
             &self,
         ) -> Result<(), ContainedSessionError> {
+            let next_step = match self.workload()? {
+                bangbang_session::elevated_probe::RuntimeWorkload::GuestNoApi => {
+                    GuestEvidenceStep::HvfCreate
+                }
+                bangbang_session::elevated_probe::RuntimeWorkload::GuestApi => {
+                    GuestEvidenceStep::ApiListener
+                }
+                bangbang_session::elevated_probe::RuntimeWorkload::RepresentativeGrants => {
+                    return Err(ContainedSessionError);
+                }
+            };
             self.exchange(
                 GuestEvidenceStep::ResourceClaim,
                 bangbang_session::elevated_probe::GuestEvidencePhase::ResourceClaim,
                 bangbang_session::elevated_probe::RuntimeFault::GuestResourceWitness,
-                GuestEvidenceStep::HvfCreate,
+                next_step,
             )
         }
 
@@ -3809,13 +3826,121 @@ mod platform {
         ) -> Result<(), ContainedSessionError> {
             let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
             let state = locked.as_mut().ok_or(ContainedSessionError)?;
-            if state.step != GuestEvidenceStep::HvfCreate
+            let expected_step = match expected_workload {
+                bangbang_session::elevated_probe::RuntimeWorkload::GuestNoApi => {
+                    GuestEvidenceStep::HvfCreate
+                }
+                bangbang_session::elevated_probe::RuntimeWorkload::GuestApi => {
+                    GuestEvidenceStep::ApiListener
+                }
+                bangbang_session::elevated_probe::RuntimeWorkload::RepresentativeGrants => {
+                    return Err(ContainedSessionError);
+                }
+            };
+            if state.step != expected_step
                 || state.mode.runtime_workload() != Some(expected_workload)
                 || state.directory_authority_consumed
             {
                 return Err(ContainedSessionError);
             }
             state.directory_authority_consumed = true;
+            Ok(())
+        }
+
+        fn receive_api_listener(&self) -> Result<ReceivedApiListener, ContainedSessionError> {
+            let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+            let Some(mut state) = locked.take() else {
+                return Err(ContainedSessionError);
+            };
+            let result = (|| {
+                if state.step != GuestEvidenceStep::ApiListener
+                    || state.mode.runtime_workload()
+                        != Some(bangbang_session::elevated_probe::RuntimeWorkload::GuestApi)
+                    || !state.directory_authority_consumed
+                    || state.fault
+                        == bangbang_session::elevated_probe::RuntimeFault::ApiListenerRequest
+                {
+                    return Err(ContainedSessionError);
+                }
+                validate_guest_evidence_worker(&state)?;
+                let request = bangbang_session::elevated_probe::ApiListenerRecord::worker_request(
+                    state.mode,
+                    state.nonce,
+                    state.session,
+                )
+                .map_err(|_| ContainedSessionError)?;
+                let send_deadline = Instant::now()
+                    .checked_add(GUEST_EVIDENCE_TIMEOUT)
+                    .ok_or(ContainedSessionError)?;
+                loop {
+                    set_remaining_write_timeout(&state.socket, send_deadline)?;
+                    match send_api_listener_request(&state.socket, request) {
+                        Ok(()) => break,
+                        Err(bangbang_session::macos::grant_transport::GrantTransportError::Io(
+                            io::ErrorKind::Interrupted,
+                        )) => {}
+                        Err(_) => return Err(ContainedSessionError),
+                    }
+                }
+                let receive_deadline = Instant::now()
+                    .checked_add(GUEST_EVIDENCE_TIMEOUT)
+                    .ok_or(ContainedSessionError)?;
+                let received = loop {
+                    set_remaining_read_timeout(&state.socket, receive_deadline)?;
+                    match receive_api_listener_ack(&state.socket) {
+                        Ok(received) => break received,
+                        Err(bangbang_session::macos::grant_transport::GrantTransportError::Io(
+                            io::ErrorKind::Interrupted,
+                        )) => {}
+                        Err(_) => return Err(ContainedSessionError),
+                    }
+                };
+                let identity = received
+                    .record
+                    .path_identity()
+                    .ok_or(ContainedSessionError)?;
+                if !received.record.matches_expected(
+                    state.mode,
+                    bangbang_session::elevated_probe::ApiListenerKind::Ack,
+                    state.nonce,
+                    state.session,
+                    Some(identity),
+                ) || !guest_evidence_transport_is_empty(&state.socket)
+                {
+                    return Err(ContainedSessionError);
+                }
+                validate_guest_evidence_worker(&state)?;
+                if state.fault
+                    == bangbang_session::elevated_probe::RuntimeFault::ApiListenerTransfer
+                    || state.fault
+                        == bangbang_session::elevated_probe::RuntimeFault::ApiListenerAdoption
+                {
+                    return Err(ContainedSessionError);
+                }
+                state.step = GuestEvidenceStep::ApiListenerReceived;
+                Ok(received)
+            })();
+            if result.is_ok() {
+                *locked = Some(state);
+            } else {
+                let _ = state.socket.shutdown(std::net::Shutdown::Both);
+            }
+            result
+        }
+
+        fn confirm_api_listener_adopted(&self) -> Result<(), ContainedSessionError> {
+            let mut locked = self.state.lock().map_err(|_| ContainedSessionError)?;
+            let state = locked.as_mut().ok_or(ContainedSessionError)?;
+            if state.step != GuestEvidenceStep::ApiListenerReceived
+                || state.mode.runtime_workload()
+                    != Some(bangbang_session::elevated_probe::RuntimeWorkload::GuestApi)
+                || !state.directory_authority_consumed
+                || !guest_evidence_transport_is_empty(&state.socket)
+            {
+                return Err(ContainedSessionError);
+            }
+            validate_guest_evidence_worker(state)?;
+            state.step = GuestEvidenceStep::HvfCreate;
             Ok(())
         }
 
@@ -4044,6 +4169,34 @@ mod platform {
                 let _ = state.socket.shutdown(std::net::Shutdown::Both);
             }
         }
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn set_remaining_write_timeout(
+        socket: &UnixDatagram,
+        deadline: Instant,
+    ) -> Result<(), ContainedSessionError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ContainedSessionError)?;
+        socket
+            .set_write_timeout(Some(remaining))
+            .map_err(|_| ContainedSessionError)
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn set_remaining_read_timeout(
+        socket: &UnixDatagram,
+        deadline: Instant,
+    ) -> Result<(), ContainedSessionError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ContainedSessionError)?;
+        socket
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| ContainedSessionError)
     }
 
     #[cfg(feature = "elevated-bootstrap-probe")]
@@ -4721,6 +4874,26 @@ mod platform {
             )
         }
 
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        pub(crate) fn receive_elevated_api_listener(
+            &self,
+        ) -> Result<Option<ReceivedApiListener>, ContainedSessionError> {
+            self.guest_evidence
+                .as_ref()
+                .map(GuestEvidenceAuthority::receive_api_listener)
+                .transpose()
+        }
+
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        pub(crate) fn confirm_elevated_api_listener_adopted(
+            &self,
+        ) -> Result<(), ContainedSessionError> {
+            let Some(authority) = &self.guest_evidence else {
+                return Err(ContainedSessionError);
+            };
+            authority.confirm_api_listener_adopted()
+        }
+
         pub(crate) fn pager_grant_authority(&self) -> Option<PagerGrantAuthority> {
             self.started.then(|| self.pager_grants.clone())
         }
@@ -5269,11 +5442,12 @@ mod platform {
     #[cfg(test)]
     pub(crate) use tests::{
         TestContainedRestoreAuthority, TestDirectory as TestVhostDirectory,
-        contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
-        empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-        root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-        snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
-        vhost_directory_authority_for_test, vsock_directory_authority_for_test,
+        api_directory_authority_for_test, contained_restore_authority_for_test,
+        contained_restore_authority_with_grants_for_test, empty_grant_authority_for_vhost_test,
+        file_grant_authority_for_test, root_file_grant_authority_for_test,
+        snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
+        snapshot_storage_grant_authority_for_test, vhost_directory_authority_for_test,
+        vsock_directory_authority_for_test,
     };
 
     #[cfg(test)]
@@ -5366,7 +5540,7 @@ mod platform {
         pub(crate) struct TestDirectory(PathBuf);
 
         impl TestDirectory {
-            fn new() -> Self {
+            pub(crate) fn new() -> Self {
                 loop {
                     let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
                     let path =
@@ -6900,6 +7074,18 @@ mod platform {
             )
         }
 
+        pub(crate) fn api_directory_authority_for_test() -> (DirectoryGrantAuthority, TestDirectory)
+        {
+            let (mut registry, directory) = directory_registry(
+                bangbang_session::elevated_probe::GUEST_API_DIRECTORY_GRANT_ID,
+                ResourceRole::ApiSocketDirectory,
+            );
+            (
+                DirectoryGrantAuthority::new(registry.take_directory_registry()),
+                directory,
+            )
+        }
+
         #[test]
         fn file_authority_is_send_sync_and_claims_fail_closed_atomically() {
             fn assert_send_sync<T: Send + Sync>() {}
@@ -8233,9 +8419,10 @@ pub(crate) use platform::{
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use platform::{
     ContainedSnapshotRestoreDriveRequest, TestContainedRestoreAuthority, TestVhostDirectory,
-    contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
-    empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-    root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-    snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
-    vhost_directory_authority_for_test, vsock_directory_authority_for_test,
+    api_directory_authority_for_test, contained_restore_authority_for_test,
+    contained_restore_authority_with_grants_for_test, empty_grant_authority_for_vhost_test,
+    file_grant_authority_for_test, root_file_grant_authority_for_test,
+    snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
+    snapshot_storage_grant_authority_for_test, vhost_directory_authority_for_test,
+    vsock_directory_authority_for_test,
 };
