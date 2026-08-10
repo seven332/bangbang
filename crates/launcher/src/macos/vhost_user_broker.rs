@@ -5,7 +5,6 @@ use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixStream};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use bangbang_session::macos::vhost_user_broker::{
@@ -18,11 +17,12 @@ use bangbang_session::{LauncherState, ObjectIdentity, SessionId};
 use crate::LauncherError;
 use crate::grant_manifest::{PreparedGrantBatch, SocketDirectoryAnchor};
 
+use super::scoped_cwd::{ScopedCwdOperationError, with_scoped_cwd};
+#[cfg(test)]
+use super::scoped_cwd::{current_directory_identity, directory_descriptor_identity};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 8;
-// Darwin has no descriptor-relative Unix-socket connect. Serialize the brief
-// cwd switch shared by pager startup and the vhost-user supervisor.
-static CWD_CONNECT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Session-bound serial connector for worker vhost-user requests.
 pub(crate) struct LauncherVhostUserBroker {
@@ -141,73 +141,18 @@ fn send(
         .map_err(|_| LauncherError::VhostUserBroker)
 }
 
-struct CwdGuard {
-    saved: Option<OwnedFd>,
-    identity: ObjectIdentity,
-}
-
-impl CwdGuard {
-    fn enter(
-        anchor_descriptor: RawFd,
-        anchor_identity: ObjectIdentity,
-    ) -> Result<Self, LauncherError> {
-        // SAFETY: The fixed relative directory path is NUL-terminated; success
-        // returns a fresh close-on-exec directory descriptor.
-        let saved = unsafe {
-            libc::open(
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if saved < 0 {
-            return Err(LauncherError::VhostUserBroker);
-        }
-        // SAFETY: `saved` is the fresh descriptor returned above.
-        let saved = unsafe { OwnedFd::from_raw_fd(saved) };
-        let identity =
-            descriptor_identity(saved.as_raw_fd()).map_err(|_| LauncherError::VhostUserBroker)?;
-        let guard = Self {
-            saved: Some(saved),
-            identity,
-        };
-        // SAFETY: The retained manifest descriptor is a live directory anchor.
-        if unsafe { libc::fchdir(anchor_descriptor) } != 0
-            || current_directory_identity().map_err(|_| LauncherError::VhostUserBroker)?
-                != anchor_identity
-        {
-            return Err(LauncherError::VhostUserBroker);
-        }
-        Ok(guard)
-    }
-
-    fn restore(&mut self) -> Result<(), LauncherError> {
-        let saved = self.saved.as_ref().ok_or(LauncherError::VhostUserBroker)?;
-        // SAFETY: `saved` remains a live descriptor for the original cwd.
-        if unsafe { libc::fchdir(saved.as_raw_fd()) } != 0
-            || current_directory_identity().map_err(|_| LauncherError::VhostUserBroker)?
-                != self.identity
-        {
-            return Err(LauncherError::VhostUserBroker);
-        }
-        self.saved.take();
-        Ok(())
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        if let Some(saved) = self.saved.as_ref() {
-            // SAFETY: Best-effort restoration uses the still-owned original cwd.
-            let _ = unsafe { libc::fchdir(saved.as_raw_fd()) };
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScopedConnectError {
     Failure(io::ErrorKind),
     Rejected,
     Invalid,
+}
+
+fn map_scoped_cwd_error(error: ScopedCwdOperationError<ScopedConnectError>) -> ScopedConnectError {
+    match error {
+        ScopedCwdOperationError::Boundary(_) => ScopedConnectError::Invalid,
+        ScopedCwdOperationError::Operation(error) => error,
+    }
 }
 
 /// Result of beginning one descriptor-relative nonblocking connection.
@@ -262,12 +207,7 @@ pub(crate) fn begin_anchored_exact_nonblocking(
     {
         return Err(ScopedConnectError::Invalid);
     }
-    let _cwd_connect = CWD_CONNECT_LOCK
-        .lock()
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let result = (|| {
+    with_scoped_cwd(anchor_descriptor, anchor_identity, || {
         let source_identity = relative_connect_target_identity_with_mode(
             name,
             expected_uid,
@@ -337,9 +277,8 @@ pub(crate) fn begin_anchored_exact_nonblocking(
             }
             return Err(ScopedConnectError::Failure(error.kind()));
         }
-    })();
-    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
-    result
+    })
+    .map_err(map_scoped_cwd_error)
 }
 
 /// Completes a writable nonblocking connection and repeats exact pathname validation.
@@ -356,12 +295,7 @@ pub(crate) fn finish_anchored_exact_nonblocking(
             io::Error::from_raw_os_error(socket_error).kind(),
         ));
     }
-    let _cwd_connect = CWD_CONNECT_LOCK
-        .lock()
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let mut guard = CwdGuard::enter(pending.anchor_descriptor, pending.anchor_identity)
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let result = (|| {
+    with_scoped_cwd(pending.anchor_descriptor, pending.anchor_identity, || {
         let after = relative_connect_target_identity_with_mode(
             &pending.name,
             pending.expected_uid,
@@ -376,9 +310,8 @@ pub(crate) fn finish_anchored_exact_nonblocking(
             pending.stream,
             pending.source_identity,
         ))
-    })();
-    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
-    result
+    })
+    .map_err(map_scoped_cwd_error)
 }
 
 /// Revalidates one exact anchored socket child without opening a connection.
@@ -392,12 +325,7 @@ pub(crate) fn validate_anchored_socket_child(
     expected_mode: u32,
     expected_identity: ObjectIdentity,
 ) -> Result<(), ScopedConnectError> {
-    let _cwd_connect = CWD_CONNECT_LOCK
-        .lock()
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let result =
+    with_scoped_cwd(anchor_descriptor, anchor_identity, || {
         relative_connect_target_identity_with_mode(name, expected_uid, expected_gid, expected_mode)
             .and_then(|identity| {
                 if identity == expected_identity {
@@ -405,9 +333,9 @@ pub(crate) fn validate_anchored_socket_child(
                 } else {
                     Err(ScopedConnectError::Rejected)
                 }
-            });
-    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
-    result
+            })
+    })
+    .map_err(map_scoped_cwd_error)
 }
 
 /// Returns whether one fixed child is absent beneath an exact retained anchor.
@@ -417,33 +345,29 @@ pub(crate) fn anchored_socket_child_is_absent(
     anchor_identity: ObjectIdentity,
     name: &CStr,
 ) -> Result<bool, ScopedConnectError> {
-    let _cwd_connect = CWD_CONNECT_LOCK
-        .lock()
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: The bounded fixed child and writable stat storage remain valid.
-    let result = unsafe {
-        libc::fstatat(
-            libc::AT_FDCWD,
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    let result = if result == 0 {
-        Ok(false)
-    } else {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            Ok(true)
+    with_scoped_cwd(anchor_descriptor, anchor_identity, || {
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: The bounded fixed child and writable stat storage remain valid.
+        let result = unsafe {
+            libc::fstatat(
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            Ok(false)
         } else {
-            Err(ScopedConnectError::Failure(error.kind()))
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(true)
+            } else {
+                Err(ScopedConnectError::Failure(error.kind()))
+            }
         }
-    };
-    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
-    result
+    })
+    .map_err(map_scoped_cwd_error)
 }
 
 fn connect_scoped(
@@ -469,14 +393,10 @@ pub(crate) fn connect_anchored_exact(
     if timeout.is_zero() || name.to_bytes().is_empty() || name.to_bytes().contains(&b'/') {
         return Err(ScopedConnectError::Invalid);
     }
-    let _cwd_connect = CWD_CONNECT_LOCK
-        .lock()
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let mut guard = CwdGuard::enter(anchor_descriptor, anchor_identity)
-        .map_err(|_| ScopedConnectError::Invalid)?;
-    let result = connect_relative_child(name, timeout);
-    guard.restore().map_err(|_| ScopedConnectError::Invalid)?;
-    result
+    with_scoped_cwd(anchor_descriptor, anchor_identity, || {
+        connect_relative_child(name, timeout)
+    })
+    .map_err(map_scoped_cwd_error)
 }
 
 fn connect_relative_child(
@@ -537,46 +457,6 @@ fn connect_relative_child(
     }
     validate_connected_peer(descriptor.as_raw_fd(), name)?;
     Ok((UnixStream::from(descriptor), before))
-}
-
-fn current_directory_identity() -> Result<ObjectIdentity, ScopedConnectError> {
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: The fixed relative name is live and output storage is writable.
-    if unsafe {
-        libc::fstatat(
-            libc::AT_FDCWD,
-            c".".as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(ScopedConnectError::Failure(
-            io::Error::last_os_error().kind(),
-        ));
-    }
-    // SAFETY: Successful fstatat initialized the complete structure.
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        return Err(ScopedConnectError::Invalid);
-    }
-    Ok(stat_identity(&stat))
-}
-
-fn descriptor_identity(descriptor: RawFd) -> Result<ObjectIdentity, ScopedConnectError> {
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: The descriptor remains live and output storage is writable.
-    if unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) } != 0 {
-        return Err(ScopedConnectError::Failure(
-            io::Error::last_os_error().kind(),
-        ));
-    }
-    // SAFETY: Successful fstat initialized the complete structure.
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        return Err(ScopedConnectError::Invalid);
-    }
-    Ok(stat_identity(&stat))
 }
 
 fn relative_connect_target_identity(name: &CStr) -> Result<ObjectIdentity, ScopedConnectError> {
@@ -959,6 +839,7 @@ mod tests {
                 Command::new(std::env::current_exe().expect("test executable should exist"))
                     .arg("scoped_connect_uses_exact_anchor_and_restores_cwd")
                     .arg("--nocapture")
+                    .current_dir("/")
                     .env(SCOPED_CONNECT_CHILD_ENV, "1")
                     .status()
                     .expect("isolated cwd test should launch");
@@ -974,8 +855,8 @@ mod tests {
         let listener = UnixListener::bind(anchor_path.join("backend.sock"))
             .expect("anchored listener should bind");
         let anchor_file = File::open(&anchor_path).expect("anchor directory should open");
-        let identity =
-            descriptor_identity(anchor_file.as_raw_fd()).expect("anchor identity should inspect");
+        let identity = directory_descriptor_identity(anchor_file.as_raw_fd())
+            .expect("anchor identity should inspect");
         let anchor = SocketDirectoryAnchor::for_test(anchor_file.as_raw_fd(), identity);
         let child = bangbang_session::SocketChild::parse("backend.sock")
             .expect("socket child should parse");

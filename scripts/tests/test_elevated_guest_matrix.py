@@ -155,6 +155,10 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
                 "guest-grant-accepted",
                 "guest-transport-contamination",
                 "guest-resource-witness",
+                "api-listener-request",
+                "api-listener-bind",
+                "api-listener-transfer",
+                "api-listener-adoption",
                 "api-socket-publication",
                 "api-logger-configuration",
                 "api-metrics-configuration",
@@ -164,6 +168,14 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
                 "api-drive-configuration",
                 "api-instance-start",
                 "no-api-startup",
+                "guest-hvf-witness",
+                "guest-hvf-create",
+                "guest-execution",
+                "guest-oracle",
+                "guest-poweroff",
+                "guest-timeout",
+                "guest-terminal-evidence",
+                "guest-cleanup",
                 "guest-hvf-witness",
                 "guest-hvf-create",
                 "guest-execution",
@@ -182,6 +194,15 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
             self.assertIn(f"result={fault.result}", line)
             self.assertNotIn("/private/", line)
             self.assertNotIn("bangbang-grant:", line)
+        self.assertEqual(
+            matrix.REACHABLE_API_FAULTS,
+            {
+                "api-listener-request",
+                "api-listener-bind",
+                "api-listener-transfer",
+                "api-listener-adoption",
+            },
+        )
 
     def test_success_output_is_closed_over_worker_and_launcher_lines(self) -> None:
         no_api = matrix.expected_success_output(matrix.mode_for("no-api"))
@@ -193,19 +214,19 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
         self.assertIn("status: VM running without API", no_api)
         self.assertIn("status: API server listening", api)
 
-    def test_measured_api_publication_boundary_is_exact_and_value_free(self) -> None:
+    def test_measured_api_adoption_boundary_is_exact_and_value_free(self) -> None:
         for identity in ("mapped", "retained-root", "unmapped"):
             case = matrix.mode_for("api", identity)
-            output = matrix.expected_api_publication_block_output(case)
-            self.assertEqual(len(output.splitlines()), 6)
-            self.assertIn("stage=api-socket-publication", output)
+            boundary = matrix.api_boundary(case)
+            output = matrix.expected_fault_line(case, boundary)
+            self.assertIn("stage=api-listener-adoption", output)
             self.assertIn("error=other", output)
             self.assertIn("result=api-boundary", output)
             self.assertNotIn("/private/", output)
             self.assertNotIn("bangbang-grant:", output)
-        self.assertIn("api-mapped=blocked-api-publication", matrix.MATRIX_SUMMARY)
+        self.assertIn("api-mapped=blocked-listener-adoption", matrix.MATRIX_SUMMARY)
         self.assertIn("no-api-mapped=complete", matrix.MATRIX_SUMMARY)
-        self.assertIn("api-later-ineligible", matrix.MATRIX_SUMMARY)
+        self.assertIn("api-through-adoption", matrix.MATRIX_SUMMARY)
 
     def test_post_adoption_barrier_is_internal_and_precedes_worker_envelope(self) -> None:
         fixture = object.__new__(matrix.Fixture)
@@ -282,10 +303,10 @@ class ElevatedGuestMatrixTests(unittest.TestCase):
             '/usr/bin/python3 "$repo_root/scripts/elevated_guest_matrix.py"', wrapper
         )
         self.assertIn('--sidecar "$guest_sidecar"', wrapper)
-        self.assertIn("deaths=worker-first-launcher-first", wrapper)
-        self.assertIn("tamper=rejected", wrapper)
+        self.assertIn("deaths=no-api-worker-first-launcher-first", wrapper)
+        self.assertIn("tamper=rejected-both-workloads", wrapper)
         self.assertIn(
-            "adoption-replacement=no-api-preopened-api-ineligible",
+            "adoption-replacement=no-api-preopened-api-rejected-at-grant",
             wrapper,
         )
 

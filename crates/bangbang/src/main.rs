@@ -40,6 +40,8 @@ mod vmm;
 #[cfg(target_os = "macos")]
 mod vsock_restore;
 
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+use anchored_socket::adopt_elevated_api_listener;
 #[cfg(target_os = "macos")]
 use anchored_socket::bind as bind_anchored_socket;
 use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
@@ -502,6 +504,44 @@ fn run(
                                         .socket_namespace()
                                         .map_err(|_| ProcessError::ContainedSession)?
                                         .ok_or(ProcessError::ContainedSession)?;
+                                    #[cfg(feature = "elevated-bootstrap-probe")]
+                                    let elevated_listener = contained
+                                        .as_ref()
+                                        .map(ContainedSession::receive_elevated_api_listener)
+                                        .transpose()
+                                        .map_err(|_| ProcessError::ContainedSession)?
+                                        .flatten();
+                                    #[cfg(feature = "elevated-bootstrap-probe")]
+                                    let socket = if let Some(received) = elevated_listener {
+                                        let socket =
+                                            adopt_elevated_api_listener(namespace, claim, received)
+                                                .map_err(|error| {
+                                                    ProcessError::ApiServer(
+                                                        ApiServerError::Anchored(error),
+                                                    )
+                                                })?;
+                                        contained
+                                            .as_ref()
+                                            .ok_or(ProcessError::ContainedSession)?
+                                            .confirm_elevated_api_listener_adopted()
+                                            .map_err(|_| ProcessError::ContainedSession)?;
+                                        socket
+                                    } else {
+                                        bind_anchored_socket(
+                                            namespace,
+                                            claim,
+                                            ResourceRole::ApiSocketDirectory,
+                                            None,
+                                        )
+                                        .map_err(
+                                            |error| {
+                                                ProcessError::ApiServer(ApiServerError::Anchored(
+                                                    error,
+                                                ))
+                                            },
+                                        )?
+                                    };
+                                    #[cfg(not(feature = "elevated-bootstrap-probe"))]
                                     let socket = bind_anchored_socket(
                                         namespace,
                                         claim,

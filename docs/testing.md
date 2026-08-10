@@ -2099,8 +2099,8 @@ merged-main OID are checked and recorded by the pull-request workflow.
 ## Explicit Elevated Bootstrap Evidence
 
 The #1373 direct-worker, #1884 inherited-root, #1885 no-chroot credential,
-#1889 / #1891 target-owned runtime-continuation, and #1893 post-transition
-guest proofs are deliberately
+#1889 / #1891 target-owned runtime-continuation, #1893 post-transition guest,
+and #1895 launcher-created API-listener proofs are deliberately
 separate from `scripts/run-integration-tests.sh`. Normal validation never
 invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
 passing skip.
@@ -2125,8 +2125,9 @@ acknowledgment, `BBN1` session authority, representative grant activation, and c
 vocabulary are absent. It then builds both ends with disabled-by-default
 evidence features, checks role-specific credential/runtime markers, adds four
 visible test-only resource markers plus the ordinary-user-verified guest
-artifacts, and uses the normal production packager, signature split,
-entitlements, Hardened Runtime, and inspections.
+artifacts, requires the launcher/worker-specific `BBL1` handoff markers in only
+their evidence binaries, and uses the normal production packager, signature
+split, entitlements, Hardened Runtime, and inspections.
 
 On a capable Apple Silicon host, calculate the explicit numeric target before
 elevation and invoke the wrapper through `sudo` (substitute the captured
@@ -2195,10 +2196,12 @@ credential, `BBA1`, `BBN1`, lifecycle, or grant prefix. Guest artifacts must be
 prepared and digest-verified before elevation; the exact-root run only verifies
 and opens the sealed copies. The matrix repeats every identity/workload three
 times, runs two concurrent mapped no-API successes and two concurrent mapped
-API boundary cases, and then exercises every fault still reachable before the
-measured API publication stop. It also checks worker-first and launcher-first
-death, immutable-input tampering, post-adoption pathname replacement, exact
-output ledgers, and final zero residue. Launcher-first cleanup removes only the
+API boundary cases, and then exercises every no-API fault plus API listener
+request, bind, transfer, and adoption faults reachable before the measured
+stop. It also checks worker-first and launcher-first no-API death,
+immutable-input tampering for both workloads, successful no-API post-adoption
+pathname replacement, API preopened-anchor replacement rejection, exact output
+ledgers, and final zero residue. Launcher-first cleanup removes only the
 pre-recorded empty session after both signed endpoints have exited and rejects
 an identity replacement.
 
@@ -2213,12 +2216,20 @@ and exact cleanup. The SDK-maximum result retained both live-code checks and is
 therefore a changed same-check witness, not a bypass. Real no-API guests then
 completed late reattestation, grant-backed startup, HVF creation, the fixed
 guest oracle, guest-requested poweroff, and cleanup for all three identities.
-All three contained API cases stopped at the value-free
+The historical #1893 contained API cases stopped at the value-free
 `api-socket-publication` boundary: mapped/unmapped App Sandbox initialization
 failed before binder application entry, while retained-root App Sandbox denied
-the descriptor-rooted staging-socket create. API configuration and later API
-faults are therefore ineligible in this measured shape. Daemon/crash
-convergence remains unmeasured.
+the descriptor-rooted staging-socket create. #1895 preserves that result and
+uses one dedicated zero-right `BBL1` request so the transitioned launcher binds
+fixed final `evidence-api.sock` beneath its retained exact anchor and replies
+with exactly one listener descriptor. All three identities completed direct
+bind and transfer, including launcher alias release, before the same signed
+worker stopped in the closed receive/adoption interval reported as
+`api-listener-adoption` / `other`; two mapped attempts reproduced that boundary
+concurrently. No durable listener record, readiness, HTTP configuration, or
+API-started HVF guest followed. The exact failing operation and sub-cause remain
+unclaimed, and API configuration plus later faults are ineligible in this
+measured shape. Daemon/crash convergence remains unmeasured.
 Stream credentials remained
 connection-time snapshots, datagram credentials were unsupported, opaque
 datagram tokens changed only for credential transitions, and live peer PIDs

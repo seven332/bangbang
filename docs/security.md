@@ -96,10 +96,14 @@ bind the same session/inode, and the launcher proves the lock through an
 independent description before committing grants. The representative grant
 workload, `Proceed`/`Starting`/terminal ownership, reap, and exact cleanup all
 complete. The same test-only authority now also completes real no-API
-guest/HVF execution for all three identities. Its contained API path stops at
-the separately measured App Sandbox `api-socket-publication` boundary before
-HTTP configuration. This does not establish public uid/gid policy, API-started
-guest execution, or daemon/crash convergence.
+guest/HVF execution for all three identities. #1893's ordinary contained API
+binder stops at the App Sandbox `api-socket-publication` boundary. #1895's
+feature-only launcher-created path advances through direct final bind and an
+exactly-one-descriptor transfer, then the same worker stops in the closed
+receive/adoption interval reported as `api-listener-adoption` / `other` before
+durable ownership or readiness. This does not establish public uid/gid policy,
+API-started guest execution, the exact failing operation or sub-cause, or
+daemon/crash convergence.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -3543,10 +3547,29 @@ remain correctly signed and the same no-API worker completes real HVF, so this
 is not a missing-HVF or generic signature result. Bypassing it would require a
 new non-sandboxed helper/signing role, a private sandbox extension mechanism,
 or another process topology; #1893 does not weaken the mandatory worker profile
-or treat those alternatives as equivalent. API configuration, API-started
-guest execution, and later API faults are consequently ineligible. Daemon/
-crash convergence remains unmeasured. The complete boundary, alternatives,
-exact cleanup rules, reproduction command, and future-OS nonclaim are in the checked
+or treat those alternatives as equivalent.
+
+#1895 preserved that historical binder evidence and changed only the
+feature-only producer. After the worker consumed the fixed API grant, its
+canonical zero-right `BBL1` request caused the permanently transitioned
+launcher to enter the retained exact anchor, bind final `evidence-api.sock`,
+validate target ownership and listener state, restore cwd, and send one
+canonical acknowledgment plus exactly one descriptor. All three identity
+classes repeated three times through successful transfer and launcher alias
+release; two mapped attempts reached the same point concurrently. The signed
+worker then stopped in the stable closed receive/adoption interval reported as
+`api-listener-adoption` / `other` before durable record, readiness, HTTP, or
+HVF. Deterministic faults are reachable through adoption, every result cleans
+exactly, and independent final scans find zero root, workspace, socket,
+launcher, or worker residue. The closed result does not distinguish the exact
+failing operation or kernel/sandbox sub-cause within that interval. It returns
+the parent to fresh Challenge rather than selecting a helper,
+sandbox change, topology change, or platform-impossible disposition.
+
+API configuration, API-started guest execution, and later API faults are
+consequently ineligible. Daemon/crash convergence remains unmeasured. The
+complete boundary, alternatives, exact cleanup rules, reproduction command,
+and future-OS nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
 The six rows remain audit outcomes until #1371 challenges the controlled result

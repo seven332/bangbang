@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bangbang_session::elevated_probe::{
-    CredentialRole, GuestEvidenceKind, GuestEvidencePhase, GuestEvidenceRecord,
-    GuestSerialTranscript, MAX_GUEST_SERIAL_TRANSCRIPT_BYTES, ProbeBootstrap, ProbeErrorCategory,
-    ProbeStage, RuntimeFault, RuntimeWorkload, classify_guest_serial_transcript,
+    ApiListenerKind, ApiListenerRecord, CredentialRole, GuestEvidenceKind, GuestEvidencePhase,
+    GuestEvidenceRecord, GuestSerialTranscript, MAX_GUEST_SERIAL_TRANSCRIPT_BYTES, ProbeBootstrap,
+    ProbeErrorCategory, ProbeStage, RuntimeFault, RuntimeWorkload,
+    classify_guest_serial_transcript,
 };
+use bangbang_session::macos::api_listener::{receive_api_listener_request, send_api_listener_ack};
 use bangbang_session::macos::grant_transport::GrantTransportError;
 use bangbang_session::macos::guest_evidence::{receive_guest_evidence, send_guest_evidence};
 use bangbang_session::macos::runtime::LauncherNamespace;
@@ -19,6 +21,10 @@ use bangbang_session::macos::verify_peer_pid;
 use bangbang_session::{Readiness, SessionId, TerminalCategory};
 
 use super::code_sign::{WorkerProfile, validate_launcher_process, validate_worker_process};
+use super::elevated_api_listener::{
+    ElevatedApiCleanupPolicy, ElevatedApiListenerError, ElevatedApiPublication,
+    bind_elevated_api_listener,
+};
 use super::local_socket::{
     LocalSocketConnectStart, PendingLocalSocket, anchored_child_is_absent, begin_connect_anchored,
     finish_connect_anchored, validate_anchored_child,
@@ -77,6 +83,9 @@ enum WitnessStep {
     AwaitingGrantAcceptance,
     AwaitingResourceRequest,
     SendingResourceAck,
+    AwaitingApiListenerRequest,
+    SendingApiListenerAck,
+    AwaitingApiListenerAdoption,
     AwaitingHvfRequest,
     SendingHvfAck,
     AwaitingHvfCreated,
@@ -490,6 +499,16 @@ fn api_socket_failure(stage: ProbeStage, error: ScopedConnectError) -> ApiDriver
     ApiDriverFailure { stage, category }
 }
 
+fn elevated_api_listener_category(error: ElevatedApiListenerError) -> ProbeErrorCategory {
+    match error {
+        ElevatedApiListenerError::Io(kind) => ProbeErrorCategory::from_io_kind(kind),
+        ElevatedApiListenerError::Cwd => ProbeErrorCategory::Other,
+        ElevatedApiListenerError::Invalid
+        | ElevatedApiListenerError::PathExists
+        | ElevatedApiListenerError::PathChanged => ProbeErrorCategory::InvalidInput,
+    }
+}
+
 fn api_deadline(stage: ProbeStage) -> Result<Instant, ApiDriverFailure> {
     Instant::now()
         .checked_add(API_REQUEST_TIMEOUT)
@@ -556,6 +575,8 @@ pub(crate) struct ElevatedGuestSupervisor {
     session: SessionId,
     step: WitnessStep,
     pending_ack: Option<GuestEvidenceRecord>,
+    pending_listener_ack: Option<ApiListenerRecord>,
+    publication: Option<ElevatedApiPublication>,
     deadline: Option<Instant>,
     transport_closed: bool,
     readiness: Option<Readiness>,
@@ -605,6 +626,8 @@ impl ElevatedGuestSupervisor {
                 session,
                 step: WitnessStep::AwaitingGrantAcceptance,
                 pending_ack: None,
+                pending_listener_ack: None,
+                publication: None,
                 deadline: None,
                 transport_closed: false,
                 readiness: None,
@@ -635,6 +658,8 @@ impl ElevatedGuestSupervisor {
         };
         if self.step != WitnessStep::AwaitingGrantAcceptance
             || self.pending_ack.is_some()
+            || self.pending_listener_ack.is_some()
+            || self.publication.is_some()
             || !matches!(transport_state(socket), TransportState::Empty)
             || !api_child_absent
         {
@@ -678,7 +703,11 @@ impl ElevatedGuestSupervisor {
                         Ok(())
                     } else {
                         self.fail(
-                            missing_serial_stage(self.contract.workload(), self.readiness),
+                            missing_serial_stage(
+                                self.contract.workload(),
+                                self.readiness,
+                                self.step,
+                            ),
                             ProbeErrorCategory::Other,
                         )
                     };
@@ -691,11 +720,21 @@ impl ElevatedGuestSupervisor {
                 }
                 TransportState::Data => {}
             }
+            if self.step == WitnessStep::AwaitingApiListenerRequest {
+                return self.accept_api_listener_request(
+                    socket,
+                    worker_pid,
+                    session_stream,
+                    namespace,
+                );
+            }
             if self.pending_ack.is_some()
+                || self.pending_listener_ack.is_some()
                 || matches!(
                     self.step,
                     WitnessStep::AwaitingGrantAcceptance
                         | WitnessStep::SendingResourceAck
+                        | WitnessStep::SendingApiListenerAck
                         | WitnessStep::SendingHvfAck
                         | WitnessStep::Complete
                 )
@@ -728,6 +767,92 @@ impl ElevatedGuestSupervisor {
         }
     }
 
+    fn accept_api_listener_request(
+        &mut self,
+        socket: &UnixDatagram,
+        worker_pid: libc::pid_t,
+        session_stream: &UnixStream,
+        namespace: Option<&LauncherNamespace>,
+    ) -> Result<(), LauncherError> {
+        if self.bootstrap.fault() == RuntimeFault::ApiListenerRequest {
+            return self.fail(ProbeStage::ApiListenerRequest, ProbeErrorCategory::Other);
+        }
+        let request = loop {
+            match receive_api_listener_request(socket) {
+                Ok(record) => break record,
+                Err(GrantTransportError::Io(io::ErrorKind::Interrupted)) => {}
+                Err(GrantTransportError::Io(io::ErrorKind::WouldBlock)) => return Ok(()),
+                Err(GrantTransportError::Io(kind)) => {
+                    return self.fail(
+                        ProbeStage::ApiListenerRequest,
+                        ProbeErrorCategory::from_io_kind(kind),
+                    );
+                }
+                Err(GrantTransportError::Invalid) => {
+                    return self.fail(
+                        ProbeStage::ApiListenerRequest,
+                        ProbeErrorCategory::InvalidInput,
+                    );
+                }
+            }
+        };
+        if !request.matches_expected(
+            self.bootstrap.mode(),
+            ApiListenerKind::Request,
+            self.bootstrap.nonce(),
+            self.session,
+            None,
+        ) || !matches!(transport_state(socket), TransportState::Empty)
+        {
+            return self.fail(
+                ProbeStage::ApiListenerRequest,
+                ProbeErrorCategory::InvalidInput,
+            );
+        }
+        self.revalidate(
+            ProbeStage::ApiListenerRequest,
+            socket,
+            worker_pid,
+            session_stream,
+            namespace,
+        )?;
+        if self.bootstrap.fault() == RuntimeFault::ApiListenerBind {
+            return self.fail(ProbeStage::ApiListenerBind, ProbeErrorCategory::Other);
+        }
+        let publication = match bind_elevated_api_listener(
+            self.contract,
+            self.bootstrap.target_uid(),
+            self.bootstrap.target_gid(),
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                return self.fail(
+                    ProbeStage::ApiListenerBind,
+                    elevated_api_listener_category(error),
+                );
+            }
+        };
+        let acknowledgment = match ApiListenerRecord::launcher_ack(
+            self.bootstrap.mode(),
+            self.bootstrap.nonce(),
+            self.session,
+            publication.path_identity(),
+        ) {
+            Ok(acknowledgment) => acknowledgment,
+            Err(_) => {
+                return self.fail(
+                    ProbeStage::ApiListenerTransfer,
+                    ProbeErrorCategory::InvalidInput,
+                );
+            }
+        };
+        self.publication = Some(publication);
+        self.pending_listener_ack = Some(acknowledgment);
+        self.step = WitnessStep::SendingApiListenerAck;
+        self.deadline = Some(deadline_after(WITNESS_TIMEOUT)?);
+        Ok(())
+    }
+
     fn accept_record(
         &mut self,
         record: GuestEvidenceRecord,
@@ -743,7 +868,7 @@ impl ElevatedGuestSupervisor {
                 ProbeStage::GuestResourceWitness,
                 WitnessStep::SendingResourceAck,
             ),
-            WitnessStep::AwaitingHvfRequest => (
+            WitnessStep::AwaitingHvfRequest | WitnessStep::AwaitingApiListenerAdoption => (
                 GuestEvidencePhase::HvfCreate,
                 GuestEvidenceKind::Request,
                 ProbeStage::GuestHvfWitness,
@@ -763,6 +888,8 @@ impl ElevatedGuestSupervisor {
             ),
             WitnessStep::AwaitingGrantAcceptance
             | WitnessStep::SendingResourceAck
+            | WitnessStep::AwaitingApiListenerRequest
+            | WitnessStep::SendingApiListenerAck
             | WitnessStep::SendingHvfAck
             | WitnessStep::Complete => {
                 return self.fail(self.expected_stage(), ProbeErrorCategory::InvalidInput);
@@ -778,6 +905,10 @@ impl ElevatedGuestSupervisor {
             }
             (RuntimeWorkload::GuestApi, GuestEvidencePhase::HvfCreate) => {
                 self.readiness == Some(Readiness::Api)
+                    && self.pending_listener_ack.is_none()
+                    && self.publication.as_ref().is_some_and(|publication| {
+                        publication.listener_fd().is_none() && publication.validate_path().is_ok()
+                    })
                     && self
                         .api
                         .as_ref()
@@ -821,7 +952,11 @@ impl ElevatedGuestSupervisor {
         ) {
             return self.fail(stage, ProbeErrorCategory::InvalidInput);
         }
-        self.revalidate(stage, socket, worker_pid, session_stream, namespace)?;
+        if guest_evidence_requires_live_sender(phase) {
+            self.revalidate(stage, socket, worker_pid, session_stream, namespace)?;
+        } else {
+            self.revalidate_terminal_receiver(stage)?;
+        }
         self.step = next;
         match kind {
             GuestEvidenceKind::Request => {
@@ -854,7 +989,86 @@ impl ElevatedGuestSupervisor {
         Ok(())
     }
 
-    pub(crate) fn pump_write(&mut self, socket: &UnixDatagram) -> Result<(), LauncherError> {
+    pub(crate) fn pump_write(
+        &mut self,
+        socket: &UnixDatagram,
+        worker_pid: libc::pid_t,
+        session_stream: &UnixStream,
+        namespace: Option<&LauncherNamespace>,
+    ) -> Result<(), LauncherError> {
+        if let Some(record) = self.pending_listener_ack {
+            if self.step != WitnessStep::SendingApiListenerAck {
+                return self.fail(
+                    ProbeStage::ApiListenerTransfer,
+                    ProbeErrorCategory::InvalidInput,
+                );
+            }
+            if self.bootstrap.fault() == RuntimeFault::ApiListenerTransfer {
+                return self.fail(ProbeStage::ApiListenerTransfer, ProbeErrorCategory::Other);
+            }
+            self.revalidate(
+                ProbeStage::ApiListenerTransfer,
+                socket,
+                worker_pid,
+                session_stream,
+                namespace,
+            )?;
+            let Some(listener) = self
+                .publication
+                .as_ref()
+                .filter(|publication| publication.validate_path().is_ok())
+                .and_then(ElevatedApiPublication::listener_fd)
+            else {
+                return self.fail(
+                    ProbeStage::ApiListenerTransfer,
+                    ProbeErrorCategory::InvalidInput,
+                );
+            };
+            return match send_api_listener_ack(socket, record, listener) {
+                Ok(()) => {
+                    self.pending_listener_ack = None;
+                    if !matches!(
+                        self.publication
+                            .as_mut()
+                            .map(ElevatedApiPublication::release_listener_alias),
+                        Some(Ok(()))
+                    ) {
+                        return self.fail(
+                            ProbeStage::ApiListenerTransfer,
+                            ProbeErrorCategory::InvalidInput,
+                        );
+                    }
+                    if !matches!(transport_state(socket), TransportState::Empty) {
+                        return self.fail(
+                            ProbeStage::ApiListenerTransfer,
+                            ProbeErrorCategory::InvalidInput,
+                        );
+                    }
+                    self.step = WitnessStep::AwaitingApiListenerAdoption;
+                    self.deadline = Some(deadline_after(WITNESS_TIMEOUT)?);
+                    self.revalidate_with_category(
+                        ProbeStage::ApiListenerAdoption,
+                        ProbeErrorCategory::Other,
+                        socket,
+                        worker_pid,
+                        session_stream,
+                        namespace,
+                    )?;
+                    Ok(())
+                }
+                Err(GrantTransportError::Io(
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock,
+                )) => Ok(()),
+                Err(GrantTransportError::Io(kind)) => self.fail(
+                    ProbeStage::ApiListenerTransfer,
+                    ProbeErrorCategory::from_io_kind(kind),
+                ),
+                Err(GrantTransportError::Invalid) => self.fail(
+                    ProbeStage::ApiListenerTransfer,
+                    ProbeErrorCategory::InvalidInput,
+                ),
+            };
+        }
         let Some(record) = self.pending_ack else {
             return Ok(());
         };
@@ -862,6 +1076,11 @@ impl ElevatedGuestSupervisor {
             Ok(()) => {
                 self.pending_ack = None;
                 self.step = match self.step {
+                    WitnessStep::SendingResourceAck
+                        if self.contract.workload() == RuntimeWorkload::GuestApi =>
+                    {
+                        WitnessStep::AwaitingApiListenerRequest
+                    }
                     WitnessStep::SendingResourceAck => WitnessStep::AwaitingHvfRequest,
                     WitnessStep::SendingHvfAck => WitnessStep::AwaitingHvfCreated,
                     _ => {
@@ -891,7 +1110,7 @@ impl ElevatedGuestSupervisor {
     }
 
     pub(crate) const fn requires_write_event(&self) -> bool {
-        self.pending_ack.is_some()
+        self.pending_ack.is_some() || self.pending_listener_ack.is_some()
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -940,6 +1159,19 @@ impl ElevatedGuestSupervisor {
                 }
             };
             return self.fail(stage, ProbeErrorCategory::InvalidInput);
+        }
+        if workload == RuntimeWorkload::GuestApi
+            && (self.step != WitnessStep::AwaitingApiListenerAdoption
+                || self.pending_listener_ack.is_some()
+                || self.publication.as_ref().is_none_or(|publication| {
+                    publication.listener_fd().is_some() || publication.validate_path().is_err()
+                })
+                || !matches!(transport_state(socket), TransportState::Empty))
+        {
+            return self.fail(
+                ProbeStage::ApiSocketPublication,
+                ProbeErrorCategory::InvalidInput,
+            );
         }
         if self.readiness.replace(readiness).is_some() || self.api.is_some() {
             return self.fail(
@@ -1016,7 +1248,7 @@ impl ElevatedGuestSupervisor {
 
     pub(crate) fn fail_endpoint_death(&mut self) -> Result<(), LauncherError> {
         self.fail(
-            missing_serial_stage(self.contract.workload(), self.readiness),
+            missing_serial_stage(self.contract.workload(), self.readiness, self.step),
             ProbeErrorCategory::Other,
         )
     }
@@ -1052,7 +1284,7 @@ impl ElevatedGuestSupervisor {
             }
             GuestSerialEvidence::Missing => {
                 return self.fail(
-                    missing_serial_stage(self.contract.workload(), self.readiness),
+                    missing_serial_stage(self.contract.workload(), self.readiness, self.step),
                     ProbeErrorCategory::Other,
                 );
             }
@@ -1071,6 +1303,12 @@ impl ElevatedGuestSupervisor {
             };
             if self.step != WitnessStep::Complete
                 || self.pending_ack.is_some()
+                || self.pending_listener_ack.is_some()
+                || (self.contract.workload() == RuntimeWorkload::GuestApi
+                    && self
+                        .publication
+                        .as_ref()
+                        .is_none_or(|publication| publication.listener_fd().is_some()))
                 || !workload_complete
             {
                 return self.fail(
@@ -1090,13 +1328,27 @@ impl ElevatedGuestSupervisor {
                     return self.fail(ProbeStage::GuestEndpointDeath, ProbeErrorCategory::Other);
                 }
             }
-        } else if self.step != WitnessStep::Complete || self.pending_ack.is_some() {
+        } else if self.step != WitnessStep::Complete
+            || self.pending_ack.is_some()
+            || self.pending_listener_ack.is_some()
+        {
             return self.fail(ProbeStage::GuestEndpointDeath, ProbeErrorCategory::Other);
         }
         Ok(())
     }
 
+    pub(crate) fn cleanup_policy(&self) -> Option<ElevatedApiCleanupPolicy> {
+        self.publication
+            .as_ref()
+            .map(ElevatedApiPublication::cleanup_policy)
+    }
+
     pub(crate) fn finish_cleanup(&mut self) -> Result<(), LauncherError> {
+        if let Some(publication) = self.publication.as_mut()
+            && publication.cleanup().is_err()
+        {
+            return self.fail(ProbeStage::GuestCleanup, ProbeErrorCategory::Other);
+        }
         if let Some(anchor) = self.contract.api_anchor()
             && anchored_child_is_absent(
                 anchor.descriptor(),
@@ -1115,6 +1367,50 @@ impl ElevatedGuestSupervisor {
     fn revalidate(
         &mut self,
         stage: ProbeStage,
+        socket: &UnixDatagram,
+        worker_pid: libc::pid_t,
+        session_stream: &UnixStream,
+        namespace: Option<&LauncherNamespace>,
+    ) -> Result<(), LauncherError> {
+        self.revalidate_with_category(
+            stage,
+            ProbeErrorCategory::PermissionDenied,
+            socket,
+            worker_pid,
+            session_stream,
+            namespace,
+        )
+    }
+
+    fn revalidate_terminal_receiver(&mut self, stage: ProbeStage) -> Result<(), LauncherError> {
+        // GuestShutdown is the final one-way record. Once its canonical bytes
+        // have been received from the connected, correlated evidence endpoint,
+        // the worker may legitimately send lifecycle Terminal and exit before
+        // the launcher is scheduled. Do not make that successful report depend
+        // on a later live-process or session-lock observation.
+        let valid = bangbang_session::elevated_credential::attest_current_process(
+            self.bootstrap.mode(),
+            self.bootstrap.target_uid(),
+            self.bootstrap.target_gid(),
+        )
+        .is_ok()
+            && self.contract.workload()
+                == self
+                    .bootstrap
+                    .mode()
+                    .runtime_workload()
+                    .unwrap_or(RuntimeWorkload::RepresentativeGrants);
+        if valid {
+            Ok(())
+        } else {
+            self.fail(stage, ProbeErrorCategory::PermissionDenied)
+        }
+    }
+
+    fn revalidate_with_category(
+        &mut self,
+        stage: ProbeStage,
+        category: ProbeErrorCategory,
         socket: &UnixDatagram,
         worker_pid: libc::pid_t,
         session_stream: &UnixStream,
@@ -1143,7 +1439,7 @@ impl ElevatedGuestSupervisor {
         if valid {
             Ok(())
         } else {
-            self.fail(stage, ProbeErrorCategory::PermissionDenied)
+            self.fail(stage, category)
         }
     }
 
@@ -1152,6 +1448,9 @@ impl ElevatedGuestSupervisor {
             WitnessStep::AwaitingGrantAcceptance
             | WitnessStep::AwaitingResourceRequest
             | WitnessStep::SendingResourceAck => ProbeStage::GuestResourceWitness,
+            WitnessStep::AwaitingApiListenerRequest => ProbeStage::ApiListenerRequest,
+            WitnessStep::SendingApiListenerAck => ProbeStage::ApiListenerTransfer,
+            WitnessStep::AwaitingApiListenerAdoption => ProbeStage::ApiListenerAdoption,
             WitnessStep::AwaitingHvfRequest | WitnessStep::SendingHvfAck => {
                 ProbeStage::GuestHvfWitness
             }
@@ -1192,12 +1491,22 @@ enum GuestSerialEvidence {
     Invalid,
 }
 
+const fn guest_evidence_requires_live_sender(phase: GuestEvidencePhase) -> bool {
+    !matches!(phase, GuestEvidencePhase::GuestShutdown)
+}
+
 const fn missing_serial_stage(
     workload: RuntimeWorkload,
     readiness: Option<Readiness>,
+    step: WitnessStep,
 ) -> ProbeStage {
     match (workload, readiness) {
-        (RuntimeWorkload::GuestApi, None) => ProbeStage::ApiSocketPublication,
+        (RuntimeWorkload::GuestApi, None) => match step {
+            WitnessStep::AwaitingApiListenerRequest => ProbeStage::ApiListenerRequest,
+            WitnessStep::SendingApiListenerAck => ProbeStage::ApiListenerTransfer,
+            WitnessStep::AwaitingApiListenerAdoption => ProbeStage::ApiListenerAdoption,
+            _ => ProbeStage::ApiSocketPublication,
+        },
         (RuntimeWorkload::GuestNoApi, None) => ProbeStage::NoApiStartup,
         _ => ProbeStage::GuestEndpointDeath,
     }
@@ -1367,6 +1676,22 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    #[test]
+    fn only_the_final_one_way_guest_report_allows_sender_exit() {
+        assert!(guest_evidence_requires_live_sender(
+            GuestEvidencePhase::ResourceClaim
+        ));
+        assert!(guest_evidence_requires_live_sender(
+            GuestEvidencePhase::HvfCreate
+        ));
+        assert!(guest_evidence_requires_live_sender(
+            GuestEvidencePhase::HvfCreated
+        ));
+        assert!(!guest_evidence_requires_live_sender(
+            GuestEvidencePhase::GuestShutdown
+        ));
+    }
 
     #[test]
     fn api_requests_are_closed_ordered_and_use_only_guest_grant_references() {
@@ -1556,20 +1881,55 @@ mod tests {
     #[test]
     fn missing_serial_before_readiness_reports_the_workload_boundary() {
         assert_eq!(
-            missing_serial_stage(RuntimeWorkload::GuestApi, None),
+            missing_serial_stage(
+                RuntimeWorkload::GuestApi,
+                None,
+                WitnessStep::AwaitingResourceRequest,
+            ),
             ProbeStage::ApiSocketPublication
         );
         assert_eq!(
-            missing_serial_stage(RuntimeWorkload::GuestNoApi, None),
+            missing_serial_stage(
+                RuntimeWorkload::GuestNoApi,
+                None,
+                WitnessStep::AwaitingHvfRequest,
+            ),
             ProbeStage::NoApiStartup
         );
         assert_eq!(
-            missing_serial_stage(RuntimeWorkload::GuestApi, Some(Readiness::Api)),
+            missing_serial_stage(
+                RuntimeWorkload::GuestApi,
+                Some(Readiness::Api),
+                WitnessStep::AwaitingApiListenerAdoption,
+            ),
             ProbeStage::GuestEndpointDeath
         );
         assert_eq!(
-            missing_serial_stage(RuntimeWorkload::GuestNoApi, Some(Readiness::NoApi)),
+            missing_serial_stage(
+                RuntimeWorkload::GuestNoApi,
+                Some(Readiness::NoApi),
+                WitnessStep::AwaitingHvfRequest,
+            ),
             ProbeStage::GuestEndpointDeath
         );
+        for (step, stage) in [
+            (
+                WitnessStep::AwaitingApiListenerRequest,
+                ProbeStage::ApiListenerRequest,
+            ),
+            (
+                WitnessStep::SendingApiListenerAck,
+                ProbeStage::ApiListenerTransfer,
+            ),
+            (
+                WitnessStep::AwaitingApiListenerAdoption,
+                ProbeStage::ApiListenerAdoption,
+            ),
+        ] {
+            assert_eq!(
+                missing_serial_stage(RuntimeWorkload::GuestApi, None, step),
+                stage
+            );
+        }
     }
 }

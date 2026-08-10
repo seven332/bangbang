@@ -26,6 +26,8 @@ pub const CONTINUATION_ACK_BYTES: usize = 48;
 pub const RUNTIME_SESSION_AUTHORITY_BYTES: usize = 120;
 /// Encoded post-grant guest-evidence record length.
 pub const GUEST_EVIDENCE_RECORD_BYTES: usize = 96;
+/// Encoded fixed API-listener request or acknowledgment length.
+pub const API_LISTENER_RECORD_BYTES: usize = 112;
 /// Exact no-API startup-config grant ID.
 pub const GUEST_CONFIG_GRANT_ID: &str = "evidence-guest-config";
 /// Exact guest kernel grant ID.
@@ -141,6 +143,11 @@ const RUNTIME_SESSION_AUTHORITY_MAGIC: [u8; 4] = *b"BBN1";
 const RUNTIME_SESSION_AUTHORITY_VERSION: u16 = 1;
 const GUEST_EVIDENCE_MAGIC: [u8; 4] = *b"BBW1";
 const GUEST_EVIDENCE_VERSION: u16 = 1;
+const API_LISTENER_MAGIC: [u8; 4] = *b"BBL1";
+const API_LISTENER_VERSION: u16 = 1;
+const API_LISTENER_PHASE: u8 = 1;
+const API_LISTENER_OPERATION: u8 = 1;
+const API_LISTENER_SEQUENCE: u32 = 1;
 const RUNTIME_WORKER_FAILURE_EXIT_BASE: u8 = 64;
 
 /// Exact evidence mode selected by the explicit root wrapper.
@@ -480,6 +487,14 @@ pub enum ProbeStage {
     GuestTerminalEvidence = 52,
     /// Clean every guest output, socket, and session object.
     GuestCleanup = 53,
+    /// Receive the fixed worker request for launcher-created API authority.
+    ApiListenerRequest = 54,
+    /// Bind and validate the fixed final API listener beneath its anchor.
+    ApiListenerBind = 55,
+    /// Transfer the exact launcher-created API listener to the worker.
+    ApiListenerTransfer = 56,
+    /// Adopt, record, and validate the transferred API listener in the worker.
+    ApiListenerAdoption = 57,
 }
 
 impl ProbeStage {
@@ -540,6 +555,10 @@ impl ProbeStage {
             Self::GuestEndpointDeath => "guest-endpoint-death",
             Self::GuestTerminalEvidence => "guest-terminal-evidence",
             Self::GuestCleanup => "guest-cleanup",
+            Self::ApiListenerRequest => "api-listener-request",
+            Self::ApiListenerBind => "api-listener-bind",
+            Self::ApiListenerTransfer => "api-listener-transfer",
+            Self::ApiListenerAdoption => "api-listener-adoption",
         }
     }
 
@@ -598,6 +617,10 @@ impl ProbeStage {
             51 => Ok(Self::GuestEndpointDeath),
             52 => Ok(Self::GuestTerminalEvidence),
             53 => Ok(Self::GuestCleanup),
+            54 => Ok(Self::ApiListenerRequest),
+            55 => Ok(Self::ApiListenerBind),
+            56 => Ok(Self::ApiListenerTransfer),
+            57 => Ok(Self::ApiListenerAdoption),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -682,6 +705,14 @@ pub enum RuntimeFault {
     GuestGrantAccepted = 35,
     /// Inject one descriptor-free datagram outside the guest witness protocol.
     GuestTransportContamination = 36,
+    /// Stop before accepting the fixed API-listener request.
+    ApiListenerRequest = 37,
+    /// Stop while binding the fixed final API listener.
+    ApiListenerBind = 38,
+    /// Stop while transferring the launcher-created API listener.
+    ApiListenerTransfer = 39,
+    /// Stop while the worker adopts and records the transferred listener.
+    ApiListenerAdoption = 40,
 }
 
 impl RuntimeFault {
@@ -725,6 +756,10 @@ impl RuntimeFault {
             "guest-cleanup" => Some(Self::GuestCleanup),
             "guest-grant-accepted" => Some(Self::GuestGrantAccepted),
             "guest-transport-contamination" => Some(Self::GuestTransportContamination),
+            "api-listener-request" => Some(Self::ApiListenerRequest),
+            "api-listener-bind" => Some(Self::ApiListenerBind),
+            "api-listener-transfer" => Some(Self::ApiListenerTransfer),
+            "api-listener-adoption" => Some(Self::ApiListenerAdoption),
             _ => None,
         }
     }
@@ -768,6 +803,10 @@ impl RuntimeFault {
             34 => Ok(Self::GuestCleanup),
             35 => Ok(Self::GuestGrantAccepted),
             36 => Ok(Self::GuestTransportContamination),
+            37 => Ok(Self::ApiListenerRequest),
+            38 => Ok(Self::ApiListenerBind),
+            39 => Ok(Self::ApiListenerTransfer),
+            40 => Ok(Self::ApiListenerAdoption),
             _ => Err(ProbeProtocolError),
         }
     }
@@ -813,6 +852,10 @@ impl RuntimeFault {
             Self::GuestCleanup => "guest-cleanup",
             Self::GuestGrantAccepted => "guest-grant-accepted",
             Self::GuestTransportContamination => "guest-transport-contamination",
+            Self::ApiListenerRequest => "api-listener-request",
+            Self::ApiListenerBind => "api-listener-bind",
+            Self::ApiListenerTransfer => "api-listener-transfer",
+            Self::ApiListenerAdoption => "api-listener-adoption",
         }
     }
 
@@ -857,6 +900,10 @@ impl RuntimeFault {
             Self::GuestCleanup => Some(ProbeStage::GuestCleanup),
             Self::GuestGrantAccepted => Some(ProbeStage::GrantAccepted),
             Self::GuestTransportContamination => Some(ProbeStage::GuestResourceWitness),
+            Self::ApiListenerRequest => Some(ProbeStage::ApiListenerRequest),
+            Self::ApiListenerBind => Some(ProbeStage::ApiListenerBind),
+            Self::ApiListenerTransfer => Some(ProbeStage::ApiListenerTransfer),
+            Self::ApiListenerAdoption => Some(ProbeStage::ApiListenerAdoption),
         }
     }
 }
@@ -1463,6 +1510,252 @@ impl RuntimeSessionAuthority {
 impl fmt::Debug for RuntimeSessionAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RuntimeSessionAuthority(<redacted>)")
+    }
+}
+
+/// Direction of the one fixed API-listener authority exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ApiListenerKind {
+    /// Worker requests the fixed final API listener without ancillary authority.
+    Request = 1,
+    /// Launcher acknowledges the request with exactly one listener descriptor.
+    Ack = 2,
+}
+
+impl ApiListenerKind {
+    fn from_byte(value: u8) -> Result<Self, ProbeProtocolError> {
+        match value {
+            1 => Ok(Self::Request),
+            2 => Ok(Self::Ack),
+            _ => Err(ProbeProtocolError),
+        }
+    }
+}
+
+/// Canonical request or acknowledgment for the fixed elevated API listener.
+///
+/// The phase, sequence, operation, and child name are deliberately not caller
+/// selected. The one operation always names [`GUEST_API_SOCKET_CHILD`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ApiListenerRecord {
+    mode: ProbeMode,
+    kind: ApiListenerKind,
+    role: CredentialRole,
+    descriptor_count: u8,
+    nonce: SessionId,
+    session: SessionId,
+    path_identity: Option<ObjectIdentity>,
+}
+
+impl ApiListenerRecord {
+    /// Constructs the worker's descriptor-free request for the fixed listener.
+    pub fn worker_request(
+        mode: ProbeMode,
+        nonce: SessionId,
+        session: SessionId,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            ApiListenerKind::Request,
+            CredentialRole::Worker,
+            0,
+            nonce,
+            session,
+            None,
+        )
+    }
+
+    /// Constructs the launcher's one-descriptor acknowledgment.
+    pub fn launcher_ack(
+        mode: ProbeMode,
+        nonce: SessionId,
+        session: SessionId,
+        path_identity: ObjectIdentity,
+    ) -> Result<Self, ProbeProtocolError> {
+        Self::new(
+            mode,
+            ApiListenerKind::Ack,
+            CredentialRole::Launcher,
+            1,
+            nonce,
+            session,
+            Some(path_identity),
+        )
+    }
+
+    fn new(
+        mode: ProbeMode,
+        kind: ApiListenerKind,
+        role: CredentialRole,
+        descriptor_count: u8,
+        nonce: SessionId,
+        session: SessionId,
+        path_identity: Option<ObjectIdentity>,
+    ) -> Result<Self, ProbeProtocolError> {
+        if mode.runtime_workload() != Some(RuntimeWorkload::GuestApi)
+            || nonce.is_pre_session()
+            || session.is_pre_session()
+        {
+            return Err(ProbeProtocolError);
+        }
+        let valid_shape = match (kind, role, descriptor_count, path_identity) {
+            (ApiListenerKind::Request, CredentialRole::Worker, 0, None) => true,
+            (
+                ApiListenerKind::Ack,
+                CredentialRole::Launcher,
+                1,
+                Some(ObjectIdentity { device, inode }),
+            ) => device != 0 && inode != 0,
+            _ => false,
+        };
+        if !valid_shape {
+            return Err(ProbeProtocolError);
+        }
+        Ok(Self {
+            mode,
+            kind,
+            role,
+            descriptor_count,
+            nonce,
+            session,
+            path_identity,
+        })
+    }
+
+    /// Returns the selected API guest mode.
+    #[must_use]
+    pub const fn mode(self) -> ProbeMode {
+        self.mode
+    }
+
+    /// Returns whether this is the request or acknowledgment.
+    #[must_use]
+    pub const fn kind(self) -> ApiListenerKind {
+        self.kind
+    }
+
+    /// Returns the exact sender role implied by the record kind.
+    #[must_use]
+    pub const fn role(self) -> CredentialRole {
+        self.role
+    }
+
+    /// Returns the exact ancillary-descriptor count implied by the record kind.
+    #[must_use]
+    pub const fn descriptor_count(self) -> u8 {
+        self.descriptor_count
+    }
+
+    /// Returns the bootstrap nonce.
+    #[must_use]
+    pub const fn nonce(self) -> SessionId {
+        self.nonce
+    }
+
+    /// Returns the lifecycle session identity.
+    #[must_use]
+    pub const fn session(self) -> SessionId {
+        self.session
+    }
+
+    /// Returns the final socket pathname identity carried only by an acknowledgment.
+    #[must_use]
+    pub const fn path_identity(self) -> Option<ObjectIdentity> {
+        self.path_identity
+    }
+
+    /// Returns the only child selected by this closed operation.
+    #[must_use]
+    pub const fn child(self) -> &'static str {
+        GUEST_API_SOCKET_CHILD
+    }
+
+    /// Returns whether every correlation and kind-specific field is exact.
+    #[must_use]
+    pub fn matches_expected(
+        self,
+        mode: ProbeMode,
+        kind: ApiListenerKind,
+        nonce: SessionId,
+        session: SessionId,
+        path_identity: Option<ObjectIdentity>,
+    ) -> bool {
+        let (role, descriptor_count) = match kind {
+            ApiListenerKind::Request => (CredentialRole::Worker, 0),
+            ApiListenerKind::Ack => (CredentialRole::Launcher, 1),
+        };
+        self.mode == mode
+            && self.kind == kind
+            && self.role == role
+            && self.descriptor_count == descriptor_count
+            && self.nonce == nonce
+            && self.session == session
+            && self.path_identity == path_identity
+    }
+
+    /// Encodes the fixed canonical listener-authority record.
+    #[must_use]
+    pub fn encode(self) -> [u8; API_LISTENER_RECORD_BYTES] {
+        let mut bytes = [0_u8; API_LISTENER_RECORD_BYTES];
+        bytes[0..4].copy_from_slice(&API_LISTENER_MAGIC);
+        bytes[4..6].copy_from_slice(&API_LISTENER_VERSION.to_be_bytes());
+        bytes[6] = self.mode as u8;
+        bytes[7] = API_LISTENER_PHASE;
+        bytes[8] = self.kind as u8;
+        bytes[9] = self.role as u8;
+        bytes[10] = API_LISTENER_OPERATION;
+        bytes[11] = self.descriptor_count;
+        bytes[12..16].copy_from_slice(&API_LISTENER_SEQUENCE.to_be_bytes());
+        bytes[16..48].copy_from_slice(self.nonce.as_bytes());
+        bytes[48..80].copy_from_slice(self.session.as_bytes());
+        if let Some(identity) = self.path_identity {
+            bytes[80..88].copy_from_slice(&identity.device.to_be_bytes());
+            bytes[88..96].copy_from_slice(&identity.inode.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// Decodes and validates one exact canonical listener-authority record.
+    pub fn decode(bytes: &[u8; API_LISTENER_RECORD_BYTES]) -> Result<Self, ProbeProtocolError> {
+        if bytes[0..4] != API_LISTENER_MAGIC
+            || bytes[4..6] != API_LISTENER_VERSION.to_be_bytes()
+            || bytes[7] != API_LISTENER_PHASE
+            || bytes[10] != API_LISTENER_OPERATION
+            || u32::from_be_bytes(array(bytes, 12)?) != API_LISTENER_SEQUENCE
+            || bytes[96..112] != [0; 16]
+        {
+            return Err(ProbeProtocolError);
+        }
+        let kind = ApiListenerKind::from_byte(bytes[8])?;
+        let identity = ObjectIdentity {
+            device: u64::from_be_bytes(array(bytes, 80)?),
+            inode: u64::from_be_bytes(array(bytes, 88)?),
+        };
+        let path_identity = match kind {
+            ApiListenerKind::Request if identity.device == 0 && identity.inode == 0 => None,
+            ApiListenerKind::Ack => Some(identity),
+            _ => return Err(ProbeProtocolError),
+        };
+        let record = Self::new(
+            ProbeMode::from_byte(bytes[6])?,
+            kind,
+            CredentialRole::from_byte(bytes[9])?,
+            bytes[11],
+            SessionId::from_bytes(array(bytes, 16)?),
+            SessionId::from_bytes(array(bytes, 48)?),
+            path_identity,
+        )?;
+        if record.encode() != *bytes {
+            return Err(ProbeProtocolError);
+        }
+        Ok(record)
+    }
+}
+
+impl fmt::Debug for ApiListenerRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApiListenerRecord(<redacted>)")
     }
 }
 
@@ -3181,6 +3474,10 @@ mod tests {
             ProbeStage::GuestEndpointDeath,
             ProbeStage::GuestTerminalEvidence,
             ProbeStage::GuestCleanup,
+            ProbeStage::ApiListenerRequest,
+            ProbeStage::ApiListenerBind,
+            ProbeStage::ApiListenerTransfer,
+            ProbeStage::ApiListenerAdoption,
         ] {
             let result = ProbeResult::failure(
                 ProbeMode::InheritedRoot,
@@ -3320,13 +3617,25 @@ mod tests {
                 36,
                 "guest-transport-contamination",
             ),
+            (RuntimeFault::ApiListenerRequest, 37, "api-listener-request"),
+            (RuntimeFault::ApiListenerBind, 38, "api-listener-bind"),
+            (
+                RuntimeFault::ApiListenerTransfer,
+                39,
+                "api-listener-transfer",
+            ),
+            (
+                RuntimeFault::ApiListenerAdoption,
+                40,
+                "api-listener-adoption",
+            ),
         ] {
             assert_eq!(RuntimeFault::parse(name), Some(fault));
             assert_eq!(RuntimeFault::from_byte(byte), Ok(fault));
             assert_eq!(fault.name(), name);
         }
         assert_eq!(RuntimeFault::parse("unknown"), None);
-        assert_eq!(RuntimeFault::from_byte(37), Err(ProbeProtocolError));
+        assert_eq!(RuntimeFault::from_byte(41), Err(ProbeProtocolError));
 
         for (result, name) in [
             (RuntimeResultClass::Complete, "complete"),
@@ -3522,6 +3831,135 @@ mod tests {
                 identity,
                 bootstrap.nonce(),
                 SessionId::pre_session(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn api_listener_records_are_canonical_closed_bound_and_redacted() {
+        let nonce = SessionId::from_bytes([0xa1; 32]);
+        let session = SessionId::from_bytes([0xa2; 32]);
+        let identity = ObjectIdentity {
+            device: 0x1234,
+            inode: 0x5678,
+        };
+        for mode in [
+            ProbeMode::GuestApiDrop,
+            ProbeMode::GuestApiRetainRoot,
+            ProbeMode::GuestApiUnmapped,
+        ] {
+            let records = [
+                ApiListenerRecord::worker_request(mode, nonce, session)
+                    .expect("request should construct"),
+                ApiListenerRecord::launcher_ack(mode, nonce, session, identity)
+                    .expect("acknowledgment should construct"),
+            ];
+            for record in records {
+                let encoded = record.encode();
+                assert_eq!(encoded.len(), API_LISTENER_RECORD_BYTES);
+                assert_eq!(ApiListenerRecord::decode(&encoded), Ok(record));
+                assert_eq!(record.mode(), mode);
+                assert_eq!(record.child(), GUEST_API_SOCKET_CHILD);
+                assert_eq!(record.nonce(), nonce);
+                assert_eq!(record.session(), session);
+                assert!(record.matches_expected(
+                    mode,
+                    record.kind(),
+                    nonce,
+                    session,
+                    record.path_identity(),
+                ));
+                assert_eq!(
+                    record.descriptor_count(),
+                    u8::from(record.kind() == ApiListenerKind::Ack)
+                );
+                assert_eq!(
+                    record.role(),
+                    match record.kind() {
+                        ApiListenerKind::Request => CredentialRole::Worker,
+                        ApiListenerKind::Ack => CredentialRole::Launcher,
+                    }
+                );
+                assert_eq!(format!("{record:?}"), "ApiListenerRecord(<redacted>)");
+                for index in 0..encoded.len() {
+                    let mut malformed = encoded;
+                    malformed[index] ^= 1;
+                    if let Ok(decoded) = ApiListenerRecord::decode(&malformed) {
+                        assert_ne!(decoded, record);
+                        assert!(!decoded.matches_expected(
+                            record.mode(),
+                            record.kind(),
+                            record.nonce(),
+                            record.session(),
+                            record.path_identity(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let request = ApiListenerRecord::worker_request(ProbeMode::GuestApiDrop, nonce, session)
+            .expect("request should construct");
+        assert_eq!(request.path_identity(), None);
+        assert!(!request.matches_expected(
+            ProbeMode::GuestApiRetainRoot,
+            ApiListenerKind::Request,
+            nonce,
+            session,
+            None,
+        ));
+        assert!(!request.matches_expected(
+            ProbeMode::GuestApiDrop,
+            ApiListenerKind::Ack,
+            nonce,
+            session,
+            Some(identity),
+        ));
+        assert!(
+            ApiListenerRecord::worker_request(ProbeMode::GuestNoApiDrop, nonce, session).is_err()
+        );
+        assert!(
+            ApiListenerRecord::worker_request(
+                ProbeMode::GuestApiDrop,
+                SessionId::pre_session(),
+                session,
+            )
+            .is_err()
+        );
+        assert!(
+            ApiListenerRecord::launcher_ack(
+                ProbeMode::GuestApiDrop,
+                nonce,
+                session,
+                ObjectIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ApiListenerRecord::new(
+                ProbeMode::GuestApiDrop,
+                ApiListenerKind::Request,
+                CredentialRole::Launcher,
+                0,
+                nonce,
+                session,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            ApiListenerRecord::new(
+                ProbeMode::GuestApiDrop,
+                ApiListenerKind::Ack,
+                CredentialRole::Launcher,
+                0,
+                nonce,
+                session,
+                Some(identity),
             )
             .is_err()
         );

@@ -889,6 +889,7 @@ fn continue_runtime_session(
     const RUNTIME_LAUNCHER_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-v2-runtime-drop-runtime-retain-root-runtime-unmapped-status: elevated runtime-BBA1-BBN1-launcher-created-session";
     const RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
     const GUEST_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-guest-launcher-boundaries-v1-guest-no-api-drop-guest-no-api-retain-root-guest-no-api-unmapped-guest-api-drop-guest-api-retain-root-guest-api-unmapped-BBW1-guest-resource-witness-guest-grant-accepted-guest-transport-contamination-guest-hvf-witness-guest-terminal-evidence-api-instance-start-bangbang-grant:evidence-guest-kernel-bangbang-grant:evidence-guest-serial";
+    const API_LISTENER_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-api-listener-launcher-v1-BBL1-request-bind-transfer-adoption-final-child-one-right";
 
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -904,6 +905,7 @@ fn continue_runtime_session(
     std::hint::black_box(RUNTIME_LAUNCHER_ARTIFACT);
     std::hint::black_box(RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT);
     std::hint::black_box(GUEST_LAUNCHER_BOUNDARY_ARTIFACT);
+    std::hint::black_box(API_LISTENER_LAUNCHER_BOUNDARY_ARTIFACT);
     let blocked = |stage, category| {
         Ok(elevated_runtime_blocked(
             bootstrap, &semantics, stage, category,
@@ -1587,6 +1589,10 @@ fn elevated_runtime_blocked(
         | ProbeStage::LifecycleTerminal
         | ProbeStage::RuntimeCleanup => RuntimeResultClass::LifecycleBoundary,
         ProbeStage::ApiSocketPublication
+        | ProbeStage::ApiListenerRequest
+        | ProbeStage::ApiListenerBind
+        | ProbeStage::ApiListenerTransfer
+        | ProbeStage::ApiListenerAdoption
         | ProbeStage::ApiLoggerConfiguration
         | ProbeStage::ApiMetricsConfiguration
         | ProbeStage::ApiSerialConfiguration

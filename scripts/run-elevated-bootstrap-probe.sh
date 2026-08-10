@@ -1749,7 +1749,7 @@ guest_matrix_output="$(/usr/bin/python3 "$repo_root/scripts/elevated_guest_matri
   --sidecar "$guest_sidecar" \
   --target-uid "$target_uid" \
   --target-gid "$target_gid")"
-expected_guest_matrix="guest-matrix: api-mapped=blocked-api-publication api-retained-root=blocked-api-publication-no-drop api-unmapped=blocked-api-publication no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=no-api-isolated-api-blocked faults=no-api-reachable-complete-api-later-ineligible deaths=worker-first-launcher-first tamper=rejected adoption-replacement=no-api-preopened-api-ineligible cleanup=exact"
+expected_guest_matrix="guest-matrix: api-mapped=blocked-listener-adoption api-retained-root=blocked-listener-adoption-no-drop api-unmapped=blocked-listener-adoption no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=no-api-complete-api-isolated-blocked faults=no-api-reachable-api-through-adoption deaths=no-api-worker-first-launcher-first tamper=rejected-both-workloads adoption-replacement=no-api-preopened-api-rejected-at-grant cleanup=exact"
 if [[ "$guest_matrix_output" != "$expected_guest_matrix" ]]; then
   echo "bangbang elevated bootstrap proof: guest matrix output invalid" >&2
   exit 1

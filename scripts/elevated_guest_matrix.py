@@ -135,6 +135,10 @@ FAULT_CASES = (
         "invalid-input",
     ),
     FaultCase("guest-resource-witness", "guest-resource-witness", "grant-boundary", "no-api"),
+    FaultCase("api-listener-request", "api-listener-request", "api-boundary", "api"),
+    FaultCase("api-listener-bind", "api-listener-bind", "api-boundary", "api"),
+    FaultCase("api-listener-transfer", "api-listener-transfer", "api-boundary", "api"),
+    FaultCase("api-listener-adoption", "api-listener-adoption", "api-boundary", "api"),
     FaultCase("api-socket-publication", "api-socket-publication", "api-boundary", "api"),
     FaultCase("api-logger-configuration", "api-logger-configuration", "api-boundary", "api"),
     FaultCase("api-metrics-configuration", "api-metrics-configuration", "api-boundary", "api"),
@@ -157,24 +161,65 @@ FAULT_CASES = (
         "no-api",
     ),
     FaultCase("guest-cleanup", "guest-cleanup", "guest-boundary", "no-api"),
-)
-
-API_PUBLICATION_BOUNDARY = FaultCase(
-    "api-socket-publication",
-    "api-socket-publication",
-    "api-boundary",
-    "api",
+    FaultCase("guest-hvf-witness", "guest-hvf-witness", "hvf-boundary", "api"),
+    FaultCase("guest-hvf-create", "guest-hvf-create", "hvf-boundary", "api"),
+    FaultCase("guest-execution", "guest-execution", "guest-boundary", "api"),
+    FaultCase("guest-oracle", "guest-oracle", "guest-boundary", "api"),
+    FaultCase("guest-poweroff", "guest-poweroff", "guest-boundary", "api"),
+    FaultCase("guest-timeout", "guest-timeout", "guest-boundary", "api"),
+    FaultCase(
+        "guest-terminal-evidence",
+        "guest-terminal-evidence",
+        "guest-boundary",
+        "api",
+    ),
+    FaultCase("guest-cleanup", "guest-cleanup", "guest-boundary", "api"),
 )
 
 MATRIX_SUMMARY = (
-    "guest-matrix: api-mapped=blocked-api-publication "
-    "api-retained-root=blocked-api-publication-no-drop "
-    "api-unmapped=blocked-api-publication no-api-mapped=complete "
+    "guest-matrix: api-mapped=blocked-listener-adoption "
+    "api-retained-root=blocked-listener-adoption-no-drop "
+    "api-unmapped=blocked-listener-adoption no-api-mapped=complete "
     "no-api-retained-root=complete-no-drop no-api-unmapped=complete "
-    "repeats=three concurrency=no-api-isolated-api-blocked "
-    "faults=no-api-reachable-complete-api-later-ineligible "
-    "deaths=worker-first-launcher-first tamper=rejected "
-    "adoption-replacement=no-api-preopened-api-ineligible cleanup=exact"
+    "repeats=three concurrency=no-api-complete-api-isolated-blocked "
+    "faults=no-api-reachable-api-through-adoption "
+    "deaths=no-api-worker-first-launcher-first tamper=rejected-both-workloads "
+    "adoption-replacement=no-api-preopened-api-rejected-at-grant cleanup=exact"
+)
+
+API_BOUNDARIES = {
+    "mapped": FaultCase(
+        "api-listener-adoption",
+        "api-listener-adoption",
+        "api-boundary",
+        "api",
+    ),
+    "retained-root": FaultCase(
+        "api-listener-adoption",
+        "api-listener-adoption",
+        "api-boundary",
+        "api",
+    ),
+    "unmapped": FaultCase(
+        "api-listener-adoption",
+        "api-listener-adoption",
+        "api-boundary",
+        "api",
+    ),
+}
+
+REACHABLE_API_FAULTS = {
+    "api-listener-request",
+    "api-listener-bind",
+    "api-listener-transfer",
+    "api-listener-adoption",
+}
+
+API_PREOPENED_REPLACEMENT_BOUNDARY = FaultCase(
+    "",
+    "grant-accepted",
+    "grant-boundary",
+    "api",
 )
 
 
@@ -669,13 +714,13 @@ class Fixture:
             if self.paths[name].stat().st_size > MAX_OUTPUT_BYTES:
                 _fail("fault-output-bound")
 
-    def validate_api_publication_block_outputs(self) -> None:
+    def validate_api_boundary_block_outputs(self) -> None:
         self.validate_shape(require_outputs=True)
         if any(
             self.paths[name].stat().st_size != 0
             for name in ("logger", "metrics", "serial")
         ):
-            _fail("api-publication-output-prefix")
+            _fail("api-transfer-output-prefix")
 
     def capture_runtime_session(self) -> tuple[Path, ObjectIdentity]:
         root = ObjectIdentity.capture(self.root)
@@ -881,18 +926,13 @@ def expected_fault_line(case: ModeCase, fault: FaultCase) -> str:
     )
 
 
-def expected_api_publication_block_output(case: ModeCase) -> str:
+def api_boundary(case: ModeCase) -> FaultCase:
     if case.workload != "api":
-        _fail("api-publication-case")
-    return (
-        "bangbang 0.1.0\n"
-        "hvf target supported: true\n"
-        "operation=shutdown outcome=abnormal\n"
-        "event=process-exit category=process-failure\n"
-        "bangbang: API server error: failed to bind contained API socket: "
-        "private anchored socket operation failed\n"
-        f"{expected_fault_line(case, API_PUBLICATION_BOUNDARY)}"
-    )
+        _fail("api-boundary-case")
+    try:
+        return API_BOUNDARIES[case.identity]
+    except KeyError as error:
+        raise MatrixError("api-boundary-identity") from error
 
 
 def _decode_output(output: bytes) -> str:
@@ -1017,18 +1057,56 @@ def assert_success(launcher: Path, fixture: Fixture) -> None:
     status, raw_output = run_process(fixture.command(launcher))
     output = _decode_output(raw_output).rstrip("\n")
     validate_redacted(output, fixture)
-    if status != 0 or output != expected_success_output(fixture.case):
-        _fail("success-result")
+    if status != 0:
+        prefix = f"status: elevated runtime {fixture.case.mode} blocked stage="
+        for line in output.splitlines():
+            if line.startswith(prefix):
+                fields = line.removeprefix(prefix).split()
+                stage = fields[0] if fields else ""
+                category = next(
+                    (field.removeprefix("error=") for field in fields if field.startswith("error=")),
+                    "",
+                )
+                if (
+                    stage
+                    and category
+                    and all(character.isalnum() or character == "-" for character in stage)
+                    and all(character.isalnum() or character == "-" for character in category)
+                ):
+                    _fail(
+                        f"success-result-{fixture.case.mode}-blocked-{stage}-{category}"
+                    )
+        _fail(f"success-result-{fixture.case.mode}-exit")
+    if output != expected_success_output(fixture.case):
+        _fail(f"success-result-{fixture.case.mode}-output")
     fixture.validate_success_outputs()
 
 
-def assert_api_publication_blocked(launcher: Path, fixture: Fixture) -> None:
+def assert_api_transfer_blocked(launcher: Path, fixture: Fixture) -> None:
+    if fixture.case.workload != "api":
+        _fail("api-transfer-case")
     status, raw_output = run_process(fixture.command(launcher))
     output = _decode_output(raw_output).rstrip("\n")
     validate_redacted(output, fixture)
-    if status != 3 or output != expected_api_publication_block_output(fixture.case):
-        _fail("api-publication-result")
-    fixture.validate_api_publication_block_outputs()
+    expected = expected_fault_line(fixture.case, api_boundary(fixture.case))
+    if (
+        status != 3
+        or expected not in output.splitlines()
+        or expected_success_line(fixture.case) in output.splitlines()
+        or "status: API server listening" in output.splitlines()
+    ):
+        prefix = f"status: elevated runtime {fixture.case.mode} blocked stage="
+        for line in output.splitlines():
+            if line.startswith(prefix):
+                fields = line.removeprefix(prefix).split()
+                stage = fields[0] if fields else "unknown"
+                category = next(
+                    (field.removeprefix("error=") for field in fields if field.startswith("error=")),
+                    "unknown",
+                )
+                _fail(f"api-transfer-result-{fixture.case.mode}-{stage}-{category}")
+        _fail(f"api-transfer-result-{fixture.case.mode}-exit")
+    fixture.validate_api_boundary_block_outputs()
 
 
 def assert_adoption_replacement(
@@ -1056,9 +1134,32 @@ def assert_adoption_replacement(
             raise MatrixError("adoption-process-timeout") from error
         output = _decode_output(raw_output).rstrip("\n")
         validate_redacted(output, fixture)
-        if process.returncode != 0 or output != expected_success_output(fixture.case):
-            _fail("adoption-process-result")
-        fixture.validate_success_outputs()
+        if fixture.case.workload == "api":
+            expected = expected_fault_line(
+                fixture.case,
+                API_PREOPENED_REPLACEMENT_BOUNDARY,
+            )
+            if process.returncode != 3 or expected not in output.splitlines():
+                prefix = f"status: elevated runtime {fixture.case.mode} blocked stage="
+                for line in output.splitlines():
+                    if line.startswith(prefix):
+                        fields = line.removeprefix(prefix).split()
+                        stage = fields[0] if fields else "unknown"
+                        category = next(
+                            (
+                                field.removeprefix("error=")
+                                for field in fields
+                                if field.startswith("error=")
+                            ),
+                            "unknown",
+                        )
+                        _fail(f"adoption-process-result-api-{stage}-{category}")
+                _fail("adoption-process-result-api")
+            fixture.validate_fault_outputs()
+        else:
+            if process.returncode != 0 or output != expected_success_output(fixture.case):
+                _fail("adoption-process-result-no-api")
+            fixture.validate_success_outputs()
         fixture.validate_runtime_replacements()
         sidecar_mutation.validate()
     finally:
@@ -1151,7 +1252,7 @@ def run_concurrent(
     launcher: Path,
     fixtures: list[Fixture],
     *,
-    api_publication_blocked: bool = False,
+    api_transfer_blocked: bool = False,
 ) -> None:
     processes = [
         subprocess.Popen(
@@ -1177,17 +1278,14 @@ def run_concurrent(
                 raise MatrixError("concurrent-timeout") from error
             decoded = _decode_output(output).rstrip("\n")
             validate_redacted(decoded, fixture)
-            expected_status = 3 if api_publication_blocked else 0
-            expected_output = (
-                expected_api_publication_block_output(fixture.case)
-                if api_publication_blocked
-                else expected_success_output(fixture.case)
-            )
-            if process.returncode != expected_status or decoded != expected_output:
-                _fail("concurrent-result")
-            if api_publication_blocked:
-                fixture.validate_api_publication_block_outputs()
+            if api_transfer_blocked:
+                expected = expected_fault_line(fixture.case, api_boundary(fixture.case))
+                if process.returncode != 3 or expected not in decoded.splitlines():
+                    _fail("concurrent-result")
+                fixture.validate_api_boundary_block_outputs()
             else:
+                if process.returncode != 0 or decoded != expected_success_output(fixture.case):
+                    _fail("concurrent-result")
                 fixture.validate_success_outputs()
     finally:
         for process in processes:
@@ -1224,7 +1322,7 @@ def run_matrix(
                 fixture = Fixture(resources, case, target_uid, target_gid)
                 live.append(fixture)
                 if case.workload == "api":
-                    assert_api_publication_blocked(launcher, fixture)
+                    assert_api_transfer_blocked(launcher, fixture)
                 else:
                     assert_success(launcher, fixture)
                 verify_resources(resources, resource_ledger)
@@ -1238,13 +1336,13 @@ def run_matrix(
             run_concurrent(
                 launcher,
                 fixtures,
-                api_publication_blocked=workload == "api",
+                api_transfer_blocked=workload == "api",
             )
             verify_resources(resources, resource_ledger)
             for fixture in fixtures:
                 fixture.cleanup()
         for fault in FAULT_CASES:
-            if fault.workload == "api":
+            if fault.workload == "api" and fault.fault not in REACHABLE_API_FAULTS:
                 continue
             fixture = Fixture(
                 resources,
@@ -1267,26 +1365,27 @@ def run_matrix(
             assert_endpoint_death(launcher, fixture, first)
             verify_resources(resources, resource_ledger)
             fixture.cleanup()
-        tamper_fixture = Fixture(
-            sidecar,
-            mode_for("no-api"),
-            target_uid,
-            target_gid,
-        )
-        live.append(tamper_fixture)
-        tamper_mutation = SidecarMutation(sidecar, sidecar_ledger, "no-api")
-        try:
-            assert_tampered_resource_rejected(
-                launcher,
-                tamper_fixture,
-                tamper_mutation,
+        for workload in ("no-api", "api"):
+            tamper_fixture = Fixture(
+                sidecar,
+                mode_for(workload),
+                target_uid,
+                target_gid,
             )
-        finally:
-            tamper_mutation.restore()
-        verify_resources(sidecar, sidecar_ledger)
-        verify_resources(resources, resource_ledger)
-        tamper_fixture.cleanup()
-        for workload in ("no-api",):
+            live.append(tamper_fixture)
+            tamper_mutation = SidecarMutation(sidecar, sidecar_ledger, workload)
+            try:
+                assert_tampered_resource_rejected(
+                    launcher,
+                    tamper_fixture,
+                    tamper_mutation,
+                )
+            finally:
+                tamper_mutation.restore()
+            verify_resources(sidecar, sidecar_ledger)
+            verify_resources(resources, resource_ledger)
+            tamper_fixture.cleanup()
+        for workload in ("no-api", "api"):
             fixture = Fixture(
                 sidecar,
                 mode_for(workload),
@@ -1302,7 +1401,10 @@ def run_matrix(
                     fixture.restore_runtime_authorities()
                 finally:
                     mutation.restore()
-            fixture.validate_success_outputs()
+            if workload == "api":
+                fixture.validate_fault_outputs()
+            else:
+                fixture.validate_success_outputs()
             verify_resources(sidecar, sidecar_ledger)
             verify_resources(resources, resource_ledger)
             fixture.cleanup()

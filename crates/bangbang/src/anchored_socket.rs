@@ -12,6 +12,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bangbang_runtime::vsock::VsockGuestConnector;
+#[cfg(feature = "elevated-bootstrap-probe")]
+use bangbang_session::macos::api_listener::ReceivedApiListener;
 use bangbang_session::macos::runtime::{
     SocketOwnershipRecord, WorkerSocketNamespace, socket_staging_name,
 };
@@ -250,6 +252,7 @@ pub(crate) struct AnchoredSocketGuard {
     namespace: WorkerSocketNamespace,
     claim: ClaimedSocketDirectory,
     record: SocketOwnershipRecord,
+    expected_owner: Option<(u32, u32)>,
 }
 
 impl fmt::Debug for AnchoredSocketGuard {
@@ -265,7 +268,12 @@ impl fmt::Debug for AnchoredSocketGuard {
 
 impl Drop for AnchoredSocketGuard {
     fn drop(&mut self) {
-        cleanup_published_record(&self.namespace, &self.claim, &self.record);
+        cleanup_published_record(
+            &self.namespace,
+            &self.claim,
+            &self.record,
+            self.expected_owner,
+        );
     }
 }
 
@@ -349,6 +357,103 @@ pub(crate) fn bind(
         broker.map(SocketBrokerClaim::Committed),
         || false,
     )
+}
+
+/// Adopts the fixed final API listener created by the elevated launcher.
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) fn adopt_elevated_api_listener(
+    namespace: WorkerSocketNamespace,
+    claim: ClaimedSocketDirectory,
+    received: ReceivedApiListener,
+) -> Result<BoundAnchoredSocket, AnchoredSocketError> {
+    use bangbang_session::elevated_probe::{GUEST_API_DIRECTORY_GRANT_ID, GUEST_API_SOCKET_CHILD};
+
+    let expected_grant = bangbang_session::GrantId::parse(GUEST_API_DIRECTORY_GRANT_ID)
+        .map_err(|_| AnchoredSocketError::Invalid)?;
+    let expected_child =
+        SocketChild::parse(GUEST_API_SOCKET_CHILD).map_err(|_| AnchoredSocketError::Invalid)?;
+    if claim.grant_id != expected_grant || claim.child != expected_child {
+        return Err(AnchoredSocketError::Invalid);
+    }
+    // SAFETY: Effective identity calls have no pointer or ownership contract.
+    let expected_owner = unsafe { (libc::geteuid(), libc::getegid()) };
+    let path_identity = received
+        .record
+        .path_identity()
+        .ok_or(AnchoredSocketError::Invalid)?;
+    if path_identity.device != claim.directory.identity().device {
+        return Err(AnchoredSocketError::Invalid);
+    }
+    let child = child_cstring(&claim.child)?;
+    let current = relative_socket_identity_with_owner(
+        claim.directory.anchor_fd(),
+        &child,
+        Some(expected_owner),
+    )?;
+    if current != path_identity {
+        return Err(AnchoredSocketError::PathChanged);
+    }
+    let record = SocketOwnershipRecord::new(
+        ResourceRole::ApiSocketDirectory,
+        claim.child.clone(),
+        path_identity,
+    )
+    .map_err(|_| AnchoredSocketError::Invalid)?;
+    let listener = UnixListener::from(received.listener);
+    let mut record_written = false;
+    let adopted = (|| {
+        validate_elevated_listener_descriptor(listener.as_raw_fd(), &child)?;
+        if relative_socket_identity_with_owner(
+            claim.directory.anchor_fd(),
+            &child,
+            Some(expected_owner),
+        )? != path_identity
+        {
+            return Err(AnchoredSocketError::PathChanged);
+        }
+        namespace
+            .write_socket_record(&record)
+            .map_err(|_| AnchoredSocketError::Invalid)?;
+        record_written = true;
+        if relative_socket_identity_with_owner(
+            claim.directory.anchor_fd(),
+            &child,
+            Some(expected_owner),
+        )? != path_identity
+        {
+            return Err(AnchoredSocketError::PathChanged);
+        }
+        validate_elevated_listener_descriptor(listener.as_raw_fd(), &child)
+    })();
+    if let Err(error) = adopted {
+        let cleanup = checked_cleanup(unlink_socket_if_owned_with_owner(
+            claim.directory.anchor_fd(),
+            &claim.child,
+            path_identity,
+            Some(expected_owner),
+        ));
+        let clear = if record_written {
+            namespace
+                .clear_socket_record(&record)
+                .map_err(|_| AnchoredSocketError::Cleanup)
+        } else {
+            Ok(())
+        };
+        if cleanup.is_err() || clear.is_err() {
+            return Err(AnchoredSocketError::Cleanup);
+        }
+        return Err(error);
+    }
+    Ok(BoundAnchoredSocket {
+        listener,
+        guard: AnchoredSocketGuard {
+            namespace,
+            claim,
+            record,
+            expected_owner: Some(expected_owner),
+        },
+        connector: None,
+    })
 }
 
 /// Binds a restore vsock while retaining reusable authority until activation.
@@ -553,7 +658,7 @@ fn bind_inner(
         match spawn_connector(&claim, endpoint) {
             Ok(connector) => (claim, Some(connector)),
             Err(_) => {
-                cleanup_published_record(&namespace, &claim, &record);
+                cleanup_published_record(&namespace, &claim, &record, None);
                 return Err(AnchoredSocketError::Broker);
             }
         }
@@ -567,6 +672,7 @@ fn bind_inner(
             namespace,
             claim,
             record,
+            expected_owner: None,
         },
         connector,
     })
@@ -1083,6 +1189,14 @@ fn validate_listener_descriptor(
     descriptor: RawFd,
     role: ResourceRole,
 ) -> Result<(), AnchoredSocketError> {
+    let staging = socket_staging_name(role).map_err(|_| AnchoredSocketError::Invalid)?;
+    validate_listener_descriptor_for_name(descriptor, staging)
+}
+
+fn validate_listener_descriptor_for_name(
+    descriptor: RawFd,
+    expected_name: &std::ffi::CStr,
+) -> Result<(), AnchoredSocketError> {
     let mut socket_type = 0;
     let mut socket_type_len = libc::socklen_t::try_from(size_of::<libc::c_int>())
         .map_err(|_| AnchoredSocketError::Invalid)?;
@@ -1102,7 +1216,6 @@ fn validate_listener_descriptor(
         return Err(AnchoredSocketError::Invalid);
     }
     validate_accepting_listener(descriptor)?;
-    let staging = socket_staging_name(role).map_err(|_| AnchoredSocketError::Invalid)?;
     let mut address = MaybeUninit::<libc::sockaddr_un>::zeroed();
     let mut address_len = libc::socklen_t::try_from(size_of::<libc::sockaddr_un>())
         .map_err(|_| AnchoredSocketError::Invalid)?;
@@ -1129,7 +1242,7 @@ fn validate_listener_descriptor(
     let path_len = returned
         .checked_sub(path_offset)
         .ok_or(AnchoredSocketError::Invalid)?;
-    let expected = staging.to_bytes_with_nul();
+    let expected = expected_name.to_bytes_with_nul();
     if path_len != expected.len() {
         return Err(AnchoredSocketError::Invalid);
     }
@@ -1140,6 +1253,26 @@ fn validate_listener_descriptor(
         return Err(AnchoredSocketError::Invalid);
     }
     Ok(())
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn validate_elevated_listener_descriptor(
+    descriptor: RawFd,
+    expected_name: &std::ffi::CStr,
+) -> Result<(), AnchoredSocketError> {
+    // SAFETY: F_GETFD and F_GETFL inspect the live received descriptor.
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    // SAFETY: F_GETFL inspects the same live received descriptor.
+    let status_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if descriptor_flags < 0
+        || status_flags < 0
+        || descriptor_flags & libc::FD_CLOEXEC == 0
+        || status_flags & libc::O_NONBLOCK == 0
+        || socket_int_option(descriptor, libc::SO_ERROR)? != 0
+    {
+        return Err(AnchoredSocketError::Invalid);
+    }
+    validate_listener_descriptor_for_name(descriptor, expected_name)
 }
 
 fn validate_accepting_listener(descriptor: RawFd) -> Result<(), AnchoredSocketError> {
@@ -1323,6 +1456,14 @@ fn relative_socket_identity(
     directory: RawFd,
     name: &std::ffi::CStr,
 ) -> Result<ObjectIdentity, AnchoredSocketError> {
+    relative_socket_identity_with_owner(directory, name, None)
+}
+
+fn relative_socket_identity_with_owner(
+    directory: RawFd,
+    name: &std::ffi::CStr,
+    expected_owner: Option<(u32, u32)>,
+) -> Result<ObjectIdentity, AnchoredSocketError> {
     let mut stat = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is writable, the directory is live, and the C string is fixed/live.
     if unsafe {
@@ -1344,8 +1485,11 @@ fn relative_socket_identity(
     {
         return Err(AnchoredSocketError::Invalid);
     }
-    // SAFETY: `geteuid` has no pointer or ownership contract.
-    if stat.st_uid != unsafe { libc::geteuid() } {
+    // SAFETY: Effective identity calls have no pointer or ownership contract.
+    let default_uid = unsafe { libc::geteuid() };
+    if stat.st_uid != expected_owner.map_or(default_uid, |(uid, _)| uid)
+        || expected_owner.is_some_and(|(_, gid)| stat.st_gid != gid)
+    {
         return Err(AnchoredSocketError::Invalid);
     }
     Ok(ObjectIdentity {
@@ -1384,8 +1528,17 @@ fn unlink_socket_if_owned(
     child: &SocketChild,
     identity: ObjectIdentity,
 ) -> Result<(), AnchoredSocketError> {
+    unlink_socket_if_owned_with_owner(directory, child, identity, None)
+}
+
+fn unlink_socket_if_owned_with_owner(
+    directory: RawFd,
+    child: &SocketChild,
+    identity: ObjectIdentity,
+    expected_owner: Option<(u32, u32)>,
+) -> Result<(), AnchoredSocketError> {
     let child = child_cstring(child)?;
-    unlink_relative_if_socket_at(directory, &child, Some(identity))
+    unlink_relative_if_socket_at_with_owner(directory, &child, Some(identity), expected_owner)
 }
 
 fn cleanup_staged_socket_checked(
@@ -1415,9 +1568,14 @@ fn cleanup_published_record(
     namespace: &WorkerSocketNamespace,
     claim: &ClaimedSocketDirectory,
     record: &SocketOwnershipRecord,
+    expected_owner: Option<(u32, u32)>,
 ) {
-    let cleanup =
-        unlink_socket_if_owned(claim.directory.anchor_fd(), &claim.child, record.identity());
+    let cleanup = unlink_socket_if_owned_with_owner(
+        claim.directory.anchor_fd(),
+        &claim.child,
+        record.identity(),
+        expected_owner,
+    );
     if matches!(
         cleanup,
         Ok(()) | Err(AnchoredSocketError::Invalid | AnchoredSocketError::PathChanged)
@@ -1463,7 +1621,16 @@ fn unlink_relative_if_socket_at(
     name: &std::ffi::CStr,
     identity: Option<ObjectIdentity>,
 ) -> Result<(), AnchoredSocketError> {
-    let current = match relative_socket_identity(directory, name) {
+    unlink_relative_if_socket_at_with_owner(directory, name, identity, None)
+}
+
+fn unlink_relative_if_socket_at_with_owner(
+    directory: RawFd,
+    name: &std::ffi::CStr,
+    identity: Option<ObjectIdentity>,
+    expected_owner: Option<(u32, u32)>,
+) -> Result<(), AnchoredSocketError> {
+    let current = match relative_socket_identity_with_owner(directory, name, expected_owner) {
         Ok(current) => current,
         Err(AnchoredSocketError::Io(io::ErrorKind::NotFound)) => return Ok(()),
         Err(error) => return Err(error),
@@ -1838,7 +2005,11 @@ fn cvt_spawn(result: libc::c_int) -> Result<(), AnchoredSocketError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
     use std::rc::Rc;
 
     use bangbang_session::SessionId;
@@ -1849,6 +2020,305 @@ mod tests {
     #[ignore = "private binder subprocess entry point"]
     fn binder_process_entry() {
         assert!(run_binder());
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    const ELEVATED_LISTENER_TEST_FD: RawFd = 9;
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    #[ignore = "private elevated-listener subprocess entry point"]
+    fn elevated_listener_process_entry() {
+        use bangbang_session::elevated_probe::GUEST_API_SOCKET_CHILD;
+
+        set_cloexec(ELEVATED_LISTENER_TEST_FD)
+            .expect("inherited test transport should become close-on-exec");
+        // SAFETY: The test spawn contract transfers fd 9 exactly once here.
+        let transport =
+            UnixStream::from(unsafe { OwnedFd::from_raw_fd(ELEVATED_LISTENER_TEST_FD) });
+        let listener = UnixListener::bind(GUEST_API_SOCKET_CHILD)
+            .expect("relative elevated listener should bind");
+        fs::set_permissions(GUEST_API_SOCKET_CHILD, fs::Permissions::from_mode(0o600))
+            .expect("elevated listener mode should install");
+        listener
+            .set_nonblocking(true)
+            .expect("elevated listener should become nonblocking");
+        let child = CString::new(GUEST_API_SOCKET_CHILD).expect("fixed child should encode");
+        let identity = relative_socket_identity(libc::AT_FDCWD, &child)
+            .expect("relative listener identity should validate");
+        send_listener(
+            &transport,
+            ResourceRole::ApiSocketDirectory,
+            identity,
+            listener.as_raw_fd(),
+        )
+        .expect("elevated listener should transfer");
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn receive_relative_elevated_listener(directory: &Path) -> (UnixListener, ObjectIdentity) {
+        let (parent, child) = UnixStream::pair().expect("test transport should create");
+        parent
+            .set_read_timeout(Some(BINDER_TIMEOUT))
+            .expect("test transport should be bounded");
+        let child_descriptor = child.as_raw_fd();
+        let mut command = Command::new(env::current_exe().expect("test executable should resolve"));
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "anchored_socket::tests::elevated_listener_process_entry",
+                "--test-threads=1",
+            ])
+            .current_dir(directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: The child hook performs only async-signal-safe descriptor operations.
+        unsafe {
+            command.pre_exec(move || {
+                if child_descriptor == ELEVATED_LISTENER_TEST_FD {
+                    let flags = libc::fcntl(child_descriptor, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(child_descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC)
+                            < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                } else if libc::dup2(child_descriptor, ELEVATED_LISTENER_TEST_FD) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut process = command
+            .spawn()
+            .expect("relative listener child should spawn");
+        drop(child);
+        let (listener, role, identity) =
+            receive_listener(&parent).expect("relative listener child should return one listener");
+        assert_eq!(role, ResourceRole::ApiSocketDirectory);
+        assert!(
+            process
+                .wait()
+                .expect("relative listener child should reap")
+                .success()
+        );
+        (listener, identity)
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn prepare_elevated_test_directory(path: &Path) {
+        let directory = fs::File::open(path).expect("test directory should open");
+        // SAFETY: The descriptor is live and effective identity calls have no pointer contract.
+        let status =
+            unsafe { libc::fchown(directory.as_raw_fd(), libc::geteuid(), libc::getegid()) };
+        assert_eq!(status, 0, "test directory owner and group should install");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("test directory mode should install");
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    fn elevated_api_adoption_fixture() -> (
+        WorkerSocketNamespace,
+        ClaimedSocketDirectory,
+        crate::contained_session::TestVhostDirectory,
+        crate::contained_session::TestVhostDirectory,
+        ReceivedApiListener,
+    ) {
+        use crate::contained_session::{TestVhostDirectory, api_directory_authority_for_test};
+        use bangbang_session::elevated_probe::{
+            ApiListenerRecord, GUEST_API_SOCKET_REFERENCE, ProbeMode,
+        };
+
+        let (authority, api_directory) = api_directory_authority_for_test();
+        prepare_elevated_test_directory(api_directory.path());
+        let claim = authority
+            .claim_socket_directory(
+                Path::new(GUEST_API_SOCKET_REFERENCE),
+                ResourceRole::ApiSocketDirectory,
+            )
+            .expect("API directory claim should validate")
+            .expect("fixed API reference should claim");
+        let namespace_directory = TestVhostDirectory::new();
+        prepare_elevated_test_directory(namespace_directory.path());
+        let namespace = WorkerSocketNamespace::from_directory_for_test(namespace_directory.path())
+            .expect("test namespace should validate");
+        let (listener, identity) = receive_relative_elevated_listener(api_directory.path());
+        let child = CString::new(bangbang_session::elevated_probe::GUEST_API_SOCKET_CHILD)
+            .expect("fixed child should encode");
+        // SAFETY: Effective identity calls have no pointer or ownership contract.
+        let expected_owner = unsafe { (libc::geteuid(), libc::getegid()) };
+        assert_eq!(
+            relative_socket_identity_with_owner(
+                claim.directory.anchor_fd(),
+                &child,
+                Some(expected_owner),
+            ),
+            Ok(identity),
+            "fixture path metadata must satisfy elevated adoption"
+        );
+        assert_eq!(
+            validate_elevated_listener_descriptor(listener.as_raw_fd(), &child),
+            Ok(()),
+            "fixture descriptor must satisfy elevated adoption"
+        );
+        let record = ApiListenerRecord::launcher_ack(
+            ProbeMode::GuestApiDrop,
+            SessionId::from_bytes([73; 32]),
+            SessionId::from_bytes([74; 32]),
+            identity,
+        )
+        .expect("listener acknowledgment should construct");
+        (
+            namespace,
+            claim,
+            namespace_directory,
+            api_directory,
+            ReceivedApiListener {
+                record,
+                listener: listener.into(),
+            },
+        )
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn elevated_listener_adoption_installs_live_authority_and_cleans_exactly() {
+        use bangbang_session::elevated_probe::GUEST_API_SOCKET_CHILD;
+
+        let (namespace, claim, namespace_directory, api_directory, received) =
+            elevated_api_adoption_fixture();
+        let path = api_directory.path().join(GUEST_API_SOCKET_CHILD);
+        let bound = adopt_elevated_api_listener(namespace, claim, received)
+            .expect("exact elevated listener should adopt");
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("published listener should exist")
+                .file_type()
+                .is_socket()
+        );
+        assert_eq!(
+            fs::read_dir(namespace_directory.path())
+                .expect("namespace should read")
+                .count(),
+            1,
+            "durable ownership must precede readiness"
+        );
+        let client = UnixStream::connect(&path).expect("adopted listener should accept clients");
+        let (listener, guard) = bound.into_parts();
+        let (server, _) = listener.accept().expect("queued client should accept");
+        drop((client, server, listener));
+        drop(guard);
+        assert_eq!(
+            fs::symlink_metadata(&path)
+                .expect_err("guard should remove the exact listener")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read_dir(namespace_directory.path())
+                .expect("namespace should read")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn elevated_listener_adoption_rejects_flags_substitution_and_queued_clients() {
+        use bangbang_session::elevated_probe::GUEST_API_SOCKET_CHILD;
+
+        let (namespace, claim, namespace_directory, api_directory, received) =
+            elevated_api_adoption_fixture();
+        let path = api_directory.path().join(GUEST_API_SOCKET_CHILD);
+        // SAFETY: F_GETFL and F_SETFL inspect and update the owned test descriptor.
+        let flags = unsafe { libc::fcntl(received.listener.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        // SAFETY: The descriptor remains live and the new flags preserve every other bit.
+        let status = unsafe {
+            libc::fcntl(
+                received.listener.as_raw_fd(),
+                libc::F_SETFL,
+                flags & !libc::O_NONBLOCK,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(
+            adopt_elevated_api_listener(namespace, claim, received)
+                .expect_err("blocking listener should reject"),
+            AnchoredSocketError::Invalid
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(namespace_directory.path())
+                .expect("namespace should read")
+                .count(),
+            0
+        );
+
+        let (namespace, claim, _namespace_directory, api_directory, mut received) =
+            elevated_api_adoption_fixture();
+        let path = api_directory.path().join(GUEST_API_SOCKET_CHILD);
+        let (bogus, bogus_peer) = UnixStream::pair().expect("substitute stream should create");
+        bogus
+            .set_nonblocking(true)
+            .expect("substitute should become nonblocking");
+        let retained_listener = std::mem::replace(&mut received.listener, bogus.into());
+        assert_eq!(
+            adopt_elevated_api_listener(namespace, claim, received)
+                .expect_err("connected descriptor substitution should reject"),
+            AnchoredSocketError::Invalid
+        );
+        drop((bogus_peer, retained_listener));
+        assert!(!path.exists());
+
+        let (namespace, claim, _namespace_directory, api_directory, received) =
+            elevated_api_adoption_fixture();
+        let path = api_directory.path().join(GUEST_API_SOCKET_CHILD);
+        let queued = UnixStream::connect(&path).expect("queued client should connect");
+        assert_eq!(
+            adopt_elevated_api_listener(namespace, claim, received)
+                .expect_err("queued client should reject"),
+            AnchoredSocketError::Invalid
+        );
+        drop(queued);
+        assert!(!path.exists());
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
+    fn elevated_listener_cleanup_preserves_post_adoption_path_replacement() {
+        use bangbang_session::elevated_probe::GUEST_API_SOCKET_CHILD;
+
+        let (namespace, claim, namespace_directory, api_directory, received) =
+            elevated_api_adoption_fixture();
+        let path = api_directory.path().join(GUEST_API_SOCKET_CHILD);
+        let displaced = api_directory.path().join("displaced-evidence-api.sock");
+        let bound = adopt_elevated_api_listener(namespace, claim, received)
+            .expect("exact elevated listener should adopt");
+        fs::rename(&path, &displaced).expect("owned listener should displace");
+        fs::write(&path, b"replacement\n").expect("replacement should create");
+        let (listener, guard) = bound.into_parts();
+        drop(listener);
+        drop(guard);
+        assert_eq!(
+            fs::read(&path).expect("replacement should remain"),
+            b"replacement\n"
+        );
+        assert!(
+            fs::symlink_metadata(&displaced)
+                .expect("displaced listener should remain")
+                .file_type()
+                .is_socket()
+        );
+        assert_eq!(
+            fs::read_dir(namespace_directory.path())
+                .expect("namespace should read")
+                .count(),
+            0,
+            "replacement preservation must still clear the exact ownership record"
+        );
     }
 
     #[test]

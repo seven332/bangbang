@@ -109,6 +109,9 @@ const ELEVATED_RUNTIME_AUTHORITY_RECORD: &[u8] = b"BBN1";
 const ELEVATED_RUNTIME_GRANT_CASE: &[u8] = b"target-runtime";
 const ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
 const ELEVATED_RUNTIME_WORKER_BOUNDARIES: &[u8] = b"bangbang-elevated-runtime-worker-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+const ELEVATED_API_LISTENER_LAUNCHER_BOUNDARY: &[u8] = b"bangbang-elevated-api-listener-launcher-v1-BBL1-request-bind-transfer-adoption-final-child-one-right";
+const ELEVATED_API_LISTENER_WORKER_BOUNDARY: &[u8] =
+    b"bangbang-elevated-api-listener-worker-v1-BBL1-request-ack-adoption-record-readiness";
 const ELEVATED_GUEST_MARKERS: &[&[u8]] = &[
     b"guest-no-api-drop",
     b"guest-no-api-retain-root",
@@ -121,6 +124,10 @@ const ELEVATED_GUEST_MARKERS: &[&[u8]] = &[
     b"guest-grant-accepted",
     b"guest-transport-contamination",
     b"guest-resource-witness",
+    b"api-listener-request",
+    b"api-listener-bind",
+    b"api-listener-transfer",
+    b"api-listener-adoption",
     b"api-socket-publication",
     b"api-logger-configuration",
     b"api-metrics-configuration",
@@ -13144,6 +13151,8 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_RUNTIME_GRANT_CASE,
             ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
             ELEVATED_RUNTIME_WORKER_BOUNDARIES,
+            ELEVATED_API_LISTENER_LAUNCHER_BOUNDARY,
+            ELEVATED_API_LISTENER_WORKER_BOUNDARY,
         ]
         .into_iter()
         .chain(ELEVATED_GUEST_MARKERS.iter().copied())
@@ -13192,6 +13201,8 @@ fn normal_production_bundle_statically_and_dynamically_excludes_elevated_probe()
             ELEVATED_RUNTIME_GRANT_CASE,
             ELEVATED_RUNTIME_LAUNCHER_BOUNDARIES,
             ELEVATED_RUNTIME_WORKER_BOUNDARIES,
+            ELEVATED_API_LISTENER_LAUNCHER_BOUNDARY,
+            ELEVATED_API_LISTENER_WORKER_BOUNDARY,
         ]
         .into_iter()
         .chain(ELEVATED_GUEST_MARKERS.iter().copied())
