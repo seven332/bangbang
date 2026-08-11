@@ -1305,9 +1305,43 @@ The public production behavior therefore remains current non-root uid/gid and
 rejects root-retained or root-transition requests with the fixed redacted
 `invalid production launch policy` result before session creation, spawn, grants, publication, or
 guest work. `tool-argument:jailer/uid` and `tool-argument:jailer/gid` are exact
-terminal platform exclusions. No #1904 adapter was merged; configurable
-chroot, `corpus:jailer`, `corpus:production-host`, and `jailer/run` remain
+terminal platform exclusions. No #1904 adapter was merged; the aggregate
+`corpus:jailer`, `corpus:production-host`, and `jailer/run` records remain
 nonterminal.
+
+### Jailer configurable-chroot platform limit
+
+Firecracker's `--chroot-base-dir` builds a real process root beneath the
+selected base and combines it with Linux mount namespace, propagation,
+bind-mount, `pivot_root`, old-root removal, resources, and exec. Public macOS
+`chroot(2)` and spawn-root inheritance exist, but Bangbang does not relabel its
+descriptor-rooted cwd or App Sandbox container as that contract.
+
+The capable-host evidence exercises both public orderings. The unsandboxed
+launcher enters the exact root; the mandatory signed App Sandbox + Hypervisor
+worker validates and `fchdir`s it but receives permission denied from direct
+chroot. When the launcher instead enters the root before spawn, it validates
+and stages the complete fixed bundle plus current dyld and receives a child
+PID, but the child exits before its first authenticated Ready record in every
+repeated and concurrent case. The unchrooted worker completes real HVF
+create/destroy. The exact inherited child sub-cause remains unknown.
+
+Apple does not provide a supported bounded runtime and IPC closure for the
+required App Sandbox/HVF/vmnet worker inside an arbitrary inherited chroot.
+Copying a shared cache/system tree, disabling required bootstrap IPC, adding a
+launchd job/helper, changing entitlements, using private APIs, or accepting a
+cwd/descriptor alias either changes the fixed topology, introduces host-
+coupled system material, or changes the Firecracker semantics.
+
+The public product result is therefore a fixed value-free rejection before the
+path is decoded, retained, opened, copied, or used for any grant, session,
+daemon, or worker state:
+
+`unsupported Firecracker jailer isolation argument on macOS: --chroot-base-dir`
+
+This exact leaf is terminal only for the supported fixed topology. It does not
+claim chroot is absent from macOS, identify the pre-Ready child failure, provide
+Linux isolation parity, or complete the three aggregate jailer/host records.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
@@ -1324,10 +1358,11 @@ describe/state/memory consumers adopt exact files, and frozen native-v1 load
 may additionally adopt its persisted root; create retains
 repeatable output anchors with bounded children and strict crash-cleanup
 records. General dynamic post-Ready delivery, hard revocation, cross-filesystem
-socket publication, vmnet provisioning and policy, configurable chroot,
-launch constraints, Developer ID possession, automatic restart, and
-notarization remain later work. Positive arbitrary uid/gid transition is the
-fixed-topology platform limit above, not feasible backlog. The exact Linux seccomp, cgroup,
+socket publication, vmnet provisioning and policy, launch constraints,
+Developer ID possession, automatic restart, and notarization remain later
+work. Positive arbitrary uid/gid transition is the fixed-topology platform
+limit above, not feasible backlog. Configurable chroot is the separate
+fixed-topology platform limit above. The exact Linux seccomp, cgroup,
 network-namespace, and PID-namespace mechanisms now have terminal macOS
 platform exclusions; this does not make the surrounding aggregate jailer or
 production-host records complete.

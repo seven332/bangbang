@@ -58,9 +58,10 @@ adopt exact read-only grants; block and pmem devices adopt exact repeatable
 read-only/read-write backing grants; logger, metrics, and serial adopt exact
 singleton write-only sink grants; vhost-user endpoints require repeatable
 connect-only directory grants and launcher-returned streams. Positive product
-uid/gid transition, configurable chroot ownership, and complete distribution-
-signing policy remain absent. Public uid/gid now has a fixed terminal rejection
-rather than an unresolved positive path. A disabled evidence bundle has
+uid/gid transition, a positive configurable chroot implementation, and complete
+distribution-signing policy remain absent. Public uid/gid and configurable
+chroot now have separate fixed terminal rejections rather than unresolved
+positive paths. A disabled evidence bundle has
 measured credential bootstrap plus same-process continuation through a
 launcher-created target-owned session. The worker consumes one exact
 session-bound descriptor authority before `Hello`; mapped, retained-root, and
@@ -84,9 +85,9 @@ commit typed startup authority, and its config, metadata, kernel, initrd,
 block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket,
 and vsock-socket consumers use granted identities or exact retained anchors
 without reopening their tagged path strings. Arbitrary numeric uid/gid is a
-terminal fixed-topology platform limit with a stable prelaunch rejection;
-configurable chroot and general dynamic post-Ready delivery/hard revocation
-still need dedicated designs.
+terminal fixed-topology platform limit with a stable prelaunch rejection.
+Configurable chroot is a separate fixed-topology platform limit; general
+dynamic post-Ready delivery and hard revocation still need dedicated designs.
 
 The elevated evidence result is intentionally narrower than product support.
 For mapped, retained-root, and SDK-maximum unmapped identities, the signed
@@ -160,9 +161,41 @@ entitlement or extension weakens the mandatory boundary; an account-derived or
 configurable root adds ambient authority; early unlink removes the accepted
 linked recovery contract; wrapper/launcher-only cleanup cannot converge after
 launcher loss. The two uid/gid argument identities are therefore terminal
-platform exclusions, while configurable chroot, `corpus:jailer`,
-`corpus:production-host`, and `jailer/run` remain nonterminal. No #1904 product
+platform exclusions, while `corpus:jailer`, `corpus:production-host`, and
+`jailer/run` remain nonterminal. No #1904 product
 adapter or new elevated runtime path was merged.
+
+## Jailer configurable-chroot fixed-topology platform limit
+
+Firecracker's configurable root combines a trusted base path with Linux mount
+namespace, propagation, bind mount, `pivot_root`, old-root detachment, chroot,
+in-root resources, and exec. Public macOS chroot and spawn-root inheritance
+exist, so the terminal result is not based on syscall absence and is not Linux
+mechanism parity.
+
+On the capable host, the unsandboxed launcher enters the exact validated root.
+The mandatory separately signed App Sandbox + Hypervisor worker validates and
+`fchdir`s that root but receives permission denied from direct chroot. In the
+inherited ordering, the launcher stages and validates the complete fixed signed
+bundle plus current dyld, enters and reattests the root, and receives a child
+PID; the child exits before its authenticated Ready record in every repeated
+and concurrent case. The unchrooted control completes real HVF create/destroy,
+but the exact inherited child sub-cause remains unknown.
+
+Apple provides no supported bounded runtime and IPC closure for the mandatory
+App Sandbox/HVF/vmnet worker inside an arbitrary inherited chroot. Copying the
+active shared cache or system tree is a host-build-coupled system-root clone;
+disabling bootstrap IPC removes required services; a launchd job/helper,
+entitlement change, private API, or descriptor/cwd alias changes the accepted
+authority, containment, or absolute-path semantics.
+
+The launcher consequently classifies the exact ASCII option name before value
+access and returns
+`unsupported Firecracker jailer isolation argument on macOS: --chroot-base-dir`.
+Attached, separated, and attached non-UTF-8 values cannot enter diagnostics or
+launch state. The conclusion is bound to the fixed topology, preserves the
+unknown child cause, and leaves `corpus:jailer`, `corpus:production-host`, and
+`jailer/run` audit-required.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -322,7 +355,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 
 | Area | Current status | Review expectation |
 | --- | --- | --- |
-| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; uid/gid has an exact fixed-topology terminal rejection; disabled evidence completes numeric credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate the feature-only credential evidence with positive product uid/gid support, configurable chroot, or Linux isolation parity. |
+| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; uid/gid and configurable chroot have separate exact fixed-topology terminal rejections; disabled evidence completes numeric credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate feature-only evidence with positive product uid/gid or configurable-chroot support, or with Linux isolation parity. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
@@ -583,7 +616,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
-| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; uid/gid root-retained/root-transition requests have a terminal fixed-topology rejection; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep the uid/gid exclusion fail-closed unless a fresh public-platform Challenge changes the accepted topology result; keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
+| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; uid/gid root-retained/root-transition and configurable-chroot requests have separate terminal fixed-topology rejections; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep the uid/gid and configurable-chroot exclusions fail-closed unless a fresh public-platform Challenge changes the accepted topology result; keep seccomp, namespaces, cgroups, and parent-cgroup controls rejected. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
@@ -3516,11 +3549,12 @@ Network Extension, vmnet, or Endpoint Security.
 At that Wave 8 checkpoint, six #1373 outcomes remained audit entries; two
 #1378 outcomes required caller-owned Apple-approved signing/profile authority
 and an isolated vmnet fixture; three #1351 isolation semantics remained
-platform-feasible. The later exact uid/gid transition leaves four #1373 rows,
-the same two #1378 rows, and the same three #1351 rows, for current totals
-377/6/3/32. Missing authority or credentials alone is not an impossibility
-proof. Global `--final` stays blocked until the remaining external outcomes
-complete.
+platform-feasible. The later exact uid/gid transition leaves four #1373 rows
+at 377/6/3/32. The subsequent exact configurable-chroot transition leaves
+three #1373 rows, the same two #1378 rows, and the same three #1351 rows, for
+current totals 377/5/3/33. Missing authority or credentials alone is not an
+impossibility proof. Global `--final` stays blocked until the remaining
+external outcomes complete.
 
 The elevated same-host gates have now been executed rather than inferred from
 split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root
@@ -3679,8 +3713,10 @@ and future-OS nonclaim are in the checked
 #1904 then exercised the fixed product topology and found the independent
 post-launcher-loss worker cleanup blocker described in
 [Jailer uid/gid fixed-topology platform limit](#jailer-uidgid-fixed-topology-platform-limit).
-#1905 makes exactly the uid/gid leaves terminal at that rejection, leaving four
-#1373 audit outcomes. The earlier evidence harness is test-only and statically
+#1905 makes exactly the uid/gid leaves terminal at that rejection. #1908 later
+makes exactly configurable chroot terminal at the separately documented
+fixed-topology result, leaving three #1373 audit outcomes. The earlier evidence
+harness is test-only and statically
 absent from normal launcher and worker builds; its daemon path is not a root
 service, public jailer/daemon mode, setuid helper, or ambient path authority.
 

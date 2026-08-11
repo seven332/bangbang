@@ -69,10 +69,9 @@ fn authoritative_reference(url: &str) -> Reference {
 #[test]
 fn jailer_uid_gid_platform_limit_is_terminal_and_fail_closed() {
     const TERMINAL_IDS: [&str; 2] = ["tool-argument:jailer/gid", "tool-argument:jailer/uid"];
-    const RETAINED_AUDIT_IDS: [&str; 4] = [
+    const RETAINED_AUDIT_IDS: [&str; 3] = [
         "corpus:jailer",
         "corpus:production-host",
-        "tool-argument:jailer/chroot-base-dir",
         "tool-operation:jailer/run",
     ];
     const CHALLENGE_URL: &str =
@@ -263,6 +262,229 @@ fn jailer_uid_gid_platform_limit_is_terminal_and_fail_closed() {
         .to_string();
         assert!(error.contains("requires exclusion evidence"));
     }
+}
+
+#[test]
+fn jailer_chroot_platform_limit_is_terminal_and_fail_closed() {
+    const ID: &str = "tool-argument:jailer/chroot-base-dir";
+    const RETAINED_AUDIT_IDS: [&str; 3] = [
+        "corpus:jailer",
+        "corpus:production-host",
+        "tool-operation:jailer/run",
+    ];
+    const CHALLENGE_URL: &str =
+        "https://github.com/seven332/bangbang/issues/1908#issuecomment-5251362795";
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+
+    let capability = by_id.get(ID).expect("jailer chroot identity must exist");
+    assert_eq!(
+        capability.disposition,
+        Disposition::ProvenPlatformImpossible
+    );
+    assert!(capability.implementation.is_empty());
+    assert!(capability.validation.is_empty());
+    assert!(capability.delivery_issue.is_none());
+    assert_eq!(capability.family, "isolation");
+    assert_eq!(
+        capability
+            .source_refs
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [ID]
+    );
+    assert!(capability.summary.contains("Public macOS chroot"));
+    assert!(
+        capability
+            .summary
+            .contains("exact pre-entry child cause remains unknown")
+    );
+    assert!(
+        capability
+            .summary
+            .contains("Reject exact --chroot-base-dir")
+    );
+
+    let exclusion = capability
+        .exclusion
+        .as_ref()
+        .expect("terminal jailer chroot must carry a complete exclusion");
+    assert_eq!(
+        exclusion.upstream_contract,
+        [
+            "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L14-L145",
+            "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L221-L232",
+            "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/prod-host-setup.md#L85-L113",
+            "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/chroot.rs#L17-L100",
+            "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L156-L168",
+            "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L644-L682",
+            "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L189-L192",
+        ]
+        .into_iter()
+        .map(authoritative_reference)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        exclusion.platform_evidence,
+        [
+            local_reference(
+                "compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md",
+                "Capable-host result",
+            ),
+            github_reference(
+                "https://github.com/seven332/bangbang/issues/1371#issuecomment-5251101370",
+            ),
+            github_reference("https://github.com/seven332/bangbang/pull/1883"),
+            github_reference("https://github.com/seven332/bangbang/pull/1886"),
+            authoritative_reference(
+                "https://developer.apple.com/documentation/security/app-sandbox",
+            ),
+            authoritative_reference(
+                "https://developer.apple.com/documentation/security/discovering-and-diagnosing-app-sandbox-violations",
+            ),
+            authoritative_reference(
+                "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/chroot.2.html",
+            ),
+            authoritative_reference(
+                "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/posix_spawn.2.html",
+            ),
+            authoritative_reference(
+                "https://github.com/apple-oss-distributions/dyld/blob/main/doc/dyld4.md",
+            ),
+        ]
+    );
+    assert_eq!(
+        exclusion
+            .alternatives
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "Adding a launchd job or privileged helper changes installation, persistence, authorization, supervision, recovery, and the accepted fixed two-process topology while retaining the documented chroot IPC warning.",
+            "Changing the worker entitlement or adding a sandbox extension weakens or replaces the mandatory separately signed App Sandbox boundary.",
+            "Copying the active dyld shared cache or a system library tree creates a large host-build-coupled system-root clone rather than a bounded distributable product dependency.",
+            "Disabling bootstrap IPC with XPC_NULL_BOOTSTRAP conflicts with the required App Sandbox and vmnet system-service behavior and supplies no positive product contract.",
+            "Interpreting chroot-base-dir as a cwd, App Sandbox container, or descriptor grant leaves absolute pathname resolution rooted at the host and changes the Firecracker security meaning.",
+            "Running public chroot in the already-started mandatory worker is denied by its fixed App Sandbox profile in the controlled direct-worker matrix.",
+            "Staging only the complete signed bundle and current Apple dyld permits launcher root entry and child creation but does not provide the runtime and IPC closure needed to reach authenticated application entry.",
+        ]
+    );
+    assert_eq!(
+        exclusion.stable_behavior,
+        [
+            local_reference(
+                "crates/launcher/src/error.rs",
+                "pub enum JailerIsolationArgument",
+            ),
+            local_reference(
+                "crates/launcher/src/launch_policy.rs",
+                "fn unsupported_jailer_isolation_argument",
+            ),
+        ]
+    );
+    assert_eq!(
+        exclusion.focused_tests,
+        [
+            local_reference(
+                "crates/launcher/src/launch_policy.rs",
+                "fn rejects_named_unsupported_isolation_before_consuming_values()",
+            ),
+            local_reference(
+                "crates/launcher/src/launch_policy.rs",
+                "fn unsupported_isolation_names_are_exact_and_pre_delimiter_only()",
+            ),
+            local_reference(
+                "crates/launcher/tests/production_bundle_e2e.rs",
+                "fn signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker()",
+            ),
+        ]
+    );
+    assert_eq!(
+        exclusion.compatibility_docs,
+        [
+            local_reference(
+                "compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md",
+                "Configurable chroot fixed-topology platform limit",
+            ),
+            local_reference(
+                "compat/firecracker/v1.16.0/isolation-contract.md",
+                "Terminal jailer configurable-chroot platform limit",
+            ),
+            local_reference(
+                "docs/firecracker-compatibility.md",
+                "Jailer configurable-chroot platform limit",
+            ),
+            local_reference(
+                "docs/firecracker-validation-matrix.md",
+                "macOS production isolation",
+            ),
+        ]
+    );
+    assert_eq!(
+        exclusion.security_docs,
+        [local_reference(
+            "docs/security.md",
+            "Jailer configurable-chroot fixed-topology platform limit",
+        )]
+    );
+    assert_eq!(exclusion.challenge, github_reference(CHALLENGE_URL));
+
+    for id in RETAINED_AUDIT_IDS {
+        let aggregate = by_id.get(id).expect("jailer aggregate must exist");
+        assert_eq!(aggregate.disposition, Disposition::AuditRequired);
+        assert!(aggregate.exclusion.is_none());
+        assert!(aggregate.summary.contains("configurable chroot"));
+    }
+
+    let mut incomplete = inventory.clone();
+    incomplete
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == ID)
+        .expect("jailer chroot identity must exist")
+        .exclusion = None;
+    let error = validate(
+        &manifest,
+        &incomplete,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("removing the chroot exclusion must fail closed")
+    .to_string();
+    assert!(error.contains("requires exclusion evidence"));
+
+    let mut noncanonical = inventory;
+    noncanonical
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == ID)
+        .and_then(|capability| capability.exclusion.as_mut())
+        .expect("jailer chroot exclusion must exist")
+        .platform_evidence
+        .swap(0, 1);
+    let error = validate(
+        &manifest,
+        &noncanonical,
+        &repository_root,
+        AuditMode::Delivery,
+    )
+    .expect_err("noncanonical chroot evidence must fail closed")
+    .to_string();
+    assert!(error.contains("not canonically sorted"));
 }
 
 #[test]
@@ -985,7 +1207,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        6
+        5
     );
     assert_eq!(
         inventory
@@ -1003,7 +1225,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
                 capability.disposition == Disposition::ProvenPlatformImpossible
             })
             .count(),
-        32
+        33
     );
 
     let mut nonterminal = inventory.clone();
@@ -2095,7 +2317,10 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
         .filter(|id| {
             !matches!(
                 *id,
-                WAVE8_ID | "tool-argument:jailer/gid" | "tool-argument:jailer/uid"
+                WAVE8_ID
+                    | "tool-argument:jailer/chroot-base-dir"
+                    | "tool-argument:jailer/gid"
+                    | "tool-argument:jailer/uid"
             )
         })
         .collect::<BTreeSet<_>>();
@@ -3778,9 +4003,9 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 6);
+    assert_eq!(count(Disposition::AuditRequired), 5);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
 #[test]
@@ -4508,9 +4733,9 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 6);
+    assert_eq!(count(Disposition::AuditRequired), 5);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
 #[test]
@@ -4805,9 +5030,9 @@ fn network_mmds_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 6);
+    assert_eq!(count(Disposition::AuditRequired), 5);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
 #[test]
@@ -4954,9 +5179,9 @@ fn vsock_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 6);
+    assert_eq!(count(Disposition::AuditRequired), 5);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
 #[test]
@@ -5202,9 +5427,9 @@ fn delivery_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 6);
+    assert_eq!(count(Disposition::AuditRequired), 5);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 
     for id in IMPLEMENTED_ORIGINAL {
         assert_eq!(

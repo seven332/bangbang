@@ -1,9 +1,11 @@
 use std::fmt;
 use std::io;
 
-/// Firecracker jailer isolation arguments that have no equivalent macOS process boundary.
+/// Firecracker jailer isolation arguments without a supported fixed macOS equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JailerIsolationArgument {
+    /// Select a configurable Firecracker jailer root base directory.
+    ChrootBaseDirectory,
     /// Configure one Linux cgroup controller property.
     Cgroup,
     /// Select the Linux cgroup hierarchy version.
@@ -20,6 +22,7 @@ impl JailerIsolationArgument {
     /// Return the fixed Firecracker jailer argument name without its `--` prefix.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::ChrootBaseDirectory => "chroot-base-dir",
             Self::Cgroup => "cgroup",
             Self::CgroupVersion => "cgroup-version",
             Self::ParentCgroup => "parent-cgroup",
@@ -31,6 +34,7 @@ impl JailerIsolationArgument {
     #[cfg(target_os = "macos")]
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         match name {
+            "chroot-base-dir" => Some(Self::ChrootBaseDirectory),
             "cgroup" => Some(Self::Cgroup),
             "cgroup-version" => Some(Self::CgroupVersion),
             "parent-cgroup" => Some(Self::ParentCgroup),
@@ -139,7 +143,7 @@ pub enum LauncherError {
     InvalidGrantInput,
     /// The versioned production launch-control envelope is invalid.
     InvalidLaunchPolicy,
-    /// A Linux-only Firecracker jailer isolation argument was requested on macOS.
+    /// An unsupported Firecracker jailer isolation argument was requested on macOS.
     UnsupportedJailerIsolation(JailerIsolationArgument),
     /// The authenticated worker rejected or could not install its launch policy.
     WorkerPolicy,

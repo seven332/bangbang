@@ -64,9 +64,11 @@ proven-platform-impossible. The later source-complete #1799 aggregate changes
 only its exact five successor rows to reach 376/9/3/30. Wave 8 then changes
 only its exact cross-capability row to reach its historical 377/8/3/30
 endpoint. The later jailer uid/gid platform-limit transition changes exactly
-those two identities to reach the current 377/6/3/32 endpoint. The scoped gate
-accepts only those four exact phases and derives every identity-checked
-difference; none of the totals is a delivery quota.
+those two identities to reach 377/6/3/32. The later configurable-chroot
+platform-limit transition changes exactly that one identity to reach the
+current 377/5/3/33 endpoint. The scoped gate accepts only those five exact
+phases and derives every identity-checked difference; none of the totals is a
+delivery quota.
 
 ## Nonclaims
 

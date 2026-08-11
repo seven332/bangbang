@@ -2044,7 +2044,8 @@ device-table relations, 261 API identities, 21 release entries, 55 public-tool
 leaves, and every supported virtio-MMIO profile. It accepts only its historical
 inventory phase `376/9/3/30` with the Wave 8 row audit-required or the exact
 one-row Wave 8 successor `377/8/3/30`, followed by the exact uid/gid-only
-platform-limit successor `377/6/3/32`. Each phase is classified by exact
+platform-limit successor `377/6/3/32` and the exact configurable-chroot-only
+successor `377/5/3/33`. Each phase is classified by exact
 identity sets, not counts. It does not execute Kani, sign binaries, run HVF, or
 collect an environment report inside the Rust process: run the targeted Kani
 job, the full signed integration wrapper, and the specification collector
@@ -2088,15 +2089,16 @@ snapshot suites. The historical Wave 8 authority independently groups its 30
 impossible records into exact x86 CPUID/MSR (13), Linux KVM feature/template
 (7), Linux hugetlbfs `2M` (2), and Linux runtime-isolation (8) reviews. Per-ID
 exclusions remain mandatory. The later uid/gid-only successor adds two
-separately challenged fixed-topology exclusions without rewriting that
-historical partition.
+separately challenged fixed-topology exclusions, and the current chroot-only
+successor adds one more, without rewriting that historical partition.
 
 At Wave 8, exactly six #1373 audit rows, two #1378 audit rows, and three #1351
-feasible rows remained. The current `377/6/3/32` phase retains exactly four
-#1373 audit rows (`corpus:jailer`, `corpus:production-host`,
-`jailer/chroot-base-dir`, and `jailer/run`), the same two #1378 audit rows, and
-the same three #1351 feasible rows. The global `--final` command deliberately
-continues to fail on those six audit and three feasible records. The Rust
+feasible rows remained. The uid/gid `377/6/3/32` phase retained four #1373
+rows. The current `377/5/3/33` phase retains exactly three #1373 audit rows
+(`corpus:jailer`, `corpus:production-host`, and `jailer/run`), the same two
+#1378 audit rows, and the same three #1351 feasible rows. The global `--final`
+command deliberately continues to fail on those five audit and three feasible
+records. The Rust
 command is offline; live GitHub hierarchy, reviews, CI, branches, merge state,
 and merged-main OID are checked and recorded by the pull-request workflow.
 
@@ -2397,10 +2399,11 @@ may skip execution. On supported Apple Silicon it proves:
   fixed executable/current credentials, ID/timing injection, duplicate and
   forwarded-singleton rejection, last-value resource limits, canonical
   default-denied vmnet grammar, and redacted failure;
-- fixed typed rejection of exact, attached, and separated `--cgroup`,
-  `--cgroup-version`, `--parent-cgroup`, `--netns`, and `--new-pid-ns` requests
-  before an intentionally invalid private grant, profile/staging/spawn work,
-  worker output, or socket/session mutation, with every supplied value absent
+- fixed typed rejection of exact, attached, and separated
+  `--chroot-base-dir`, `--cgroup`, `--cgroup-version`, `--parent-cgroup`,
+  `--netns`, and `--new-pid-ns` requests before an intentionally invalid
+  private grant, profile/staging/spawn work, worker output, or socket/session
+  mutation, with attached non-UTF-8 coverage and every supplied value absent
   from stdout and stderr;
 - rejection of every positive host/shared/bridge/count vmnet authority by the
   exact two-entitlement networkless profile before worker execution, plus

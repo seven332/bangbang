@@ -202,9 +202,13 @@ fn validate_header(
         errors.push("Wave 8 requires the exact ordered seven interaction domains".to_string());
     }
     match classify_inventory_phase(inventory) {
-        Ok(InventoryPhase::Wave8 | InventoryPhase::JailerUidGidPlatformLimit) => {}
+        Ok(
+            InventoryPhase::Wave8
+            | InventoryPhase::JailerUidGidPlatformLimit
+            | InventoryPhase::JailerChrootPlatformLimit,
+        ) => {}
         Ok(phase) => errors.push(format!(
-            "Wave 8 live inventory must be its exact 377/8/3/30 phase or the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, found {}",
+            "Wave 8 live inventory must be its exact 377/8/3/30 phase, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, or the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor; found {}",
             phase.name()
         )),
         Err(error) => errors.push(format!("Wave 8 live inventory phase is invalid: {error}")),
@@ -545,8 +549,11 @@ fn validate_platform_reviews(
         .filter(|capability| capability.disposition == Disposition::ProvenPlatformImpossible)
         .map(|capability| capability.id.as_str())
         .collect::<BTreeSet<_>>();
-    if let Ok(phase @ (InventoryPhase::Wave8 | InventoryPhase::JailerUidGidPlatformLimit)) =
-        classify_inventory_phase(inventory)
+    if let Ok(
+        phase @ (InventoryPhase::Wave8
+        | InventoryPhase::JailerUidGidPlatformLimit
+        | InventoryPhase::JailerChrootPlatformLimit),
+    ) = classify_inventory_phase(inventory)
     {
         let expected = expected_impossible_ids(phase);
         if impossible != expected {
@@ -617,7 +624,11 @@ fn validate_handoffs(
         })
         .map(|capability| capability.id.as_str())
         .collect::<BTreeSet<_>>();
-    if let Some(phase @ (InventoryPhase::Wave8 | InventoryPhase::JailerUidGidPlatformLimit)) = phase
+    if let Some(
+        phase @ (InventoryPhase::Wave8
+        | InventoryPhase::JailerUidGidPlatformLimit
+        | InventoryPhase::JailerChrootPlatformLimit),
+    ) = phase
     {
         let expected = expected_nonterminal_ids(phase);
         if nonterminal != expected {

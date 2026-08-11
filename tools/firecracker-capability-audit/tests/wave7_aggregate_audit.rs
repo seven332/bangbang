@@ -186,7 +186,11 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
         .expect("terminal Wave 7 aggregate must certify");
 
     let mut historical = inventory.clone();
-    for id in ["tool-argument:jailer/gid", "tool-argument:jailer/uid"] {
+    for id in [
+        "tool-argument:jailer/chroot-base-dir",
+        "tool-argument:jailer/gid",
+        "tool-argument:jailer/uid",
+    ] {
         let capability = historical
             .capabilities
             .iter_mut()

@@ -956,10 +956,10 @@ fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation(
 }
 
 #[test]
-fn signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker() {
+fn signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker() {
     let bundle = production_bundle();
     initialize_worker_container(&bundle);
-    let private = TestDir::new("linux-isolation-rejection");
+    let private = TestDir::new("unsupported-isolation-rejection");
 
     let run_case = |case: &str,
                     argument: JailerIsolationArgument,
@@ -985,7 +985,7 @@ fn signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker() {
         let output = run_with_timeout(
             &mut command,
             PROCESS_TIMEOUT,
-            "signed Linux isolation rejection",
+            "signed unsupported isolation rejection",
         );
 
         assert_eq!(output.status.code(), Some(PROCESS_FAILURE_EXIT_CODE));
@@ -1017,6 +1017,7 @@ fn signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker() {
     };
 
     let arguments = [
+        JailerIsolationArgument::ChrootBaseDirectory,
         JailerIsolationArgument::Cgroup,
         JailerIsolationArgument::CgroupVersion,
         JailerIsolationArgument::ParentCgroup,
@@ -1042,6 +1043,7 @@ fn signed_jailer_rejects_linux_isolation_before_grants_sessions_and_worker() {
     }
 
     for argument in [
+        JailerIsolationArgument::ChrootBaseDirectory,
         JailerIsolationArgument::Cgroup,
         JailerIsolationArgument::CgroupVersion,
         JailerIsolationArgument::ParentCgroup,
