@@ -25,7 +25,7 @@ use super::block_control::LauncherBlockControlBroker;
 use super::daemon::{NotifierEvent, SessionNotifier};
 #[cfg(feature = "elevated-bootstrap-probe")]
 use super::elevated_guest::ElevatedGuestSupervisor;
-use super::socket_broker::LauncherSocketBroker;
+use super::socket_broker::{LauncherSocketBroker, SocketBrokerDrainStatus};
 use super::spawn::OwnedWorker;
 use super::vhost_user_broker::LauncherVhostUserBroker;
 use crate::LauncherError;
@@ -903,6 +903,7 @@ fn wait_session_inner(
     let mut block_control_closed = false;
     let mut grant_send = GrantSendState::new(grants, lifecycle.session());
     let mut broker = LauncherSocketBroker::new(lifecycle.session());
+    let mut broker_complete = false;
     let mut vhost_broker = LauncherVhostUserBroker::new(lifecycle.session());
     let mut block_control = LauncherBlockControlBroker::new(lifecycle.session());
     #[cfg(feature = "elevated-bootstrap-probe")]
@@ -1084,17 +1085,25 @@ fn wait_session_inner(
         }
 
         if !child_exited
+            && !broker_complete
             && events
                 .iter()
                 .any(|queued| queued.filter == libc::EVFILT_READ && queued.ident == broker_fd)
-        {
-            broker.drain(
+            && broker.drain(
                 socket_broker,
                 worker.pid(),
                 lifecycle.state(),
                 lifecycle.is_cancelled(),
                 grants,
+            )? == SocketBrokerDrainStatus::Complete
+        {
+            // Shutdown is the broker's authenticated terminal message. Stop
+            // observing the descriptor before the worker closes its peer.
+            register_events(
+                kqueue.as_raw_fd(),
+                &[event(broker_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
             )?;
+            broker_complete = true;
         }
 
         if !child_exited

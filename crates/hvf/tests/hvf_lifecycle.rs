@@ -11627,25 +11627,29 @@ fn capture_ready_vsock_resets_signed_mmio_and_pci_owners() {
     drop(mmio_guard);
 
     notify_vsock_capture_event_queue(&mut mmio_session, mmio_base, false);
-    let mmio_empty_guard = mmio_session
+    let mmio_pending_guard = mmio_session
         .quiesce_limiter_retry_wakeups()
-        .expect("MMIO empty-event reset capture should quiesce");
-    let mmio_empty = mmio_session
-        .capture_ready_vsock_state(Some(vsock_config.clone()), &mmio_metrics, &mmio_empty_guard)
-        .expect("active MMIO vsock with an empty event queue should capture")
+        .expect("MMIO pending-event reset capture should quiesce");
+    let mmio_pending = mmio_session
+        .capture_ready_vsock_state(
+            Some(vsock_config.clone()),
+            &mmio_metrics,
+            &mmio_pending_guard,
+        )
+        .expect("active MMIO vsock without an event refill should capture")
         .expect("configured MMIO vsock should remain present");
     assert_eq!(
-        mmio_empty.validation().reset_attempt(),
-        VirtioVsockTransportResetAttempt::QueueEmpty
+        mmio_pending.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::AlreadyPending
     );
     assert!(
-        !mmio_empty
+        !mmio_pending
             .validation()
             .source_work()
             .dropped_any_source_work()
     );
-    drop(mmio_empty_guard);
-    assert_eq!(mmio_metrics.snapshot().ev_queue_event_fails(), 1);
+    drop(mmio_pending_guard);
+    assert_eq!(mmio_metrics.snapshot().ev_queue_event_fails(), 0);
 
     for (descriptor_index, stage) in [
         HvfArm64BootVsockCaptureStage::InterruptDelivery,
@@ -11664,6 +11668,7 @@ fn capture_ready_vsock_resets_signed_mmio_and_pci_owners() {
             descriptor_index,
             descriptor_index + 1,
         );
+        notify_vsock_capture_event_queue(&mut mmio_session, mmio_base, false);
         let mmio_cancel_guard = mmio_session
             .quiesce_limiter_retry_wakeups()
             .expect("MMIO cancellation capture should quiesce");
@@ -11681,7 +11686,6 @@ fn capture_ready_vsock_resets_signed_mmio_and_pci_owners() {
         );
         assert_eq!(cancelled.stage(), stage);
         drop(mmio_cancel_guard);
-        notify_vsock_capture_event_queue(&mut mmio_session, mmio_base, false);
     }
     mmio_session
         .shutdown()
@@ -11744,25 +11748,56 @@ fn capture_ready_vsock_resets_signed_mmio_and_pci_owners() {
     assert_eq!(pci_metrics.snapshot().ev_queue_event_fails(), 0);
     drop(pci_guard);
     notify_vsock_capture_event_queue(&mut pci_session, pci_base, true);
-    let pci_empty_guard = pci_session
+    let pci_pending_guard = pci_session
         .quiesce_limiter_retry_wakeups()
-        .expect("PCI empty-event reset capture should quiesce");
-    let pci_empty = pci_session
-        .capture_ready_vsock_state(Some(vsock_config), &pci_metrics, &pci_empty_guard)
-        .expect("active PCI vsock with an empty event queue should capture")
+        .expect("PCI pending-event reset capture should quiesce");
+    let pci_pending = pci_session
+        .capture_ready_vsock_state(Some(vsock_config.clone()), &pci_metrics, &pci_pending_guard)
+        .expect("active PCI vsock without an event refill should capture")
         .expect("configured PCI vsock should remain present");
     assert_eq!(
-        pci_empty.validation().reset_attempt(),
-        VirtioVsockTransportResetAttempt::QueueEmpty
+        pci_pending.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::AlreadyPending
     );
     assert!(
-        !pci_empty
+        !pci_pending
             .validation()
             .source_work()
             .dropped_any_source_work()
     );
-    drop(pci_empty_guard);
-    assert_eq!(pci_metrics.snapshot().ev_queue_event_fails(), 1);
+    drop(pci_pending_guard);
+    assert_eq!(pci_metrics.snapshot().ev_queue_event_fails(), 0);
+
+    write_vsock_capture_event(
+        pci_session
+            .guest_memory_mut()
+            .expect("PCI vsock guest memory should remain mapped"),
+        1,
+        2,
+    );
+    notify_vsock_capture_event_queue(&mut pci_session, pci_base, true);
+    let pci_refill_guard = pci_session
+        .quiesce_limiter_retry_wakeups()
+        .expect("PCI refilled-event reset capture should quiesce");
+    let pci_refilled = pci_session
+        .capture_ready_vsock_state(Some(vsock_config), &pci_metrics, &pci_refill_guard)
+        .expect("active PCI vsock with an event refill should capture")
+        .expect("configured PCI vsock should remain present");
+    assert!(matches!(
+        pci_refilled.validation().reset_attempt(),
+        VirtioVsockTransportResetAttempt::Published(_)
+    ));
+    let queues = pci_refilled
+        .transport()
+        .pci_state()
+        .expect("refilled PCI vsock should retain PCI state")
+        .device()
+        .active_queues()
+        .expect("refilled PCI capture should retain all queues");
+    assert_eq!(queues.event().next_available(), 2);
+    assert_eq!(queues.event().next_used(), 2);
+    assert_eq!(pci_metrics.snapshot().ev_queue_event_fails(), 0);
+    drop(pci_refill_guard);
     pci_session
         .shutdown()
         .expect("signed PCI vsock session should shut down");

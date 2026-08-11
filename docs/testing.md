@@ -3083,6 +3083,14 @@ payload/reply integrity, half-close/EOF behavior, and the exact clone-local
 cursor increment. Recapture records `saved + 16`; source artifacts, destination
 metrics, socket ownership, and clone cursors remain independent.
 
+The reset acknowledgement is tied to the guest refilling the event buffer that
+carried `TRANSPORT_RESET`: the runtime records the event ring's `avail.idx` when
+the source reset is published and reconstructs the same runtime-only checkpoint
+from destination guest memory. A queue-2 kick at the unchanged index is valid
+transport activity but does not release restored RX. A validated index advance,
+including `u16` wraparound, clears the gate once; TX remains live throughout.
+This checkpoint is not part of native-v2 state or its compatibility version.
+
 The production/App Sandbox test repeats original and overridden MMIO/PCI
 destinations through the normal outer launcher, nested worker, and exact grant
 manifests. Process-local serial output is the guest evidence channel. Its
@@ -3755,8 +3763,10 @@ supported bangbang extension. Focused runtime tests additionally validate the
 real event queue's reset payload and used-ring transaction, EVENT_IDX state,
 mandatory MMIO queue intent and PCI queue-2 delivery, typed empty/malformed
 failures and metrics, runtime-only restored-origin acknowledgement gate, TX
-progress, preserved RX work, post-ack drain, and EVENT_IDX rearming against a
-pre-filled event ring. Repeated pre-boot `PUT /vsock`
+progress, preserved RX work, refill-aware `avail.idx` acknowledgement and
+post-ack drain, malformed-ring fail-closed behavior, wraparound, and EVENT_IDX
+rearming against a pre-filled event ring. An event notification without an
+index advance leaves RX gated and is not counted as a failure. Repeated pre-boot `PUT /vsock`
 replaces stored configuration and post-start PUT is stably rejected; PATCH,
 DELETE, runtime hotplug, and broader CID routing are not supported. Focused
 capture tests now cover repeatable inactive/active MMIO values, endpoint-locked
@@ -3793,9 +3803,17 @@ through contained host authority. Host initiation enters through the supplied
 granted main listener. Guest initiation keeps queue, credit, routing, and
 shutdown state in the worker but asks the already authenticated launcher only
 for one relative `<SocketChild>_<port>` connection at a time; the launcher never
-receives payload bytes. API-only and direct-path cases keep that broker dormant.
-These tests prove the narrow fixed facet, not general dynamic brokerage,
-outbound-network entitlement, cross-filesystem publication, or hard revocation.
+receives payload bytes. The certifier keeps each guest-initiated per-port
+listener pathname published until the first exact payload proves that the
+launcher's post-connect pathname identity check and SCM_RIGHTS handoff have
+completed; `accept` alone is earlier than that authority boundary. It then drops
+the listener and unlinks the path before sending the response. An authenticated
+`Shutdown`/`Complete` exchange is the broker's terminal boundary: the launcher
+stops observing that descriptor before the worker closes its peer, so a clean
+teardown cannot be reinterpreted as a malformed follow-up frame. API-only and
+direct-path cases keep that broker dormant. These tests prove the narrow fixed
+facet, not general dynamic brokerage, outbound-network entitlement,
+cross-filesystem publication, or hard revocation.
 
 For Network/MMDS specifically, this evidence validates the supported
 public MMDS-only subset over the selected startup transport: guest-visible MTU,

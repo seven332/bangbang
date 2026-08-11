@@ -926,7 +926,7 @@ mod tests {
         let (stream, mut parent) = UnixStream::pair().expect("handoff pair should open");
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut notifier = DaemonNotifier::new(stream, deadline).expect("notifier should open");
-        let descriptor = notifier.as_raw_fd().expect("transport should be live");
+        notifier.as_raw_fd().expect("transport should be live");
         notifier.notify_ready(42).expect("Ready should be written");
         assert_eq!(
             read_frame_until(&mut parent, deadline, || Ok(())).expect("Ready should decode"),
@@ -949,9 +949,13 @@ mod tests {
         );
         notifier.close_transport();
         assert_eq!(notifier.as_raw_fd(), Err(LauncherError::DaemonHandoff));
-        // SAFETY: This reads flags from the formerly owned descriptor number.
-        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            parent
+                .read(&mut byte)
+                .expect("closed transport should read"),
+            0
+        );
     }
 
     #[test]
