@@ -90,8 +90,7 @@ The following remain under delivery issue
 
 - general dynamic post-Ready brokerage and hard revocation;
 - broader external vmnet connectivity, cleanup, and per-VM network policy;
-- arbitrary uid/gid transition, configurable chroot ownership, and any
-  installer-owned or elevated service needed to support them;
+- configurable chroot ownership and its deployment policy;
 - automatic restart/reconnect and long-lived broker/service policy;
 - cross-filesystem socket publication; and
 - Developer ID/team possession, notarization, launch constraints, and release
@@ -103,6 +102,37 @@ These gaps keep the three composite isolation records
 - `semantic.isolation:host-resource-authority-and-brokerage`
 - `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`
 - `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
+
+## Terminal jailer uid/gid platform limit
+
+Firecracker's public `--uid` and `--gid` contract accepts arbitrary numeric
+targets and installs them after privileged jail setup. Bangbang retains only
+the current non-root caller identity in the production launcher/worker
+topology. A root caller requesting either retained root or a permanent numeric
+transition is rejected by shared launch-policy validation with the fixed
+redacted `invalid production launch policy` result before session creation, worker spawn,
+grants, publication, or guest work.
+
+The terminal limit is not based on the absence of Darwin credential syscalls.
+The controlled #1904 experiment completed exact `/private/tmp` target-root
+construction, independent launcher/worker authority, permanent credential
+transition, launcher-created target-session adoption, grants, and ordinary
+lifecycle. After simulated launcher loss, however, the mandatory App Sandbox
+worker moved outside the target root but received `permission-denied` while
+removing its exact empty inner session. Exact empty-only outer cleanup was
+therefore `busy`; only the surviving unsandboxed launcher recovery path could
+converge. The final scan found zero residue, and the elevation wrapper only
+scanned the product root.
+
+Passing descriptors earlier does not grant the unchanged sandboxed worker the
+required pathname-mutation authority. A privileged helper/service, a new
+entitlement or sandbox extension, an account/configurable path, early unlinking
+that abandons linked foreground recovery, or wrapper/launcher-only cleanup
+changes the fixed accepted topology or fails independent worker cleanup.
+Accordingly `tool-argument:jailer/uid` and `tool-argument:jailer/gid` are exact
+`proven-platform-impossible` leaves. This conclusion does not complete
+`corpus:jailer`, `corpus:production-host`, configurable chroot ownership, or
+the aggregate `jailer/run` contract.
 
 ## Certified Linux runtime isolation exclusions
 
@@ -129,6 +159,7 @@ publication, or worker output; post-delimiter worker arguments remain opaque.
 | Suspended worker validation, lifecycle, limits, daemon supervision, and cleanup | `crates/launcher/src/supervisor.rs`, `crates/launcher/src/macos/spawn.rs`, `crates/session/src/lib.rs` | launcher/session unit tests and signed production-bundle cases |
 | Typed startup grants and contained resource consumers | `crates/launcher/src/grant_manifest.rs` and the owning VMM/device consumers | focused grant tests plus signed direct and production device/snapshot matrices |
 | Stable Linux-mechanism exclusions | launcher policy parser and process CLI handling | focused unit/process tests, signed production-bundle pre-mutation cases, [compatibility](../../../docs/firecracker-compatibility.md#runtime-isolation-platform-exclusions), and [security](../../../docs/security.md#certified-linux-runtime-isolation-exclusions) |
+| Stable jailer uid/gid platform limit | `crates/launcher/src/launch_policy.rs`, `crates/launcher/src/macos/daemon.rs`, and `crates/launcher/src/supervisor.rs` | launch-identity unit tests, signed exact-help/policy validation, the [controlled platform result](elevated-bootstrap-evidence.md#product-uidgid-runtime-root-platform-gate), [compatibility](../../../docs/firecracker-compatibility.md#jailer-uidgid-platform-limit), and [security](../../../docs/security.md#jailer-uidgid-fixed-topology-platform-limit) |
 
 All signed production cases run through
 [`scripts/run-integration-tests.sh`](../../../scripts/run-integration-tests.sh);
@@ -144,4 +175,6 @@ evidence references, and dispositions. Linux seccomp, cgroup, network
 namespace, and PID namespace records are terminal only for the named stable
 macOS exclusions. The offline seccompiler is a separate implemented artifact
 tool and does not enforce runtime seccomp. The three composite records remain
-nonterminal until #1351's broader feasible work is complete.
+nonterminal until #1351's broader feasible work is complete. The uid/gid
+argument leaves are separately terminal at the fixed topology above; the four
+remaining #1373 records stay audit-required.

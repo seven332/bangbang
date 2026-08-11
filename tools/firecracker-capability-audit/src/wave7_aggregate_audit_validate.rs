@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::inventory_phase::{
+    InventoryPhase, WAVE8_SUCCESSOR_ID, classify_inventory_phase, disposition_counts,
+    expected_disposition, expected_nonterminal_ids,
+};
 use crate::validate::{tracked_repository_files, validate_reference};
 use crate::{
     CapabilityInventory, Disposition, FIRECRACKER_COMMIT, FIRECRACKER_TARGET, FIRECRACKER_VERSION,
@@ -568,20 +572,20 @@ fn validate_scope_and_counts(
     }
 
     let counts = disposition_counts(inventory);
-    let expected_wave8 = wave8_phase_disposition(inventory);
-    if expected_wave8.is_none() {
-        errors.push(format!(
-            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase or the exact one-row Wave 8 successor 377/8/3/30 phase, found {}/{}/{}/{}",
+    match classify_inventory_phase(inventory) {
+        Ok(
+            InventoryPhase::Wave7
+            | InventoryPhase::Wave8
+            | InventoryPhase::JailerUidGidPlatformLimit,
+        ) => {}
+        Ok(phase) => errors.push(format!(
+            "Wave 7 aggregate inventory cannot use the earlier {} phase",
+            phase.name()
+        )),
+        Err(error) => errors.push(format!(
+            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, or the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor; found {}/{}/{}/{}: {error}",
             counts.0, counts.1, counts.2, counts.3
-        ));
-    }
-    let capabilities = capability_map(inventory);
-    if expected_wave8.is_some_and(|expected| {
-        capabilities
-            .get("semantic.cross-capability:state-errors-metrics-security-and-snapshots")
-            .is_none_or(|capability| capability.disposition != expected)
-    }) {
-        errors.push("Wave 7 aggregate Wave 8 successor identity drifted".to_string());
+        )),
     }
 }
 
@@ -626,15 +630,15 @@ fn validate_design(
     }
 
     let capabilities = capability_map(inventory);
-    let wave8_disposition = wave8_phase_disposition(inventory);
+    let phase = classify_inventory_phase(inventory).ok();
     for record in &audit.design {
         let expected = match record.outcome {
             Wave7DesignOutcome::Implemented => Disposition::ImplementedAndVerified,
             Wave7DesignOutcome::Handoff1351 => Disposition::MissingPlatformFeasible,
             Wave7DesignOutcome::Handoff1378 => Disposition::AuditRequired,
-            Wave7DesignOutcome::HandoffWave8 => {
-                wave8_disposition.unwrap_or(Disposition::AuditRequired)
-            }
+            Wave7DesignOutcome::HandoffWave8 => phase.map_or(Disposition::AuditRequired, |phase| {
+                expected_disposition(phase, WAVE8_SUCCESSOR_ID)
+            }),
         };
         if capabilities
             .get(record.capability_id.as_str())
@@ -1033,6 +1037,7 @@ fn validate_tools(
             tool_items.len()
         ));
     }
+    let phase = classify_inventory_phase(inventory).ok();
     let capabilities = capability_map(inventory);
     let mut seen = BTreeSet::new();
     for (index, (record, spec)) in audit.tools.iter().zip(expected).enumerate() {
@@ -1097,12 +1102,17 @@ fn validate_tools(
                 None => errors.push(format!("Wave 7 tool capability is missing: {}", item.id)),
             }
         }
-        if (derived.0, derived.1, derived.2)
-            != (
-                record.counts.implemented,
-                record.counts.proven_platform_impossible,
-                record.counts.audit_handoff_1373,
-            )
+        let expected_live =
+            if prefix == "jailer/" && phase == Some(InventoryPhase::JailerUidGidPlatformLimit) {
+                (5, 7, 2)
+            } else {
+                (
+                    record.counts.implemented,
+                    record.counts.proven_platform_impossible,
+                    record.counts.audit_handoff_1373,
+                )
+            };
+        if (derived.0, derived.1, derived.2) != expected_live
             || derived.0 + derived.1 + derived.2 != record.counts.total
         {
             errors.push(format!(
@@ -1326,6 +1336,7 @@ fn validate_handoffs(
     inventory: &CapabilityInventory,
     errors: &mut Vec<String>,
 ) {
+    let phase = classify_inventory_phase(inventory).ok();
     let expected = [
         (
             "semantic.isolation:host-resource-authority-and-brokerage",
@@ -1414,11 +1425,9 @@ fn validate_handoffs(
             ));
             continue;
         };
-        let expected_disposition = if handoff.owner == Wave7HandoffOwner::Wave8 {
-            wave8_phase_disposition(inventory).unwrap_or(handoff.disposition)
-        } else {
-            handoff.disposition
-        };
+        let expected_disposition = phase.map_or(handoff.disposition, |phase| {
+            expected_disposition(phase, &handoff.capability_id)
+        });
         if capability.disposition != expected_disposition {
             errors.push(format!(
                 "Wave 7 handoff disposition drifted: {}",
@@ -1451,18 +1460,19 @@ fn validate_handoffs(
         })
         .map(|capability| capability.id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut handoff_ids = audit
-        .handoffs
-        .iter()
-        .map(|handoff| handoff.capability_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if wave8_phase_disposition(inventory) == Some(Disposition::ImplementedAndVerified) {
-        handoff_ids.remove("semantic.cross-capability:state-errors-metrics-security-and-snapshots");
-    }
-    if nonterminal != handoff_ids {
-        errors.push(format!(
-            "Wave 7 aggregate nonterminal inventory differs from explicit handoffs: expected {handoff_ids:?}, found {nonterminal:?}"
-        ));
+    if let Some(
+        phase @ (InventoryPhase::Wave7
+        | InventoryPhase::Wave8
+        | InventoryPhase::JailerUidGidPlatformLimit),
+    ) = phase
+    {
+        let expected = expected_nonterminal_ids(phase);
+        if nonterminal != expected {
+            errors.push(format!(
+                "Wave 7 aggregate nonterminal inventory differs from the exact {} phase: expected {expected:?}, found {nonterminal:?}",
+                phase.name()
+            ));
+        }
     }
 }
 
@@ -1651,26 +1661,6 @@ fn capability_map(inventory: &CapabilityInventory) -> BTreeMap<&str, &crate::Cap
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
         .collect()
-}
-
-fn disposition_counts(inventory: &CapabilityInventory) -> (usize, usize, usize, usize) {
-    inventory.capabilities.iter().fold(
-        (0, 0, 0, 0),
-        |(implemented, audit, feasible, impossible), capability| match capability.disposition {
-            Disposition::ImplementedAndVerified => (implemented + 1, audit, feasible, impossible),
-            Disposition::AuditRequired => (implemented, audit + 1, feasible, impossible),
-            Disposition::MissingPlatformFeasible => (implemented, audit, feasible + 1, impossible),
-            Disposition::ProvenPlatformImpossible => (implemented, audit, feasible, impossible + 1),
-        },
-    )
-}
-
-fn wave8_phase_disposition(inventory: &CapabilityInventory) -> Option<Disposition> {
-    match disposition_counts(inventory) {
-        (376, 9, 3, 30) => Some(Disposition::AuditRequired),
-        (377, 8, 3, 30) => Some(Disposition::ImplementedAndVerified),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

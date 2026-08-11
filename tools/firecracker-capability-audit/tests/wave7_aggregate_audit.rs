@@ -186,6 +186,15 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
         .expect("terminal Wave 7 aggregate must certify");
 
     let mut historical = inventory.clone();
+    for id in ["tool-argument:jailer/gid", "tool-argument:jailer/uid"] {
+        let capability = historical
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("post-Wave 8 jailer capability must exist");
+        capability.disposition = Disposition::AuditRequired;
+        capability.exclusion = None;
+    }
     let wave8 = historical
         .capabilities
         .iter_mut()

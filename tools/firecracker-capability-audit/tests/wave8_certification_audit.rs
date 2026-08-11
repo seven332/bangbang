@@ -172,7 +172,20 @@ fn wave8_terminal_transition_is_exact() {
     validate_wave8_certification_compatibility(&manifest, &inventory, &audit, &root)
         .expect("terminal Wave 8 transition must certify");
 
-    let mut downgraded = inventory.clone();
+    let mut historical_wave8 = inventory.clone();
+    for id in ["tool-argument:jailer/gid", "tool-argument:jailer/uid"] {
+        let capability = historical_wave8
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("post-Wave 8 jailer capability must exist");
+        capability.disposition = Disposition::AuditRequired;
+        capability.exclusion = None;
+    }
+    validate_wave8_certification_compatibility(&manifest, &historical_wave8, &audit, &root)
+        .expect("historical 377/8/3/30 Wave 8 phase must remain valid");
+
+    let mut downgraded = historical_wave8;
     let capability = downgraded
         .capabilities
         .iter_mut()

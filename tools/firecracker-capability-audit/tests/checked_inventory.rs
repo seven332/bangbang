@@ -48,6 +48,103 @@ fn checked_inventory_is_valid_for_delivery() {
 }
 
 #[test]
+fn jailer_uid_gid_platform_limit_is_terminal_and_fail_closed() {
+    const TERMINAL_IDS: [&str; 2] = ["tool-argument:jailer/gid", "tool-argument:jailer/uid"];
+    const RETAINED_AUDIT_IDS: [&str; 4] = [
+        "corpus:jailer",
+        "corpus:production-host",
+        "tool-argument:jailer/chroot-base-dir",
+        "tool-operation:jailer/run",
+    ];
+    const CHALLENGE_URL: &str =
+        "https://github.com/seven332/bangbang/issues/1905#issuecomment-5249781101";
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+
+    for id in TERMINAL_IDS {
+        let capability = by_id.get(id).expect("jailer identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ProvenPlatformImpossible,
+            "jailer identity must retain its terminal platform disposition: {id}"
+        );
+        assert!(capability.implementation.is_empty());
+        assert!(capability.validation.is_empty());
+        assert!(capability.delivery_issue.is_none());
+        assert!(
+            capability
+                .summary
+                .contains("current-user production identity")
+        );
+        assert!(
+            capability
+                .summary
+                .contains("root-retained or root-transition")
+        );
+
+        let exclusion = capability
+            .exclusion
+            .as_ref()
+            .expect("terminal jailer identity must carry a complete exclusion");
+        assert_eq!(exclusion.upstream_contract.len(), 4);
+        assert_eq!(exclusion.platform_evidence.len(), 2);
+        assert_eq!(exclusion.alternatives.len(), 5);
+        assert_eq!(exclusion.stable_behavior.len(), 3);
+        assert_eq!(exclusion.focused_tests.len(), 2);
+        assert_eq!(exclusion.compatibility_docs.len(), 4);
+        assert_eq!(exclusion.security_docs.len(), 1);
+        assert_eq!(
+            exclusion.challenge,
+            Reference::Github {
+                url: CHALLENGE_URL.to_string()
+            }
+        );
+    }
+
+    for id in RETAINED_AUDIT_IDS {
+        let capability = by_id.get(id).expect("jailer sibling must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "unowned jailer sibling must remain audit-required: {id}"
+        );
+        assert!(capability.exclusion.is_none());
+    }
+
+    for id in TERMINAL_IDS {
+        let mut incomplete = inventory.clone();
+        incomplete
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("jailer identity must exist")
+            .exclusion = None;
+        let error = validate(
+            &manifest,
+            &incomplete,
+            &repository_root,
+            AuditMode::Delivery,
+        )
+        .expect_err("removing either terminal jailer exclusion must fail closed")
+        .to_string();
+        assert!(error.contains("requires exclusion evidence"));
+    }
+}
+
+#[test]
 fn checked_source_manifest_is_canonical_and_deterministic() {
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -767,7 +864,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        8
+        6
     );
     assert_eq!(
         inventory
@@ -785,7 +882,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
                 capability.disposition == Disposition::ProvenPlatformImpossible
             })
             .count(),
-        30
+        32
     );
 
     let mut nonterminal = inventory.clone();
@@ -1874,7 +1971,12 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let current_handoffs = handoffs
         .iter()
         .copied()
-        .filter(|id| *id != WAVE8_ID)
+        .filter(|id| {
+            !matches!(
+                *id,
+                WAVE8_ID | "tool-argument:jailer/gid" | "tool-argument:jailer/uid"
+            )
+        })
         .collect::<BTreeSet<_>>();
     let implemented = CORE_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
     let logger_implemented = LOGGER_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
@@ -3555,9 +3657,9 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4285,9 +4387,9 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4582,9 +4684,9 @@ fn network_mmds_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4731,9 +4833,9 @@ fn vsock_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4979,9 +5081,9 @@ fn delivery_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 
     for id in IMPLEMENTED_ORIGINAL {
         assert_eq!(

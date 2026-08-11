@@ -3,13 +3,16 @@
 This contract records the #1373 direct-worker result, the #1884 inherited-root
 follow-up, the #1885 no-chroot credential-transition result, the #1889 / #1891
 target-owned runtime continuation results, and the #1893 post-transition guest
-result, the #1895 / #1897 launcher-created API-listener results, and the #1900
-retired feature-daemon result beneath #1371.
+result, the #1895 / #1897 launcher-created API-listener results, the #1900
+retired feature-daemon result beneath #1371, and the later #1904 product
+runtime-root platform gate.
 Together they test public chroot orderings, numeric
 credential bootstrap, same-process continuation into the ordinary production
 lifecycle, and real guest execution against Bangbang's mandatory worker
-boundary. They do not add a public root mode, accept jailer uid/gid/chroot
-options, or change a capability disposition by themselves.
+boundary. They do not add a public root mode or accept jailer uid/gid/chroot
+options. The feature evidence through #1900 did not change a disposition by
+itself; #1904 supplied the separate product-topology result used by #1905's
+uid/gid disposition review.
 
 ## Exact test boundary
 
@@ -315,8 +318,48 @@ cleanup by both listener owners. Exact object state and the final residue scan
 remained clean. #1891 is the separately
 challenged launcher-created-session authority result; it is not a hidden
 fallback in #1889. #1885, #1889, #1891, #1893, #1895, #1897, and #1900 are evidence
-results; product uid/gid behavior still requires the parent-selected
-continuation.
+results; #1904 later exercised the parent-selected product-topology
+continuation described below.
+
+## Product uid/gid runtime-root platform gate
+
+#1904 tested the accepted fixed production topology rather than treating the
+earlier credential syscall success as product support. On the exact signed
+Apple Silicon capable host—macOS 26.5.2, SDK 26.5, arm64, HVF supported, and
+explicit root authority—the adapter completed fixed real `/private/tmp`
+validation, randomized no-clobber target-root construction, independent
+launcher and worker parent/child descriptions, stable authority adoption,
+permanent worker-then-launcher credential transition, launcher-created target
+session adoption, representative grants, ordinary lifecycle, and terminal
+state.
+
+The required independent worker convergence failed after launcher loss. The
+mandatory App Sandbox worker first moved outside the target root through its
+already-held fixed-parent descriptor, then received the value-free
+`permission-denied` result while removing the exact empty inner target
+session. Exact empty-only outer cleanup consequently returned `busy`. The
+surviving unsandboxed launcher recovery path removed the same inner session and
+outer root, leaving zero matching roots and processes; the sudo wrapper only
+scanned residue and neither created nor removed the asserted product root.
+
+This distinguishes a topology limit from a missing Darwin credential
+primitive: descriptor transfer does not give the unchanged sandboxed worker
+the pathname-mutation authority needed after launcher loss. The reviewed
+alternatives all change or fail the accepted contract—a helper/service, a new
+sandbox entitlement or extension, an account/configurable path, early unlink
+that abandons linked foreground recovery, or wrapper/launcher-only cleanup.
+The stable public result therefore retains current non-root uid/gid and rejects
+root-retained or root-transition requests before launch with the fixed redacted
+`invalid production launch policy` error.
+
+Implementation stopped at the #1904 platform gate: no PR or partial product
+adapter was merged, and the experimental source remains outside the checked
+tree. The authoritative result is the controlled #1904 issue comment; the
+reproduction instructions below cover the earlier #1900 evidence harness and
+must not be presented as a checked reproducer for the discarded #1904 adapter.
+The #1905 capability transition makes only the two uid/gid argument leaves
+terminal; configurable chroot, the two remaining jailer corpus/run records,
+and `corpus:production-host` remain nonterminal.
 
 ## Supported conclusion and nonclaims
 
@@ -346,8 +389,8 @@ must instead be evaluated explicitly by the parent.
 
 The measured public credential primitives are available in the exact signed
 no-chroot process shape: mapped ordinary and SDK-maximum unmapped transitions
-both completed, while zero remained an explicit no-drop class. This is not yet
-a Firecracker uid/gid implementation. Same-process continuation is viable
+both completed, while zero remained an explicit no-drop class. This is not a
+Firecracker uid/gid implementation. Same-process continuation is viable
 through exact acknowledgment, launcher-created session authority, worker
 adoption, the representative grant workload, and ordinary terminal cleanup for
 mapped, retained-root, and SDK-maximum unmapped numeric identities on the
@@ -368,14 +411,17 @@ PID before sending. #1900 additionally proves feature-daemon detach, exact
 pre-grant namespace retirement, and the measured single-endpoint, signal, and
 concurrency convergence above without a service, privileged helper, new
 entitlement, persistent observer, or result file. Simultaneous uncatchable
-death of both signed endpoints, restart/reconnect, public uid/gid launch policy,
-and aggregate jailer behavior remain unmeasured. This evidence does not weaken App Sandbox,
+death of both signed endpoints, restart/reconnect, and aggregate jailer
+behavior remain unmeasured by that feature harness. The later #1904 gate gives
+public uid/gid a fixed-topology terminal rejection, not a positive arbitrary-
+numeric launch mode. This evidence does not weaken App Sandbox,
 use a private extension API, or treat a different topology as equivalent. It
 also does not prove that a larger fixed in-root Darwin dependency set or a
 materially different security model cannot work; nor does it claim Linux
 mount/PID/user namespace parity, notarized distribution, or behavior beyond
-the recorded OS/SDK. A changed platform result requires rerunning the wrapper
-and a fresh ID-by-ID Challenge.
+the recorded OS/SDK. A changed platform result requires a fresh controlled
+product-topology experiment and ID-by-ID Challenge; rerunning the earlier
+feature wrapper alone is insufficient.
 
 ## Reproduction
 

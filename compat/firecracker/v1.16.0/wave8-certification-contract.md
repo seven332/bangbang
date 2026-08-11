@@ -55,10 +55,10 @@ all possible runtime interleavings. Existing focused logger, metrics,
 fatal-exit, cross-process snapshot, configuration-failure, and device tests
 remain supporting evidence and continue to run in the repository test matrix.
 
-## Platform exclusion re-challenge
+## Wave 8 platform exclusion re-challenge
 
 Wave 8 independently partitions every proven-platform-impossible record into
-four current public-mechanism reviews. Each record must also retain its own
+four exact public-mechanism reviews at the #1881 phase. Each record must also retain its own
 upstream contract, public platform evidence, credible alternatives, stable
 behavior, focused tests, compatibility and security text, and Challenge link
 in the capability inventory.
@@ -78,10 +78,10 @@ record impossible.
 
 ## Exact retained external boundary
 
-After the Wave 8 transition, the inventory is exactly 377 implemented, eight
+At the Wave 8 transition, the inventory was exactly 377 implemented, eight
 audit-required, three missing-platform-feasible, and 30
 proven-platform-impossible records. The eleven nonterminal outcomes are an
-exact external-evidence partition:
+exact historical external-evidence partition:
 
 - six #1373 audit-required outcomes: `corpus:jailer`,
   `corpus:production-host`, `jailer/chroot-base-dir`, `jailer/gid`,
@@ -109,11 +109,38 @@ returned success but the worker exited before the first application record.
 #1885 separately completed worker-first and launcher-second public credential
 transitions without chroot for mapped ordinary and SDK-maximum unmapped classes;
 zero remained retained-root/no-drop. Target runtime/resources, lifecycle/API,
-guest/HVF continuation, and final uid/gid disposition remain unmeasured.
-The six rows remain `audit-required` in this Wave 8 snapshot until #1371
-challenges the result and any remaining credible public alternative per ID and
-an authoritative inventory transition lands. No evidence PR silently
-rewrites this checked historical boundary.
+guest/HVF continuation, and final uid/gid disposition were still unmeasured at
+that checkpoint. The six #1373 rows therefore remain `audit-required` in the
+immutable Wave 8 snapshot. No later evidence or disposition PR rewrites that
+checked historical boundary.
+
+#1904 subsequently exercised the accepted product topology at the same exact
+macOS 26.5.2 / SDK 26.5 capable-host boundary. Fixed `/private/tmp` target-root
+construction, independent endpoint authority, permanent transition,
+launcher-created target-session adoption, representative grants, and terminal
+lifecycle all completed. After launcher loss, the mandatory App Sandbox worker
+moved outside the root but its descriptor-relative removal of the exact empty
+inner session returned `permission-denied`; exact outer cleanup was `busy`.
+The unsandboxed launcher recovery path then removed the same objects and the
+wrapper's scan found zero residue. This proves that the worker cannot own the
+required independent cleanup in the fixed no-helper topology.
+
+The exact post-Wave-8 jailer uid/gid successor is `377/6/3/32`. It moves only
+`tool-argument:jailer/gid` and `tool-argument:jailer/uid` from audit-required to
+proven-platform-impossible. The nine current nonterminal outcomes are:
+
+- four #1373 audit-required outcomes: `corpus:jailer`,
+  `corpus:production-host`, `jailer/chroot-base-dir`, and `jailer/run`;
+- two #1378 audit-required outcomes: `corpus:network-setup` and
+  `semantic.network:virtio-net-vmnet-policy-and-connectivity`; and
+- three #1351 missing-platform-feasible isolation semantics.
+
+The current inventory therefore retains four #1373 rows, not six #1373 rows.
+The two terminal uid/gid exclusions require their own pinned upstream
+contracts, #1904 platform evidence, five rejected alternatives, stable public
+rejection, focused tests, compatibility/security documentation, and #1905
+Challenge result. They do not complete the broader jailer or production-host
+records.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -131,12 +158,13 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-
 It composes every Wave 7 component authority, the phase-aware Wave 7
 certifier, and the Wave 8 authority. The Wave 7 artifact remains historical at
 376/9/3/30 with one Wave 8 handoff. Its certifier accepts that exact historical
-phase or the exact one-row Wave 8 successor at 377/8/3/30; it rejects unrelated
-or partial drift.
+phase, the exact one-row Wave 8 successor at 377/8/3/30, or the exact uid/gid-
+only successor at 377/6/3/32; it rejects unrelated, count-preserving identity
+swaps, and partial drift.
 
 The global `--final` mode remains stronger and intentionally fails while the
-eight audit-required and three feasible external outcomes remain. Wave 8 does
-not weaken that completion gate.
+six audit-required and three feasible external outcomes remain. Neither Wave 8
+nor its exact uid/gid successor weakens that completion gate.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,
 assignment, review threads, pull-request checks, remote branches, merge state,

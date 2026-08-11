@@ -1276,8 +1276,38 @@ maximum unmapped identities. Every retirement fault, both single-endpoint death
 orders for both workloads, supervisor SIGINT/SIGTERM, worker SIGHUP, same-name
 replacement preservation, and concurrent peer survival are measured without
 wrapper-side product-session teardown. This is evidence for #1371, not a public
-launch policy or capability disposition; simultaneous uncatchable two-endpoint
-death, restart/reconnect, and final public uid/gid semantics remain unmeasured.
+positive launch mode; at the #1900 checkpoint simultaneous uncatchable two-
+endpoint death, restart/reconnect, and final public uid/gid disposition were
+still unmeasured.
+
+### Jailer uid/gid platform limit
+
+#1904 later tested the exact product topology on Apple Silicon macOS 26.5.2 /
+SDK 26.5 with root and HVF available. Fixed `/private/tmp` target-root
+construction, independent launcher/worker authority, permanent credential
+transition, launcher-created target-session adoption, representative grants,
+and terminal lifecycle all completed. After launcher loss, the mandatory App
+Sandbox worker moved outside the target root but its descriptor-relative
+removal of the exact empty inner session returned `permission-denied`; exact
+outer cleanup returned `busy`. The unsandboxed launcher recovery owner then
+removed both exact objects, the wrapper only scanned, and final residue was
+zero.
+
+The failure is not evidence that Darwin lacks numeric credential syscalls. It
+shows that passing descriptors before transition does not give the unchanged
+sandboxed worker the pathname-mutation authority required for independent
+cleanup after launcher loss. A helper/service, entitlement or sandbox
+extension, account/configurable root, early unlink, or wrapper/launcher-only
+cleanup either changes the accepted fixed topology or fails its linked
+foreground/recovery contract.
+
+The public production behavior therefore remains current non-root uid/gid and
+rejects root-retained or root-transition requests with the fixed redacted
+`invalid production launch policy` result before session creation, spawn, grants, publication, or
+guest work. `tool-argument:jailer/uid` and `tool-argument:jailer/gid` are exact
+terminal platform exclusions. No #1904 adapter was merged; configurable
+chroot, `corpus:jailer`, `corpus:production-host`, and `jailer/run` remain
+nonterminal.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
@@ -1294,10 +1324,10 @@ describe/state/memory consumers adopt exact files, and frozen native-v1 load
 may additionally adopt its persisted root; create retains
 repeatable output anchors with bounded children and strict crash-cleanup
 records. General dynamic post-Ready delivery, hard revocation, cross-filesystem
-socket publication, vmnet provisioning and policy, productized arbitrary
-uid/gid transition beyond the measured bootstrap boundary, configurable chroot,
+socket publication, vmnet provisioning and policy, configurable chroot,
 launch constraints, Developer ID possession, automatic restart, and
-notarization remain later work. The exact Linux seccomp, cgroup,
+notarization remain later work. Positive arbitrary uid/gid transition is the
+fixed-topology platform limit above, not feasible backlog. The exact Linux seccomp, cgroup,
 network-namespace, and PID-namespace mechanisms now have terminal macOS
 platform exclusions; this does not make the surrounding aggregate jailer or
 production-host records complete.
@@ -2802,7 +2832,8 @@ Sandbox + Hypervisor worker after numeric credential transition. Mapped,
 retained-root no-drop, and SDK-maximum unmapped no-API modes all complete the
 real HVF guest, fixed oracle, guest-requested poweroff, and exact cleanup. This
 is positive post-transition guest evidence for the config-file path, not a
-public uid/gid policy.
+positive public uid/gid mode; the product surface retains the fixed rejection
+in [Jailer uid/gid platform limit](#jailer-uidgid-platform-limit).
 
 The corresponding contained API modes stop earlier at the measured
 `api-socket-publication` boundary. Mapped and unmapped signed binder images fail
@@ -2847,8 +2878,9 @@ faults, API/no-API worker-first and launcher-first death, supervisor
 SIGINT/SIGTERM, worker SIGHUP, same-name replacement, and killed-peer
 concurrency all converge exactly. This adds no service, privileged helper,
 entitlement, result file, or public sandbox authority. Simultaneous uncatchable
-loss of both signed endpoints, restart/reconnect, public uid/gid policy, and
-Linux namespace parity remain nonclaims.
+loss of both signed endpoints, restart/reconnect, a positive arbitrary-numeric
+uid/gid mode, and Linux namespace parity remain nonclaims. The fixed public
+uid/gid rejection is terminal as documented above.
 
 ## Specification Benchmark Observations
 
