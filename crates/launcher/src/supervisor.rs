@@ -27,8 +27,44 @@ where
     {
         let args = args.into_iter().collect::<Vec<_>>();
         #[cfg(feature = "elevated-bootstrap-probe")]
-        let (elevated_probe, args) = crate::elevated_probe::Config::parse(args)?;
+        let elevated_child_bootstrap = crate::macos::elevated_daemon::child_bootstrap()?;
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        let (elevated_probe, args, elevated_child_timing, mut elevated_child_notifier) =
+            match elevated_child_bootstrap {
+                Some(crate::macos::elevated_daemon::ChildBootstrap {
+                    timing,
+                    root,
+                    mut notifier,
+                }) => match crate::elevated_probe::Config::parse_daemon(args, root) {
+                    Ok((probe, args)) => (probe, args, Some(timing), Some(notifier)),
+                    Err(error) => {
+                        notifier.notify_failure(error);
+                        return Err(error);
+                    }
+                },
+                None => {
+                    let (probe, args) = crate::elevated_probe::Config::parse(args)?;
+                    (probe, args, None, None)
+                }
+            };
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        let child_bootstrap = if elevated_child_notifier.is_none() {
+            crate::macos::daemon::child_bootstrap()?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "elevated-bootstrap-probe"))]
         let child_bootstrap = crate::macos::daemon::child_bootstrap()?;
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        let timing = match elevated_child_timing {
+            Some(timing) => timing,
+            None => child_bootstrap
+                .as_ref()
+                .map_or_else(crate::launch_policy::LaunchTiming::sample, |bootstrap| {
+                    Ok(bootstrap.timing)
+                })?,
+        };
+        #[cfg(not(feature = "elevated-bootstrap-probe"))]
         let timing = child_bootstrap
             .as_ref()
             .map_or_else(crate::launch_policy::LaunchTiming::sample, |bootstrap| {
@@ -50,8 +86,35 @@ where
         let layout = BundleLayout::from_launcher_executable(&executable)?;
         let worker_profile = crate::macos::code_sign::validate_bundle(&layout)?;
         #[cfg(feature = "elevated-bootstrap-probe")]
-        if elevated_probe.is_some() && (child_bootstrap.is_some() || request.requests_daemonize()) {
-            return Err(LauncherError::InvalidLaunchPolicy);
+        if let Some(mut notifier) = elevated_child_notifier.take() {
+            let result = (|| {
+                let probe = elevated_probe.ok_or(LauncherError::InvalidLaunchPolicy)?;
+                probe.validate_daemon()?;
+                notifier.validate_config(&probe)?;
+                if !request.requests_daemonize() {
+                    return Err(LauncherError::InvalidLaunchPolicy);
+                }
+                let mut launch =
+                    request.prepare(layout.worker_executable(), timing, true, worker_profile)?;
+                let guest_contract =
+                    probe.validate_runtime_contract(&launch.worker_args, &launch.grants, true)?;
+                probe.prepend_worker_activation(&mut launch.worker_args)?;
+                launch_elevated_prepared(
+                    &layout,
+                    launch,
+                    probe,
+                    guest_contract,
+                    Some(&mut notifier),
+                )
+            })();
+            match result {
+                Err(error) => notifier.notify_failure(error),
+                Ok(exit) if exit.code() != 0 => {
+                    notifier.notify_failure(LauncherError::DaemonHandoff);
+                }
+                Ok(_) => {}
+            }
+            return result;
         }
         #[cfg(feature = "elevated-bootstrap-probe")]
         if elevated_probe.as_ref().is_some_and(|probe| {
@@ -88,6 +151,10 @@ where
             };
         }
         if let Some(mut bootstrap) = child_bootstrap {
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if elevated_probe.is_some() {
+                return Err(LauncherError::InvalidLaunchPolicy);
+            }
             let result = (|| {
                 if !request.requests_daemonize()
                     || bootstrap.notifier.check_parent()?
@@ -110,6 +177,19 @@ where
             return result;
         }
         if request.requests_daemonize() {
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if let Some(probe) = elevated_probe {
+                probe.validate_daemon()?;
+                crate::macos::elevated_daemon::launch_parent(
+                    &request,
+                    timing,
+                    &executable,
+                    &layout,
+                    &worker_profile,
+                    probe,
+                )?;
+                return Ok(LauncherExit(0));
+            }
             crate::macos::daemon::launch_parent(&request, timing, &executable, &layout)?;
             return Ok(LauncherExit(0));
         }
@@ -118,9 +198,12 @@ where
         let mut launch = launch;
         #[cfg(feature = "elevated-bootstrap-probe")]
         if let Some(elevated_probe) = elevated_probe {
-            let mut guest_contract = match elevated_probe
-                .validate_runtime_contract(&launch.worker_args, &launch.grants)
-            {
+            elevated_probe.validate_foreground()?;
+            let mut guest_contract = match elevated_probe.validate_runtime_contract(
+                &launch.worker_args,
+                &launch.grants,
+                false,
+            ) {
                 Ok(contract) => contract,
                 Err(error) if elevated_probe.mode().continues_runtime() => {
                     return Err(error);
@@ -128,11 +211,14 @@ where
                 Err(_) => None,
             };
             if elevated_probe.stop_after_adoption()? {
-                guest_contract = elevated_probe
-                    .validate_runtime_contract(&launch.worker_args, &launch.grants)?;
+                guest_contract = elevated_probe.validate_runtime_contract(
+                    &launch.worker_args,
+                    &launch.grants,
+                    false,
+                )?;
             }
             elevated_probe.prepend_worker_activation(&mut launch.worker_args)?;
-            return launch_elevated_prepared(&layout, launch, elevated_probe, guest_contract);
+            return launch_elevated_prepared(&layout, launch, elevated_probe, guest_contract, None);
         }
         launch_prepared(&layout, launch, None)
     }
@@ -150,9 +236,13 @@ fn launch_elevated_prepared(
     mut launch: crate::launch_policy::PreparedLaunch,
     mut elevated_probe: crate::elevated_probe::Config,
     guest_contract: Option<crate::grant_manifest::ElevatedGuestContract>,
+    notifier: Option<&mut crate::macos::elevated_daemon::Notifier>,
 ) -> Result<LauncherExit, LauncherError> {
     let bootstrap = elevated_probe.bootstrap()?;
     if elevated_probe.mode() == bangbang_session::elevated_probe::ProbeMode::InheritedRoot {
+        if notifier.is_some() {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
         return launch_inherited_prepared(launch, elevated_probe, bootstrap);
     }
     let runtime = if bootstrap.mode().continues_runtime() {
@@ -176,7 +266,7 @@ fn launch_elevated_prepared(
     // The completed spawn copied the fixed root descriptor into the worker.
     // Close the launcher-owned copy before any credential transition begins.
     drop(elevated_probe);
-    finish_elevated_exchange(spawned, launch, bootstrap, false, runtime)
+    finish_elevated_exchange(spawned, launch, bootstrap, false, runtime, notifier)
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -258,7 +348,7 @@ fn launch_inherited_prepared(
             ));
         }
     };
-    finish_elevated_exchange(spawned, launch, bootstrap, true, None)
+    finish_elevated_exchange(spawned, launch, bootstrap, true, None, None)
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -268,6 +358,7 @@ fn finish_elevated_exchange(
     bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
     inherited_root: bool,
     runtime: Option<ElevatedRuntimeLaunch>,
+    notifier: Option<&mut crate::macos::elevated_daemon::Notifier>,
 ) -> Result<LauncherExit, LauncherError> {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -390,7 +481,12 @@ fn finish_elevated_exchange(
                 ));
             }
         };
-        return finish_credential_exchange(spawned, launch, bootstrap, initial, baseline, runtime);
+        return finish_credential_exchange(
+            spawned, launch, bootstrap, initial, baseline, runtime, notifier,
+        );
+    }
+    if notifier.is_some() {
+        return Err(LauncherError::InvalidLaunchPolicy);
     }
     let mut encoded_result = [0_u8; RESULT_RECORD_BYTES];
     if spawned.session.read_exact(&mut encoded_result).is_err() {
@@ -627,6 +723,7 @@ fn finish_credential_exchange(
     initial: bangbang_session::elevated_probe::PeerObservation,
     baseline: bangbang_session::elevated_credential::PeerBaseline,
     runtime: Option<ElevatedRuntimeLaunch>,
+    mut notifier: Option<&mut crate::macos::elevated_daemon::Notifier>,
 ) -> Result<LauncherExit, LauncherError> {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -825,7 +922,10 @@ fn finish_credential_exchange(
                 transition.state(),
             ));
         };
-        return continue_runtime_session(spawned, launch, runtime, bootstrap, semantics);
+        if let Some(notifier) = notifier.as_deref_mut() {
+            notifier.notify_transitioned(spawned.worker.pid(), &launch.worker_profile)?;
+        }
+        return continue_runtime_session(spawned, launch, runtime, bootstrap, semantics, notifier);
     }
     if runtime.is_some() || credential_wait_for_exit(&mut spawned, 0).is_err() {
         return Ok(credential_protocol_blocked_after_reap(
@@ -879,15 +979,28 @@ fn finish_credential_exchange(
 }
 
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+fn require_elevated_daemon_parent(
+    notifier: &mut Option<&mut crate::macos::elevated_daemon::Notifier>,
+) -> Result<(), LauncherError> {
+    if let Some(notifier) = notifier.as_deref_mut()
+        && notifier.check_parent()? != crate::macos::daemon::NotifierEvent::Pending
+    {
+        return Err(LauncherError::DaemonHandoff);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 fn continue_runtime_session(
     mut spawned: crate::macos::spawn::SuspendedWorker,
     launch: crate::launch_policy::PreparedLaunch,
     runtime: ElevatedRuntimeLaunch,
     bootstrap: bangbang_session::elevated_probe::ProbeBootstrap,
     semantics: CredentialSemantics,
+    mut notifier: Option<&mut crate::macos::elevated_daemon::Notifier>,
 ) -> Result<LauncherExit, LauncherError> {
     const RUNTIME_LAUNCHER_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-v2-runtime-drop-runtime-retain-root-runtime-unmapped-status: elevated runtime-BBA1-BBN1-launcher-created-session";
-    const RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary";
+    const RUNTIME_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-runtime-launcher-boundaries-v2-pre-ack-post-ack-session-create-session-open-authority-send-authority-receive-authority-validate-session-lock-session-enter-prepared-namespace-grant-transfer-proceed-terminal-continuation-ack-lifecycle-hello-runtime-session-create-runtime-session-open-runtime-authority-send-runtime-authority-receive-runtime-authority-validate-runtime-session-lock-runtime-session-enter-lifecycle-prepared-runtime-namespace-grant-accepted-lifecycle-proceed-lifecycle-terminal-runtime-cleanup-complete-continuation-boundary-identity-boundary-explicit-root-boundary-namespace-boundary-grant-boundary-lifecycle-boundary-namespace-retire-before-unlink-namespace-retire-after-unlink-namespace-retire-observe-runtime-namespace-retirement-retired-record-free-namespace-record-write";
     const GUEST_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-guest-launcher-boundaries-v1-guest-no-api-drop-guest-no-api-retain-root-guest-no-api-unmapped-guest-api-drop-guest-api-retain-root-guest-api-unmapped-BBW1-guest-resource-witness-guest-grant-accepted-guest-transport-contamination-guest-hvf-witness-guest-terminal-evidence-api-instance-start-bangbang-grant:evidence-guest-kernel-bangbang-grant:evidence-guest-serial";
     const API_LISTENER_LAUNCHER_BOUNDARY_ARTIFACT: &str = "bangbang-elevated-api-listener-launcher-v2-BBL1-request-bind-transfer-adoption-final-child-one-right-retained-exact-post-reap-cleanup";
 
@@ -936,6 +1049,7 @@ fn continue_runtime_session(
         let _ = credential_wait_for_exit(&mut spawned, 1);
         return blocked(ProbeStage::ContinuationAck, ProbeErrorCategory::Other);
     }
+    require_elevated_daemon_parent(&mut notifier)?;
     let ack = ContinuationAck::launcher(bootstrap.mode(), bootstrap.nonce())
         .map_err(|_| LauncherError::SessionProtocol)?;
     if spawned.session.write_all(&ack.encode()).is_err() {
@@ -978,6 +1092,11 @@ fn continue_runtime_session(
         Err(_) => return blocked(ProbeStage::LifecycleHello, ProbeErrorCategory::Other),
     };
     let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
+    require_elevated_daemon_parent(&mut notifier)?;
+    if let Some(notifier) = notifier.as_deref_mut() {
+        notifier.bind_session(session_id)?;
+    }
+    require_elevated_daemon_parent(&mut notifier)?;
     let mut lifecycle = LauncherLifecycle::new(session_id);
     if bootstrap.fault() == RuntimeFault::SessionCreate {
         spawned.worker.terminate_and_reap();
@@ -997,6 +1116,14 @@ fn continue_runtime_session(
             return blocked(stage, runtime_namespace_error_category(error));
         }
     };
+    if let Err(error) = require_elevated_daemon_parent(&mut notifier) {
+        if prepared.cleanup_unpublished().is_err() {
+            spawned.worker.terminate_and_reap();
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        spawned.worker.terminate_and_reap();
+        return Err(error);
+    }
     if bootstrap.fault() == RuntimeFault::SessionOpen {
         if prepared.cleanup_unpublished().is_err() {
             spawned.worker.terminate_and_reap();
@@ -1035,6 +1162,14 @@ fn continue_runtime_session(
         spawned.worker.terminate_and_reap();
         return blocked(ProbeStage::RuntimeAuthoritySend, ProbeErrorCategory::Other);
     }
+    if let Err(error) = require_elevated_daemon_parent(&mut notifier) {
+        if prepared.cleanup_unpublished().is_err() {
+            spawned.worker.terminate_and_reap();
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        spawned.worker.terminate_and_reap();
+        return Err(error);
+    }
     let (transfer, handles) = prepared.into_publication();
     if let Err(error) = send_runtime_session_authority(&spawned.grants, authority, transfer) {
         if finish_published_runtime_session(&mut spawned, handles).is_err() {
@@ -1046,6 +1181,17 @@ fn continue_runtime_session(
         );
     }
     let mut handles = Some(handles);
+    if let Err(error) = require_elevated_daemon_parent(&mut notifier) {
+        if finish_published_runtime_session(
+            &mut spawned,
+            handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+        )
+        .is_err()
+        {
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        return Err(error);
+    }
     if crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle).is_err()
     {
         let outcome = finish_published_runtime_session(
@@ -1113,6 +1259,17 @@ fn continue_runtime_session(
         }
         return blocked(ProbeStage::LiveIdentity, category);
     }
+    if let Err(error) = require_elevated_daemon_parent(&mut notifier) {
+        if finish_published_runtime_session(
+            &mut spawned,
+            handles.take().ok_or(LauncherError::RuntimeNamespace)?,
+        )
+        .is_err()
+        {
+            return blocked(ProbeStage::RuntimeCleanup, ProbeErrorCategory::Other);
+        }
+        return Err(error);
+    }
     let start = match lifecycle.start(launch.worker_policy) {
         Ok(start) => start,
         Err(_) => {
@@ -1139,6 +1296,35 @@ fn continue_runtime_session(
         }
         None => (None, None),
     };
+    let namespace_policy = if notifier.is_some() {
+        if bootstrap
+            .mode()
+            .runtime_workload()
+            .is_none_or(|workload| !workload.supports_retired_record_free_namespace())
+        {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        crate::macos::supervise::PreopenedNamespacePolicy::RetiredRecordFree
+    } else {
+        crate::macos::supervise::PreopenedNamespacePolicy::Linked
+    };
+    let retirement_fault = match bootstrap.fault() {
+        RuntimeFault::NamespaceRetireBeforeUnlink => {
+            crate::macos::supervise::NamespaceRetirementFault::BeforeUnlink
+        }
+        RuntimeFault::NamespaceRetireAfterUnlink => {
+            crate::macos::supervise::NamespaceRetirementFault::AfterUnlink
+        }
+        _ => crate::macos::supervise::NamespaceRetirementFault::None,
+    };
+    let retirement_barrier = if notifier
+        .as_ref()
+        .is_some_and(|notifier| notifier.uses_namespace_retirement_barrier())
+    {
+        crate::macos::supervise::NamespaceRetirementBarrier::BeforeAndAfterUnlink
+    } else {
+        crate::macos::supervise::NamespaceRetirementBarrier::None
+    };
     let status = match crate::macos::supervise::wait_session_with_preopened_namespace(
         &mut spawned.worker,
         &mut spawned.session,
@@ -1155,6 +1341,10 @@ fn continue_runtime_session(
             handles.take().ok_or(LauncherError::RuntimeNamespace)?,
             start,
             guest,
+            namespace_policy,
+            retirement_fault,
+            retirement_barrier,
+            notifier.map(|notifier| notifier as &mut dyn crate::macos::daemon::SessionNotifier),
         ),
     ) {
         Ok(status) => status,
@@ -1579,7 +1769,8 @@ fn elevated_runtime_blocked(
         | ProbeStage::RuntimeAuthorityValidate
         | ProbeStage::RuntimeSessionLock
         | ProbeStage::RuntimeSessionEnter
-        | ProbeStage::LifecyclePrepared => RuntimeResultClass::NamespaceBoundary,
+        | ProbeStage::LifecyclePrepared
+        | ProbeStage::RuntimeNamespaceRetirement => RuntimeResultClass::NamespaceBoundary,
         ProbeStage::GrantTransfer
         | ProbeStage::GrantAccepted
         | ProbeStage::GuestGrantContract
@@ -1666,7 +1857,7 @@ fn probe_error_category(
 fn launch_prepared(
     layout: &BundleLayout,
     launch: crate::launch_policy::PreparedLaunch,
-    notifier: Option<&mut crate::macos::daemon::DaemonNotifier>,
+    notifier: Option<&mut dyn crate::macos::daemon::SessionNotifier>,
 ) -> Result<LauncherExit, LauncherError> {
     use std::os::fd::AsRawFd;
 

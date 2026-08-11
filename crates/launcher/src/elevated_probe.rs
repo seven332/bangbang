@@ -21,6 +21,8 @@ const TARGET_GID_OPTION: &str = "--target-gid";
 const MODE_OPTION: &str = "--mode";
 const FAULT_OPTION: &str = "--fault";
 const ADOPTION_BARRIER_OPTION: &str = "--bangbang-internal-post-adoption-stop-v1";
+const DAEMON_BARRIER_OPTION: &str = "--bangbang-internal-daemon-barrier-v1";
+const DAEMON_FAULT_OPTION: &str = "--bangbang-internal-daemon-fault-v1";
 const DELIMITER: &str = "--";
 const MAX_ROOT_PATH_BYTES: usize = 1024;
 const ROOT_CHILD_PREFIX: &str = "bangbang-elevated-probe.";
@@ -36,7 +38,60 @@ pub(crate) struct ProbeFailure {
     pub(crate) category: ProbeErrorCategory,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DaemonBarrier {
+    #[default]
+    None,
+    ParentBeforeTransitionAck,
+    ChildAfterTransitionAck,
+    ParentAfterReady,
+    PostAckWatch,
+    ParentAfterAck,
+    NamespaceRetirement,
+}
+
+impl DaemonBarrier {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "parent-before-transition-ack" => Some(Self::ParentBeforeTransitionAck),
+            "child-after-transition-ack" => Some(Self::ChildAfterTransitionAck),
+            "parent-after-ready" => Some(Self::ParentAfterReady),
+            "post-ack-watch" => Some(Self::PostAckWatch),
+            "parent-after-ack" => Some(Self::ParentAfterAck),
+            "daemon-namespace-retirement" => Some(Self::NamespaceRetirement),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DaemonFault {
+    #[default]
+    None,
+    RootAdoption,
+    TransitionWitness,
+    TransitionAck,
+    SessionBind,
+    ReadySend,
+    ReadyAck,
+}
+
+impl DaemonFault {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "root-adoption" => Some(Self::RootAdoption),
+            "transition-witness" => Some(Self::TransitionWitness),
+            "transition-ack" => Some(Self::TransitionAck),
+            "session-bind" => Some(Self::SessionBind),
+            "ready-send" => Some(Self::ReadySend),
+            "ready-ack" => Some(Self::ReadyAck),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct Config {
+    activation: Vec<OsString>,
     root: OwnedFd,
     root_path: PathBuf,
     root_identity: ObjectIdentity,
@@ -47,6 +102,8 @@ pub(crate) struct Config {
     mode: ProbeMode,
     fault: RuntimeFault,
     adoption_barrier: bool,
+    daemon_barrier: DaemonBarrier,
+    daemon_fault: DaemonFault,
 }
 
 impl std::fmt::Debug for Config {
@@ -59,10 +116,27 @@ impl Config {
     pub(crate) fn parse(
         args: Vec<OsString>,
     ) -> Result<(Option<Self>, Vec<OsString>), LauncherError> {
+        Self::parse_inner(args, None)
+    }
+
+    pub(crate) fn parse_daemon(
+        args: Vec<OsString>,
+        root: OwnedFd,
+    ) -> Result<(Option<Self>, Vec<OsString>), LauncherError> {
+        Self::parse_inner(args, Some(root))
+    }
+
+    fn parse_inner(
+        args: Vec<OsString>,
+        inherited_root: Option<OwnedFd>,
+    ) -> Result<(Option<Self>, Vec<OsString>), LauncherError> {
         if args
             .first()
             .is_none_or(|arg| arg != OsStr::new(LAUNCHER_ACTIVATION))
         {
+            if inherited_root.is_some() {
+                return Err(LauncherError::InvalidLaunchPolicy);
+            }
             return Ok((None, args));
         }
         if args.len() < 10
@@ -91,10 +165,11 @@ impl Config {
             .and_then(|value| value.to_str())
             .and_then(|value| ProbeMode::parse(value, target_uid, target_gid))
             .ok_or(LauncherError::InvalidLaunchPolicy)?;
-        let (fault, adoption_barrier, tail_delimiter) = parse_runtime_options(
-            args.get(9..).ok_or(LauncherError::InvalidLaunchPolicy)?,
-            mode,
-        )?;
+        let (fault, adoption_barrier, daemon_barrier, daemon_fault, tail_delimiter) =
+            parse_runtime_options(
+                args.get(9..).ok_or(LauncherError::InvalidLaunchPolicy)?,
+                mode,
+            )?;
         let delimiter = 9_usize
             .checked_add(tail_delimiter)
             .ok_or(LauncherError::InvalidLaunchPolicy)?;
@@ -104,8 +179,11 @@ impl Config {
         if !mode.continues_runtime() && delimiter + 1 != args.len() {
             return Err(LauncherError::InvalidLaunchPolicy);
         }
+        if inherited_root.is_some() && !mode.continues_runtime() {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
         validate_initial_root()?;
-        let (root, root_identity) = open_private_root(
+        let (linked_root, root_identity) = open_private_root(
             &root_path,
             if mode.continues_runtime() {
                 (target_uid, target_gid)
@@ -113,6 +191,22 @@ impl Config {
                 (0, 0)
             },
         )?;
+        let root = match inherited_root {
+            Some(root) => {
+                validate_inherited_root(
+                    &root,
+                    root_identity,
+                    if mode.continues_runtime() {
+                        (target_uid, target_gid)
+                    } else {
+                        (0, 0)
+                    },
+                )?;
+                drop(linked_root);
+                root
+            }
+            None => linked_root,
+        };
         let runtime_root = if mode.continues_runtime() {
             let independent = openat_directory(root.as_raw_fd(), c".")?;
             Some(
@@ -135,6 +229,10 @@ impl Config {
         };
         Ok((
             Some(Self {
+                activation: args
+                    .get(..=delimiter)
+                    .ok_or(LauncherError::InvalidLaunchPolicy)?
+                    .to_vec(),
                 root,
                 root_path,
                 root_identity,
@@ -145,9 +243,45 @@ impl Config {
                 mode,
                 fault,
                 adoption_barrier,
+                daemon_barrier,
+                daemon_fault,
             }),
             args.into_iter().skip(delimiter + 1).collect(),
         ))
+    }
+
+    pub(crate) fn daemon_args(&self, request: &[OsString]) -> Result<Vec<OsString>, LauncherError> {
+        if !self.mode.continues_runtime() || self.activation.is_empty() {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        let mut args = self.activation.clone();
+        args.extend_from_slice(request);
+        Ok(args)
+    }
+
+    pub(crate) fn validate_daemon(&self) -> Result<(), LauncherError> {
+        if self.mode.continues_runtime() && !self.adoption_barrier {
+            Ok(())
+        } else {
+            Err(LauncherError::InvalidLaunchPolicy)
+        }
+    }
+
+    pub(crate) fn validate_foreground(&self) -> Result<(), LauncherError> {
+        if self.daemon_barrier == DaemonBarrier::None
+            && self.daemon_fault == DaemonFault::None
+            && !matches!(
+                self.fault,
+                RuntimeFault::NamespaceRetireBeforeUnlink
+                    | RuntimeFault::NamespaceRetireAfterUnlink
+                    | RuntimeFault::NamespaceRetireObserve
+                    | RuntimeFault::NamespaceRecordWrite
+            )
+        {
+            Ok(())
+        } else {
+            Err(LauncherError::InvalidLaunchPolicy)
+        }
     }
 
     pub(crate) fn prepend_worker_activation(
@@ -165,6 +299,7 @@ impl Config {
         &self,
         worker_args: &[OsString],
         grants: &PreparedGrantBatch,
+        daemonized: bool,
     ) -> Result<Option<ElevatedGuestContract>, LauncherError> {
         use bangbang_session::elevated_probe::{
             GUEST_API_SOCKET_REFERENCE, GUEST_CONFIG_REFERENCE, RuntimeWorkload,
@@ -180,6 +315,41 @@ impl Config {
             }
             RuntimeWorkload::GuestNoApi => &["--config-file", GUEST_CONFIG_REFERENCE, "--no-api"],
             RuntimeWorkload::GuestApi => &["--api-sock", GUEST_API_SOCKET_REFERENCE],
+        };
+        let worker_args = if daemonized {
+            let prefix = worker_args
+                .get(..8)
+                .ok_or(LauncherError::InvalidLaunchPolicy)?;
+            let [
+                id_option,
+                id,
+                start_option,
+                start,
+                cpu_option,
+                cpu,
+                parent_option,
+                parent_cpu,
+            ] = prefix
+            else {
+                return Err(LauncherError::InvalidLaunchPolicy);
+            };
+            if id_option != OsStr::new("--id")
+                || id.is_empty()
+                || id.as_bytes().contains(&0)
+                || start_option != OsStr::new("--start-time-us")
+                || !canonical_decimal(start)
+                || cpu_option != OsStr::new("--start-time-cpu-us")
+                || cpu != OsStr::new("0")
+                || parent_option != OsStr::new("--parent-cpu-time-us")
+                || !canonical_decimal(parent_cpu)
+            {
+                return Err(LauncherError::InvalidLaunchPolicy);
+            }
+            worker_args
+                .get(8..)
+                .ok_or(LauncherError::InvalidLaunchPolicy)?
+        } else {
+            worker_args
         };
         if worker_args.len() != exact_args.len()
             || worker_args
@@ -216,6 +386,26 @@ impl Config {
 
     pub(crate) fn root_fd(&self) -> RawFd {
         self.root.as_raw_fd()
+    }
+
+    pub(crate) const fn root_identity(&self) -> ObjectIdentity {
+        self.root_identity
+    }
+
+    pub(crate) const fn target_uid(&self) -> u32 {
+        self.target_uid
+    }
+
+    pub(crate) const fn target_gid(&self) -> u32 {
+        self.target_gid
+    }
+
+    pub(crate) const fn daemon_barrier(&self) -> DaemonBarrier {
+        self.daemon_barrier
+    }
+
+    pub(crate) const fn daemon_fault(&self) -> DaemonFault {
+        self.daemon_fault
     }
 
     pub(crate) const fn mode(&self) -> ProbeMode {
@@ -361,6 +551,13 @@ impl Config {
     }
 }
 
+fn canonical_decimal(value: &OsStr) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.iter().all(u8::is_ascii_digit)
+        && (bytes.len() == 1 || bytes.first() != Some(&b'0'))
+}
+
 fn cvt_root_syscall(result: libc::c_int) -> Result<(), ProbeErrorCategory> {
     if result == 0 {
         Ok(())
@@ -448,9 +645,40 @@ fn parse_u32(value: Option<&OsString>) -> Result<u32, LauncherError> {
 fn parse_runtime_options(
     args: &[OsString],
     mode: ProbeMode,
-) -> Result<(RuntimeFault, bool, usize), LauncherError> {
+) -> Result<(RuntimeFault, bool, DaemonBarrier, DaemonFault, usize), LauncherError> {
     if args.first() == Some(&OsString::from(DELIMITER)) {
-        return Ok((RuntimeFault::None, false, 0));
+        return Ok((
+            RuntimeFault::None,
+            false,
+            DaemonBarrier::None,
+            DaemonFault::None,
+            0,
+        ));
+    }
+    if mode.continues_runtime()
+        && args.first() == Some(&OsString::from(FAULT_OPTION))
+        && args.get(2) == Some(&OsString::from(DAEMON_BARRIER_OPTION))
+        && args.get(4) == Some(&OsString::from(DELIMITER))
+    {
+        let fault = args
+            .get(1)
+            .and_then(|value| value.to_str())
+            .and_then(RuntimeFault::parse)
+            .filter(|fault| *fault == RuntimeFault::GuestEndpointDeath)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        let barrier = args
+            .get(3)
+            .and_then(|value| value.to_str())
+            .and_then(DaemonBarrier::parse)
+            .filter(|barrier| *barrier == DaemonBarrier::PostAckWatch)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        if mode
+            .runtime_workload()
+            .is_none_or(|workload| !workload.is_guest())
+        {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        return Ok((fault, false, barrier, DaemonFault::None, 4));
     }
     if mode.continues_runtime()
         && args.first() == Some(&OsString::from(FAULT_OPTION))
@@ -461,7 +689,7 @@ fn parse_runtime_options(
             .and_then(|value| value.to_str())
             .and_then(RuntimeFault::parse)
             .ok_or(LauncherError::InvalidLaunchPolicy)?;
-        return Ok((fault, false, 2));
+        return Ok((fault, false, DaemonBarrier::None, DaemonFault::None, 2));
     }
     if mode
         .runtime_workload()
@@ -469,7 +697,35 @@ fn parse_runtime_options(
         && args.first() == Some(&OsString::from(ADOPTION_BARRIER_OPTION))
         && args.get(1) == Some(&OsString::from(DELIMITER))
     {
-        return Ok((RuntimeFault::None, true, 1));
+        return Ok((
+            RuntimeFault::None,
+            true,
+            DaemonBarrier::None,
+            DaemonFault::None,
+            1,
+        ));
+    }
+    if mode.continues_runtime()
+        && args.first() == Some(&OsString::from(DAEMON_BARRIER_OPTION))
+        && args.get(2) == Some(&OsString::from(DELIMITER))
+    {
+        let barrier = args
+            .get(1)
+            .and_then(|value| value.to_str())
+            .and_then(DaemonBarrier::parse)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        return Ok((RuntimeFault::None, false, barrier, DaemonFault::None, 2));
+    }
+    if mode.continues_runtime()
+        && args.first() == Some(&OsString::from(DAEMON_FAULT_OPTION))
+        && args.get(2) == Some(&OsString::from(DELIMITER))
+    {
+        let fault = args
+            .get(1)
+            .and_then(|value| value.to_str())
+            .and_then(DaemonFault::parse)
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
+        return Ok((RuntimeFault::None, false, DaemonBarrier::None, fault, 2));
     }
     Err(LauncherError::InvalidLaunchPolicy)
 }
@@ -519,6 +775,29 @@ fn open_private_root(
         return Err(LauncherError::InvalidLaunchPolicy);
     }
     Ok((root, identity))
+}
+
+fn validate_inherited_root(
+    root: &OwnedFd,
+    expected_identity: ObjectIdentity,
+    expected_owner: (u32, u32),
+) -> Result<(), LauncherError> {
+    let stat = descriptor_stat(root.as_raw_fd())?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || stat.st_mode & 0o7777 != 0o700
+        || stat.st_uid != expected_owner.0
+        || stat.st_gid != expected_owner.1
+        || stat.st_nlink < 2
+        || stat_identity(&stat) != expected_identity
+    {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    // SAFETY: `root` is live and `F_GETFD` only returns descriptor flags.
+    let flags = unsafe { libc::fcntl(root.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    Ok(())
 }
 
 fn private_root_child(path: &Path) -> Option<&OsStr> {
@@ -652,7 +931,8 @@ mod tests {
     #[test]
     fn debug_output_redacts_values() {
         let root = std::fs::File::open("/").expect("test root descriptor should open");
-        let config = Config {
+        let mut config = Config {
+            activation: Vec::new(),
             root: root.into(),
             root_path: PathBuf::from("/private/var/root/bangbang-elevated-probe.A1b2C3d4"),
             root_identity: ObjectIdentity {
@@ -666,6 +946,8 @@ mod tests {
             mode: ProbeMode::Drop,
             fault: RuntimeFault::None,
             adoption_barrier: false,
+            daemon_barrier: DaemonBarrier::None,
+            daemon_fault: DaemonFault::None,
         };
         let output = format!("{config:?}");
         assert_eq!(output, "ElevatedProbeConfig(<redacted>)");
@@ -680,6 +962,12 @@ mod tests {
             .prepend_worker_activation(&mut empty)
             .expect("empty worker envelope should activate");
         assert_eq!(empty, [OsString::from(WORKER_ACTIVATION)]);
+        assert_eq!(config.validate_foreground(), Ok(()));
+        config.daemon_barrier = DaemonBarrier::PostAckWatch;
+        assert_eq!(
+            config.validate_foreground(),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
     }
 
     #[test]
@@ -721,7 +1009,13 @@ mod tests {
         for mode in [ProbeMode::GuestNoApiDrop, ProbeMode::GuestApiDrop] {
             assert_eq!(
                 parse_runtime_options(&barrier, mode),
-                Ok((RuntimeFault::None, true, 1))
+                Ok((
+                    RuntimeFault::None,
+                    true,
+                    DaemonBarrier::None,
+                    DaemonFault::None,
+                    1,
+                ))
             );
         }
         assert_eq!(
@@ -736,6 +1030,113 @@ mod tests {
         ];
         assert_eq!(
             parse_runtime_options(&fault_then_barrier, ProbeMode::GuestNoApiDrop),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+    }
+
+    #[test]
+    fn daemon_barriers_and_faults_are_closed_and_exclusive() {
+        let mode = ProbeMode::GuestNoApiDrop;
+        for (name, expected) in [
+            (
+                "parent-before-transition-ack",
+                DaemonBarrier::ParentBeforeTransitionAck,
+            ),
+            (
+                "child-after-transition-ack",
+                DaemonBarrier::ChildAfterTransitionAck,
+            ),
+            ("parent-after-ready", DaemonBarrier::ParentAfterReady),
+            ("post-ack-watch", DaemonBarrier::PostAckWatch),
+            ("parent-after-ack", DaemonBarrier::ParentAfterAck),
+            (
+                "daemon-namespace-retirement",
+                DaemonBarrier::NamespaceRetirement,
+            ),
+        ] {
+            let args = vec![
+                OsString::from(DAEMON_BARRIER_OPTION),
+                OsString::from(name),
+                OsString::from(DELIMITER),
+            ];
+            assert_eq!(
+                parse_runtime_options(&args, mode),
+                Ok((RuntimeFault::None, false, expected, DaemonFault::None, 2,))
+            );
+        }
+        for (name, expected) in [
+            ("root-adoption", DaemonFault::RootAdoption),
+            ("transition-witness", DaemonFault::TransitionWitness),
+            ("transition-ack", DaemonFault::TransitionAck),
+            ("session-bind", DaemonFault::SessionBind),
+            ("ready-send", DaemonFault::ReadySend),
+            ("ready-ack", DaemonFault::ReadyAck),
+        ] {
+            let args = vec![
+                OsString::from(DAEMON_FAULT_OPTION),
+                OsString::from(name),
+                OsString::from(DELIMITER),
+            ];
+            assert_eq!(
+                parse_runtime_options(&args, mode),
+                Ok((RuntimeFault::None, false, DaemonBarrier::None, expected, 2,))
+            );
+        }
+
+        for invalid in [
+            vec![
+                OsString::from(DAEMON_BARRIER_OPTION),
+                OsString::from("unknown"),
+                OsString::from(DELIMITER),
+            ],
+            vec![
+                OsString::from(DAEMON_FAULT_OPTION),
+                OsString::from("none"),
+                OsString::from(DELIMITER),
+            ],
+            vec![
+                OsString::from(DAEMON_BARRIER_OPTION),
+                OsString::from("post-ack-watch"),
+                OsString::from(DAEMON_FAULT_OPTION),
+                OsString::from("ready-send"),
+                OsString::from(DELIMITER),
+            ],
+        ] {
+            assert_eq!(
+                parse_runtime_options(&invalid, mode),
+                Err(LauncherError::InvalidLaunchPolicy)
+            );
+        }
+        let watched_death = vec![
+            OsString::from(FAULT_OPTION),
+            OsString::from("guest-endpoint-death"),
+            OsString::from(DAEMON_BARRIER_OPTION),
+            OsString::from("post-ack-watch"),
+            OsString::from(DELIMITER),
+        ];
+        assert_eq!(
+            parse_runtime_options(&watched_death, mode),
+            Ok((
+                RuntimeFault::GuestEndpointDeath,
+                false,
+                DaemonBarrier::PostAckWatch,
+                DaemonFault::None,
+                4,
+            ))
+        );
+        let mut incompatible = watched_death;
+        incompatible[1] = OsString::from("guest-oracle");
+        assert_eq!(
+            parse_runtime_options(&incompatible, mode),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+        let control = vec![
+            OsString::from(DAEMON_BARRIER_OPTION),
+            OsString::from("post-ack-watch"),
+            OsString::from(DELIMITER),
+        ];
+        assert_eq!(
+            parse_runtime_options(&control, ProbeMode::CredentialControl),
             Err(LauncherError::InvalidLaunchPolicy)
         );
     }

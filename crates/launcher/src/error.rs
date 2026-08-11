@@ -41,6 +41,79 @@ impl JailerIsolationArgument {
     }
 }
 
+/// Feature-only value-free phase of an elevated daemon handoff failure.
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevatedDaemonStage {
+    /// The exact inherited root failed the daemon-child adoption boundary.
+    RootAdoption,
+    /// The inherited exact-root configuration was not adopted.
+    Config,
+    /// The transitioned supervisor/worker witness was not accepted.
+    TransitionWitness,
+    /// The daemon supervisor's transitioned self-attestation failed.
+    TransitionSelf,
+    /// Independent live supervisor/worker process inspection failed.
+    TransitionProcesses,
+    /// Live supervisor/worker credential fields did not match the selected class.
+    TransitionCredentials,
+    /// Live supervisor/worker parent, group, or session topology changed.
+    TransitionTopology,
+    /// Live supervisor/worker code identity validation failed.
+    TransitionCode,
+    /// A live process start identity changed during transition.
+    TransitionStart,
+    /// The authenticated transition exchange did not complete.
+    TransitionProtocol,
+    /// The transitioned original parent was no longer the authenticated peer.
+    TransitionParentPeer,
+    /// The transitioned original parent code identity validation failed.
+    TransitionParentCode,
+    /// The transitioned original parent credential fields were not exact.
+    TransitionParentCredentials,
+    /// The transitioned original parent start identity changed.
+    TransitionParentStart,
+    /// The post-transition handoff transport could not enter its readiness state.
+    TransitionTransport,
+    /// The original parent transition was not acknowledged.
+    TransitionAck,
+    /// The lifecycle session correlation was not bound.
+    SessionBind,
+    /// Session-bound readiness was not sent.
+    ReadySend,
+    /// Session-bound readiness was not acknowledged.
+    ReadyAck,
+}
+
+#[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+impl ElevatedDaemonStage {
+    /// Returns the stable value-free phase spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RootAdoption => "root-adoption",
+            Self::Config => "config",
+            Self::TransitionWitness => "transition-witness",
+            Self::TransitionSelf => "transition-self",
+            Self::TransitionProcesses => "transition-processes",
+            Self::TransitionCredentials => "transition-credentials",
+            Self::TransitionTopology => "transition-topology",
+            Self::TransitionCode => "transition-code",
+            Self::TransitionStart => "transition-start",
+            Self::TransitionProtocol => "transition-protocol",
+            Self::TransitionParentPeer => "transition-parent-peer",
+            Self::TransitionParentCode => "transition-parent-code",
+            Self::TransitionParentCredentials => "transition-parent-credentials",
+            Self::TransitionParentStart => "transition-parent-start",
+            Self::TransitionTransport => "transition-transport",
+            Self::TransitionAck => "transition-ack",
+            Self::SessionBind => "session-bind",
+            Self::ReadySend => "ready-send",
+            Self::ReadyAck => "ready-ack",
+        }
+    }
+}
+
 /// Stable launcher failure categories that do not expose package paths or tool output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LauncherError {
@@ -72,6 +145,9 @@ pub enum LauncherError {
     WorkerPolicy,
     /// The private daemon ownership handoff failed.
     DaemonHandoff,
+    /// The feature-only elevated daemon handoff failed at one closed phase.
+    #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+    ElevatedDaemonHandoff(ElevatedDaemonStage),
     /// An approved host resource could not be prepared without weakening identity.
     GrantPreparation,
     /// The private startup grant transaction failed.
@@ -131,6 +207,14 @@ impl fmt::Display for LauncherError {
             ),
             Self::WorkerPolicy => formatter.write_str("sandbox worker launch policy failed"),
             Self::DaemonHandoff => formatter.write_str("private daemon handoff failed"),
+            #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
+            Self::ElevatedDaemonHandoff(stage) => {
+                write!(
+                    formatter,
+                    "elevated daemon handoff failed stage={}",
+                    stage.name()
+                )
+            }
             Self::GrantPreparation => formatter.write_str("resource grant preparation failed"),
             Self::GrantProtocol => formatter.write_str("private resource grant failed"),
             Self::SocketBroker => formatter.write_str("private socket broker failed"),

@@ -22,7 +22,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
 
 use super::block_control::LauncherBlockControlBroker;
-use super::daemon::{DaemonNotifier, NotifierEvent};
+use super::daemon::{NotifierEvent, SessionNotifier};
 #[cfg(feature = "elevated-bootstrap-probe")]
 use super::elevated_guest::ElevatedGuestSupervisor;
 use super::socket_broker::LauncherSocketBroker;
@@ -173,7 +173,7 @@ pub(crate) fn wait_session(
     lifecycle: LauncherLifecycle,
     wakeups: SignalWakeups,
     grants: &PreparedGrantBatch,
-    notifier: Option<&mut DaemonNotifier>,
+    notifier: Option<&mut dyn SessionNotifier>,
 ) -> Result<ExitStatus, LauncherError> {
     wait_session_with_roots(
         worker,
@@ -187,28 +187,70 @@ pub(crate) fn wait_session(
             roots: NamespaceRoots::Ordinary,
             #[cfg(feature = "elevated-bootstrap-probe")]
             guest: None,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            namespace_policy: PreopenedNamespacePolicy::Linked,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            retirement_fault: NamespaceRetirementFault::None,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            retirement_barrier: NamespaceRetirementBarrier::None,
         },
     )
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
-pub(crate) struct PreopenedSessionStart {
-    handles: LauncherSessionHandles,
-    frame: Frame,
-    guest: Option<ElevatedGuestSupervisor>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreopenedNamespacePolicy {
+    Linked,
+    RetiredRecordFree,
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
-impl PreopenedSessionStart {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NamespaceRetirementFault {
+    #[default]
+    None,
+    BeforeUnlink,
+    AfterUnlink,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NamespaceRetirementBarrier {
+    #[default]
+    None,
+    BeforeAndAfterUnlink,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) struct PreopenedSessionStart<'a> {
+    handles: LauncherSessionHandles,
+    frame: Frame,
+    guest: Option<ElevatedGuestSupervisor>,
+    namespace_policy: PreopenedNamespacePolicy,
+    retirement_fault: NamespaceRetirementFault,
+    retirement_barrier: NamespaceRetirementBarrier,
+    notifier: Option<&'a mut dyn SessionNotifier>,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+impl<'a> PreopenedSessionStart<'a> {
     pub(crate) const fn new(
         handles: LauncherSessionHandles,
         frame: Frame,
         guest: Option<ElevatedGuestSupervisor>,
+        namespace_policy: PreopenedNamespacePolicy,
+        retirement_fault: NamespaceRetirementFault,
+        retirement_barrier: NamespaceRetirementBarrier,
+        notifier: Option<&'a mut dyn SessionNotifier>,
     ) -> Self {
         Self {
             handles,
             frame,
             guest,
+            namespace_policy,
+            retirement_fault,
+            retirement_barrier,
+            notifier,
         }
     }
 }
@@ -221,25 +263,26 @@ pub(crate) fn wait_session_with_preopened_namespace(
     lifecycle: LauncherLifecycle,
     wakeups: SignalWakeups,
     grants: &PreparedGrantBatch,
-    start: PreopenedSessionStart,
+    start: PreopenedSessionStart<'_>,
 ) -> Result<ExitStatus, LauncherError> {
     let PreopenedSessionStart {
         handles,
         frame,
         guest,
+        namespace_policy,
+        retirement_fault,
+        retirement_barrier,
+        notifier,
     } = start;
-    let socket_record_policy = guest
-        .as_ref()
-        .map_or(SocketRecordPolicy::Ordinary, |guest| {
-            if guest.forbids_api_socket_record() {
-                SocketRecordPolicy::RejectTransferredApi
-            } else {
-                SocketRecordPolicy::Ordinary
-            }
-        });
+    let socket_record_policy = socket_record_policy(namespace_policy, guest.as_ref());
     let mut roots = NamespaceRoots::Preopened(handles);
     if let Err(error) = write_frame(session, frame) {
-        terminate_session(worker, session, &auxiliary);
+        terminate_session(
+            worker,
+            session,
+            &auxiliary,
+            error_reap_policy(namespace_policy),
+        );
         roots
             .recover_after_worker_exit(lifecycle.session())
             .and_then(|recovered| {
@@ -258,9 +301,12 @@ pub(crate) fn wait_session_with_preopened_namespace(
         wakeups,
         grants,
         SessionOptions {
-            notifier: None,
+            notifier,
             roots,
             guest,
+            namespace_policy,
+            retirement_fault,
+            retirement_barrier,
         },
     )
 }
@@ -279,6 +325,12 @@ fn wait_session_with_roots(
         mut roots,
         #[cfg(feature = "elevated-bootstrap-probe")]
         mut guest,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        namespace_policy,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        retirement_fault,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        retirement_barrier,
     } = options;
     let session_id = lifecycle.session();
     let mut observation = SessionObservation::default();
@@ -295,22 +347,24 @@ fn wait_session_with_roots(
             roots: &mut roots,
             #[cfg(feature = "elevated-bootstrap-probe")]
             guest: &mut guest,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            namespace_policy,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            retirement_fault,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            retirement_barrier,
         },
     );
     if result.is_err() {
-        terminate_session(worker, session, &auxiliary);
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        let reap_policy = error_reap_policy(namespace_policy);
+        #[cfg(not(feature = "elevated-bootstrap-probe"))]
+        let reap_policy = ErrorReapPolicy::Immediate;
+        terminate_session(worker, session, &auxiliary, reap_policy);
     }
 
     #[cfg(feature = "elevated-bootstrap-probe")]
-    let socket_cleanup = guest
-        .as_ref()
-        .map_or(SocketRecordPolicy::Ordinary, |guest| {
-            if guest.forbids_api_socket_record() {
-                SocketRecordPolicy::RejectTransferredApi
-            } else {
-                SocketRecordPolicy::Ordinary
-            }
-        });
+    let socket_cleanup = socket_record_policy(namespace_policy, guest.as_ref());
     #[cfg(not(feature = "elevated-bootstrap-probe"))]
     let socket_cleanup: Option<StrictSocketCleanupPolicy> = None;
 
@@ -348,10 +402,25 @@ fn wait_session_with_roots(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorReapPolicy {
+    Immediate,
+    ObserveExit,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+const fn error_reap_policy(policy: PreopenedNamespacePolicy) -> ErrorReapPolicy {
+    match policy {
+        PreopenedNamespacePolicy::Linked => ErrorReapPolicy::Immediate,
+        PreopenedNamespacePolicy::RetiredRecordFree => ErrorReapPolicy::ObserveExit,
+    }
+}
+
 fn terminate_session(
     worker: &mut OwnedWorker,
     session: &UnixStream,
     auxiliary: &AuxiliaryChannels<'_>,
+    reap_policy: ErrorReapPolicy,
 ) {
     let _ = session.shutdown(std::net::Shutdown::Both);
     shutdown_grants(auxiliary.grant_socket);
@@ -362,14 +431,35 @@ fn terminate_session(
     let _ = auxiliary
         .block_control_broker
         .shutdown(std::net::Shutdown::Both);
+    if reap_policy == ErrorReapPolicy::ObserveExit
+        && let Some(deadline) = Instant::now().checked_add(SESSION_EXIT_GRACE)
+    {
+        loop {
+            match worker.try_wait() {
+                Ok(Some(_)) => return,
+                Err(_) => break,
+                Ok(None) => {}
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
     worker.terminate_and_reap();
 }
 
 struct SessionOptions<'a> {
-    notifier: Option<&'a mut DaemonNotifier>,
+    notifier: Option<&'a mut dyn SessionNotifier>,
     roots: NamespaceRoots,
     #[cfg(feature = "elevated-bootstrap-probe")]
     guest: Option<ElevatedGuestSupervisor>,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    namespace_policy: PreopenedNamespacePolicy,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    retirement_fault: NamespaceRetirementFault,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    retirement_barrier: NamespaceRetirementBarrier,
 }
 
 enum NamespaceRoots {
@@ -418,6 +508,21 @@ struct StrictSocketCleanupPolicy {
 enum SocketRecordPolicy {
     Ordinary,
     RejectTransferredApi,
+    RejectAll,
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn socket_record_policy(
+    namespace_policy: PreopenedNamespacePolicy,
+    guest: Option<&ElevatedGuestSupervisor>,
+) -> SocketRecordPolicy {
+    if namespace_policy == PreopenedNamespacePolicy::RetiredRecordFree {
+        SocketRecordPolicy::RejectAll
+    } else if guest.is_some_and(ElevatedGuestSupervisor::forbids_api_socket_record) {
+        SocketRecordPolicy::RejectTransferredApi
+    } else {
+        SocketRecordPolicy::Ordinary
+    }
 }
 
 #[cfg(feature = "elevated-bootstrap-probe")]
@@ -436,6 +541,9 @@ fn cleanup_namespace_after_worker(
         namespace.clear_socket_record(&record)?;
     }
     for record in namespace.snapshot_staging_records()? {
+        if socket_record_policy == SocketRecordPolicy::RejectAll {
+            return Err(RuntimeError::InvalidEntry);
+        }
         let anchor = grants
             .snapshot_directory_anchor(record.directory_identity())
             .ok_or(RuntimeError::InvalidEntry)?;
@@ -493,8 +601,9 @@ fn validate_socket_record_policy(
     record: &SocketOwnershipRecord,
     policy: SocketRecordPolicy,
 ) -> Result<(), RuntimeError> {
-    if policy == SocketRecordPolicy::RejectTransferredApi
-        && record.role() == bangbang_session::ResourceRole::ApiSocketDirectory
+    if policy == SocketRecordPolicy::RejectAll
+        || (policy == SocketRecordPolicy::RejectTransferredApi
+            && record.role() == bangbang_session::ResourceRole::ApiSocketDirectory)
     {
         return Err(RuntimeError::InvalidEntry);
     }
@@ -642,12 +751,18 @@ impl<'a> AuxiliaryChannels<'a> {
     }
 }
 
-struct SessionHooks<'a> {
-    observation: &'a mut SessionObservation,
-    notifier: Option<&'a mut DaemonNotifier>,
-    roots: &'a mut NamespaceRoots,
+struct SessionHooks<'state, 'notifier> {
+    observation: &'state mut SessionObservation,
+    notifier: Option<&'notifier mut dyn SessionNotifier>,
+    roots: &'state mut NamespaceRoots,
     #[cfg(feature = "elevated-bootstrap-probe")]
-    guest: &'a mut Option<ElevatedGuestSupervisor>,
+    guest: &'state mut Option<ElevatedGuestSupervisor>,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    namespace_policy: PreopenedNamespacePolicy,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    retirement_fault: NamespaceRetirementFault,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    retirement_barrier: NamespaceRetirementBarrier,
 }
 
 fn wait_session_inner(
@@ -657,7 +772,7 @@ fn wait_session_inner(
     lifecycle: &mut LauncherLifecycle,
     wakeups: &mut SignalWakeups,
     grants: &PreparedGrantBatch,
-    hooks: SessionHooks<'_>,
+    hooks: SessionHooks<'_, '_>,
 ) -> Result<ExitStatus, LauncherError> {
     let grant_socket = &mut *auxiliary.grant_socket;
     let socket_broker = &mut *auxiliary.socket_broker;
@@ -669,6 +784,12 @@ fn wait_session_inner(
         roots,
         #[cfg(feature = "elevated-bootstrap-probe")]
         guest,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        namespace_policy,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        retirement_fault,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        retirement_barrier,
     } = hooks;
     session
         .set_nonblocking(true)
@@ -821,6 +942,12 @@ fn wait_session_inner(
                         observation,
                         grant_send: &mut grant_send,
                         roots,
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        namespace_policy,
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        retirement_fault,
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        retirement_barrier,
                     },
                     #[cfg(feature = "elevated-bootstrap-probe")]
                     guest.as_mut(),
@@ -833,13 +960,6 @@ fn wait_session_inner(
                     )?;
                 }
             }
-        }
-        #[cfg(feature = "elevated-bootstrap-probe")]
-        if session_closed
-            && observation.terminal.is_none()
-            && let Some(guest) = guest.as_mut()
-        {
-            guest.fail_endpoint_death()?;
         }
         #[cfg(feature = "elevated-bootstrap-probe")]
         if !child_exited
@@ -855,6 +975,13 @@ fn wait_session_inner(
                 session,
                 observation.namespace.as_ref(),
             )?;
+            if guest.transport_closed() {
+                exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
+                register_events(
+                    kqueue.as_raw_fd(),
+                    &[event(grant_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
+                )?;
+            }
         }
         if observation.terminal.is_some() {
             exit_deadline.get_or_insert(Instant::now() + SESSION_EXIT_GRACE);
@@ -1110,6 +1237,12 @@ fn wait_session_inner(
                         observation,
                         grant_send: &mut grant_send,
                         roots,
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        namespace_policy,
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        retirement_fault,
+                        #[cfg(feature = "elevated-bootstrap-probe")]
+                        retirement_barrier,
                     },
                     #[cfg(feature = "elevated-bootstrap-probe")]
                     guest.as_mut(),
@@ -1328,6 +1461,12 @@ struct SessionDrainState<'a> {
     observation: &'a mut SessionObservation,
     grant_send: &'a mut GrantSendState,
     roots: &'a mut NamespaceRoots,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    namespace_policy: PreopenedNamespacePolicy,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    retirement_fault: NamespaceRetirementFault,
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    retirement_barrier: NamespaceRetirementBarrier,
 }
 
 fn drain_session(
@@ -1345,6 +1484,12 @@ fn drain_session(
         observation,
         grant_send,
         roots,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        namespace_policy,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        retirement_fault,
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        retirement_barrier,
     } = state;
     let mut buffer = [0_u8; 4096];
     loop {
@@ -1383,6 +1528,31 @@ fn drain_session(
                                 .validate(lifecycle.session(), NamespaceIdentity { device, inode })
                                 .map_err(|_| LauncherError::RuntimeNamespace)?;
                             observation.namespace = Some(validated);
+                            #[cfg(feature = "elevated-bootstrap-probe")]
+                            if namespace_policy == PreopenedNamespacePolicy::RetiredRecordFree {
+                                if retirement_barrier
+                                    == NamespaceRetirementBarrier::BeforeAndAfterUnlink
+                                {
+                                    stop_for_namespace_retirement()?;
+                                }
+                                if retirement_fault == NamespaceRetirementFault::BeforeUnlink {
+                                    return Err(LauncherError::RuntimeNamespace);
+                                }
+                                observation
+                                    .namespace
+                                    .as_mut()
+                                    .ok_or(LauncherError::RuntimeNamespace)?
+                                    .retire_linked()
+                                    .map_err(|_| LauncherError::RuntimeNamespace)?;
+                                if retirement_barrier
+                                    == NamespaceRetirementBarrier::BeforeAndAfterUnlink
+                                {
+                                    stop_for_namespace_retirement()?;
+                                }
+                                if retirement_fault == NamespaceRetirementFault::AfterUnlink {
+                                    return Err(LauncherError::RuntimeNamespace);
+                                }
+                            }
                             if !lifecycle.is_cancelled() {
                                 lifecycle
                                     .expect_grants(
@@ -1459,6 +1629,17 @@ fn drain_session(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return Err(LauncherError::SessionProtocol),
         }
+    }
+}
+
+#[cfg(feature = "elevated-bootstrap-probe")]
+fn stop_for_namespace_retirement() -> Result<(), LauncherError> {
+    // SAFETY: SIGSTOP has fixed kernel semantics and takes no pointer. This
+    // feature-only supervisor resumes only under the exact-root test driver.
+    if unsafe { libc::raise(libc::SIGSTOP) } == 0 {
+        Ok(())
+    } else {
+        Err(LauncherError::RuntimeNamespace)
     }
 }
 
@@ -1808,6 +1989,19 @@ mod tests {
 
     #[cfg(feature = "elevated-bootstrap-probe")]
     #[test]
+    fn only_retired_namespaces_observe_natural_error_exit_before_kill() {
+        assert_eq!(
+            error_reap_policy(PreopenedNamespacePolicy::Linked),
+            ErrorReapPolicy::Immediate,
+        );
+        assert_eq!(
+            error_reap_policy(PreopenedNamespacePolicy::RetiredRecordFree),
+            ErrorReapPolicy::ObserveExit,
+        );
+    }
+
+    #[cfg(feature = "elevated-bootstrap-probe")]
+    #[test]
     fn transferred_api_policy_rejects_only_api_socket_records() {
         let identity = ObjectIdentity {
             device: 17,
@@ -1837,6 +2031,14 @@ mod tests {
         assert_eq!(
             validate_socket_record_policy(&vsock, SocketRecordPolicy::RejectTransferredApi,),
             Ok(())
+        );
+        assert_eq!(
+            validate_socket_record_policy(&api, SocketRecordPolicy::RejectAll),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
+            validate_socket_record_policy(&vsock, SocketRecordPolicy::RejectAll),
+            Err(RuntimeError::InvalidEntry)
         );
     }
 

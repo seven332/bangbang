@@ -702,29 +702,14 @@ impl ElevatedGuestSupervisor {
         namespace: Option<&LauncherNamespace>,
     ) -> Result<(), LauncherError> {
         if self.transport_closed {
-            return self.fail(self.expected_stage(), ProbeErrorCategory::InvalidInput);
+            return Ok(());
         }
         loop {
             match transport_state(socket) {
                 TransportState::Empty => return Ok(()),
                 TransportState::Closed => {
                     self.transport_closed = true;
-                    return if matches!(
-                        self.step,
-                        WitnessStep::AwaitingGuestShutdown | WitnessStep::Complete
-                    ) && self.pending_ack.is_none()
-                    {
-                        Ok(())
-                    } else {
-                        self.fail(
-                            missing_serial_stage(
-                                self.contract.workload(),
-                                self.readiness,
-                                self.step,
-                            ),
-                            ProbeErrorCategory::Other,
-                        )
-                    };
+                    return Ok(());
                 }
                 TransportState::Error(kind) => {
                     return self.fail(
@@ -1127,6 +1112,10 @@ impl ElevatedGuestSupervisor {
         self.pending_ack.is_some() || self.pending_listener_ack.is_some()
     }
 
+    pub(crate) const fn transport_closed(&self) -> bool {
+        self.transport_closed
+    }
+
     pub(crate) fn deadline(&self) -> Option<Instant> {
         [
             self.deadline,
@@ -1258,13 +1247,6 @@ impl ElevatedGuestSupervisor {
 
     pub(crate) fn fail_transport_event(&mut self) -> Result<(), LauncherError> {
         self.fail(self.expected_stage(), ProbeErrorCategory::Other)
-    }
-
-    pub(crate) fn fail_endpoint_death(&mut self) -> Result<(), LauncherError> {
-        self.fail(
-            missing_serial_stage(self.contract.workload(), self.readiness, self.step),
-            ProbeErrorCategory::Other,
-        )
     }
 
     pub(crate) fn clear_retired_api_streams(&mut self) {

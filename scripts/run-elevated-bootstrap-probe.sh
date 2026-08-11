@@ -1749,7 +1749,7 @@ guest_matrix_output="$(/usr/bin/python3 "$repo_root/scripts/elevated_guest_matri
   --sidecar "$guest_sidecar" \
   --target-uid "$target_uid" \
   --target-gid "$target_gid")"
-expected_guest_matrix="guest-matrix: api-mapped=complete api-retained-root=complete-no-drop api-unmapped=complete no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=api-no-api-complete faults=all-reachable deaths=no-api-post-worker-first-launcher-first-api-pre-post-worker-first-launcher-first tamper=rejected-both-workloads adoption-replacement=no-api-complete-api-rejected-at-grant socket-replacement=both-cleanup-owners-preserve cleanup=exact"
+expected_guest_matrix="guest-matrix: api-mapped=complete api-retained-root=complete-no-drop api-unmapped=complete no-api-mapped=complete no-api-retained-root=complete-no-drop no-api-unmapped=complete repeats=three concurrency=api-no-api-complete faults=all-reachable deaths=no-api-post-worker-first-launcher-first-api-pre-post-worker-first-launcher-first tamper=rejected-both-workloads adoption-replacement=no-api-complete-api-rejected-at-grant socket-replacement=both-cleanup-owners-preserve daemon=api-no-api-all-identities-retired daemon-faults=retirement-all-reachable daemon-deaths=api-no-api-worker-first-launcher-first daemon-signals=int-term-hup daemon-replacement=preserved daemon-concurrency=peer-survives-launcher-kill cleanup=exact-no-product-session-teardown"
 if [[ "$guest_matrix_output" != "$expected_guest_matrix" ]]; then
   echo "bangbang elevated bootstrap proof: guest matrix output invalid" >&2
   exit 1
@@ -1804,4 +1804,4 @@ echo "result: inherited-root-worker=blocked stage=worker-bootstrap error=other c
 echo "$guest_matrix_output"
 echo "observations: stream-eid=snapshot stream-cred=snapshot stream-pid=exact datagram-cred=unsupported datagram-token=changed-or-unchanged datagram-pid=exact"
 echo "residue: roots=zero workspaces=zero sockets=zero launchers=zero workers=zero"
-echo "nonclaims: daemon-crash=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal"
+echo "nonclaims: simultaneous-uncatchable-death=unmeasured public-policy=unchanged chroot=unresolved aggregate-jailer=nonterminal"

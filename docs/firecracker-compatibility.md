@@ -1263,9 +1263,21 @@ worker guard, and retains the launcher's independent exact post-reap guard.
 All three identity classes then complete the canonical API/HVF guest three
 times; mapped API guests also complete concurrently, every closed API fault is
 reachable, and deterministic pre-readiness/post-HVF death plus replacement
-cases prove both exact cleanup owners. This is evidence for #1371, not a public
-launch policy or capability disposition; daemon/crash convergence and final
-uid/gid semantics remain unmeasured.
+cases prove both exact cleanup owners. #1900 composes the same guest prefix with
+the feature daemon's independent authenticated `BBD1` handoff and exact fd-8
+root authority. After `Prepared` and the worker-lock proof, the supervisor
+exact-unlinks the empty canonical session before the first grant; both signed
+endpoints retain and validate only the locked open directory, and the feature
+namespace rejects ownership records. Ordinary foreground and daemon sessions
+remain linked and record-bearing.
+
+API and no-API daemons complete for mapped, retained-root/no-drop, and SDK-
+maximum unmapped identities. Every retirement fault, both single-endpoint death
+orders for both workloads, supervisor SIGINT/SIGTERM, worker SIGHUP, same-name
+replacement preservation, and concurrent peer survival are measured without
+wrapper-side product-session teardown. This is evidence for #1371, not a public
+launch policy or capability disposition; simultaneous uncatchable two-endpoint
+death, restart/reconnect, and final public uid/gid semantics remain unmeasured.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
@@ -2784,13 +2796,13 @@ This does not broaden the supported API/device surface or claim arbitrary
 kernel/distribution boot, production containment, guest networking, artifact
 redistribution/authentication or byte-reproducible ext4.
 
-The separate #1893 / #1895 / #1897 exact-root evidence composes the same checked guest
-inputs with the fixed production launcher and mandatory App Sandbox +
-Hypervisor worker after numeric credential transition. Mapped, retained-root
-no-drop, and SDK-maximum unmapped no-API modes all complete the real HVF guest,
-fixed oracle, guest-requested poweroff, and exact cleanup. This is positive
-post-transition guest evidence for the config-file path, not a public uid/gid
-policy.
+The separate #1893 / #1895 / #1897 / #1900 exact-root evidence composes the
+same checked guest inputs with the fixed production launcher and mandatory App
+Sandbox + Hypervisor worker after numeric credential transition. Mapped,
+retained-root no-drop, and SDK-maximum unmapped no-API modes all complete the
+real HVF guest, fixed oracle, guest-requested poweroff, and exact cleanup. This
+is positive post-transition guest evidence for the config-file path, not a
+public uid/gid policy.
 
 The corresponding contained API modes stop earlier at the measured
 `api-socket-publication` boundary. Mapped and unmapped signed binder images fail
@@ -2818,8 +2830,25 @@ ownership, and cleanup. Two mapped API guests complete concurrently; every
 closed API fault is reachable; pre-readiness and post-HVF worker-first and
 launcher-first cases pass; and same-name replacements are preserved by both
 cleanup owners. No helper/signing role, entitlement, bookmark, broker, or
-public sandbox authority changed. Daemon/crash convergence remains a separate
-nonclaim.
+public sandbox authority changed.
+
+#1900 then re-executes only the feature-enabled launcher as a detached
+supervisor. Its independent fixed-shape `BBD1` channel authenticates the
+original parent, daemon supervisor, worker, transition order, readiness, and
+detach while the ordinary lifecycle/grant/`BBN1`/`BBL1` channels remain
+separate. For this shape only, the supervisor retires the exact empty canonical
+session after `Prepared` and before the first grant; the worker independently
+observes name absence while its fd, cwd, identity, and lock remain exact. The
+retired namespace is record-free and neither the wrapper nor a persistent
+observer performs product-session cleanup.
+
+All six identity/workload daemon cases complete real HVF guests. Retirement
+faults, API/no-API worker-first and launcher-first death, supervisor
+SIGINT/SIGTERM, worker SIGHUP, same-name replacement, and killed-peer
+concurrency all converge exactly. This adds no service, privileged helper,
+entitlement, result file, or public sandbox authority. Simultaneous uncatchable
+loss of both signed endpoints, restart/reconnect, public uid/gid policy, and
+Linux namespace parity remain nonclaims.
 
 ## Specification Benchmark Observations
 

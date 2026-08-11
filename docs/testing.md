@@ -2100,8 +2100,9 @@ merged-main OID are checked and recorded by the pull-request workflow.
 
 The #1373 direct-worker, #1884 inherited-root, #1885 no-chroot credential,
 #1889 / #1891 target-owned runtime-continuation, #1893 post-transition guest,
-and #1895 / #1897 launcher-created API-listener proofs are deliberately
-separate from `scripts/run-integration-tests.sh`. Normal validation never
+the #1895 / #1897 launcher-created API-listener proofs, and the #1900 retired
+feature-daemon proof are deliberately separate from
+`scripts/run-integration-tests.sh`. Normal validation never
 invokes `sudo`, prompts for a password, or treats missing root/HVF support as a
 passing skip.
 The capable-host wrapper is a manual certification artifact, not an ordinary
@@ -2126,8 +2127,9 @@ vocabulary are absent. It then builds both ends with disabled-by-default
 evidence features, checks role-specific credential/runtime markers, adds four
 visible test-only resource markers plus the ordinary-user-verified guest
 artifacts, requires the launcher/worker-specific `BBL1` handoff markers in only
-their evidence binaries, and uses the normal production packager, signature
-split, entitlements, Hardened Runtime, and inspections.
+their evidence binaries, requires the `BBD1` elevated-daemon and retirement
+markers only in their intended evidence roles, and uses the normal production
+packager, signature split, entitlements, Hardened Runtime, and inspections.
 
 On a capable Apple Silicon host, calculate the explicit numeric target before
 elevation and invoke the wrapper through `sudo` (substitute the captured
@@ -2205,8 +2207,8 @@ cleanup owners independently preserve it. Immutable-input tampering for both
 workloads, successful no-API post-adoption pathname replacement, API
 preopened-anchor replacement rejection, exact output ledgers, and final zero
 residue remain mandatory. Launcher-first cleanup removes only the pre-recorded
-empty session after both signed endpoints have exited and rejects an identity
-replacement.
+empty session for the linked foreground case after both signed endpoints have
+exited and rejects an identity replacement.
 
 It reports OS/SDK/architecture and only value-free terminal classes. The
 inherited result remains `worker-bootstrap` / `other`: in-root `posix_spawn`
@@ -2248,7 +2250,29 @@ exact first stage, both endpoint-death orders passed at both API lifetime
 boundaries, and both exact cleanup owners preserved replacements. Each new API
 connection verifies the live worker PID before request transmission and carries
 that immutable connected-stream fact through the close-delimited response.
-Daemon/crash convergence remains unmeasured.
+
+The #1900 feature-daemon branch re-executes the validated launcher with
+default-close descriptors, `SETSID`, `/dev/null` standard streams, an
+independent `BBD1` parent/supervisor handoff, and the exact root authority at
+fd 8. The supervisor and worker transition first; the original parent then
+transitions and is revalidated before it can acknowledge readiness, print the
+daemon PID, and detach. After `Prepared` and the independent worker-lock proof,
+the supervisor retires the exact empty canonical session name before the first
+grant. The worker must observe that its fd, cwd, lock, and identity remain exact
+while the name is absent. This feature-only namespace is record-free; ordinary
+foreground and ordinary daemon sessions remain linked and record-bearing.
+
+The capable-host matrix completes API and no-API daemons for mapped,
+retained-root/no-drop, and SDK-maximum unmapped identities. It reaches all four
+retirement fault boundaries, checks worker-first and launcher-first death for
+both workloads, checks supervisor SIGINT/SIGTERM and worker SIGHUP, preserves a
+same-name replacement after retirement, and proves that an API peer completes
+while a concurrent no-API launcher is killed. Exact raw wait statuses and
+bounded surviving-end cleanup are required. The wrapper only checks fixture
+and residue ledgers; it never removes a retired product session name. The
+remaining nonclaims are simultaneous uncatchable loss of both signed
+endpoints, restart/reconnect, and any public root/uid/gid policy.
+
 Stream credentials remained
 connection-time snapshots, datagram credentials were unsupported, opaque
 datagram tokens changed only for credential transitions, and live peer PIDs

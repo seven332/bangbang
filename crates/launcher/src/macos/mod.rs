@@ -5,6 +5,8 @@ pub(crate) mod daemon;
 #[cfg(feature = "elevated-bootstrap-probe")]
 pub(crate) mod elevated_api_listener;
 #[cfg(feature = "elevated-bootstrap-probe")]
+pub(crate) mod elevated_daemon;
+#[cfg(feature = "elevated-bootstrap-probe")]
 pub(crate) mod elevated_guest;
 pub(crate) mod local_socket;
 pub(crate) mod publish;
