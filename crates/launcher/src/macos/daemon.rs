@@ -151,7 +151,7 @@ pub(crate) fn launch_parent(
     executable: &Path,
     layout: &BundleLayout,
 ) -> Result<(), LauncherError> {
-    request.validate(layout.worker_executable(), true)?;
+    request.validate_current(layout.worker_executable(), true)?;
     let signals = DaemonSignals::install()?;
     let (mut child, mut stream) = spawn_daemon_suspended(executable, request.raw_args().to_vec())?;
     super::code_sign::validate_launcher_process(child.pid())?;

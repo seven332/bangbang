@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use bangbang_session::{
     MAX_VMNET_ACTIVE_INTERFACES, MAX_VMNET_BRIDGE_NAMES, VmnetAuthority, WorkerPolicy,
+    credential::CredentialTarget,
 };
 
 use crate::grant_manifest::{LaunchInput, PreparedGrantBatch};
@@ -78,6 +79,72 @@ pub(crate) struct PreparedLaunch {
     pub(crate) grants: PreparedGrantBatch,
     pub(crate) worker_policy: WorkerPolicy,
     pub(crate) worker_profile: crate::macos::code_sign::WorkerProfile,
+    pub(crate) identity: LaunchIdentity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchIdentity {
+    Current { uid: u32, gid: u32 },
+    RootRetained(CredentialTarget),
+    RootTransition(CredentialTarget),
+}
+
+impl LaunchIdentity {
+    pub(crate) const fn is_current(self) -> bool {
+        matches!(self, Self::Current { .. })
+    }
+
+    const fn uid(self) -> u32 {
+        match self {
+            Self::Current { uid, .. } => uid,
+            Self::RootRetained(target) | Self::RootTransition(target) => target.uid(),
+        }
+    }
+
+    const fn gid(self) -> u32 {
+        match self {
+            Self::Current { gid, .. } => gid,
+            Self::RootRetained(target) | Self::RootTransition(target) => target.gid(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LaunchIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LaunchIdentity(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CallerCredentials {
+    uid: u32,
+    effective_uid: u32,
+    gid: u32,
+    effective_gid: u32,
+}
+
+impl CallerCredentials {
+    const fn new(uid: u32, effective_uid: u32, gid: u32, effective_gid: u32) -> Self {
+        Self {
+            uid,
+            effective_uid,
+            gid,
+            effective_gid,
+        }
+    }
+
+    const fn current(self) -> Result<(u32, u32), LauncherError> {
+        if self.uid != self.effective_uid || self.gid != self.effective_gid {
+            return Err(LauncherError::InvalidLaunchPolicy);
+        }
+        Ok((self.uid, self.gid))
+    }
+}
+
+impl std::fmt::Debug for CallerCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CallerCredentials(<redacted>)")
+    }
 }
 
 impl std::fmt::Debug for PreparedLaunch {
@@ -176,21 +243,30 @@ impl LaunchRequest {
         &self,
         worker_executable: &Path,
         daemonized: bool,
-    ) -> Result<(), LauncherError> {
-        let (uid, gid) = current_credentials()?;
+    ) -> Result<LaunchIdentity, LauncherError> {
+        let caller = current_credentials();
         match &self.jailer {
             Some(jailer)
                 if jailer.exec_file == worker_executable
                     && jailer.exec_file.is_absolute()
-                    && jailer.uid == uid
-                    && jailer.gid == gid
                     && jailer.daemonize == daemonized =>
             {
-                Ok(())
+                classify_launch_identity(caller, jailer.uid, jailer.gid)
             }
-            None if !daemonized => Ok(()),
+            None if !daemonized => {
+                let (uid, gid) = caller.current()?;
+                classify_launch_identity(caller, uid, gid)
+            }
             Some(_) | None => Err(LauncherError::InvalidLaunchPolicy),
         }
+    }
+
+    pub(crate) fn validate_current(
+        &self,
+        worker_executable: &Path,
+        daemonized: bool,
+    ) -> Result<LaunchIdentity, LauncherError> {
+        require_current_identity(self.validate(worker_executable, daemonized)?)
     }
 
     pub(crate) fn prepare(
@@ -200,7 +276,7 @@ impl LaunchRequest {
         daemonized: bool,
         worker_profile: crate::macos::code_sign::WorkerProfile,
     ) -> Result<PreparedLaunch, LauncherError> {
-        self.validate(worker_executable, daemonized)?;
+        let identity = self.validate(worker_executable, daemonized)?;
         let vmnet_authority = self
             .jailer
             .as_ref()
@@ -209,7 +285,7 @@ impl LaunchRequest {
             return Err(LauncherError::InvalidLaunchPolicy);
         }
         let (mut worker_args, grants) = self.grants.prepare()?;
-        let (uid, gid) = current_credentials()?;
+        let (uid, gid) = (identity.uid(), identity.gid());
         let (no_file, file_size) = if let Some(jailer) = self.jailer {
             let mut injected = vec![
                 OsString::from(ID_OPTION),
@@ -233,6 +309,7 @@ impl LaunchRequest {
             worker_policy: WorkerPolicy::new(uid, gid, no_file, file_size, daemonized)
                 .with_vmnet_authority(vmnet_authority),
             worker_profile,
+            identity,
         })
     }
 }
@@ -458,7 +535,7 @@ fn parse_u32(value: &str) -> Result<u32, LauncherError> {
         .map_err(|_| LauncherError::InvalidLaunchPolicy)
 }
 
-fn current_credentials() -> Result<(u32, u32), LauncherError> {
+fn current_credentials() -> CallerCredentials {
     // SAFETY: These credential getters take no pointers and have no failure mode.
     let (uid, effective_uid, gid, effective_gid) = unsafe {
         (
@@ -468,10 +545,44 @@ fn current_credentials() -> Result<(u32, u32), LauncherError> {
             libc::getegid(),
         )
     };
-    if uid != effective_uid || gid != effective_gid {
+    CallerCredentials::new(uid, effective_uid, gid, effective_gid)
+}
+
+fn classify_launch_identity(
+    caller: CallerCredentials,
+    requested_uid: u32,
+    requested_gid: u32,
+) -> Result<LaunchIdentity, LauncherError> {
+    let (current_uid, current_gid) = caller.current()?;
+    if (requested_uid, requested_gid) == (current_uid, current_gid)
+        && (current_uid, current_gid) != (0, 0)
+    {
+        return Ok(LaunchIdentity::Current {
+            uid: requested_uid,
+            gid: requested_gid,
+        });
+    }
+    if (current_uid, current_gid) != (0, 0) {
         return Err(LauncherError::InvalidLaunchPolicy);
     }
-    Ok((uid, gid))
+    let target = CredentialTarget::new(requested_uid, requested_gid)
+        .map_err(|_| LauncherError::InvalidLaunchPolicy)?;
+    match target.mode() {
+        bangbang_session::credential::CredentialMode::RetainedRoot => {
+            Ok(LaunchIdentity::RootRetained(target))
+        }
+        bangbang_session::credential::CredentialMode::Transition => {
+            Ok(LaunchIdentity::RootTransition(target))
+        }
+    }
+}
+
+fn require_current_identity(identity: LaunchIdentity) -> Result<LaunchIdentity, LauncherError> {
+    if identity.is_current() {
+        Ok(identity)
+    } else {
+        Err(LauncherError::InvalidLaunchPolicy)
+    }
 }
 
 fn clock_microseconds(clock: libc::clockid_t) -> Result<u64, LauncherError> {
@@ -515,7 +626,9 @@ mod tests {
     }
 
     fn base(worker: &Path) -> Vec<OsString> {
-        let (uid, gid) = current_credentials().expect("test credentials should be ordinary");
+        let (uid, gid) = current_credentials()
+            .current()
+            .expect("test credentials should be ordinary");
         vec![
             JAILER_ACTIVATION.into(),
             ID_OPTION.into(),
@@ -1051,7 +1164,12 @@ mod tests {
         else {
             panic!("run command expected");
         };
-        assert_eq!(request.validate(worker, false), Ok(()));
+        assert!(
+            request
+                .validate(worker, false)
+                .expect("current policy should validate")
+                .is_current()
+        );
         assert_eq!(
             request.validate(Path::new("/fixed/other-worker"), false),
             Err(LauncherError::InvalidLaunchPolicy)
@@ -1061,7 +1179,9 @@ mod tests {
             Err(LauncherError::InvalidLaunchPolicy)
         );
 
-        let (uid, gid) = current_credentials().expect("credentials should be ordinary");
+        let (uid, gid) = current_credentials()
+            .current()
+            .expect("credentials should be ordinary");
         for (index, value) in [(6, uid.wrapping_add(1)), (8, gid.wrapping_add(1))] {
             let mut args = base(worker);
             args[index] = value.to_string().into();
@@ -1083,10 +1203,78 @@ mod tests {
         else {
             panic!("run command expected");
         };
-        assert_eq!(daemon_request.validate(worker, true), Ok(()));
+        assert!(
+            daemon_request
+                .validate(worker, true)
+                .expect("current daemon policy should validate")
+                .is_current()
+        );
         assert_eq!(
             daemon_request.validate(worker, false),
             Err(LauncherError::InvalidLaunchPolicy)
+        );
+    }
+
+    #[test]
+    fn launch_identity_classifier_covers_current_and_exact_root_targets() {
+        let ordinary = CallerCredentials::new(501, 501, 20, 20);
+        assert_eq!(
+            classify_launch_identity(ordinary, 501, 20),
+            Ok(LaunchIdentity::Current { uid: 501, gid: 20 })
+        );
+        assert_eq!(
+            classify_launch_identity(ordinary, 502, 20),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+
+        let unusual_current = CallerCredentials::new(0, 0, 20, 20);
+        assert_eq!(
+            classify_launch_identity(unusual_current, 0, 20),
+            Ok(LaunchIdentity::Current { uid: 0, gid: 20 })
+        );
+
+        let root = CallerCredentials::new(0, 0, 0, 0);
+        let retained = classify_launch_identity(root, 0, 0).expect("root no-drop");
+        assert!(matches!(retained, LaunchIdentity::RootRetained(_)));
+        assert_eq!(
+            require_current_identity(retained),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+        let transition = classify_launch_identity(root, 501, 20).expect("root transition");
+        assert!(matches!(transition, LaunchIdentity::RootTransition(_)));
+        assert_eq!(
+            require_current_identity(transition),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+        assert!(matches!(
+            classify_launch_identity(root, u32::MAX, u32::MAX),
+            Ok(LaunchIdentity::RootTransition(_))
+        ));
+        assert_eq!(
+            classify_launch_identity(root, 0, 20),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+        assert_eq!(
+            classify_launch_identity(root, 501, 0),
+            Err(LauncherError::InvalidLaunchPolicy)
+        );
+
+        for mismatched in [
+            CallerCredentials::new(501, 0, 20, 20),
+            CallerCredentials::new(501, 501, 20, 0),
+        ] {
+            assert_eq!(
+                classify_launch_identity(mismatched, 501, 20),
+                Err(LauncherError::InvalidLaunchPolicy)
+            );
+        }
+        assert_eq!(
+            format!("{:?}", CallerCredentials::new(1, 1, 2, 2)),
+            "CallerCredentials(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", LaunchIdentity::Current { uid: 1, gid: 2 }),
+            "LaunchIdentity(<redacted>)"
         );
     }
 

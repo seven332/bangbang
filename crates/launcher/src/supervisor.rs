@@ -150,6 +150,12 @@ where
                 )),
             };
         }
+        #[cfg(feature = "elevated-bootstrap-probe")]
+        if elevated_probe.is_none() {
+            request.validate_current(layout.worker_executable(), request.requests_daemonize())?;
+        }
+        #[cfg(not(feature = "elevated-bootstrap-probe"))]
+        request.validate_current(layout.worker_executable(), request.requests_daemonize())?;
         if let Some(mut bootstrap) = child_bootstrap {
             #[cfg(feature = "elevated-bootstrap-probe")]
             if elevated_probe.is_some() {
@@ -1863,6 +1869,9 @@ fn launch_prepared(
 
     use bangbang_session::{LauncherLifecycle, SessionId};
 
+    if !launch.identity.is_current() {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
     let wakeups = crate::macos::supervise::SignalWakeups::install()?;
     let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
     let mut lifecycle = LauncherLifecycle::new(session_id);
