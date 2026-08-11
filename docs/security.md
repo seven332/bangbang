@@ -57,9 +57,10 @@ handoff, and socket-broker channels. Contained startup config, startup metadata,
 adopt exact read-only grants; block and pmem devices adopt exact repeatable
 read-only/read-write backing grants; logger, metrics, and serial adopt exact
 singleton write-only sink grants; vhost-user endpoints require repeatable
-connect-only directory grants and launcher-returned streams. Public product
-uid/gid transition, configurable chroot ownership, and complete
-distribution-signing policy remain absent. A disabled evidence bundle has
+connect-only directory grants and launcher-returned streams. Positive product
+uid/gid transition, configurable chroot ownership, and complete distribution-
+signing policy remain absent. Public uid/gid now has a fixed terminal rejection
+rather than an unresolved positive path. A disabled evidence bundle has
 measured credential bootstrap plus same-process continuation through a
 launcher-created target-owned session. The worker consumes one exact
 session-bound descriptor authority before `Hello`; mapped, retained-root, and
@@ -82,8 +83,10 @@ The direct CLI remains an ordinary non-sandboxed executable. Production can
 commit typed startup authority, and its config, metadata, kernel, initrd,
 block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket,
 and vsock-socket consumers use granted identities or exact retained anchors
-without reopening their tagged path strings. General dynamic post-Ready
-delivery and hard revocation still need dedicated designs.
+without reopening their tagged path strings. Arbitrary numeric uid/gid is a
+terminal fixed-topology platform limit with a stable prelaunch rejection;
+configurable chroot and general dynamic post-Ready delivery/hard revocation
+still need dedicated designs.
 
 The elevated evidence result is intentionally narrower than product support.
 For mapped, retained-root, and SDK-maximum unmapped identities, the signed
@@ -124,8 +127,42 @@ cases complete. The matrix reaches every retirement fault, both single-endpoint
 death orders for both workloads, supervisor SIGINT/SIGTERM, worker SIGHUP,
 same-name replacement preservation, and concurrent peer survival. The wrapper
 does not perform product-session teardown. This does not establish public
-uid/gid policy, restart/reconnect, or simultaneous uncatchable two-endpoint
-death convergence.
+positive uid/gid transition, restart/reconnect, or simultaneous uncatchable
+two-endpoint death convergence; the later product gate establishes only the
+fixed rejection documented below.
+
+## Jailer uid/gid fixed-topology platform limit
+
+Firecracker's `--uid` and `--gid` leaves require arbitrary numeric target
+identity after privileged jail preparation. Bangbang's accepted production
+security topology instead has one unsandboxed launcher and one mandatory App
+Sandbox + Hypervisor worker, no helper/service, no sandbox extension, and
+linked foreground recovery. Current non-root uid/gid remains supported. A root
+caller requesting retained root or a permanent transition is classified but
+rejected by `validate_current` with the same value-free
+`invalid production launch policy` result
+before session creation, spawn, resource grants, publication, or guest work.
+
+The #1904 platform gate ran on the exact Apple Silicon macOS 26.5.2 / SDK 26.5
+capable host. It proved that public Darwin credential calls, fixed
+`/private/tmp` root construction, independent endpoint descriptors, permanent
+transition, launcher-created target-session adoption, grants, and ordinary
+lifecycle all work. After launcher loss, the sandboxed worker moved outside
+the root but descriptor-relative removal of its exact empty inner session was
+denied. The outer root consequently remained busy until the unsandboxed
+launcher recovery owner removed both exact objects; the wrapper only scanned,
+and the final residue count was zero.
+
+That failure is security-topology-specific: earlier descriptor delivery does
+not confer later pathname-mutation permission on the sandboxed worker. A
+privileged helper or service adds persistent elevated authority; a new
+entitlement or extension weakens the mandatory boundary; an account-derived or
+configurable root adds ambient authority; early unlink removes the accepted
+linked recovery contract; wrapper/launcher-only cleanup cannot converge after
+launcher loss. The two uid/gid argument identities are therefore terminal
+platform exclusions, while configurable chroot, `corpus:jailer`,
+`corpus:production-host`, and `jailer/run` remain nonterminal. No #1904 product
+adapter or new elevated runtime path was merged.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -285,7 +322,7 @@ Use this checklist when reviewing Firecracker-facing host isolation changes:
 
 | Area | Current status | Review expectation |
 | --- | --- | --- |
-| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; disabled evidence completes numeric credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate the feature-only evidence with product uid/gid support, configurable chroot, or Linux isolation parity. |
+| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Direct mechanisms unsupported; fixed-code/current-user/private-root/rlimit/daemon observable subset implemented; uid/gid has an exact fixed-topology terminal rejection; disabled evidence completes numeric credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes | Preserve the exact macOS launch-policy contract and reject unsupported Linux controls. Do not equate the feature-only credential evidence with positive product uid/gid support, configurable chroot, or Linux isolation parity. |
 | API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
 | Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
 | HVF entitlement and code signing | Implemented direct, App Sandbox, and production nested-worker validation paths | Keep real HVF tests in signed targets, inspect entitlement separation and nested signatures, and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
@@ -546,7 +583,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
 | macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
-| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep product uid/gid pending #1371's cumulative Challenge and inventory disposition; keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
+| Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; uid/gid root-retained/root-transition requests have a terminal fixed-topology rejection; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep the uid/gid exclusion fail-closed unless a fresh public-platform Challenge changes the accepted topology result; keep configurable chroot, seccomp, namespaces, cgroups, and parent-cgroup controls rejected until separately challenged macOS outcomes exist. |
 
 This document intentionally does not define a sandbox profile, broker protocol,
 privilege-dropping flow, or new public API. PRs that add host resource types
@@ -3467,20 +3504,23 @@ The portable snapshot oracle separately proves cancellation and no escaped
 artifact, so the containment claim does not depend only on one end-to-end
 trace.
 
-The same authority re-challenges all 30 platform-impossible identities as four
-exact public-mechanism families. It does not broaden them: every identity still
+The Wave 8 authority re-challenges its historical 30 platform-impossible
+identities as four exact public-mechanism families. It does not broaden them:
+every identity still
 requires its own stable behavior, tests, compatibility/security evidence, and
 Challenge. Linux CPUID/MSR and KVM feature identities, exact hugetlbfs `2M`,
 and seccomp/cgroup/network/PID namespace mechanisms are not aliases for public
 HVF registers/granules, XNU allocation, App Sandbox, rlimits, launchd,
 Network Extension, vmnet, or Endpoint Security.
 
-Six #1373 outcomes remain audit entries pending their parent Challenge; two
-#1378 outcomes still require caller-owned Apple-approved signing/profile
-authority and an isolated vmnet fixture; three #1351 isolation semantics remain
-platform-feasible. Missing authority or credentials is not an impossibility
-proof. Global `--final` stays blocked until evidence is translated into an
-ID-specific disposition and the other external outcomes complete.
+At that Wave 8 checkpoint, six #1373 outcomes remained audit entries; two
+#1378 outcomes required caller-owned Apple-approved signing/profile authority
+and an isolated vmnet fixture; three #1351 isolation semantics remained
+platform-feasible. The later exact uid/gid transition leaves four #1373 rows,
+the same two #1378 rows, and the same three #1351 rows, for current totals
+377/6/3/32. Missing authority or credentials alone is not an impossibility
+proof. Global `--final` stays blocked until the remaining external outcomes
+complete.
 
 The elevated same-host gates have now been executed rather than inferred from
 split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root
@@ -3631,16 +3671,18 @@ classes, all four retirement failures, worker-first and launcher-first death,
 supervisor SIGINT/SIGTERM, worker SIGHUP, same-name replacement preservation,
 and concurrent peer survival. It adds no service, setuid helper, entitlement,
 result file, or persistent observer. Simultaneous uncatchable death of both
-signed endpoints, restart/reconnect, and public uid/gid policy remain
-nonclaims. The complete evidence, exact cleanup rules, reproduction command,
+signed endpoints, restart/reconnect, and a positive arbitrary-numeric uid/gid
+mode remain nonclaims. The complete evidence, exact cleanup rules, reproduction command,
 and future-OS nonclaim are in the checked
 [elevated bootstrap evidence](../compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md).
 
-The six rows remain audit outcomes until #1371 challenges the controlled result
-and remaining credible alternatives per ID and an inventory transition lands.
-The evidence harness is test-only and statically absent from normal launcher
-and worker builds; its daemon path is not a root service, public jailer/daemon
-mode, setuid helper, or ambient path authority.
+#1904 then exercised the fixed product topology and found the independent
+post-launcher-loss worker cleanup blocker described in
+[Jailer uid/gid fixed-topology platform limit](#jailer-uidgid-fixed-topology-platform-limit).
+#1905 makes exactly the uid/gid leaves terminal at that rejection, leaving four
+#1373 audit outcomes. The earlier evidence harness is test-only and statically
+absent from normal launcher and worker builds; its daemon path is not a root
+service, public jailer/daemon mode, setuid helper, or ambient path authority.
 
 ## Current Non-Goals
 

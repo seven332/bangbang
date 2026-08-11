@@ -1,6 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::inventory_phase::{
+    InventoryPhase, WAVE8_ARM_KVM_TEMPLATE_IDS, WAVE8_HUGETLBFS_IDS, WAVE8_LINUX_ISOLATION_IDS,
+    WAVE8_X86_CPUID_MSR_IDS, classify_inventory_phase, expected_disposition,
+    expected_impossible_ids, expected_nonterminal_ids, wave8_historical_impossible_ids,
+};
 use crate::validate::{tracked_repository_files, validate_reference};
 use crate::{
     CapabilityInventory, Disposition, FIRECRACKER_COMMIT, FIRECRACKER_TARGET, FIRECRACKER_VERSION,
@@ -40,48 +45,6 @@ const OUTCOMES: [Wave8Outcome; 11] = [
     Wave8Outcome::CancellationWithoutArtifacts,
     Wave8Outcome::ClaimFailureNonconsumption,
     Wave8Outcome::TerminalCleanup,
-];
-
-const X86_CPUID_MSR_IDS: [&str; 13] = [
-    "api-property:CpuConfig.cpuid_modifiers",
-    "api-property:CpuConfig.msr_modifiers",
-    "api-property:CpuidLeafModifier.flags",
-    "api-property:CpuidLeafModifier.leaf",
-    "api-property:CpuidLeafModifier.modifiers",
-    "api-property:CpuidLeafModifier.subleaf",
-    "api-property:CpuidRegisterModifier.bitmap",
-    "api-property:CpuidRegisterModifier.register",
-    "api-property:MsrModifier.addr",
-    "api-property:MsrModifier.bitmap",
-    "api-schema:CpuidLeafModifier",
-    "api-schema:CpuidRegisterModifier",
-    "api-schema:MsrModifier",
-];
-
-const ARM_KVM_TEMPLATE_IDS: [&str; 7] = [
-    "api-property:CpuConfig.kvm_capabilities",
-    "api-property:CpuConfig.vcpu_features",
-    "api-property:MachineConfiguration.cpu_template",
-    "api-property:VcpuFeatures.bitmap",
-    "api-property:VcpuFeatures.index",
-    "api-schema:CpuTemplate",
-    "api-schema:VcpuFeatures",
-];
-
-const HUGETLBFS_IDS: [&str; 2] = [
-    "api-property:MachineConfiguration.huge_pages",
-    "corpus:hugepages",
-];
-
-const LINUX_ISOLATION_IDS: [&str; 8] = [
-    "corpus:seccomp",
-    "firecracker-argument:no-seccomp",
-    "firecracker-argument:seccomp-filter",
-    "tool-argument:jailer/cgroup",
-    "tool-argument:jailer/cgroup-version",
-    "tool-argument:jailer/netns",
-    "tool-argument:jailer/new-pid-ns",
-    "tool-argument:jailer/parent-cgroup",
 ];
 
 const HANDOFFS: [(&str, Wave8HandoffOwner, Disposition); 11] = [
@@ -238,8 +201,13 @@ fn validate_header(
     if audit.domains != DOMAINS {
         errors.push("Wave 8 requires the exact ordered seven interaction domains".to_string());
     }
-    if disposition_counts(inventory) != (377, 8, 3, 30) {
-        errors.push("Wave 8 inventory counts must be exactly 377/8/3/30".to_string());
+    match classify_inventory_phase(inventory) {
+        Ok(InventoryPhase::Wave8 | InventoryPhase::JailerUidGidPlatformLimit) => {}
+        Ok(phase) => errors.push(format!(
+            "Wave 8 live inventory must be its exact 377/8/3/30 phase or the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, found {}",
+            phase.name()
+        )),
+        Err(error) => errors.push(format!("Wave 8 live inventory phase is invalid: {error}")),
     }
 }
 
@@ -423,7 +391,7 @@ fn validate_platform_reviews(
     const EXPECTED: [ExpectedReview; 4] = [
         ExpectedReview {
             mechanism: Wave8PlatformMechanism::X86CpuidMsr,
-            ids: &X86_CPUID_MSR_IDS,
+            ids: &WAVE8_X86_CPUID_MSR_IDS,
             observation: Wave8PlatformObservation::Arm64SdkLacksX86CpuidMsr,
             upstream_sources: &[
                 "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/swagger/firecracker.yaml#L1092-L1165",
@@ -442,7 +410,7 @@ fn validate_platform_reviews(
         },
         ExpectedReview {
             mechanism: Wave8PlatformMechanism::ArmKvmFeatureTemplate,
-            ids: &ARM_KVM_TEMPLATE_IDS,
+            ids: &WAVE8_ARM_KVM_TEMPLATE_IDS,
             observation: Wave8PlatformObservation::HvfRegistersDoNotPreserveKvmIdentity,
             upstream_sources: &[
                 "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/vmm/src/arch/aarch64/vcpu.rs#L202-L216",
@@ -461,7 +429,7 @@ fn validate_platform_reviews(
         },
         ExpectedReview {
             mechanism: Wave8PlatformMechanism::LinuxHugetlbfs2m,
-            ids: &HUGETLBFS_IDS,
+            ids: &WAVE8_HUGETLBFS_IDS,
             observation: Wave8PlatformObservation::Arm64XnuRejectsTwoMibSuperpages,
             upstream_sources: &[
                 "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/hugepages.md",
@@ -482,7 +450,7 @@ fn validate_platform_reviews(
         },
         ExpectedReview {
             mechanism: Wave8PlatformMechanism::LinuxRuntimeIsolation,
-            ids: &LINUX_ISOLATION_IDS,
+            ids: &WAVE8_LINUX_ISOLATION_IDS,
             observation: Wave8PlatformObservation::MacosLacksLinuxIsolationPrimitives,
             upstream_sources: &[
                 "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/firecracker/src/main.rs",
@@ -563,22 +531,35 @@ fn validate_platform_reviews(
         .iter()
         .flat_map(|review| review.capability_ids.iter().map(String::as_str))
         .collect::<BTreeSet<_>>();
+    let historical_impossible = wave8_historical_impossible_ids();
+    if reviewed.len() != 30 || reviewed != historical_impossible {
+        errors.push(
+            "Wave 8 platform reviews must partition the exact historical 30 impossible capabilities"
+                .to_string(),
+        );
+    }
+
     let impossible = inventory
         .capabilities
         .iter()
         .filter(|capability| capability.disposition == Disposition::ProvenPlatformImpossible)
         .map(|capability| capability.id.as_str())
         .collect::<BTreeSet<_>>();
-    if reviewed.len() != 30 || reviewed != impossible {
-        errors.push(
-            "Wave 8 platform reviews must partition the exact 30 impossible capabilities"
-                .to_string(),
-        );
+    if let Ok(phase @ (InventoryPhase::Wave8 | InventoryPhase::JailerUidGidPlatformLimit)) =
+        classify_inventory_phase(inventory)
+    {
+        let expected = expected_impossible_ids(phase);
+        if impossible != expected {
+            errors.push(format!(
+                "Wave 8 live impossible set differs from the exact {} successor: expected {expected:?}, found {impossible:?}",
+                phase.name()
+            ));
+        }
     }
     for capability in inventory
         .capabilities
         .iter()
-        .filter(|capability| reviewed.contains(capability.id.as_str()))
+        .filter(|capability| impossible.contains(capability.id.as_str()))
     {
         if capability.exclusion.is_none() {
             errors.push(format!(
@@ -608,12 +589,16 @@ fn validate_handoffs(
     if actual != HANDOFFS {
         errors.push("Wave 8 requires the exact ordered 11 external handoffs".to_string());
     }
+    let phase = classify_inventory_phase(inventory).ok();
     let capabilities = inventory
         .capabilities
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
-    for (id, _, disposition) in HANDOFFS {
+    for (id, _, historical_disposition) in HANDOFFS {
+        let disposition = phase.map_or(historical_disposition, |phase| {
+            expected_disposition(phase, id)
+        });
         if capabilities
             .get(id)
             .is_none_or(|capability| capability.disposition != disposition)
@@ -632,12 +617,15 @@ fn validate_handoffs(
         })
         .map(|capability| capability.id.as_str())
         .collect::<BTreeSet<_>>();
-    let handoff_ids = HANDOFFS
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect::<BTreeSet<_>>();
-    if nonterminal != handoff_ids {
-        errors.push("Wave 8 retained handoffs must be the complete nonterminal set".to_string());
+    if let Some(phase @ (InventoryPhase::Wave8 | InventoryPhase::JailerUidGidPlatformLimit)) = phase
+    {
+        let expected = expected_nonterminal_ids(phase);
+        if nonterminal != expected {
+            errors.push(format!(
+                "Wave 8 retained handoffs differ from the exact {} nonterminal set: expected {expected:?}, found {nonterminal:?}",
+                phase.name()
+            ));
+        }
     }
 }
 
@@ -841,29 +829,17 @@ fn validate_exact_authoritative_references(
     }
 }
 
-fn disposition_counts(inventory: &CapabilityInventory) -> (usize, usize, usize, usize) {
-    inventory.capabilities.iter().fold(
-        (0, 0, 0, 0),
-        |(implemented, audit, feasible, impossible), capability| match capability.disposition {
-            Disposition::ImplementedAndVerified => (implemented + 1, audit, feasible, impossible),
-            Disposition::AuditRequired => (implemented, audit + 1, feasible, impossible),
-            Disposition::MissingPlatformFeasible => (implemented, audit, feasible + 1, impossible),
-            Disposition::ProvenPlatformImpossible => (implemented, audit, feasible, impossible + 1),
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn fixed_partitions_are_exact_and_unique() {
-        let impossible = X86_CPUID_MSR_IDS
+        let impossible = WAVE8_X86_CPUID_MSR_IDS
             .into_iter()
-            .chain(ARM_KVM_TEMPLATE_IDS)
-            .chain(HUGETLBFS_IDS)
-            .chain(LINUX_ISOLATION_IDS)
+            .chain(WAVE8_ARM_KVM_TEMPLATE_IDS)
+            .chain(WAVE8_HUGETLBFS_IDS)
+            .chain(WAVE8_LINUX_ISOLATION_IDS)
             .collect::<BTreeSet<_>>();
         assert_eq!(impossible.len(), 30);
         assert_eq!(HANDOFFS.len(), 11);

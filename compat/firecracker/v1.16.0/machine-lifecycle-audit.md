@@ -131,5 +131,5 @@ Delivery validation must pass, and the generated manifest must still compare
 byte-for-byte with a clean Firecracker checkout at
 `d83d72b710361a10294480131377b1b00b163af8`. The scoped Wave 7 and Wave 8 gates
 pass their exact historical/successor phases. Global final validation continues
-to reject the eight audit and three feasible external records until their
-owners supply the required root/HVF or approved-vmnet evidence.
+to reject the six audit and three feasible external records until their
+owners deliver the required implementation or root/HVF/approved-vmnet evidence.

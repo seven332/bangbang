@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::inventory_phase::{classify_inventory_phase, disposition_counts};
 use crate::specification_benchmark_audit_validate::SPECIFICATION_BENCHMARK_CAPABILITY_IDS;
 use crate::{
     AuditMode, CapabilityInventory, Disposition, SourceManifest, SpecificationBenchmarkAudit,
@@ -8,15 +9,6 @@ use crate::{
 };
 
 const CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/specification-benchmark-contract.md";
-const WAVE7_AGGREGATE_SUCCESSOR_IDS: [&str; 5] = [
-    "corpus:design",
-    "corpus:device-api",
-    "corpus:release-changelog",
-    "semantic.tools:packaging-help-errors-and-applicable-operations",
-    "semantic.transport:virtio-mmio-activation",
-];
-const WAVE8_SUCCESSOR_ID: &str =
-    "semantic.cross-capability:state-errors-metrics-security-and-snapshots";
 
 /// Certify exactly the terminal #1798 capability transition and totals.
 pub fn validate_specification_benchmark_compatibility(
@@ -112,58 +104,10 @@ fn validate_capabilities(inventory: &CapabilityInventory, errors: &mut Vec<Strin
 }
 
 fn validate_totals(inventory: &CapabilityInventory, errors: &mut Vec<String>) {
-    let mut audit_required = 0;
-    let mut implemented = 0;
-    let mut missing = 0;
-    let mut impossible = 0;
-    for capability in &inventory.capabilities {
-        match capability.disposition {
-            Disposition::AuditRequired => audit_required += 1,
-            Disposition::ImplementedAndVerified => implemented += 1,
-            Disposition::MissingPlatformFeasible => missing += 1,
-            Disposition::ProvenPlatformImpossible => impossible += 1,
-        }
-    }
-    let totals = (implemented, audit_required, missing, impossible);
-    let expected_successor_dispositions = match totals {
-        (371, 14, 3, 30) => Some((Disposition::AuditRequired, Disposition::AuditRequired)),
-        (376, 9, 3, 30) => Some((
-            Disposition::ImplementedAndVerified,
-            Disposition::AuditRequired,
-        )),
-        (377, 8, 3, 30) => Some((
-            Disposition::ImplementedAndVerified,
-            Disposition::ImplementedAndVerified,
-        )),
-        _ => None,
-    };
-    let capabilities = inventory
-        .capabilities
-        .iter()
-        .map(|capability| (capability.id.as_str(), capability))
-        .collect::<BTreeMap<_, _>>();
-    if let Some((wave7_expected, wave8_expected)) = expected_successor_dispositions {
-        for id in WAVE7_AGGREGATE_SUCCESSOR_IDS {
-            if capabilities
-                .get(id)
-                .is_none_or(|capability| capability.disposition != wave7_expected)
-            {
-                errors.push(format!(
-                    "specification benchmark successor phase drifted: {id}"
-                ));
-            }
-        }
-        if capabilities
-            .get(WAVE8_SUCCESSOR_ID)
-            .is_none_or(|capability| capability.disposition != wave8_expected)
-        {
-            errors.push(format!(
-                "specification benchmark Wave 8 successor phase drifted: {WAVE8_SUCCESSOR_ID}"
-            ));
-        }
-    } else {
+    if let Err(error) = classify_inventory_phase(inventory) {
+        let (implemented, audit_required, missing, impossible) = disposition_counts(inventory);
         errors.push(format!(
-            "specification benchmark terminal totals must be its exact 371/14/3/30 phase, the exact five-row Wave 7 successor 376/9/3/30 phase, or the exact one-row Wave 8 successor 377/8/3/30 phase, found {implemented}/{audit_required}/{missing}/{impossible}"
+            "specification benchmark terminal totals must be its exact 371/14/3/30 phase, the exact Wave 7 376/9/3/30 successor, the exact Wave 8 377/8/3/30 successor, or the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor; found {implemented}/{audit_required}/{missing}/{impossible}: {error}"
         ));
     }
 }
@@ -177,6 +121,7 @@ fn validate_contract(contract: &str, errors: &mut Vec<String>) {
         "logger.missed_metrics_count",
         "#1378",
         "371 implemented-and-verified",
+        "377/6/3/32",
     ] {
         if !contract.contains(token) {
             errors.push(format!(
@@ -229,7 +174,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let exact = format!(
-            "SPECIFICATION.md docs/network-performance.md scripts/specification-benchmark.py whole-process RSS logger.missed_metrics_count #1378 371 implemented-and-verified\n{rows}"
+            "SPECIFICATION.md docs/network-performance.md scripts/specification-benchmark.py whole-process RSS logger.missed_metrics_count #1378 371 implemented-and-verified 377/6/3/32\n{rows}"
         );
         let mut errors = Vec::new();
         validate_contract(&exact, &mut errors);

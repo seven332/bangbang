@@ -47,6 +47,224 @@ fn checked_inventory_is_valid_for_delivery() {
         .expect("checked inventory must satisfy delivery-time invariants");
 }
 
+fn local_reference(path: &str, anchor: &str) -> Reference {
+    Reference::Local {
+        path: path.to_string(),
+        anchor: Some(anchor.to_string()),
+    }
+}
+
+fn github_reference(url: &str) -> Reference {
+    Reference::Github {
+        url: url.to_string(),
+    }
+}
+
+fn authoritative_reference(url: &str) -> Reference {
+    Reference::Authoritative {
+        url: url.to_string(),
+    }
+}
+
+#[test]
+fn jailer_uid_gid_platform_limit_is_terminal_and_fail_closed() {
+    const TERMINAL_IDS: [&str; 2] = ["tool-argument:jailer/gid", "tool-argument:jailer/uid"];
+    const RETAINED_AUDIT_IDS: [&str; 4] = [
+        "corpus:jailer",
+        "corpus:production-host",
+        "tool-argument:jailer/chroot-base-dir",
+        "tool-operation:jailer/run",
+    ];
+    const CHALLENGE_URL: &str =
+        "https://github.com/seven332/bangbang/issues/1905#issuecomment-5249781101";
+
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|tools| tools.parent())
+        .expect("tool package must be nested under the repository tools directory")
+        .to_path_buf();
+    let manifest = read_source_manifest(&repository_root.join(SOURCE_MANIFEST_PATH))
+        .expect("checked source manifest must parse");
+    let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
+        .expect("checked capability inventory must parse");
+    let by_id = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
+
+    for id in TERMINAL_IDS {
+        let capability = by_id.get(id).expect("jailer identity must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::ProvenPlatformImpossible,
+            "jailer identity must retain its terminal platform disposition: {id}"
+        );
+        assert!(capability.implementation.is_empty());
+        assert!(capability.validation.is_empty());
+        assert!(capability.delivery_issue.is_none());
+        assert_eq!(capability.family, "isolation");
+        assert_eq!(
+            capability
+                .source_refs
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [id]
+        );
+        assert!(
+            capability
+                .summary
+                .contains("current-user production identity")
+        );
+        assert!(
+            capability
+                .summary
+                .contains("root-retained or root-transition")
+        );
+
+        let exclusion = capability
+            .exclusion
+            .as_ref()
+            .expect("terminal jailer identity must carry a complete exclusion");
+        let expected_upstream = if id == "tool-argument:jailer/gid" {
+            [
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L14-L38",
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L177-L182",
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L534-L549",
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L182-L186",
+            ]
+        } else {
+            [
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L14-L38",
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L170-L175",
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L534-L549",
+                "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L177-L181",
+            ]
+        };
+        assert_eq!(
+            exclusion.upstream_contract,
+            expected_upstream
+                .into_iter()
+                .map(authoritative_reference)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            exclusion.platform_evidence,
+            [
+                github_reference(
+                    "https://github.com/seven332/bangbang/issues/1904#issuecomment-5249533110",
+                ),
+                authoritative_reference(
+                    "https://developer.apple.com/documentation/security/app-sandbox"
+                ),
+            ]
+        );
+        assert_eq!(
+            exclusion
+                .alternatives
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "Adding a privileged helper or service creates the persistent elevated authority excluded by the fixed production topology.",
+                "Changing the worker's App Sandbox entitlement or adding a sandbox extension weakens or replaces the mandatory signed containment boundary.",
+                "Deriving a target root from an account, home directory, or caller-configurable path adds mutable identity or path authority outside the accepted product contract.",
+                "Relying on launcher or sudo-wrapper cleanup cannot converge after launcher loss and therefore does not supply the required independent worker cleanup owner.",
+                "Retiring the linked runtime name before grants avoids the denied cleanup operation but abandons the accepted linked foreground reachability and recovery contract.",
+            ]
+        );
+        assert_eq!(
+            exclusion.stable_behavior,
+            [
+                local_reference(
+                    "crates/launcher/src/launch_policy.rs",
+                    "pub(crate) fn validate_current(",
+                ),
+                local_reference(
+                    "crates/launcher/src/macos/daemon.rs",
+                    "pub(crate) fn launch_parent(",
+                ),
+                local_reference(
+                    "crates/launcher/src/supervisor.rs",
+                    "request.validate_current(layout.worker_executable(), request.requests_daemonize())?;",
+                ),
+            ]
+        );
+        assert_eq!(
+            exclusion.focused_tests,
+            [
+                local_reference(
+                    "crates/launcher/src/launch_policy.rs",
+                    "fn launch_identity_classifier_covers_current_and_exact_root_targets()",
+                ),
+                local_reference(
+                    "crates/launcher/tests/production_bundle_e2e.rs",
+                    "fn launcher_exposes_exact_jailer_help_version_and_policy_validation()",
+                ),
+            ]
+        );
+        assert_eq!(
+            exclusion.compatibility_docs,
+            [
+                local_reference(
+                    "compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md",
+                    "Product uid/gid runtime-root platform gate",
+                ),
+                local_reference(
+                    "compat/firecracker/v1.16.0/isolation-contract.md",
+                    "Terminal jailer uid/gid platform limit",
+                ),
+                local_reference(
+                    "docs/firecracker-compatibility.md",
+                    "Jailer uid/gid platform limit",
+                ),
+                local_reference(
+                    "docs/firecracker-validation-matrix.md",
+                    "macOS production isolation",
+                ),
+            ]
+        );
+        assert_eq!(
+            exclusion.security_docs,
+            [local_reference(
+                "docs/security.md",
+                "Jailer uid/gid fixed-topology platform limit",
+            )]
+        );
+        assert_eq!(exclusion.challenge, github_reference(CHALLENGE_URL));
+    }
+
+    for id in RETAINED_AUDIT_IDS {
+        let capability = by_id.get(id).expect("jailer sibling must exist");
+        assert_eq!(
+            capability.disposition,
+            Disposition::AuditRequired,
+            "unowned jailer sibling must remain audit-required: {id}"
+        );
+        assert!(capability.exclusion.is_none());
+    }
+
+    for id in TERMINAL_IDS {
+        let mut incomplete = inventory.clone();
+        incomplete
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("jailer identity must exist")
+            .exclusion = None;
+        let error = validate(
+            &manifest,
+            &incomplete,
+            &repository_root,
+            AuditMode::Delivery,
+        )
+        .expect_err("removing either terminal jailer exclusion must fail closed")
+        .to_string();
+        assert!(error.contains("requires exclusion evidence"));
+    }
+}
+
 #[test]
 fn checked_source_manifest_is_canonical_and_deterministic() {
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -767,7 +985,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        8
+        6
     );
     assert_eq!(
         inventory
@@ -785,7 +1003,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
                 capability.disposition == Disposition::ProvenPlatformImpossible
             })
             .count(),
-        30
+        32
     );
 
     let mut nonterminal = inventory.clone();
@@ -1874,7 +2092,12 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
     let current_handoffs = handoffs
         .iter()
         .copied()
-        .filter(|id| *id != WAVE8_ID)
+        .filter(|id| {
+            !matches!(
+                *id,
+                WAVE8_ID | "tool-argument:jailer/gid" | "tool-argument:jailer/uid"
+            )
+        })
         .collect::<BTreeSet<_>>();
     let implemented = CORE_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
     let logger_implemented = LOGGER_IMPLEMENTED.into_iter().collect::<BTreeSet<_>>();
@@ -3555,9 +3778,9 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4285,9 +4508,9 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4582,9 +4805,9 @@ fn network_mmds_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4731,9 +4954,9 @@ fn vsock_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 }
 
 #[test]
@@ -4979,9 +5202,9 @@ fn delivery_closure_policy_is_stable() {
             .count()
     };
     assert_eq!(count(Disposition::ImplementedAndVerified), 377);
-    assert_eq!(count(Disposition::AuditRequired), 8);
+    assert_eq!(count(Disposition::AuditRequired), 6);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 3);
-    assert_eq!(count(Disposition::ProvenPlatformImpossible), 30);
+    assert_eq!(count(Disposition::ProvenPlatformImpossible), 32);
 
     for id in IMPLEMENTED_ORIGINAL {
         assert_eq!(

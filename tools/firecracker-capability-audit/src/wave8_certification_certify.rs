@@ -103,6 +103,8 @@ fn validate_contract(repository_root: &Path, errors: &mut Vec<String>) {
         "three missing-platform-feasible",
         "30 proven-platform-impossible",
         "six #1373",
+        "377/6/3/32",
+        "four #1373",
         "two #1378",
         "three #1351",
         "validate --wave8-final",

@@ -245,7 +245,7 @@ interaction outcome. Aggregate completion does not infer completion of any of
 those handoffs.
 
 That 376/9/3/30 paragraph is the immutable #1799 phase recorded by this Wave 7
-authority. The phase-aware certifier also accepts exactly one successor:
+authority. The phase-aware certifier also accepts the exact later successors:
 
 ```console
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
@@ -254,12 +254,15 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-
 The successor promotes only
 `semantic.cross-capability:state-errors-metrics-security-and-snapshots` under
 the checked [Wave 8 contract](wave8-certification-contract.md), producing
-377/8/3/30. The remaining six #1373, two #1378, and three #1351 external
-outcomes stay nonterminal. Any other identity or count transition fails the
-Wave 7 gate.
+377/8/3/30. The later uid/gid platform-limit review moves only those two jailer
+argument identities to `proven-platform-impossible`, producing the current
+377/6/3/32 phase with four #1373, two #1378, and three #1351 outcomes still
+nonterminal. Any other identity or count transition fails the Wave 7 gate.
 
-The public-tool ledger derives 46 implemented leaves, five terminal Linux-only
-jailer exclusions, and four #1373 jailer handoffs. The virtio-MMIO ledger
+The historical public-tool ledger derives 46 implemented leaves, five terminal
+Linux-only jailer exclusions, and four #1373 jailer handoffs. Its exact current
+successor is 46 implemented, seven terminal platform exclusions, and two #1373
+handoffs. The virtio-MMIO ledger
 requires common identity/features/queue/notification/interrupt/status/reset/
 activation/configuration/restore/observability behavior, file and vhost-user
 block variants, pmem, network, vsock, entropy, balloon, and virtio-mem, with
@@ -370,7 +373,7 @@ interactions.
 
 ## Exact retained handoffs
 
-| Identity | Retained owner | Current disposition |
+| Identity | Retained owner | Wave 7 disposition |
 | --- | --- | --- |
 | `corpus:jailer` | #1373 | `audit-required` |
 | `corpus:production-host` | #1373 | `audit-required` |
@@ -381,6 +384,11 @@ interactions.
 | `corpus:network-setup` | #1378 | `audit-required` |
 | `semantic.network:virtio-net-vmnet-policy-and-connectivity` | #1378 | `audit-required` |
 | `semantic.cross-capability:state-errors-metrics-security-and-snapshots` | Wave 8 | `audit-required` |
+
+This table is the immutable Wave 7 handoff snapshot. Wave 8 later implements
+its cross-capability row; #1905 later makes only `jailer/gid` and `jailer/uid`
+terminal platform exclusions. The other four #1373 rows and both #1378 rows
+remain audit-required in the current inventory.
 
 ## Disposition accounting
 
@@ -422,7 +430,8 @@ after the checked source-complete authority derives every design semantic,
 device relation and API identity, release entry, public-tool leaf, and
 virtio-MMIO device profile while retaining all external handoffs. The #1799
 inventory was therefore exactly 376 implemented, nine audit-required, three
-missing-platform-feasible, and 30 proven-platform-impossible. The current Wave
-8 successor is exactly 377/eight/three/30. These are exact consequences of the
+missing-platform-feasible, and 30 proven-platform-impossible. The historical
+Wave 8 successor is exactly 377/eight/three/30; the current uid/gid-only
+successor is exactly 377/6/3/32. These are exact consequences of the
 corresponding row sets, not quotas; authoritative current totals remain
 derived from `capabilities.json` and are rechecked by `validate --wave8-final`.

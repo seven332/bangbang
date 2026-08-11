@@ -2043,10 +2043,12 @@ It derives the exact 93 parent-owned identities, 37 design semantics, 958
 device-table relations, 261 API identities, 21 release entries, 55 public-tool
 leaves, and every supported virtio-MMIO profile. It accepts only its historical
 inventory phase `376/9/3/30` with the Wave 8 row audit-required or the exact
-one-row Wave 8 successor `377/8/3/30`. It does not execute Kani, sign binaries,
-run HVF, or collect an environment report inside the Rust process: run the
-targeted Kani job, the full signed integration wrapper, and the specification
-collector separately for a current PR head.
+one-row Wave 8 successor `377/8/3/30`, followed by the exact uid/gid-only
+platform-limit successor `377/6/3/32`. Each phase is classified by exact
+identity sets, not counts. It does not execute Kani, sign binaries, run HVF, or
+collect an environment report inside the Rust process: run the targeted Kani
+job, the full signed integration wrapper, and the specification collector
+separately for a current PR head.
 
 ## Wave 8 final certification
 
@@ -2082,19 +2084,21 @@ scripts/run-integration-tests.sh --test production_bundle -- \
 
 The full signed wrapper remains the release gate because the Wave 8 authority
 also composes the supporting logger, metrics, fatal-exit, device, network, and
-snapshot suites. The authority independently groups all 30 impossible records
-into exact x86 CPUID/MSR (13), Linux KVM feature/template (7), Linux hugetlbfs
-`2M` (2), and Linux runtime-isolation (8) reviews. Per-ID exclusions remain
-mandatory.
+snapshot suites. The historical Wave 8 authority independently groups its 30
+impossible records into exact x86 CPUID/MSR (13), Linux KVM feature/template
+(7), Linux hugetlbfs `2M` (2), and Linux runtime-isolation (8) reviews. Per-ID
+exclusions remain mandatory. The later uid/gid-only successor adds two
+separately challenged fixed-topology exclusions without rewriting that
+historical partition.
 
-Exactly six #1373 audit rows, two #1378 audit rows, and three #1351 feasible
-rows remain; the checked authority owns the machine-derived current totals.
-The root/HVF gate has produced controlled #1373 and #1884 evidence, but it does
-not rewrite inventory by itself. The global `--final` command deliberately
-continues to fail until #1371 challenges and transitions those rows and the
-approved-vmnet and remaining feasible gates complete. The Rust command is
-offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
-merged-main OID are checked and recorded by the pull-request workflow.
+At Wave 8, exactly six #1373 audit rows, two #1378 audit rows, and three #1351
+feasible rows remained. The current `377/6/3/32` phase retains exactly four
+#1373 audit rows (`corpus:jailer`, `corpus:production-host`,
+`jailer/chroot-base-dir`, and `jailer/run`), the same two #1378 audit rows, and
+the same three #1351 feasible rows. The global `--final` command deliberately
+continues to fail on those six audit and three feasible records. The Rust
+command is offline; live GitHub hierarchy, reviews, CI, branches, merge state,
+and merged-main OID are checked and recorded by the pull-request workflow.
 
 ## Explicit Elevated Bootstrap Evidence
 
@@ -2110,6 +2114,17 @@ PR or CI gate. CI builds the statically isolated bundle and verifies its
 fail-closed non-root boundary; deterministic unit and process tests cover the
 authority codec and transport, session validation and locking, fault stages,
 and exact recovery without elevation.
+
+#1904 was a later gated product-topology experiment, not another checked
+feature-harness mode. On macOS 26.5.2 / SDK 26.5 it completed the exact
+`/private/tmp` root, permanent transition, authority, target-session, grants,
+and lifecycle prefix, then proved the App Sandbox worker cannot remove the
+inner session after launcher loss (`permission-denied`; outer cleanup `busy`).
+Unsandboxed launcher recovery converged with zero residue and the sudo wrapper
+only scanned. Implementation stopped before PR submission, so the commands
+below reproduce #1900 evidence only; they must not be used as a substitute for
+the #1904 result or its fresh #1905 Challenge.
+
 First build the test-only bundle as an ordinary user at an absent absolute
 destination whose ancestry is traversable by every selected numeric identity.
 A fresh directory beneath `/private/tmp` is recommended:
@@ -2271,7 +2286,9 @@ while a concurrent no-API launcher is killed. Exact raw wait statuses and
 bounded surviving-end cleanup are required. The wrapper only checks fixture
 and residue ledgers; it never removes a retired product session name. The
 remaining nonclaims are simultaneous uncatchable loss of both signed
-endpoints, restart/reconnect, and any public root/uid/gid policy.
+endpoints, restart/reconnect, and any positive public root/uid/gid mode. The
+later #1904/#1905 result supplies only the fixed prelaunch rejection described
+above.
 
 Stream credentials remained
 connection-time snapshots, datagram credentials were unsupported, opaque

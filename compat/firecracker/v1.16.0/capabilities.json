@@ -12871,7 +12871,7 @@
     {
       "id": "corpus:jailer",
       "family": "isolation",
-      "summary": "Five production launch-control leaves are implemented and the cgroup, network-namespace, and PID-namespace leaves have terminal macOS exclusions; continue auditing arbitrary uid/gid transition, configurable chroot ownership, remaining arguments, and aggregate jailer behavior.",
+      "summary": "Five production launch-control leaves are implemented; uid/gid and the cgroup, network-namespace, and PID-namespace leaves have terminal macOS exclusions. Continue auditing configurable chroot ownership, remaining arguments, and aggregate jailer behavior.",
       "source_refs": [
         "corpus:jailer"
       ],
@@ -15522,7 +15522,7 @@
     {
       "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
       "family": "isolation",
-      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a closed environment and default-close standard/lifecycle/grant/vsock-broker/vhost-user-broker descriptor allowlist, authenticated lifecycle v5 credential/resource-limit/vmnet launch policy, exact worker-only RLIMIT_FSIZE/RLIMIT_NOFILE, current-credential and session verification, a descriptor-entered locked private namespace, and exact contained consumption of granted file, create-children socket/snapshot, and connect-only vhost-user authority. The canonical vmnet policy is immutable and redacted, and final contained InstanceStart enforces complete resource and network preflight before backend construction or the first vhost broker request. A signed same-code launcher re-exec provides detached readiness, PID, signal, supervision, and cleanup ownership without exposing an orphaned worker. Normal signed execution proves outside-container descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, snapshot staging recovery preserves replacements, both real vsock initiation directions work, two exact vhost-user children share one retained directory grant without a helper or entitlement change, active PATCH reuses its stream, and networkless vmnet requests are rejected. A disposable feature-gated signed bundle further proves coherent root-plus-vsock restore authority, reverse abort and reuse, deterministic cancellation, one-time adoption, replacement-safe and independent-death cleanup, concurrent same-ID isolation, unchanged entitlements, no ambient worker path, and no ready-state helper; the normal bundle excludes the probe. The exact Linux seccomp, cgroup, network-namespace, and PID-namespace mechanisms have terminal macOS platform exclusions rather than false native aliases. Arbitrary uid/gid transition and configurable chroot ownership, general brokerage and hard revocation, cross-filesystem socket publication, real vmnet start/connectivity/cleanup evidence and repository-owned approved credentials, and deployment outcomes remain feasible independent work under #1351.",
+      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a closed environment and default-close standard/lifecycle/grant/vsock-broker/vhost-user-broker descriptor allowlist, authenticated lifecycle v5 credential/resource-limit/vmnet launch policy, exact worker-only RLIMIT_FSIZE/RLIMIT_NOFILE, current-credential and session verification, a descriptor-entered locked private namespace, and exact contained consumption of granted file, create-children socket/snapshot, and connect-only vhost-user authority. The canonical vmnet policy is immutable and redacted, and final contained InstanceStart enforces complete resource and network preflight before backend construction or the first vhost broker request. A signed same-code launcher re-exec provides detached readiness, PID, signal, supervision, and cleanup ownership without exposing an orphaned worker. Normal signed execution proves outside-container descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, snapshot staging recovery preserves replacements, both real vsock initiation directions work, two exact vhost-user children share one retained directory grant without a helper or entitlement change, active PATCH reuses its stream, and networkless vmnet requests are rejected. A disposable feature-gated signed bundle further proves coherent root-plus-vsock restore authority, reverse abort and reuse, deterministic cancellation, one-time adoption, replacement-safe and independent-death cleanup, concurrent same-ID isolation, unchanged entitlements, no ambient worker path, and no ready-state helper; the normal bundle excludes the probe. The exact uid/gid, Linux seccomp, cgroup, network-namespace, and PID-namespace contracts have terminal macOS platform exclusions rather than false native aliases. Configurable chroot ownership, general brokerage and hard revocation, cross-filesystem socket publication, real vmnet start/connectivity/cleanup evidence and repository-owned approved credentials, and deployment outcomes remain feasible independent work under #1351.",
       "source_refs": [
         "corpus:jailer",
         "corpus:production-host",
@@ -16726,7 +16726,7 @@
     {
       "id": "semantic.tools:packaging-help-errors-and-applicable-operations",
       "family": "public-tools",
-      "summary": "Certify the exact six-tool, 55-leaf public surface as 46 implemented operations/arguments, five proven Linux-only jailer exclusions, and four retained #1373 jailer identity handoffs, with actual-binary help, strict-input, failure, publication, redaction, and applicable signed-product evidence.",
+      "summary": "Certify the exact six-tool, 55-leaf public surface as 46 implemented operations/arguments, seven proven jailer platform exclusions, and two retained #1373 jailer identity handoffs, with actual-binary help, strict-input, failure, publication, redaction, and applicable signed-product evidence.",
       "source_refs": [
         "corpus:cpu-template-helper",
         "corpus:jailer",
@@ -18086,11 +18086,110 @@
     {
       "id": "tool-argument:jailer/gid",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/gid.",
+      "summary": "Retain current-user production identity but reject root-retained or root-transition jailer gid with a fixed redacted policy result; the full arbitrary numeric contract is unavailable because the mandatory App Sandbox worker cannot independently retire its linked target runtime after launcher loss in the fixed no-helper topology.",
       "source_refs": [
         "tool-argument:jailer/gid"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L14-L38"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L177-L182"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L534-L549"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L182-L186"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "github",
+            "url": "https://github.com/seven332/bangbang/issues/1904#issuecomment-5249533110"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          }
+        ],
+        "alternatives": [
+          "Adding a privileged helper or service creates the persistent elevated authority excluded by the fixed production topology.",
+          "Changing the worker's App Sandbox entitlement or adding a sandbox extension weakens or replaces the mandatory signed containment boundary.",
+          "Deriving a target root from an account, home directory, or caller-configurable path adds mutable identity or path authority outside the accepted product contract.",
+          "Relying on launcher or sudo-wrapper cleanup cannot converge after launcher loss and therefore does not supply the required independent worker cleanup owner.",
+          "Retiring the linked runtime name before grants avoids the denied cleanup operation but abandons the accepted linked foreground reachability and recovery contract."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "pub(crate) fn validate_current("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/macos/daemon.rs",
+            "anchor": "pub(crate) fn launch_parent("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/supervisor.rs",
+            "anchor": "request.validate_current(layout.worker_executable(), request.requests_daemonize())?;"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "fn launch_identity_classifier_covers_current_and_exact_root_targets()"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn launcher_exposes_exact_jailer_help_version_and_policy_validation()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md",
+            "anchor": "Product uid/gid runtime-root platform gate"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Terminal jailer uid/gid platform limit"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Jailer uid/gid platform limit"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-validation-matrix.md",
+            "anchor": "macOS production isolation"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Jailer uid/gid fixed-topology platform limit"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1905#issuecomment-5249781101"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/id",
@@ -18429,11 +18528,110 @@
     {
       "id": "tool-argument:jailer/uid",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/uid.",
+      "summary": "Retain current-user production identity but reject root-retained or root-transition jailer uid with a fixed redacted policy result; the full arbitrary numeric contract is unavailable because the mandatory App Sandbox worker cannot independently retire its linked target runtime after launcher loss in the fixed no-helper topology.",
       "source_refs": [
         "tool-argument:jailer/uid"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L14-L38"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L170-L175"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L534-L549"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L177-L181"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "github",
+            "url": "https://github.com/seven332/bangbang/issues/1904#issuecomment-5249533110"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          }
+        ],
+        "alternatives": [
+          "Adding a privileged helper or service creates the persistent elevated authority excluded by the fixed production topology.",
+          "Changing the worker's App Sandbox entitlement or adding a sandbox extension weakens or replaces the mandatory signed containment boundary.",
+          "Deriving a target root from an account, home directory, or caller-configurable path adds mutable identity or path authority outside the accepted product contract.",
+          "Relying on launcher or sudo-wrapper cleanup cannot converge after launcher loss and therefore does not supply the required independent worker cleanup owner.",
+          "Retiring the linked runtime name before grants avoids the denied cleanup operation but abandons the accepted linked foreground reachability and recovery contract."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "pub(crate) fn validate_current("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/macos/daemon.rs",
+            "anchor": "pub(crate) fn launch_parent("
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/supervisor.rs",
+            "anchor": "request.validate_current(layout.worker_executable(), request.requests_daemonize())?;"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "fn launch_identity_classifier_covers_current_and_exact_root_targets()"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn launcher_exposes_exact_jailer_help_version_and_policy_validation()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md",
+            "anchor": "Product uid/gid runtime-root platform gate"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Terminal jailer uid/gid platform limit"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Jailer uid/gid platform limit"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-validation-matrix.md",
+            "anchor": "macOS production isolation"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Jailer uid/gid fixed-topology platform limit"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1905#issuecomment-5249781101"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/version",
@@ -19574,7 +19772,7 @@
     {
       "id": "tool-operation:jailer/run",
       "family": "isolation",
-      "summary": "The fixed-code/current-user/resource-limit/daemon leaves are implemented and Linux cgroup/network/PID namespace inputs have terminal macOS exclusions; continue auditing uid/gid/chroot, remaining arguments, ordering, and the aggregate jailer run contract.",
+      "summary": "The fixed-code/current-user/resource-limit/daemon leaves are implemented and uid/gid plus Linux cgroup/network/PID namespace inputs have terminal macOS exclusions; continue auditing chroot, remaining arguments, ordering, and the aggregate jailer run contract.",
       "source_refs": [
         "tool-operation:jailer/run"
       ],

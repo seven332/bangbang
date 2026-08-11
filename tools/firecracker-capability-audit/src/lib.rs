@@ -9,6 +9,7 @@ mod formal_verification_certify;
 mod guest_workflow_audit_model;
 mod guest_workflow_audit_validate;
 mod guest_workflow_certify;
+mod inventory_phase;
 mod logger_certify;
 mod logger_model;
 mod logger_upstream;
