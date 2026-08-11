@@ -274,7 +274,7 @@ mod tests {
         );
         set_disposition(
             &mut inventory,
-            "corpus:jailer",
+            "tool-argument:jailer/chroot-base-dir",
             Disposition::ProvenPlatformImpossible,
         );
         assert!(
@@ -299,5 +299,36 @@ mod tests {
                 .expect_err("terminal equal-count swap must fail")
                 .contains("identity partition")
         );
+
+        let mut aggregate_swap = current_inventory();
+        set_disposition(
+            &mut aggregate_swap,
+            "corpus:jailer",
+            Disposition::ImplementedAndVerified,
+        );
+        set_disposition(
+            &mut aggregate_swap,
+            "api-operation:GET /",
+            Disposition::AuditRequired,
+        );
+        assert!(
+            classify_inventory_phase(&aggregate_swap)
+                .expect_err("aggregate equal-count movement must fail")
+                .contains("identity partition")
+        );
+    }
+
+    #[test]
+    fn partial_uid_gid_successors_do_not_classify() {
+        for id in JAILER_UID_GID_IDS {
+            let mut partial = current_inventory();
+            set_disposition(&mut partial, id, Disposition::AuditRequired);
+            assert!(
+                classify_inventory_phase(&partial)
+                    .expect_err("one terminal jailer identity alone must not classify")
+                    .contains("inventory does not match an exact accepted phase"),
+                "partial successor unexpectedly classified: {id}"
+            );
+        }
     }
 }
