@@ -20,6 +20,9 @@ pub(crate) const JAILER_CHROOT_BASE_DIR_ID: &str = "tool-argument:jailer/chroot-
 
 pub(crate) const JAILER_AGGREGATE_IDS: [&str; 2] = ["corpus:jailer", "tool-operation:jailer/run"];
 
+pub(crate) const MULTIPROCESS_ISOLATION_ID: &str =
+    "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity";
+
 const WAVE8_AUDIT_IDS: [&str; 8] = [
     "corpus:jailer",
     "corpus:network-setup",
@@ -87,6 +90,7 @@ pub(crate) enum InventoryPhase {
     JailerUidGidPlatformLimit,
     JailerChrootPlatformLimit,
     JailerAggregate,
+    MultiprocessIsolation,
 }
 
 impl InventoryPhase {
@@ -98,6 +102,7 @@ impl InventoryPhase {
             Self::JailerUidGidPlatformLimit => "post-Wave-8 jailer uid/gid 377/6/3/32",
             Self::JailerChrootPlatformLimit => "post-uid/gid jailer chroot-base-dir 377/5/3/33",
             Self::JailerAggregate => "aggregate jailer 379/3/3/33",
+            Self::MultiprocessIsolation => "multiprocess isolation 380/3/2/33",
         }
     }
 }
@@ -113,6 +118,7 @@ pub(crate) fn classify_inventory_phase(
         (377, 6, 3, 32) => InventoryPhase::JailerUidGidPlatformLimit,
         (377, 5, 3, 33) => InventoryPhase::JailerChrootPlatformLimit,
         (379, 3, 3, 33) => InventoryPhase::JailerAggregate,
+        (380, 3, 2, 33) => InventoryPhase::MultiprocessIsolation,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -124,7 +130,7 @@ pub(crate) fn classify_inventory_phase(
         (Disposition::AuditRequired, expected_audit_ids(phase)),
         (
             Disposition::MissingPlatformFeasible,
-            expected_feasible_ids(),
+            expected_feasible_ids(phase),
         ),
         (
             Disposition::ProvenPlatformImpossible,
@@ -146,7 +152,7 @@ pub(crate) fn classify_inventory_phase(
 pub(crate) fn expected_disposition(phase: InventoryPhase, id: &str) -> Disposition {
     if expected_audit_ids(phase).contains(id) {
         Disposition::AuditRequired
-    } else if expected_feasible_ids().contains(id) {
+    } else if expected_feasible_ids(phase).contains(id) {
         Disposition::MissingPlatformFeasible
     } else if expected_impossible_ids(phase).contains(id) {
         Disposition::ProvenPlatformImpossible
@@ -158,7 +164,7 @@ pub(crate) fn expected_disposition(phase: InventoryPhase, id: &str) -> Dispositi
 pub(crate) fn expected_nonterminal_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
     expected_audit_ids(phase)
         .into_iter()
-        .chain(expected_feasible_ids())
+        .chain(expected_feasible_ids(phase))
         .collect()
 }
 
@@ -169,12 +175,15 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
         InventoryPhase::JailerUidGidPlatformLimit
             | InventoryPhase::JailerChrootPlatformLimit
             | InventoryPhase::JailerAggregate
+            | InventoryPhase::MultiprocessIsolation
     ) {
         ids.extend(JAILER_UID_GID_IDS);
     }
     if matches!(
         phase,
-        InventoryPhase::JailerChrootPlatformLimit | InventoryPhase::JailerAggregate
+        InventoryPhase::JailerChrootPlatformLimit
+            | InventoryPhase::JailerAggregate
+            | InventoryPhase::MultiprocessIsolation
     ) {
         ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
@@ -224,7 +233,7 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             }
             ids.remove(JAILER_CHROOT_BASE_DIR_ID);
         }
-        InventoryPhase::JailerAggregate => {
+        InventoryPhase::JailerAggregate | InventoryPhase::MultiprocessIsolation => {
             for id in JAILER_UID_GID_IDS {
                 ids.remove(id);
             }
@@ -237,8 +246,14 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
     ids
 }
 
-fn expected_feasible_ids() -> BTreeSet<&'static str> {
-    MISSING_PLATFORM_FEASIBLE_IDS.into_iter().collect()
+fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
+    let mut ids = MISSING_PLATFORM_FEASIBLE_IDS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if phase == InventoryPhase::MultiprocessIsolation {
+        ids.remove(MULTIPROCESS_ISOLATION_ID);
+    }
+    ids
 }
 
 fn disposition_ids(inventory: &CapabilityInventory, disposition: Disposition) -> BTreeSet<&str> {
@@ -277,10 +292,21 @@ mod tests {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::MultiprocessIsolation)
+        );
+
+        let mut aggregate = current.clone();
+        set_disposition(
+            &mut aggregate,
+            MULTIPROCESS_ISOLATION_ID,
+            Disposition::MissingPlatformFeasible,
+        );
+        assert_eq!(
+            classify_inventory_phase(&aggregate),
             Ok(InventoryPhase::JailerAggregate)
         );
 
-        let mut chroot = current.clone();
+        let mut chroot = aggregate;
         for id in JAILER_AGGREGATE_IDS {
             set_disposition(&mut chroot, id, Disposition::AuditRequired);
         }
@@ -379,6 +405,11 @@ mod tests {
         let mut wave8 = current_inventory();
         set_disposition(
             &mut wave8,
+            MULTIPROCESS_ISOLATION_ID,
+            Disposition::MissingPlatformFeasible,
+        );
+        set_disposition(
+            &mut wave8,
             JAILER_CHROOT_BASE_DIR_ID,
             Disposition::AuditRequired,
         );
@@ -400,6 +431,11 @@ mod tests {
     #[test]
     fn chroot_without_uid_gid_predecessor_does_not_classify() {
         let mut partial = current_inventory();
+        set_disposition(
+            &mut partial,
+            MULTIPROCESS_ISOLATION_ID,
+            Disposition::MissingPlatformFeasible,
+        );
         for id in JAILER_AGGREGATE_IDS {
             set_disposition(&mut partial, id, Disposition::AuditRequired);
         }

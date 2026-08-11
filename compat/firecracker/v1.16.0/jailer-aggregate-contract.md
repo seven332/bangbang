@@ -124,7 +124,9 @@ because Bangbang does not build Linux mount/cgroup hierarchies.
 The #1912 transition is exactly `377/5/3/33` to `379/3/3/33`. A checked digest
 pins every unrelated capability record, so changing an unrelated summary,
 source, disposition, ownership marker, or evidence fails even when cardinality
-is preserved.
+is preserved. At the exact `380/3/2/33` multiprocess successor, the checked
+digest advances to include that independently certified row while the two
+#1912 rows and their original transition remain unchanged.
 
 | Capability | Owner | Disposition |
 | --- | --- | --- |

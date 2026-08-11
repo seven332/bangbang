@@ -162,7 +162,7 @@ sub-cause, and the aggregate records' independent nonterminal state.
 
 ## Exact aggregate-jailer successor
 
-The current aggregate-jailer successor is exactly `379/3/3/33`: 379
+The aggregate-jailer successor is exactly `379/3/3/33`: 379
 implemented, three audit-required, three missing-platform-feasible, and 33
 proven-platform-impossible. It moves only `corpus:jailer` and
 `tool-operation:jailer/run` to implemented-and-verified. The six remaining
@@ -179,7 +179,20 @@ digest of every unrelated inventory record. It composes five implemented
 argument leaves with eight terminal fixed-topology exclusions without changing
 any leaf disposition. It does not claim Linux mechanism parity,
 production-host deployment, external vmnet connectivity, or completion of the
-three isolation composites.
+three isolation composites at that historical phase.
+
+## Exact multiprocess-isolation successor
+
+The current multiprocess-isolation successor is exactly `380/3/2/33`: 380
+implemented, three audit-required, two missing-platform-feasible, and 33
+proven-platform-impossible. It moves only
+`semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
+to implemented-and-verified. The five remaining nonterminal outcomes are one
+#1373 audit-required outcome, the same two #1378 audit-required outcomes, and
+two #1351 missing-platform-feasible isolation semantics. The checked
+[multiprocess isolation contract](multiprocess-isolation-contract.md) pins 13
+ordered design/production-host clauses, current-tree evidence, terminal
+dependencies, residual classifications, and every explicit nonclaim.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -199,11 +212,12 @@ certifier, and the Wave 8 authority. The Wave 7 artifact remains historical at
 376/9/3/30 with one Wave 8 handoff. Its certifier accepts that exact historical
 phase, the exact one-row Wave 8 successor at 377/8/3/30, or the exact uid/gid-
 only successor at 377/6/3/32, or the exact configurable-chroot-only successor
-at 377/5/3/33, or the exact aggregate-jailer successor at 379/3/3/33; it
+at 377/5/3/33, the exact aggregate-jailer successor at 379/3/3/33, or the exact
+multiprocess-isolation successor at 380/3/2/33; it
 rejects unrelated, count-preserving identity swaps, and partial drift.
 
 The global `--final` mode remains stronger and intentionally fails while the
-three audit-required and three feasible external outcomes remain. Neither Wave
+three audit-required and two feasible external outcomes remain. Neither Wave
 8 nor any exact later successor weakens that completion gate.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,
