@@ -544,6 +544,7 @@ const READ_ONLY_BLOCK_FAILURE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_F
 const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const PROCESS_FAILURE_EXIT_CODE: i32 = 1;
+const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const REAL_PERIODIC_METRICS_TIMEOUT: Duration = Duration::from_secs(90);
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -22856,12 +22857,9 @@ fn try_http_request(
     body: &str,
 ) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )?;
+    stream.set_read_timeout(Some(HTTP_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_IO_TIMEOUT))?;
+    write_http_request_frame(&mut stream, method, path, body)?;
     if let Err(error) = stream.shutdown(std::net::Shutdown::Write)
         && error.kind() != std::io::ErrorKind::NotConnected
     {
@@ -22870,6 +22868,50 @@ fn try_http_request(
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(response)
+}
+
+fn write_http_request_frame(
+    writer: &mut impl Write,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    writer.write_all(request.as_bytes())
+}
+
+#[test]
+fn production_http_request_writer_submits_one_complete_frame() {
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let body = r#"{"state":"Resumed","marker":"雪"}"#;
+    let expected = format!(
+        "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut writer = RecordingWriter::default();
+
+    write_http_request_frame(&mut writer, "PATCH", "/vm", body)
+        .expect("complete production HTTP frame should write");
+
+    assert_eq!(writer.writes, vec![expected.into_bytes()]);
 }
 
 fn assert_http_status(response: &str, expected: u16, context: &str) {
