@@ -680,6 +680,13 @@ enum RequestRead {
     TooLarge,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RequestProgress {
+    Complete(usize),
+    Read(usize),
+    TooLarge,
+}
+
 fn handle_connection(
     stream: &mut UnixStream,
     vmm: &mut impl VmmRequestHandler,
@@ -2205,26 +2212,21 @@ fn read_request_until_with_limit(
     let mut chunk = [0; READ_CHUNK_SIZE];
 
     loop {
-        let remaining = match request_total_len_with_limit(&request, http_api_max_payload_size) {
-            Ok(Some(total_len)) if request.len() >= total_len => {
+        let remaining = match request_progress(&request, http_api_max_payload_size) {
+            RequestProgress::Complete(total_len) => {
                 request.truncate(total_len);
                 return Ok(RequestRead::Complete(request));
             }
-            Ok(Some(total_len)) => total_len.saturating_sub(request.len()),
-            Ok(None) => HTTP_MAX_REQUEST_HEAD_SIZE.saturating_sub(request.len()),
-            Err(RequestError::PayloadTooLarge) => return Ok(RequestRead::TooLarge),
-            Err(_) => return Ok(RequestRead::Complete(request)),
+            RequestProgress::Read(remaining) => remaining,
+            RequestProgress::TooLarge => return Ok(RequestRead::TooLarge),
         };
-        if remaining == 0 {
-            return Ok(RequestRead::Complete(request));
-        }
 
         let read_len = chunk.len().min(remaining);
         let Some(read_timeout) = deadline.checked_duration_since(now()) else {
-            return Ok(RequestRead::Complete(request));
+            return drain_ready_request_with_limit(stream, request, http_api_max_payload_size);
         };
         if read_timeout.is_zero() {
-            return Ok(RequestRead::Complete(request));
+            return drain_ready_request_with_limit(stream, request, http_api_max_payload_size);
         }
         stream
             .set_read_timeout(Some(read_timeout))
@@ -2241,7 +2243,7 @@ fn read_request_until_with_limit(
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                return Ok(RequestRead::Complete(request));
+                return drain_ready_request_with_limit(stream, request, http_api_max_payload_size);
             }
             Err(err) => return Err(ApiServerError::Connection(err.kind())),
         };
@@ -2255,6 +2257,81 @@ fn read_request_until_with_limit(
             .ok_or(ApiServerError::Connection(std::io::ErrorKind::InvalidInput))?;
         request.extend_from_slice(bytes);
     }
+}
+
+fn request_progress(request: &[u8], http_api_max_payload_size: usize) -> RequestProgress {
+    let remaining = match request_total_len_with_limit(request, http_api_max_payload_size) {
+        Ok(Some(total_len)) if request.len() >= total_len => {
+            return RequestProgress::Complete(total_len);
+        }
+        Ok(Some(total_len)) => total_len.saturating_sub(request.len()),
+        Ok(None) => HTTP_MAX_REQUEST_HEAD_SIZE.saturating_sub(request.len()),
+        Err(RequestError::PayloadTooLarge) => return RequestProgress::TooLarge,
+        Err(_) => return RequestProgress::Complete(request.len()),
+    };
+
+    if remaining == 0 {
+        RequestProgress::Complete(request.len())
+    } else {
+        RequestProgress::Read(remaining)
+    }
+}
+
+// The total request deadline bounds waiting, not bytes which the kernel has
+// already made readable. Drain those bytes without blocking, then restore the
+// accepted stream's blocking mode before response I/O.
+fn drain_ready_request_with_limit(
+    stream: &mut UnixStream,
+    mut request: Vec<u8>,
+    http_api_max_payload_size: usize,
+) -> Result<RequestRead, ApiServerError> {
+    stream
+        .set_nonblocking(true)
+        .map_err(|err| ApiServerError::Connection(err.kind()))?;
+
+    let result = (|| {
+        let mut chunk = [0; READ_CHUNK_SIZE];
+        loop {
+            let remaining = match request_progress(&request, http_api_max_payload_size) {
+                RequestProgress::Complete(total_len) => {
+                    request.truncate(total_len);
+                    return Ok(RequestRead::Complete(request));
+                }
+                RequestProgress::Read(remaining) => remaining,
+                RequestProgress::TooLarge => return Ok(RequestRead::TooLarge),
+            };
+            let read_len = chunk.len().min(remaining);
+            let read_buffer = chunk
+                .get_mut(..read_len)
+                .ok_or(ApiServerError::Connection(std::io::ErrorKind::InvalidInput))?;
+            let bytes_read = match stream.read(read_buffer) {
+                Ok(bytes_read) => bytes_read,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Ok(RequestRead::Complete(request));
+                }
+                Err(err) => return Err(ApiServerError::Connection(err.kind())),
+            };
+
+            if bytes_read == 0 {
+                return Ok(RequestRead::Complete(request));
+            }
+
+            let bytes = chunk
+                .get(..bytes_read)
+                .ok_or(ApiServerError::Connection(std::io::ErrorKind::InvalidInput))?;
+            request.extend_from_slice(bytes);
+        }
+    })();
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| ApiServerError::Connection(err.kind()))?;
+    result
 }
 
 #[cfg(test)]
@@ -13458,6 +13535,79 @@ mod tests {
             .expect("read timeout should not fail");
 
         assert_eq!(request, RequestRead::Complete(partial_request.to_vec()));
+        // SAFETY: `F_GETFL` only inspects the live server fixture descriptor.
+        let flags = unsafe { libc::fcntl(server.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn request_read_deadline_drains_fully_queued_request() {
+        let (mut client, mut server) = UnixStream::pair().expect("stream pair should be created");
+        let body = format!(r#""{}""#, "a".repeat(READ_CHUNK_SIZE));
+        let request = request_with_body("PUT", "/mmds", &body);
+        assert!(request.len() > READ_CHUNK_SIZE);
+        client
+            .write_all(request.as_bytes())
+            .expect("client should queue the complete request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("client should close its write half");
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let mut first_now = true;
+        let mut now = || {
+            if std::mem::replace(&mut first_now, false) {
+                start
+            } else {
+                deadline + Duration::from_nanos(1)
+            }
+        };
+
+        let read = read_request_until(&mut server, deadline, &mut now)
+            .expect("ready request bytes should drain without waiting");
+
+        assert_eq!(read, RequestRead::Complete(request.into_bytes()));
+        // SAFETY: `F_GETFL` only inspects the live server fixture descriptor.
+        let flags = unsafe { libc::fcntl(server.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn request_read_deadline_ready_drain_preserves_payload_limit() {
+        let (mut client, mut server) = UnixStream::pair().expect("stream pair should be created");
+        let padding = "a".repeat(READ_CHUNK_SIZE);
+        let request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nX-Fill: {padding}\r\nContent-Length: 2\r\n\r\n{{}}"
+        );
+        client
+            .write_all(request.as_bytes())
+            .expect("client should queue the oversized request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("client should close its write half");
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let mut first_now = true;
+        let mut now = || {
+            if std::mem::replace(&mut first_now, false) {
+                start
+            } else {
+                deadline + Duration::from_nanos(1)
+            }
+        };
+
+        let read = read_request_until_with_limit(&mut server, deadline, &mut now, 1)
+            .expect("ready oversized request should classify without waiting");
+
+        assert_eq!(read, RequestRead::TooLarge);
+        // SAFETY: `F_GETFL` only inspects the live server fixture descriptor.
+        let flags = unsafe { libc::fcntl(server.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
     }
 
     #[test]
