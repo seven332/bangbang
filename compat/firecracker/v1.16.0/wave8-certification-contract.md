@@ -145,8 +145,8 @@ records.
 The later configurable-chroot successor is exactly `377/5/3/33`: 377
 implemented, five audit-required, three missing-platform-feasible, and 33
 proven-platform-impossible. It moves only
-`tool-argument:jailer/chroot-base-dir`. The current eight nonterminal outcomes
-are:
+`tool-argument:jailer/chroot-base-dir`. The eight nonterminal outcomes at that
+phase were:
 
 - three #1373 audit-required outcomes: `corpus:jailer`,
   `corpus:production-host`, and `jailer/run`;
@@ -159,6 +159,27 @@ alternatives, a stable pre-value rejection, focused portable and signed tests,
 compatibility/security documentation, and #1908 Challenge authority. It
 preserves public chroot and spawn-root inheritance, the unknown inherited child
 sub-cause, and the aggregate records' independent nonterminal state.
+
+## Exact aggregate-jailer successor
+
+The current aggregate-jailer successor is exactly `379/3/3/33`: 379
+implemented, three audit-required, three missing-platform-feasible, and 33
+proven-platform-impossible. It moves only `corpus:jailer` and
+`tool-operation:jailer/run` to implemented-and-verified. The six remaining
+nonterminal outcomes are:
+
+- one #1373 audit-required outcome: `corpus:production-host`;
+- the same two #1378 audit-required outcomes; and
+- the same three #1351 missing-platform-feasible isolation semantics.
+
+The checked [aggregate jailer contract](jailer-aggregate-contract.md) requires
+the complete pinned jailer corpus, 13 ordered argument leaves, 16 ordered
+operation steps, seven corpus sections, current-tree evidence, and an exact
+digest of every unrelated inventory record. It composes five implemented
+argument leaves with eight terminal fixed-topology exclusions without changing
+any leaf disposition. It does not claim Linux mechanism parity,
+production-host deployment, external vmnet connectivity, or completion of the
+three isolation composites.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -178,12 +199,12 @@ certifier, and the Wave 8 authority. The Wave 7 artifact remains historical at
 376/9/3/30 with one Wave 8 handoff. Its certifier accepts that exact historical
 phase, the exact one-row Wave 8 successor at 377/8/3/30, or the exact uid/gid-
 only successor at 377/6/3/32, or the exact configurable-chroot-only successor
-at 377/5/3/33; it rejects unrelated, count-preserving identity swaps, and
-partial drift.
+at 377/5/3/33, or the exact aggregate-jailer successor at 379/3/3/33; it
+rejects unrelated, count-preserving identity swaps, and partial drift.
 
 The global `--final` mode remains stronger and intentionally fails while the
-five audit-required and three feasible external outcomes remain. Neither Wave
-8 nor either exact later successor weakens that completion gate.
+three audit-required and three feasible external outcomes remain. Neither Wave
+8 nor any exact later successor weakens that completion gate.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,
 assignment, review threads, pull-request checks, remote branches, merge state,

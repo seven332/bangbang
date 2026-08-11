@@ -148,10 +148,13 @@ Historical delivery arithmetic belongs in Git and GitHub.
 
 Wave 7 retains its historical handoff snapshot. The phase-aware gates accept
 only the exact Wave 8 one-row successor, the later exact uid/gid-only
-377/6/3/32 successor, and the current exact configurable-chroot-only
-377/5/3/33 successor while retaining the remaining #1351/#1373/#1378 external
-outcomes. See the [Wave 8 contract](wave8-certification-contract.md) for the
-checked transitions and [`docs/testing.md`](../../../docs/testing.md#wave-8-final-certification)
+377/6/3/32 successor, the exact configurable-chroot-only 377/5/3/33 successor,
+and the current aggregate-jailer 379/3/3/33 successor while retaining the
+remaining #1351/#1373/#1378 external outcomes. See the
+[Wave 8 contract](wave8-certification-contract.md) for the checked transitions,
+the [aggregate jailer contract](jailer-aggregate-contract.md) for the current
+two-row transition, and
+[`docs/testing.md`](../../../docs/testing.md#aggregate-jailer-certification)
 for the canonical commands.
 
 ## Guest workflow artifact authority

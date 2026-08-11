@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    CAPABILITY_INVENTORY_PATH, Disposition, Reference, SOURCE_MANIFEST_PATH,
-    WAVE7_AGGREGATE_AUDIT_PATH, WAVE7_AGGREGATE_CAPABILITY_IDS, WAVE7_OWNED_CAPABILITY_IDS,
-    WAVE7_PLATFORM_IMPOSSIBLE_CAPABILITY_IDS, Wave7AggregateAudit, Wave7AggregateNonclaim,
-    Wave7HandoffOwner, read_capability_inventory, read_source_manifest, read_wave7_aggregate_audit,
-    validate_wave7_aggregate_audit, validate_wave7_aggregate_compatibility,
-    wave7_aggregate_audit_json,
+    CAPABILITY_INVENTORY_PATH, Disposition, JAILER_AGGREGATE_CAPABILITY_IDS, Reference,
+    SOURCE_MANIFEST_PATH, WAVE7_AGGREGATE_AUDIT_PATH, WAVE7_AGGREGATE_CAPABILITY_IDS,
+    WAVE7_OWNED_CAPABILITY_IDS, WAVE7_PLATFORM_IMPOSSIBLE_CAPABILITY_IDS, Wave7AggregateAudit,
+    Wave7AggregateNonclaim, Wave7HandoffOwner, read_capability_inventory, read_source_manifest,
+    read_wave7_aggregate_audit, validate_wave7_aggregate_audit,
+    validate_wave7_aggregate_compatibility, wave7_aggregate_audit_json,
 };
 
 fn repository_root() -> PathBuf {
@@ -186,6 +186,16 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
         .expect("terminal Wave 7 aggregate must certify");
 
     let mut historical = inventory.clone();
+    for id in JAILER_AGGREGATE_CAPABILITY_IDS {
+        let capability = historical
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("aggregate-jailer successor capability must exist");
+        capability.disposition = Disposition::AuditRequired;
+        capability.implementation.clear();
+        capability.validation.clear();
+    }
     for id in [
         "tool-argument:jailer/chroot-base-dir",
         "tool-argument:jailer/gid",

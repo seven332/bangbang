@@ -359,8 +359,10 @@ reproduction instructions below cover the earlier #1900 evidence harness and
 must not be presented as a checked reproducer for the discarded #1904 adapter.
 The #1905 capability transition makes only the two uid/gid argument leaves
 terminal. The later #1908 transition makes only configurable chroot terminal;
-the two remaining jailer corpus/run records and `corpus:production-host`
-remain nonterminal.
+at that checkpoint the two jailer corpus/run records and
+`corpus:production-host` remained nonterminal. #1912 later certifies the two
+jailer aggregates from the complete checked authority, while
+`corpus:production-host` remains independent.
 
 ## Supported conclusion and nonclaims
 

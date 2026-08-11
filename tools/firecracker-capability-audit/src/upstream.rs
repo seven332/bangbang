@@ -12,6 +12,8 @@ use crate::{
 const SWAGGER_PATH: &str = "src/firecracker/swagger/firecracker.yaml";
 const FIRECRACKER_MAIN_PATH: &str = "src/firecracker/src/main.rs";
 const PARSED_REQUEST_PATH: &str = "src/firecracker/src/api_server/parsed_request.rs";
+const JAILER_AGGREGATE_INPUT_PATHS: [&str; 2] =
+    ["src/jailer/src/chroot.rs", "src/jailer/src/env.rs"];
 
 #[derive(Clone, Copy)]
 struct StaticItem {
@@ -658,6 +660,11 @@ pub fn derive_source_manifest(path: &Path) -> Result<SourceManifest, AuditError>
     for spec in TOOL_OPERATIONS.iter().chain(TOOL_ARGUMENTS).chain(CORPUS) {
         input_extractors
             .entry(spec.path.to_string())
+            .or_insert_with(|| "curated-source-v1".to_string());
+    }
+    for path in JAILER_AGGREGATE_INPUT_PATHS {
+        input_extractors
+            .entry(path.to_string())
             .or_insert_with(|| "curated-source-v1".to_string());
     }
 

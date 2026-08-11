@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    CAPABILITY_INVENTORY_PATH, Disposition, Reference, SOURCE_MANIFEST_PATH,
-    WAVE8_CERTIFICATION_AUDIT_PATH, WAVE8_CERTIFICATION_CAPABILITY_ID, WAVE8_OWNED_CAPABILITY_IDS,
-    Wave8CertificationAudit, Wave8HandoffOwner, read_capability_inventory, read_source_manifest,
-    read_wave8_certification_audit, validate_wave8_certification_audit,
-    validate_wave8_certification_compatibility, wave8_certification_audit_json,
+    CAPABILITY_INVENTORY_PATH, Disposition, JAILER_AGGREGATE_CAPABILITY_IDS, Reference,
+    SOURCE_MANIFEST_PATH, WAVE8_CERTIFICATION_AUDIT_PATH, WAVE8_CERTIFICATION_CAPABILITY_ID,
+    WAVE8_OWNED_CAPABILITY_IDS, Wave8CertificationAudit, Wave8HandoffOwner,
+    read_capability_inventory, read_source_manifest, read_wave8_certification_audit,
+    validate_wave8_certification_audit, validate_wave8_certification_compatibility,
+    wave8_certification_audit_json,
 };
 
 fn repository_root() -> PathBuf {
@@ -173,6 +174,16 @@ fn wave8_terminal_transition_is_exact() {
         .expect("terminal Wave 8 transition must certify");
 
     let mut historical_wave8 = inventory.clone();
+    for id in JAILER_AGGREGATE_CAPABILITY_IDS {
+        let capability = historical_wave8
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("aggregate-jailer successor capability must exist");
+        capability.disposition = Disposition::AuditRequired;
+        capability.implementation.clear();
+        capability.validation.clear();
+    }
     for id in [
         "tool-argument:jailer/chroot-base-dir",
         "tool-argument:jailer/gid",

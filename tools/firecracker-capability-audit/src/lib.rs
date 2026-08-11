@@ -10,6 +10,9 @@ mod guest_workflow_audit_model;
 mod guest_workflow_audit_validate;
 mod guest_workflow_certify;
 mod inventory_phase;
+mod jailer_aggregate_audit_model;
+mod jailer_aggregate_audit_validate;
+mod jailer_aggregate_certify;
 mod logger_certify;
 mod logger_model;
 mod logger_upstream;
@@ -93,6 +96,17 @@ pub use guest_workflow_audit_validate::{
 pub use guest_workflow_certify::{
     GUEST_WORKFLOW_COMPATIBILITY_CAPABILITY_IDS, validate_guest_workflow_compatibility,
 };
+pub use jailer_aggregate_audit_model::{
+    JailerAggregateAudit, JailerAggregateNonclaim, JailerArgumentCardinality,
+    JailerArgumentOutcome, JailerArgumentRecord, JailerArgumentRequirement, JailerCorpusSection,
+    JailerDispositionCounts, JailerEvidenceProfile, JailerEvidenceProfileId,
+    JailerOperationOutcome, JailerOperationStep, JailerPinnedSource,
+};
+pub use jailer_aggregate_audit_validate::{
+    JAILER_AGGREGATE_AUDIT_PATH, JAILER_AGGREGATE_AUDIT_SCHEMA_VERSION,
+    JAILER_AGGREGATE_CAPABILITY_IDS, validate_jailer_aggregate_audit,
+};
+pub use jailer_aggregate_certify::validate_jailer_aggregate_compatibility;
 pub use logger_certify::{LOGGER_COMPATIBILITY_CAPABILITY_IDS, validate_logger_compatibility};
 pub use logger_model::{
     LoggerClassDisposition, LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerField,
@@ -388,6 +402,16 @@ pub fn read_guest_workflow_audit(path: &Path) -> Result<GuestWorkflowAudit, Audi
         .map_err(|error| AuditError::new(format!("failed to parse guest workflow audit: {error}")))
 }
 
+/// Read and parse the checked aggregate jailer authority.
+pub fn read_jailer_aggregate_audit(path: &Path) -> Result<JailerAggregateAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read jailer aggregate audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!("failed to parse jailer aggregate audit: {error}"))
+    })
+}
+
 /// Read and parse the checked targeted formal-verification authority.
 pub fn read_formal_verification_audit(path: &Path) -> Result<FormalVerificationAudit, AuditError> {
     let bytes = std::fs::read(path).map_err(|error| {
@@ -521,6 +545,11 @@ pub fn cpu_template_helper_audit_json(
 /// Serialize the checked guest-workflow authority using canonical pretty JSON.
 pub fn guest_workflow_audit_json(audit: &GuestWorkflowAudit) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "guest workflow audit")
+}
+
+/// Serialize the checked aggregate jailer authority using canonical pretty JSON.
+pub fn jailer_aggregate_audit_json(audit: &JailerAggregateAudit) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "jailer aggregate audit")
 }
 
 /// Serialize the checked targeted formal-verification authority using canonical pretty JSON.

@@ -6,25 +6,26 @@ use std::process::{Command, ExitCode};
 
 use bangbang_firecracker_capability_audit::{
     AuditError, AuditMode, CAPABILITY_INVENTORY_PATH, CPU_TEMPLATE_HELPER_AUDIT_PATH,
-    FORMAL_VERIFICATION_AUDIT_PATH, GUEST_WORKFLOW_AUDIT_PATH, LOGGER_PRODUCER_AUDIT_PATH,
-    LOGGER_PRODUCER_MANIFEST_PATH, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
+    FORMAL_VERIFICATION_AUDIT_PATH, GUEST_WORKFLOW_AUDIT_PATH, JAILER_AGGREGATE_AUDIT_PATH,
+    LOGGER_PRODUCER_AUDIT_PATH, LOGGER_PRODUCER_MANIFEST_PATH, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
     METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
     METRICS_SCHEMA_AUTHORITY_PATH, SOURCE_MANIFEST_PATH, SPECIFICATION_BENCHMARK_AUDIT_PATH,
     TRACING_AUDIT_PATH, WAVE7_AGGREGATE_AUDIT_PATH, WAVE8_CERTIFICATION_AUDIT_PATH,
     derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
     logger_producer_manifest_json, metrics_schema_source_candidate_json, read_capability_inventory,
     read_cpu_template_helper_audit, read_formal_verification_audit, read_guest_workflow_audit,
-    read_logger_producer_audit, read_logger_producer_manifest, read_metrics_device_producer_audit,
-    read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
-    read_metrics_schema_authority, read_source_manifest, read_specification_benchmark_audit,
-    read_tracing_audit, read_wave7_aggregate_audit, read_wave8_certification_audit,
-    source_manifest_json, validate, validate_cpu_template_compatibility,
-    validate_cpu_template_fingerprint_compare_compatibility,
+    read_jailer_aggregate_audit, read_logger_producer_audit, read_logger_producer_manifest,
+    read_metrics_device_producer_audit, read_metrics_lifecycle_audit,
+    read_metrics_process_producer_audit, read_metrics_schema_authority, read_source_manifest,
+    read_specification_benchmark_audit, read_tracing_audit, read_wave7_aggregate_audit,
+    read_wave8_certification_audit, source_manifest_json, validate,
+    validate_cpu_template_compatibility, validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility, validate_cpu_template_helper_audit,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
     validate_cpu_template_strip_compatibility, validate_formal_verification_audit,
     validate_formal_verification_compatibility, validate_guest_workflow_audit,
-    validate_guest_workflow_compatibility, validate_logger_compatibility,
+    validate_guest_workflow_compatibility, validate_jailer_aggregate_audit,
+    validate_jailer_aggregate_compatibility, validate_logger_compatibility,
     validate_logger_producers, validate_metrics_compatibility,
     validate_metrics_device_compatibility, validate_metrics_device_producers,
     validate_metrics_lifecycle, validate_metrics_process_compatibility,
@@ -84,6 +85,7 @@ enum ValidateMode {
     CpuTemplateFingerprintCompareFinal,
     CpuTemplateFinal,
     GuestWorkflowFinal,
+    JailerFinal,
     FormalVerificationFinal,
     SpecificationBenchmarkFinal,
     Wave7Final,
@@ -110,6 +112,7 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
         }
         [flag] if flag == "--cpu-template-final" => Ok(ValidateMode::CpuTemplateFinal),
         [flag] if flag == "--guest-workflow-final" => Ok(ValidateMode::GuestWorkflowFinal),
+        [flag] if flag == "--jailer-final" => Ok(ValidateMode::JailerFinal),
         [flag] if flag == "--formal-verification-final" => {
             Ok(ValidateMode::FormalVerificationFinal)
         }
@@ -119,7 +122,7 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
         [flag] if flag == "--wave7-final" => Ok(ValidateMode::Wave7Final),
         [flag] if flag == "--wave8-final" => Ok(ValidateMode::Wave8Final),
         _ => Err(AuditError::new(
-            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, --guest-workflow-final, --formal-verification-final, --specification-benchmark-final, --wave7-final, or --wave8-final flag",
+            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, --guest-workflow-final, --jailer-final, --formal-verification-final, --specification-benchmark-final, --wave7-final, or --wave8-final flag",
         )),
     }
 }
@@ -143,6 +146,8 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let cpu_template_helper_audit =
         read_cpu_template_helper_audit(&root.join(CPU_TEMPLATE_HELPER_AUDIT_PATH))?;
     let guest_workflow_audit = read_guest_workflow_audit(&root.join(GUEST_WORKFLOW_AUDIT_PATH))?;
+    let jailer_aggregate_audit =
+        read_jailer_aggregate_audit(&root.join(JAILER_AGGREGATE_AUDIT_PATH))?;
     let formal_verification_audit =
         read_formal_verification_audit(&root.join(FORMAL_VERIFICATION_AUDIT_PATH))?;
     let specification_benchmark_audit =
@@ -165,6 +170,12 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     validate_guest_workflow_audit(&guest_workflow_audit, &inventory, &root).map_err(|errors| {
         AuditError::new(format!("guest workflow audit validation errors:\n{errors}"))
     })?;
+    validate_jailer_aggregate_audit(&jailer_aggregate_audit, &manifest, &inventory, &root)
+        .map_err(|errors| {
+            AuditError::new(format!(
+                "jailer aggregate audit validation errors:\n{errors}"
+            ))
+        })?;
     validate_formal_verification_audit(&formal_verification_audit, &root).map_err(|errors| {
         AuditError::new(format!(
             "formal verification audit validation errors:\n{errors}"
@@ -794,6 +805,65 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
                     .to_string(),
             );
         }
+        ValidateMode::JailerFinal => {
+            validate_jailer_aggregate_compatibility(
+                &manifest,
+                &inventory,
+                &jailer_aggregate_audit,
+                &root,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "jailer aggregate compatibility validation errors:\n{errors}"
+                ))
+            })?;
+            validate_logger_producers(&logger_manifest, &logger_audit, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("logger producer validation errors:\n{errors}"))
+                })?;
+            validate_metrics_schema(&metrics_authority, &manifest, &root, AuditMode::Delivery)
+                .map_err(|errors| {
+                    AuditError::new(format!("metrics schema validation errors:\n{errors}"))
+                })?;
+            validate_metrics_process_producers(
+                &metrics_process_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics process producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_device_producers(
+                &metrics_device_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!(
+                    "metrics device producer validation errors:\n{errors}"
+                ))
+            })?;
+            validate_metrics_lifecycle(
+                &metrics_lifecycle_audit,
+                &metrics_authority,
+                &root,
+                AuditMode::Delivery,
+            )
+            .map_err(|errors| {
+                AuditError::new(format!("metrics lifecycle validation errors:\n{errors}"))
+            })?;
+            validate_tracing_audit(&tracing_audit, &root, AuditMode::Delivery).map_err(
+                |errors| AuditError::new(format!("tracing audit validation errors:\n{errors}")),
+            )?;
+            return Ok(
+                "Firecracker capability inventory and canonical aggregate jailer authority are valid for the terminal macOS jailer compatibility scope"
+                    .to_string(),
+            );
+        }
         ValidateMode::FormalVerificationFinal => {
             validate_formal_verification_compatibility(
                 &manifest,
@@ -1077,7 +1147,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         AuditMode::Final => "final",
     };
     Ok(format!(
-        "Firecracker capability inventory, canonical CPU-template helper, guest-workflow, formal-verification, specification-benchmark, Wave 7 aggregate, and Wave 8 certification audits, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
+        "Firecracker capability inventory, canonical CPU-template helper, guest-workflow, jailer aggregate, formal-verification, specification-benchmark, Wave 7 aggregate, and Wave 8 certification audits, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
     ))
 }
 
@@ -1249,6 +1319,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
     let tracing_audit_path = root.join(TRACING_AUDIT_PATH);
     let cpu_template_helper_audit_path = root.join(CPU_TEMPLATE_HELPER_AUDIT_PATH);
     let guest_workflow_audit_path = root.join(GUEST_WORKFLOW_AUDIT_PATH);
+    let jailer_aggregate_audit_path = root.join(JAILER_AGGREGATE_AUDIT_PATH);
     let formal_verification_audit_path = root.join(FORMAL_VERIFICATION_AUDIT_PATH);
     let specification_benchmark_audit_path = root.join(SPECIFICATION_BENCHMARK_AUDIT_PATH);
     let wave7_aggregate_audit_path = root.join(WAVE7_AGGREGATE_AUDIT_PATH);
@@ -1266,6 +1337,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
         &tracing_audit_path,
         &cpu_template_helper_audit_path,
         &guest_workflow_audit_path,
+        &jailer_aggregate_audit_path,
         &formal_verification_audit_path,
         &specification_benchmark_audit_path,
         &wave7_aggregate_audit_path,
@@ -1391,7 +1463,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final | --formal-verification-final | --specification-benchmark-final | --wave7-final | --wave8-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final | --jailer-final | --formal-verification-final | --specification-benchmark-final | --wave7-final | --wave8-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -1461,6 +1533,10 @@ mod tests {
         assert_eq!(
             parse_validate_mode(&["--guest-workflow-final".to_string()]).unwrap(),
             ValidateMode::GuestWorkflowFinal
+        );
+        assert_eq!(
+            parse_validate_mode(&["--jailer-final".to_string()]).unwrap(),
+            ValidateMode::JailerFinal
         );
         assert_eq!(
             parse_validate_mode(&["--formal-verification-final".to_string()]).unwrap(),
@@ -1616,6 +1692,13 @@ mod tests {
     }
 
     #[test]
+    fn jailer_final_mode_certifies_the_terminal_aggregate_scope() {
+        let message = run_validate(&["--jailer-final".to_string()])
+            .expect("terminal aggregate jailer validation must pass");
+        assert!(message.contains("terminal macOS jailer compatibility scope"));
+    }
+
+    #[test]
     fn wave7_final_mode_certifies_the_terminal_aggregate_scope() {
         let message = run_validate(&["--wave7-final".to_string()])
             .expect("terminal Wave 7 aggregate validation must pass");
@@ -1673,6 +1756,7 @@ mod tests {
             TRACING_AUDIT_PATH,
             CPU_TEMPLATE_HELPER_AUDIT_PATH,
             GUEST_WORKFLOW_AUDIT_PATH,
+            JAILER_AGGREGATE_AUDIT_PATH,
             FORMAL_VERIFICATION_AUDIT_PATH,
             SPECIFICATION_BENCHMARK_AUDIT_PATH,
             WAVE7_AGGREGATE_AUDIT_PATH,

@@ -18,6 +18,8 @@ pub(crate) const JAILER_UID_GID_IDS: [&str; 2] =
 
 pub(crate) const JAILER_CHROOT_BASE_DIR_ID: &str = "tool-argument:jailer/chroot-base-dir";
 
+pub(crate) const JAILER_AGGREGATE_IDS: [&str; 2] = ["corpus:jailer", "tool-operation:jailer/run"];
+
 const WAVE8_AUDIT_IDS: [&str; 8] = [
     "corpus:jailer",
     "corpus:network-setup",
@@ -84,6 +86,7 @@ pub(crate) enum InventoryPhase {
     Wave8,
     JailerUidGidPlatformLimit,
     JailerChrootPlatformLimit,
+    JailerAggregate,
 }
 
 impl InventoryPhase {
@@ -94,6 +97,7 @@ impl InventoryPhase {
             Self::Wave8 => "Wave 8 377/8/3/30",
             Self::JailerUidGidPlatformLimit => "post-Wave-8 jailer uid/gid 377/6/3/32",
             Self::JailerChrootPlatformLimit => "post-uid/gid jailer chroot-base-dir 377/5/3/33",
+            Self::JailerAggregate => "aggregate jailer 379/3/3/33",
         }
     }
 }
@@ -108,6 +112,7 @@ pub(crate) fn classify_inventory_phase(
         (377, 8, 3, 30) => InventoryPhase::Wave8,
         (377, 6, 3, 32) => InventoryPhase::JailerUidGidPlatformLimit,
         (377, 5, 3, 33) => InventoryPhase::JailerChrootPlatformLimit,
+        (379, 3, 3, 33) => InventoryPhase::JailerAggregate,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -161,11 +166,16 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
     let mut ids = wave8_historical_impossible_ids();
     if matches!(
         phase,
-        InventoryPhase::JailerUidGidPlatformLimit | InventoryPhase::JailerChrootPlatformLimit
+        InventoryPhase::JailerUidGidPlatformLimit
+            | InventoryPhase::JailerChrootPlatformLimit
+            | InventoryPhase::JailerAggregate
     ) {
         ids.extend(JAILER_UID_GID_IDS);
     }
-    if phase == InventoryPhase::JailerChrootPlatformLimit {
+    if matches!(
+        phase,
+        InventoryPhase::JailerChrootPlatformLimit | InventoryPhase::JailerAggregate
+    ) {
         ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
     ids
@@ -214,6 +224,15 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             }
             ids.remove(JAILER_CHROOT_BASE_DIR_ID);
         }
+        InventoryPhase::JailerAggregate => {
+            for id in JAILER_UID_GID_IDS {
+                ids.remove(id);
+            }
+            ids.remove(JAILER_CHROOT_BASE_DIR_ID);
+            for id in JAILER_AGGREGATE_IDS {
+                ids.remove(id);
+            }
+        }
     }
     ids
 }
@@ -258,10 +277,19 @@ mod tests {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::JailerAggregate)
+        );
+
+        let mut chroot = current.clone();
+        for id in JAILER_AGGREGATE_IDS {
+            set_disposition(&mut chroot, id, Disposition::AuditRequired);
+        }
+        assert_eq!(
+            classify_inventory_phase(&chroot),
             Ok(InventoryPhase::JailerChrootPlatformLimit)
         );
 
-        let mut uid_gid = current.clone();
+        let mut uid_gid = chroot;
         set_disposition(
             &mut uid_gid,
             JAILER_CHROOT_BASE_DIR_ID,
@@ -302,7 +330,7 @@ mod tests {
         );
         set_disposition(
             &mut inventory,
-            "tool-argument:jailer/chroot-base-dir",
+            "corpus:production-host",
             Disposition::ProvenPlatformImpossible,
         );
         assert!(
@@ -332,12 +360,12 @@ mod tests {
         set_disposition(
             &mut aggregate_swap,
             "corpus:jailer",
-            Disposition::ImplementedAndVerified,
+            Disposition::AuditRequired,
         );
         set_disposition(
             &mut aggregate_swap,
-            "api-operation:GET /",
-            Disposition::AuditRequired,
+            "corpus:production-host",
+            Disposition::ImplementedAndVerified,
         );
         assert!(
             classify_inventory_phase(&aggregate_swap)
@@ -372,6 +400,9 @@ mod tests {
     #[test]
     fn chroot_without_uid_gid_predecessor_does_not_classify() {
         let mut partial = current_inventory();
+        for id in JAILER_AGGREGATE_IDS {
+            set_disposition(&mut partial, id, Disposition::AuditRequired);
+        }
         for id in JAILER_UID_GID_IDS {
             set_disposition(&mut partial, id, Disposition::AuditRequired);
         }

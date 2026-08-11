@@ -257,15 +257,17 @@ the checked [Wave 8 contract](wave8-certification-contract.md), producing
 377/8/3/30. The later uid/gid platform-limit review moves only those two jailer
 argument identities to `proven-platform-impossible`, producing 377/6/3/32.
 The later configurable-chroot review moves only that one identity, producing
-the current 377/5/3/33 phase with three #1373, two #1378, and three #1351
-outcomes still nonterminal. Any other identity or count transition fails the
-Wave 7 gate.
+the 377/5/3/33 phase. The aggregate-jailer review then moves exactly
+`corpus:jailer` and `tool-operation:jailer/run`, producing the current
+379/3/3/33 phase with one #1373, two #1378, and three #1351 outcomes still
+nonterminal. Any other identity or count transition fails the Wave 7 gate.
 
 The historical public-tool ledger derives 46 implemented leaves, five terminal
 Linux-only jailer exclusions, and four #1373 jailer handoffs. Its uid/gid
 successor is 46 implemented, seven terminal platform exclusions, and two #1373
-handoffs; its exact current successor is 46 implemented, eight terminal
-platform exclusions, and one #1373 handoff. The virtio-MMIO ledger
+handoffs; its configurable-chroot successor is 46 implemented, eight terminal
+platform exclusions, and one #1373 handoff. The aggregate-jailer successor is
+47 implemented, eight terminal platform exclusions, and no jailer handoff. The virtio-MMIO ledger
 requires common identity/features/queue/notification/interrupt/status/reset/
 activation/configuration/restore/observability behavior, file and vhost-user
 block variants, pmem, network, vsock, entropy, balloon, and virtio-mem, with
@@ -391,8 +393,10 @@ interactions.
 This table is the immutable Wave 7 handoff snapshot. Wave 8 later implements
 its cross-capability row; #1905 later makes only `jailer/gid` and `jailer/uid`
 terminal platform exclusions, and #1908 later makes only
-`jailer/chroot-base-dir` terminal. The other three #1373 rows and both #1378
-rows remain audit-required in the current inventory.
+`jailer/chroot-base-dir` terminal. #1912 later makes `corpus:jailer` and
+`jailer/run` implemented-and-verified from the checked aggregate authority.
+Only `corpus:production-host` remains audit-required among the historical
+#1373 rows; both #1378 rows remain audit-required.
 
 ## Disposition accounting
 
@@ -436,7 +440,8 @@ virtio-MMIO device profile while retaining all external handoffs. The #1799
 inventory was therefore exactly 376 implemented, nine audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. The historical
 Wave 8 successor is exactly 377/eight/three/30; the uid/gid-only successor is
-exactly 377/6/3/32, and the current configurable-chroot-only successor is
-exactly 377/5/3/33. These are exact consequences of the
-corresponding row sets, not quotas; authoritative current totals remain
-derived from `capabilities.json` and are rechecked by `validate --wave8-final`.
+exactly 377/6/3/32, the configurable-chroot-only successor is exactly
+377/5/3/33, and the current aggregate-jailer successor is exactly 379/3/3/33.
+These are exact consequences of the corresponding row sets, not quotas;
+authoritative current totals remain derived from `capabilities.json` and are
+rechecked by `validate --wave8-final` and `validate --jailer-final`.

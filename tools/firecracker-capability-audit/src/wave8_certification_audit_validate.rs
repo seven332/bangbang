@@ -205,10 +205,11 @@ fn validate_header(
         Ok(
             InventoryPhase::Wave8
             | InventoryPhase::JailerUidGidPlatformLimit
-            | InventoryPhase::JailerChrootPlatformLimit,
+            | InventoryPhase::JailerChrootPlatformLimit
+            | InventoryPhase::JailerAggregate,
         ) => {}
         Ok(phase) => errors.push(format!(
-            "Wave 8 live inventory must be its exact 377/8/3/30 phase, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, or the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor; found {}",
+            "Wave 8 live inventory must be its exact 377/8/3/30 phase, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, or the exact aggregate jailer 379/3/3/33 successor; found {}",
             phase.name()
         )),
         Err(error) => errors.push(format!("Wave 8 live inventory phase is invalid: {error}")),
@@ -552,7 +553,8 @@ fn validate_platform_reviews(
     if let Ok(
         phase @ (InventoryPhase::Wave8
         | InventoryPhase::JailerUidGidPlatformLimit
-        | InventoryPhase::JailerChrootPlatformLimit),
+        | InventoryPhase::JailerChrootPlatformLimit
+        | InventoryPhase::JailerAggregate),
     ) = classify_inventory_phase(inventory)
     {
         let expected = expected_impossible_ids(phase);
@@ -627,7 +629,8 @@ fn validate_handoffs(
     if let Some(
         phase @ (InventoryPhase::Wave8
         | InventoryPhase::JailerUidGidPlatformLimit
-        | InventoryPhase::JailerChrootPlatformLimit),
+        | InventoryPhase::JailerChrootPlatformLimit
+        | InventoryPhase::JailerAggregate),
     ) = phase
     {
         let expected = expected_nonterminal_ids(phase);
