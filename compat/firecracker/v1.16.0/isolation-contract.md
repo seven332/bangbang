@@ -95,12 +95,11 @@ The following remain under delivery issue
 - Developer ID/team possession, notarization, launch constraints, and release
   policy.
 
-These gaps keep the three composite isolation records
+These gaps keep two composite isolation records
 `missing-platform-feasible`:
 
 - `semantic.isolation:host-resource-authority-and-brokerage`
 - `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`
-- `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
 
 ## Terminal jailer uid/gid platform limit
 
@@ -214,6 +213,23 @@ digest pins every unrelated inventory record.
 The complete human mapping and scoped command are in the
 [aggregate jailer contract](jailer-aggregate-contract.md).
 
+## Terminal multiprocess isolation outcome
+
+#1914 separately certifies
+`semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
+from the 13 exact multiprocess clauses in the pinned Firecracker design and
+production-host documents. One launcher/worker/VM boundary, authenticated and
+redacted lifecycle state, failure-atomic typed grants, replacement-safe
+publication, bounded crash recovery, and noninterchangeable concurrent
+sessions provide the applicable outcome. The checked mapping distinguishes
+operator-owned overwatching, workload policy, and host-path allocation from
+product obligations and composes the terminal uid/gid result without claiming
+positive unique credentials or malicious same-bundle sibling isolation.
+
+The exact transition is `379/3/3/33` to `380/3/2/33`; the complete authority,
+residual classification, nonclaims, and scoped command are in the
+[multiprocess isolation contract](multiprocess-isolation-contract.md).
+
 ## Evidence Map
 
 | Claim | Implementation | Validation |
@@ -238,9 +254,10 @@ The checked inventory is authoritative for the exact isolation leaves,
 evidence references, and dispositions. Linux seccomp, cgroup, network
 namespace, and PID namespace records are terminal only for the named stable
 macOS exclusions. The offline seccompiler is a separate implemented artifact
-tool and does not enforce runtime seccomp. The three composite records remain
-nonterminal until #1351's broader feasible work is complete. The uid/gid
+tool and does not enforce runtime seccomp. The two remaining composite records
+stay nonterminal until #1351's broader feasible work is complete. The uid/gid
 argument leaves and configurable chroot are separately terminal at the fixed
-topology above. The aggregate jailer corpus and run records are now separately
-terminal under #1912; `corpus:production-host`, the two network/vmnet records,
-and all three composite isolation records retain their independent states.
+topology above. The aggregate jailer corpus and run records are separately
+terminal under #1912, and the multiprocess aggregate is terminal under #1914;
+`corpus:production-host`, the two network/vmnet records, and two composite
+isolation records retain their independent states.

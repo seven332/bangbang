@@ -1397,11 +1397,39 @@ namespace, device-node, or arbitrary credential mechanisms into macOS aliases.
 Exactly `corpus:jailer` and `tool-operation:jailer/run` become
 implemented-and-verified. The transition is `377/5/3/33` to `379/3/3/33`;
 `corpus:production-host`, `corpus:network-setup`, and aggregate vmnet
-connectivity remain audit-required, and the three isolation composites remain
-missing-platform-feasible. The scoped gate is:
+connectivity remain audit-required. #1914 later closes the multiprocess
+isolation composite, leaving two isolation composites
+missing-platform-feasible. The scoped jailer gate is:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-final
+```
+
+### Multiprocess isolation compatibility
+
+The checked
+[multiprocess isolation contract](../compat/firecracker/v1.16.0/multiprocess-isolation-contract.md)
+maps 13 ordered clauses from the pinned Firecracker design and production-host
+documents. The applicable result is one launcher, one signed App Sandbox/HVF
+worker, and one VM; exact lifecycle identity and redaction; failure-atomic
+typed authority; replacement-safe publication; bounded cancellation, reap,
+and crash recovery; and noninterchangeable concurrent sessions.
+
+External overwatching, workload-specific host policy, automatic restart, and
+cross-launcher path allocation remain operator-owned. General dynamic
+brokerage and hard revocation are not requirements of this pinned aggregate;
+snapshot create-before-record and immediate zero residue after dual death are
+explicit nonclaims. Positive unique uid/gid and malicious same-bundle sibling
+isolation compose the terminal fixed-topology identity limit instead of being
+reported as implemented.
+
+Exactly
+`semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
+moves from missing-platform-feasible to implemented-and-verified, producing
+the exact `379/3/3/33` to `380/3/2/33` transition. The scoped gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multiprocess-isolation-final
 ```
 
 The macOS host security baseline is documented separately in
@@ -1465,9 +1493,9 @@ error, observability, resource, device, network/MMDS, and snapshot domains from
 four exact portable and signed product leaves. It also rechecks the historical
 30-record platform-exclusion partition and originally retained the exact eleven
 #1351/#1373/#1378 external outcomes. Its certifier accepts only the checked
-uid/gid, configurable-chroot, and aggregate-jailer successors. The current
-successor is `379/3/3/33`: one #1373 audit record, two #1378 audit records, and
-three #1351 feasible records remain. It does not turn missing credentials,
+uid/gid, configurable-chroot, aggregate-jailer, and multiprocess-isolation
+successors. The current successor is `380/3/2/33`: one #1373 audit record, two
+#1378 audit records, and two #1351 feasible records remain. It does not turn missing credentials,
 root/HVF authority, skipped execution, or a weaker macOS mechanism into success
 or impossibility.
 

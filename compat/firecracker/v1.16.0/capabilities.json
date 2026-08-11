@@ -15564,13 +15564,41 @@
     {
       "id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
       "family": "isolation",
-      "summary": "The fixed launcher owns one dynamically validated worker through exact-sequence lifecycle, grant, dormant vsock-broker, and dedicated vhost-user-broker channels with nonblocking signal/child observation, one absolute grant deadline, failure-atomic staging and typed claims, synchronized pending-authority invalidation, structured readiness/terminal state, replacement-safe namespaces, crash-order cleanup, redaction, and signed noninterchangeable concurrent authority. Per-device block/pmem ownership provides validate-claim-commit rollback and active block swap; output ownership provides failure-atomic singleton sinks and signed same-GrantId session isolation. Snapshot ownership atomically adopts inputs, retains output anchors, publishes no-clobber, and records exact crash-cleanup identities. API/vsock socket ownership adds validation-before-claim, strict publication and replacement-safe cleanup. Vhost-user ownership retains one exact connect-only anchor per grant, leases exact children per drive, restores fresh claims on normal failure, performs zero broker I/O on startup/runtime preflight or duplicate rejection, reuses streams for PATCH, and releases child leases on DELETE while preserving directory authority for reinsertion. A disposable signed test bundle certifies one session-generation-bound root/vsock restore transaction across preflight, reverse reservation abort, deterministic cancellation, typed one-time take/adopt/commit, prepared/active cleanup, both independent process-death orders, socket replacement preservation, and concurrent same-ID isolation with fixed redacted output. General dynamic-resource races, unavoidable snapshot create-before-record and simultaneous uncatchable-death residue, hard revocation, and malicious same-container sibling isolation remain feasible under #1351.",
+      "summary": "Certify the complete applicable Firecracker v1.16 multiprocess isolation outcome through 13 pinned design and production-host clauses: one fixed launcher owns one signed App Sandbox/HVF worker and one VM; exact lifecycle identity and redaction, failure-atomic typed grants, replacement-safe publication, bounded cancellation/reap/recovery, and signed noninterchangeable concurrent sessions provide the implemented macOS result. The authority separately classifies general dynamic brokerage and hard revocation as broader nonrequirements, snapshot create-before-record and simultaneous uncatchable-death residue as explicit implementation nonclaims, restart and cross-launcher path allocation as operator responsibilities, and positive unique uid/gid plus malicious same-bundle sibling isolation through the already-terminal fixed-topology identity limit.",
       "source_refs": [
         "corpus:design",
         "corpus:production-host"
       ],
-      "disposition": "missing-platform-feasible",
-      "delivery_issue": "https://github.com/seven332/bangbang/issues/1351"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/multiprocess-isolation-audit.json",
+          "anchor": "\"source_clauses\": ["
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/multiprocess-isolation-contract.md",
+          "anchor": "## Terminal multiprocess isolation outcome"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/multiprocess_isolation_audit_validate.rs",
+          "anchor": "pub fn validate_multiprocess_isolation_audit("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_sessions_remain_independent_when_one_worker_crashes()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/multiprocess_isolation_audit.rs",
+          "anchor": "fn multiprocess_terminal_transition_is_exact()"
+        }
+      ]
     },
     {
       "id": "semantic.lifecycle:pause-resume-quiescence-and-failure",

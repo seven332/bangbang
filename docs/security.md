@@ -233,7 +233,8 @@ and long-lived service behavior. Exactly `corpus:jailer` and
 `tool-operation:jailer/run` become implemented-and-verified, moving the
 inventory from `377/5/3/33` to `379/3/3/33`. The remaining audit records are
 `corpus:network-setup`, `corpus:production-host`, and the aggregate vmnet
-connectivity identity; the three isolation composites remain
+connectivity identity. #1914 then certifies the multiprocess isolation
+composite at `380/3/2/33`; the other two isolation composites remain
 missing-platform-feasible.
 
 ## Certified Linux Runtime Isolation Exclusions
@@ -3563,6 +3564,17 @@ and locked private namespace, and signed tests prove that one crashed session
 does not terminate or clean a concurrent peer. This does not allocate unique
 external resources or coordinate caller-supplied paths across launchers.
 
+The checked #1914
+[multiprocess isolation contract](../compat/firecracker/v1.16.0/multiprocess-isolation-contract.md)
+maps 13 exact clauses from the pinned Firecracker design and production-host
+documents onto this boundary. It certifies authenticated/redacted lifecycle
+state, failure-atomic typed grants, replacement-safe cleanup, bounded crash
+recovery, and noninterchangeable concurrent sessions. It separately keeps
+external overwatching, workload policy, restart, and cross-launcher path
+allocation operator-owned; composes the terminal uid/gid result; and does not
+claim malicious same-bundle sibling isolation, immediate zero residue after
+dual SIGKILL, a general dynamic broker, or hard revocation.
+
 ## Wave 8 Cross-Capability Security Composition
 
 The checked
@@ -3593,7 +3605,9 @@ at `377/6/3/32`. The subsequent exact configurable-chroot transition leaves
 three #1373 rows, the same two #1378 rows, and the same three #1351 rows, for
 totals `377/5/3/33`. #1912 then certifies the jailer corpus and operation
 aggregates, leaving one #1373 production-host row, the same two #1378 rows,
-and the same three #1351 rows at the current `379/3/3/33` successor. Missing
+and the same three #1351 rows at `379/3/3/33`. #1914 then certifies exactly the
+multiprocess isolation row, leaving those three audit rows and two #1351 rows
+at the current `380/3/2/33` successor. Missing
 authority or credentials alone is not an impossibility proof. Global `--final`
 stays blocked until the remaining external outcomes complete.
 
@@ -3762,6 +3776,8 @@ leaving only `corpus:production-host` in #1373. The earlier evidence harness is
 test-only and statically
 absent from normal launcher and worker builds; its daemon path is not a root
 service, public jailer/daemon mode, setuid helper, or ambient path authority.
+#1914 subsequently certifies the exact multiprocess aggregate without adding a
+new executable, helper, privilege, or topology.
 
 ## Current Non-Goals
 

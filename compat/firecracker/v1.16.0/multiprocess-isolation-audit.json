@@ -1,0 +1,529 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1351",
+  "delivery_issue": "#1914",
+  "upstream_sources": [
+    {
+      "id": "firecracker-design",
+      "manifest_id": "corpus:design",
+      "path": "docs/design.md",
+      "anchor": "entire-file",
+      "git_blob": "143fef76410e4f7e45b32d3986e0d78eedf5175a"
+    },
+    {
+      "id": "production-host-setup",
+      "manifest_id": "corpus:production-host",
+      "path": "docs/prod-host-setup.md",
+      "anchor": "entire-file",
+      "git_blob": "8939b56a965963d8df1c44c583dcd38361197347"
+    }
+  ],
+  "capability_id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+  "previous_counts": {
+    "implemented_and_verified": 379,
+    "audit_required": 3,
+    "missing_platform_feasible": 3,
+    "proven_platform_impossible": 33
+  },
+  "target_counts": {
+    "implemented_and_verified": 380,
+    "audit_required": 3,
+    "missing_platform_feasible": 2,
+    "proven_platform_impossible": 33
+  },
+  "unrelated_inventory_sha256": "1ef84b42d22bc9dd3202209d96d84500c23a39338e31b018fa7fb00754a47a83",
+  "source_clauses": [
+    {
+      "order": 1,
+      "id": "different-customer-multitenancy",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Firecracker can safely run workloads from different customers on the same machine.",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "process-per-vm-boundary",
+        "concurrent-noninterchangeability",
+        "terminal-identity-limit"
+      ]
+    },
+    {
+      "order": 2,
+      "id": "simultaneous-microvms-resource-bounded",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "The number of Firecracker microVMs running simultaneously on a host is limited only by the availability of hardware resources.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "process-per-vm-boundary",
+        "operator-boundary"
+      ]
+    },
+    {
+      "order": 3,
+      "id": "one-process-one-microvm",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Each Firecracker process encapsulates one and only one microVM.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "process-per-vm-boundary"
+      ]
+    },
+    {
+      "order": 4,
+      "id": "malicious-vcpu-trust-zones",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "all vCPU threads are considered to be running malicious code",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "process-per-vm-boundary",
+        "lifecycle-identity-and-redaction",
+        "terminal-identity-limit"
+      ]
+    },
+    {
+      "order": 5,
+      "id": "process-level-defense-in-depth",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "To assure defense in depth, Firecracker should only run constrained at the process level.",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "process-per-vm-boundary",
+        "lifecycle-identity-and-redaction",
+        "terminal-identity-limit"
+      ]
+    },
+    {
+      "order": 6,
+      "id": "privileged-third-party-resource-grants",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Firecracker can only access resources that a privileged third-party grants access to",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "lifecycle-identity-and-redaction",
+        "atomic-resource-authority"
+      ]
+    },
+    {
+      "order": 7,
+      "id": "per-microvm-fair-resource-controls",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "each Firecracker microVM can have its own dedicated quota of the CPU time",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "atomic-resource-authority",
+        "operator-boundary"
+      ]
+    },
+    {
+      "order": 8,
+      "id": "external-overwatcher-sigkill",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "customers have an overwatcher process on the host",
+      "outcome": "operator-owned-recommendation",
+      "evidence_profiles": [
+        "crash-cancellation-and-recovery",
+        "operator-boundary"
+      ]
+    },
+    {
+      "order": 9,
+      "id": "jailer-or-equivalent-constraints",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "process constraints equal or more restrictive than those in the jailer",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "process-per-vm-boundary",
+        "atomic-resource-authority",
+        "terminal-identity-limit"
+      ]
+    },
+    {
+      "order": 10,
+      "id": "trusted-jailer-inputs",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "The jailer treats all its inputs as trusted",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "atomic-resource-authority",
+        "replacement-safe-publication",
+        "operator-boundary"
+      ]
+    },
+    {
+      "order": 11,
+      "id": "dedicated-identity-and-unique-instance-layer",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "When running multiple Firecracker instances it is recommended that each runs with its unique `uid` and `gid`",
+      "outcome": "composed-terminal-platform-limit",
+      "evidence_profiles": [
+        "atomic-resource-authority",
+        "terminal-identity-limit"
+      ]
+    },
+    {
+      "order": 12,
+      "id": "operator-workload-resource-controls",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "use the provided `resource-limits` and `cgroup` functionalities",
+      "outcome": "independently-owned-outcome",
+      "evidence_profiles": [
+        "atomic-resource-authority",
+        "operator-boundary"
+      ]
+    },
+    {
+      "order": 13,
+      "id": "single-tenant-process-boundary",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "each Firecracker process corresponds to a workload of a single tenant.",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "process-per-vm-boundary",
+        "concurrent-noninterchangeability",
+        "terminal-identity-limit"
+      ]
+    }
+  ],
+  "terminal_dependencies": [
+    {
+      "capability_id": "corpus:jailer",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.process:signals-exits-fd-and-cleanup",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/gid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/uid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-operation:jailer/run",
+      "disposition": "implemented-and-verified"
+    }
+  ],
+  "evidence_profiles": [
+    {
+      "id": "process-per-vm-boundary",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/supervisor.rs",
+          "anchor": "fn launch_prepared("
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/runtime.rs",
+          "anchor": "pub struct WorkerNamespace"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_sessions_remain_independent_when_one_worker_crashes()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn launcher_runs_real_sandboxed_hvf_guest_to_system_off()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    },
+    {
+      "id": "lifecycle-identity-and-redaction",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn wait_session_inner("
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/codec.rs",
+          "anchor": "pub enum Message"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/state.rs",
+          "anchor": "pub struct LauncherLifecycle"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn worker_rejects_malformed_forged_bootstrap_before_public_processing()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/codec.rs",
+          "anchor": "fn session_debug_and_errors_are_redacted()"
+        }
+      ]
+    },
+    {
+      "id": "atomic-resource-authority",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "pub(crate) struct GrantAuthority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "pub struct GrantRegistry"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "pub struct StagedGrantBatch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_grant_mismatch_fails_closed_without_mutation()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "fn directory_registry_batch_adoption_is_failure_atomic()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "fn file_registry_batch_adoption_is_failure_atomic()"
+        }
+      ]
+    },
+    {
+      "id": "crash-cancellation-and-recovery",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn cleanup_namespace_after_worker("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn wait_session_inner("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn incomplete_grant_phase_obeys_one_absolute_deadline()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn launcher_first_and_both_killed_orders_follow_namespace_ownership()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signal_cancels_an_incomplete_grant_phase_without_waiting_for_timeout()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_grant_scopes_cleanup_across_both_process_crash_orders()"
+        }
+      ]
+    },
+    {
+      "id": "replacement-safe-publication",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/runtime.rs",
+          "anchor": "pub struct SnapshotStagingOwnershipRecord"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/runtime.rs",
+          "anchor": "pub struct SocketOwnershipRecord"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn grant_test_bundle_recovers_recorded_snapshot_staging_after_worker_sigkill()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_granted_socket_cleanup_preserves_replacements_in_both_death_orders()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_restore_transaction_preserves_a_published_socket_replacement()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/runtime.rs",
+          "anchor": "fn staged_socket_cleanup_requires_the_recorded_identity()"
+        }
+      ]
+    },
+    {
+      "id": "concurrent-noninterchangeability",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/supervisor.rs",
+          "anchor": "fn launch_prepared("
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/state.rs",
+          "anchor": "pub struct LauncherLifecycle"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_sessions_remain_independent_when_one_worker_crashes()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_signed_grant_sessions_keep_authority_noninterchangeable()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_signed_restore_transactions_keep_same_ids_noninterchangeable()"
+        }
+      ]
+    },
+    {
+      "id": "terminal-identity-limit",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+          "anchor": "## Terminal jailer uid/gid platform limit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn classify_launch_identity("
+        },
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "## Jailer uid/gid fixed-topology platform limit"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn launch_identity_classifier_covers_current_and_exact_root_targets()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    },
+    {
+      "id": "operator-boundary",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+          "anchor": "## Remaining Feasible Isolation Work"
+        },
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "## Multi-Process Operation"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_sessions_remain_independent_when_one_worker_crashes()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    }
+  ],
+  "residuals": [
+    {
+      "id": "general-dynamic-resource-races",
+      "classification": "generic-nonrequirement",
+      "evidence_profile": "atomic-resource-authority"
+    },
+    {
+      "id": "hard-revocation",
+      "classification": "generic-nonrequirement",
+      "evidence_profile": "atomic-resource-authority"
+    },
+    {
+      "id": "snapshot-create-before-record",
+      "classification": "implementation-specific-nonclaim",
+      "evidence_profile": "replacement-safe-publication"
+    },
+    {
+      "id": "simultaneous-uncatchable-death-residue",
+      "classification": "implementation-specific-nonclaim",
+      "evidence_profile": "crash-cancellation-and-recovery"
+    },
+    {
+      "id": "malicious-same-container-sibling",
+      "classification": "terminal-platform-limit",
+      "evidence_profile": "terminal-identity-limit"
+    },
+    {
+      "id": "automatic-restart-reconnect",
+      "classification": "operator-owned-nonrequirement",
+      "evidence_profile": "operator-boundary"
+    },
+    {
+      "id": "global-cross-launcher-path-coordination",
+      "classification": "operator-owned-nonrequirement",
+      "evidence_profile": "operator-boundary"
+    }
+  ],
+  "nonclaims": [
+    "linux-jailer-mechanism-parity",
+    "general-dynamic-resource-broker",
+    "hard-revocation",
+    "immediate-zero-snapshot-create-window",
+    "immediate-zero-residue-after-dual-death",
+    "malicious-same-bundle-sibling-isolation",
+    "positive-unique-uid-gid-per-instance",
+    "automatic-restart-or-reconnect",
+    "global-cross-launcher-path-allocation",
+    "production-vmnet-or-host-deployment"
+  ]
+}

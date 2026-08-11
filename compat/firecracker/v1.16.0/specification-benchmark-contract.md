@@ -67,8 +67,9 @@ endpoint. The later jailer uid/gid platform-limit transition changes exactly
 those two identities to reach 377/6/3/32. The later configurable-chroot
 platform-limit transition changes exactly that one identity to reach
 377/5/3/33. The aggregate-jailer transition then changes exactly
-`corpus:jailer` and `tool-operation:jailer/run` to reach the current
-379/3/3/33 endpoint. The scoped gate accepts only those six exact phases and
+`corpus:jailer` and `tool-operation:jailer/run` to reach 379/3/3/33. The
+multiprocess-isolation transition then changes its one exact semantic row to
+reach the current 380/3/2/33 endpoint. The scoped gate accepts only those seven exact phases and
 derives every identity-checked difference; none of the totals is a delivery
 quota.
 
