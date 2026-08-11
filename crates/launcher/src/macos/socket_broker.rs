@@ -43,6 +43,14 @@ enum BrokerState {
     Complete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketBrokerDrainStatus {
+    /// The authenticated broker remains open for another request.
+    Pending,
+    /// The authenticated terminal handshake completed and no authority remains.
+    Complete,
+}
+
 impl LauncherSocketBroker {
     pub(crate) const fn new(session: SessionId) -> Self {
         Self {
@@ -59,11 +67,13 @@ impl LauncherSocketBroker {
         lifecycle_state: LauncherState,
         lifecycle_cancelled: bool,
         grants: &PreparedGrantBatch,
-    ) -> Result<(), LauncherError> {
+    ) -> Result<SocketBrokerDrainStatus, LauncherError> {
         loop {
             let received = match receive_socket_broker_message(socket) {
                 Ok(received) => received,
-                Err(SocketBrokerError::Io(io::ErrorKind::WouldBlock)) => return Ok(()),
+                Err(SocketBrokerError::Io(io::ErrorKind::WouldBlock)) => {
+                    return Ok(SocketBrokerDrainStatus::Pending);
+                }
                 Err(_) => return Err(LauncherError::SocketBroker),
             };
             verify_peer_pid(socket.as_raw_fd(), worker_pid)
@@ -146,6 +156,10 @@ impl LauncherSocketBroker {
                         },
                         None,
                     )?;
+                    // The worker closes its datagram immediately after receiving
+                    // Complete. Do not turn that valid terminal close into one
+                    // more frame-decoding attempt in this drain.
+                    return Ok(SocketBrokerDrainStatus::Complete);
                 }
                 _ => return Err(LauncherError::SocketBroker),
             }
@@ -473,7 +487,7 @@ mod tests {
         descriptor: Option<RawFd>,
         lifecycle_state: LauncherState,
         cancelled: bool,
-    ) -> Result<(), LauncherError> {
+    ) -> Result<SocketBrokerDrainStatus, LauncherError> {
         let (launcher, worker) = UnixDatagram::pair().expect("broker pair should open");
         launcher
             .set_nonblocking(true)
@@ -604,5 +618,49 @@ mod tests {
             ),
             Err(LauncherError::SocketBroker)
         );
+    }
+
+    #[test]
+    fn broker_shutdown_reports_a_terminal_drain() {
+        let (launcher, worker) = UnixDatagram::pair().expect("broker pair should open");
+        launcher
+            .set_nonblocking(true)
+            .expect("launcher endpoint should become nonblocking");
+        let mut broker = LauncherSocketBroker::new(session());
+        broker.state =
+            BrokerState::Active(SocketChild::parse("vm.vsock").expect("broker child should parse"));
+        broker.next_sequence = 2;
+        send_socket_broker_message(
+            &worker,
+            &SocketBrokerMessage::Shutdown {
+                session: session(),
+                sequence: 2,
+            },
+            None,
+        )
+        .expect("shutdown should send");
+        // SAFETY: The test process owns both authenticated socketpair peers.
+        let pid = unsafe { libc::getpid() };
+
+        assert_eq!(
+            broker.drain(
+                &launcher,
+                pid,
+                LauncherState::ReadyToProceed,
+                true,
+                &empty_grants(),
+            ),
+            Ok(SocketBrokerDrainStatus::Complete)
+        );
+        assert!(matches!(
+            receive_socket_broker_message(&worker),
+            Ok(bangbang_session::macos::socket_broker::ReceivedSocketBrokerMessage {
+                message: SocketBrokerMessage::Complete {
+                    session: response_session,
+                    sequence: 2,
+                },
+                descriptor: None,
+            }) if response_session == session()
+        ));
     }
 }

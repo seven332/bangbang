@@ -2374,6 +2374,8 @@ fn run_certified_production_vsock_snapshot_restore(
         },
         &format!("production {transport} source"),
         &source,
+        &source_logger.opened,
+        &source_fixture.snapshot.opened_metrics,
     );
     let (mut source_host_streams, source_host_ports) =
         connect_certified_production_vsock_source_host_streams(
@@ -3201,6 +3203,8 @@ fn run_certified_production_vsock_destination(
         },
         &format!("production {case}"),
         &running,
+        &logger.opened,
+        &fixture.snapshot.opened_metrics,
     );
     drop(fresh_guest_streams);
     for (index, stream) in host_streams.iter_mut().enumerate() {
@@ -3208,8 +3212,12 @@ fn run_certified_production_vsock_destination(
             read_certified_production_vsock_connect_ok(stream, PROCESS_TIMEOUT).unwrap_or_else(
                 |error| {
                     panic!(
-                        "production {case} preserved-listener stream {index} should connect: {error}; stdout:\n{}",
-                        running.stdout_snapshot()
+                        "production {case} preserved-listener stream {index} should connect: {error}; {}",
+                        certified_production_vsock_failure_diagnostics(
+                            &running,
+                            &logger.opened,
+                            &fixture.snapshot.opened_metrics,
+                        )
                     )
                 },
             );
@@ -3223,8 +3231,12 @@ fn run_certified_production_vsock_destination(
         let mut guest_reply = vec![0_u8; 4096];
         read_exact_nonblocking(stream, &mut guest_reply, PROCESS_TIMEOUT).unwrap_or_else(|error| {
             panic!(
-                "production {case} host stream {index} guest reply should arrive: {error}; stdout:\n{}",
-                running.stdout_snapshot()
+                "production {case} host stream {index} guest reply should arrive: {error}; {}",
+                certified_production_vsock_failure_diagnostics(
+                    &running,
+                    &logger.opened,
+                    &fixture.snapshot.opened_metrics,
+                )
             )
         });
         assert_eq!(
@@ -3238,7 +3250,14 @@ fn run_certified_production_vsock_destination(
             PROCESS_TIMEOUT,
         )
         .unwrap_or_else(|error| {
-            panic!("production {case} host stream {index} payload should write: {error}")
+            panic!(
+                "production {case} host stream {index} payload should write: {error}; {}",
+                certified_production_vsock_failure_diagnostics(
+                    &running,
+                    &logger.opened,
+                    &fixture.snapshot.opened_metrics,
+                )
+            )
         });
         stream
             .shutdown(std::net::Shutdown::Write)
@@ -3246,7 +3265,14 @@ fn run_certified_production_vsock_destination(
                 panic!("production {case} host stream {index} should half-close: {error}")
             });
         wait_for_stream_eof_nonblocking(stream, PROCESS_TIMEOUT).unwrap_or_else(|error| {
-            panic!("production {case} host stream {index} EOF should arrive: {error}")
+            panic!(
+                "production {case} host stream {index} EOF should arrive: {error}; {}",
+                certified_production_vsock_failure_diagnostics(
+                    &running,
+                    &logger.opened,
+                    &fixture.snapshot.opened_metrics,
+                )
+            )
         });
     }
 
@@ -3405,6 +3431,8 @@ fn accept_certified_production_vsock_guest_streams(
     exchange: CertifiedProductionVsockGuestExchange,
     context: &str,
     running: &RunningSerialApiLauncher,
+    logger: &Path,
+    metrics: &Path,
 ) -> Vec<UnixStream> {
     let CertifiedProductionVsockGuestExchange {
         request_kind,
@@ -3420,13 +3448,10 @@ fn accept_certified_production_vsock_guest_streams(
             let mut stream =
                 wait_for_unix_listener_accept(&listener, PROCESS_TIMEOUT).unwrap_or_else(|error| {
                     panic!(
-                        "{context} guest stream {request_kind}[{index}] should arrive: {error}; stdout:\n{}",
-                        running.stdout_snapshot()
+                        "{context} guest stream {request_kind}[{index}] should arrive: {error}; {}",
+                        certified_production_vsock_failure_diagnostics(running, logger, metrics)
                     )
                 });
-            drop(listener);
-            fs::remove_file(&path)
-                .expect("production certified guest listener path should clean after accept");
             stream
                 .set_nonblocking(true)
                 .expect("production certified guest stream should be nonblocking");
@@ -3435,11 +3460,17 @@ fn accept_certified_production_vsock_guest_streams(
             read_exact_nonblocking(&mut stream, &mut received, PROCESS_TIMEOUT).unwrap_or_else(
                 |error| {
                     panic!(
-                        "{context} guest stream {request_kind}[{index}] payload should arrive: {error}; stdout:\n{}",
-                        running.stdout_snapshot()
+                        "{context} guest stream {request_kind}[{index}] payload should arrive: {error}; {}",
+                        certified_production_vsock_failure_diagnostics(running, logger, metrics)
                     )
                 },
             );
+            // `accept` can win before the launcher finishes its post-connect
+            // pathname identity check and SCM_RIGHTS handoff. The exact payload
+            // proves that boundary before the test withdraws the pathname.
+            drop(listener);
+            fs::remove_file(&path)
+                .expect("production certified guest listener path should clean after payload");
             assert_eq!(
                 received, expected,
                 "{context} guest stream {request_kind}[{index}] payload must remain isolated"
@@ -3471,6 +3502,46 @@ fn accept_certified_production_vsock_guest_streams(
             stream
         })
         .collect()
+}
+
+fn certified_production_vsock_failure_diagnostics(
+    running: &RunningSerialApiLauncher,
+    logger: &Path,
+    metrics: &Path,
+) -> String {
+    let flush = try_http_request(
+        &running.socket,
+        "PUT",
+        "/actions",
+        r#"{"action_type":"FlushMetrics"}"#,
+    )
+    .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    let logger = fs::read(logger)
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|line| line.contains("device-kind=vsock"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    let metrics = fs::read_to_string(metrics)
+        .ok()
+        .and_then(|output| output.lines().last().map(str::to_owned))
+        .and_then(|generation| serde_json::from_str::<serde_json::Value>(&generation).ok())
+        .map(|generation| {
+            serde_json::json!({
+                "logger": generation.get("logger"),
+                "signals": generation.get("signals"),
+                "vsock": generation.get("vsock"),
+            })
+            .to_string()
+        })
+        .unwrap_or_else(|| "<unavailable>".to_owned());
+    format!(
+        "metrics flush response:\n{flush}\nstdout:\n{}\ndevice logger:\n{logger}\nmetrics:\n{metrics}",
+        running.stdout_snapshot()
+    )
 }
 
 fn connect_certified_production_vsock_source_host_streams(
@@ -22774,26 +22845,31 @@ fn http_put(socket: &Path, path: &str, body: &str) -> String {
 }
 
 fn http_request(socket: &Path, method: &str, path: &str, body: &str) -> String {
-    let mut stream = UnixStream::connect(socket).expect("API socket should accept connections");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("API read timeout should be configured");
+    try_http_request(socket, method, path, body)
+        .unwrap_or_else(|error| panic!("HTTP request {method} {path} should complete: {error}"))
+}
+
+fn try_http_request(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> std::io::Result<String> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
-    )
-    .unwrap_or_else(|error| panic!("HTTP request {method} {path} should be written: {error}"));
+    )?;
     if let Err(error) = stream.shutdown(std::net::Shutdown::Write)
         && error.kind() != std::io::ErrorKind::NotConnected
     {
-        panic!("HTTP request {method} {path} write should close: {error}");
+        return Err(error);
     }
     let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("HTTP response should be read");
-    response
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 fn assert_http_status(response: &str, expected: u16, context: &str) {

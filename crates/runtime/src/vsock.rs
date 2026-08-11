@@ -7278,6 +7278,73 @@ impl std::error::Error for VirtioVsockTxQueueDispatchError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VirtioVsockPendingEventAck {
+    available_index: u16,
+}
+
+impl VirtioVsockPendingEventAck {
+    const fn new(available_index: u16) -> Self {
+        Self { available_index }
+    }
+
+    const fn available_index(self) -> u16 {
+        self.available_index
+    }
+}
+
+impl fmt::Debug for VirtioVsockPendingEventAck {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockPendingEventAck")
+            .field("checkpoint", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Failure to validate the guest event ring before acknowledging a restored reset.
+pub struct VirtioVsockEventQueueAckError {
+    source: VirtqueueAvailableRingError,
+}
+
+impl VirtioVsockEventQueueAckError {
+    fn new(source: VirtqueueAvailableRingError) -> Self {
+        Self { source }
+    }
+
+    /// Returns the retained available-ring failure without including it in the
+    /// redacted outer display or debug representation.
+    pub const fn ring_error(&self) -> &VirtqueueAvailableRingError {
+        &self.source
+    }
+}
+
+impl fmt::Debug for VirtioVsockEventQueueAckError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VirtioVsockEventQueueAckError")
+            .field("source", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for VirtioVsockEventQueueAckError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("virtio-vsock event queue reset acknowledgement is invalid")
+    }
+}
+
+impl std::error::Error for VirtioVsockEventQueueAckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+struct PreparedVirtioVsockTransportResetPublication {
+    publication: VirtioVsockTransportResetPublication,
+    pending_event_ack: VirtioVsockPendingEventAck,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioVsockEventQueue {
     queue_state: VirtioMmioQueueState,
@@ -7364,10 +7431,44 @@ impl VirtioVsockEventQueue {
         self.event_idx_enabled
     }
 
+    fn pending_event_ack_checkpoint(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<VirtioVsockPendingEventAck, VirtqueueAvailableRingError> {
+        let available_index = self.available.available_index(memory)?;
+        let available_len = available_index.wrapping_sub(self.available.next_avail());
+        if available_len > self.available.queue_size() {
+            return Err(VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: self.available.queue_size(),
+                available_len,
+            });
+        }
+        Ok(VirtioVsockPendingEventAck::new(available_index))
+    }
+
+    fn acknowledges_pending_event_reset(
+        &self,
+        memory: &GuestMemory,
+        pending: VirtioVsockPendingEventAck,
+    ) -> Result<bool, VirtqueueAvailableRingError> {
+        let current = self.pending_event_ack_checkpoint(memory)?;
+        let available_advance = current
+            .available_index()
+            .wrapping_sub(pending.available_index());
+        if available_advance > self.available.queue_size() {
+            return Err(VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: self.available.queue_size(),
+                available_len: available_advance,
+            });
+        }
+        Ok(available_advance != 0)
+    }
+
     fn publish_transport_reset(
         &mut self,
         memory: &mut GuestMemory,
-    ) -> Result<Option<VirtioVsockTransportResetPublication>, VirtioVsockTransportResetError> {
+    ) -> Result<Option<PreparedVirtioVsockTransportResetPublication>, VirtioVsockTransportResetError>
+    {
         let checkpoint = self.available.checkpoint();
         let chain = self
             .available
@@ -7388,7 +7489,7 @@ impl VirtioVsockEventQueue {
         &mut self,
         memory: &mut GuestMemory,
         chain: &VirtqueueDescriptorChain,
-    ) -> Result<VirtioVsockTransportResetPublication, VirtioVsockTransportResetError> {
+    ) -> Result<PreparedVirtioVsockTransportResetPublication, VirtioVsockTransportResetError> {
         let descriptor_head = descriptor_chain_head(chain)
             .ok_or(VirtioVsockTransportResetError::EmptyDescriptorChain)?;
         let descriptor = chain
@@ -7430,23 +7531,27 @@ impl VirtioVsockEventQueue {
             .validate_mapped(memory)
             .map_err(|source| VirtioVsockTransportResetError::UsedRing { source })?;
 
-        let notification_suppression =
-            if self.event_idx_enabled {
-                VirtqueueNotificationSuppression::EventIdx {
-                    used_event: self.available.used_event(memory).map_err(|source| {
-                        VirtioVsockTransportResetError::AvailableRing { source }
-                    })?,
-                    // The event queue is intentionally not drained: Linux usually
-                    // pre-publishes the whole ring. Match Firecracker's
-                    // enable_notification() and arm the guest's next publish after
-                    // its current avail.idx, not after our one-entry cursor.
-                    avail_event: self.available.available_index(memory).map_err(|source| {
-                        VirtioVsockTransportResetError::AvailableRing { source }
-                    })?,
-                }
-            } else {
-                VirtqueueNotificationSuppression::Disabled
-            };
+        // Linux pre-publishes event buffers. The index observed after consuming
+        // the reset buffer becomes the runtime proof point for its later refill.
+        let pending_event_ack = self
+            .pending_event_ack_checkpoint(memory)
+            .map_err(|source| VirtioVsockTransportResetError::AvailableRing { source })?;
+
+        let notification_suppression = if self.event_idx_enabled {
+            VirtqueueNotificationSuppression::EventIdx {
+                used_event: self
+                    .available
+                    .used_event(memory)
+                    .map_err(|source| VirtioVsockTransportResetError::AvailableRing { source })?,
+                // The event queue is intentionally not drained: Linux usually
+                // pre-publishes the whole ring. Match Firecracker's
+                // enable_notification() and arm the guest's next publish after
+                // its current avail.idx, not after our one-entry cursor.
+                avail_event: pending_event_ack.available_index(),
+            }
+        } else {
+            VirtqueueNotificationSuppression::Disabled
+        };
 
         memory
             .write_slice(
@@ -7469,10 +7574,13 @@ impl VirtioVsockEventQueue {
             )
             .map_err(|source| VirtioVsockTransportResetError::UsedRing { source })?;
 
-        Ok(VirtioVsockTransportResetPublication {
-            descriptor_head,
-            descriptor_len: descriptor.len(),
-            event_idx_would_notify: notification.needs_queue_interrupt(),
+        Ok(PreparedVirtioVsockTransportResetPublication {
+            publication: VirtioVsockTransportResetPublication {
+                descriptor_head,
+                descriptor_len: descriptor.len(),
+                event_idx_would_notify: notification.needs_queue_interrupt(),
+            },
+            pending_event_ack,
         })
     }
 }
@@ -8337,6 +8445,9 @@ pub enum VirtioVsockReconstructionError {
         queue_index: usize,
         source: VirtioVsockQueueBuildError,
     },
+    EventQueueAck {
+        source: VirtioVsockEventQueueAckError,
+    },
     HandlerBuild(VirtioMmioRegisterHandlerError),
     Transport,
 }
@@ -8359,6 +8470,8 @@ impl fmt::Display for VirtioVsockReconstructionError {
             Self::QueueBuild { queue_index, .. } => {
                 write!(formatter, "failed to rebuild vsock queue {queue_index}")
             }
+            Self::EventQueueAck { .. } => formatter
+                .write_str("failed to establish restored vsock event acknowledgement checkpoint"),
             Self::HandlerBuild(_) => {
                 formatter.write_str("failed to build reconstructed vsock MMIO handler")
             }
@@ -8375,6 +8488,7 @@ impl std::error::Error for VirtioVsockReconstructionError {
             Self::Capture(source) => Some(source),
             Self::HostSocket(source) => Some(source),
             Self::QueueBuild { source, .. } => Some(source),
+            Self::EventQueueAck { source } => Some(source),
             Self::HandlerBuild(source) => Some(source),
             Self::ResourceSelectorMismatch
             | Self::ResourceConsumed
@@ -8732,7 +8846,13 @@ fn reconstruct_vsock_snapshot_device(
                 queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
                 source,
             })?;
-            Ok::<_, VirtioVsockReconstructionError>((rx, tx, event))
+            let pending_event_ack =
+                event
+                    .pending_event_ack_checkpoint(memory)
+                    .map_err(|source| VirtioVsockReconstructionError::EventQueueAck {
+                        source: VirtioVsockEventQueueAckError::new(source),
+                    })?;
+            Ok::<_, VirtioVsockReconstructionError>((rx, tx, event, pending_event_ack))
         })
         .transpose()?;
 
@@ -8763,12 +8883,11 @@ fn reconstruct_vsock_snapshot_device(
     device
         .host_connections
         .attach_metrics(device.metrics.clone());
-    if let Some((rx, tx, event)) = active_queues {
+    if let Some((rx, tx, event, pending_event_ack)) = active_queues {
         device.active_rx_queue = Some(rx);
         device.active_tx_queue = Some(tx);
         device.active_event_queue = Some(event);
-        let signal = device.signal_restored_transport_reset();
-        debug_assert_eq!(signal, VirtioVsockRestoredTransportResetSignal::Signaled);
+        device.arm_restored_transport_reset(pending_event_ack);
     }
     let config_space =
         VirtioVsockConfigSpace::with_metrics(state.guest_cid(), device.metrics.clone());
@@ -8899,7 +9018,7 @@ pub struct VirtioVsockDevice {
     active_rx_queue: Option<VirtioVsockRxQueue>,
     active_tx_queue: Option<VirtioVsockTxQueue>,
     active_event_queue: Option<VirtioVsockEventQueue>,
-    pending_event_ack: bool,
+    pending_event_ack: Option<VirtioVsockPendingEventAck>,
     host_socket_path: Option<PathBuf>,
     host_socket_owner: Option<VsockHostSocketOwner>,
     guest_connector: Option<Box<dyn VsockGuestConnector>>,
@@ -8934,7 +9053,7 @@ impl VirtioVsockDevice {
             active_rx_queue: None,
             active_tx_queue: None,
             active_event_queue: None,
-            pending_event_ack: false,
+            pending_event_ack: None,
             host_socket_path: None,
             host_socket_owner: None,
             guest_connector: None,
@@ -9026,9 +9145,18 @@ impl VirtioVsockDevice {
 
     /// Whether guest RX is waiting for a snapshot-origin transport-reset acknowledgement.
     ///
-    /// This flag is runtime-only and must not be persisted as frontend state.
+    /// The underlying event-ring checkpoint is runtime-only and must not be
+    /// persisted as frontend state.
     pub const fn pending_event_ack(&self) -> bool {
-        self.pending_event_ack
+        self.pending_event_ack.is_some()
+    }
+
+    #[cfg(test)]
+    const fn pending_event_ack_available_index(&self) -> Option<u16> {
+        match self.pending_event_ack {
+            Some(pending) => Some(pending.available_index()),
+            None => None,
+        }
     }
 
     pub(crate) fn host_wakeup(&self) -> Result<VsockHostWakeup, TryReserveError> {
@@ -9369,17 +9497,22 @@ impl VirtioVsockDevice {
         };
 
         match (queues_active, reset_attempt) {
-            (false, VirtioVsockTransportResetAttempt::Inactive) if !self.pending_event_ack => {}
+            (false, VirtioVsockTransportResetAttempt::Inactive)
+                if self.pending_event_ack.is_none() => {}
             (false, _) => {
                 return Err(VirtioVsockDeviceCaptureError::InactiveResetAttemptMismatch);
             }
             (true, VirtioVsockTransportResetAttempt::Inactive) => {
                 return Err(VirtioVsockDeviceCaptureError::ActiveResetAttemptMissing);
             }
-            (true, VirtioVsockTransportResetAttempt::Published(_)) if !self.pending_event_ack => {
+            (true, VirtioVsockTransportResetAttempt::Published(_))
+                if self.pending_event_ack.is_none() =>
+            {
                 return Err(VirtioVsockDeviceCaptureError::PublishedResetWithoutGate);
             }
-            (true, VirtioVsockTransportResetAttempt::AlreadyPending) if !self.pending_event_ack => {
+            (true, VirtioVsockTransportResetAttempt::AlreadyPending)
+                if self.pending_event_ack.is_none() =>
+            {
                 return Err(VirtioVsockDeviceCaptureError::PendingResetWithoutGate);
             }
             (true, VirtioVsockTransportResetAttempt::QueueEmpty)
@@ -9582,7 +9715,7 @@ impl VirtioVsockDevice {
         self.active_rx_queue = Some(active_rx_queue);
         self.active_tx_queue = Some(active_tx_queue);
         self.active_event_queue = Some(active_event_queue);
-        self.pending_event_ack = false;
+        self.pending_event_ack = None;
         Ok(())
     }
 
@@ -9622,35 +9755,52 @@ impl VirtioVsockDevice {
         if !self.is_activated() {
             return Ok(VirtioVsockTransportResetAttempt::Inactive);
         }
-        if self.pending_event_ack {
+        if self.pending_event_ack.is_some() {
             return Ok(VirtioVsockTransportResetAttempt::AlreadyPending);
         }
         let Some(event_queue) = self.active_event_queue.as_mut() else {
             return Ok(VirtioVsockTransportResetAttempt::Inactive);
         };
-        let Some(publication) = event_queue.publish_transport_reset(memory)? else {
+        let Some(prepared) = event_queue.publish_transport_reset(memory)? else {
             return Ok(VirtioVsockTransportResetAttempt::QueueEmpty);
         };
 
-        self.pending_event_ack = true;
-        Ok(VirtioVsockTransportResetAttempt::Published(publication))
+        self.pending_event_ack = Some(prepared.pending_event_ack);
+        Ok(VirtioVsockTransportResetAttempt::Published(
+            prepared.publication,
+        ))
+    }
+
+    fn arm_restored_transport_reset(&mut self, checkpoint: VirtioVsockPendingEventAck) {
+        debug_assert!(self.is_activated());
+        let already_pending = self.pending_event_ack.is_some();
+        self.pending_event_ack = Some(checkpoint);
+        if !already_pending && let Some(logger) = &self.guest_logger {
+            logger.log_vsock(LoggerVsockOutcome::TransportResetSucceeded);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_restored_transport_reset_for_test(
+        &mut self,
+        memory: &GuestMemory,
+    ) -> Result<bool, VirtioVsockEventQueueAckError> {
+        let Some(event_queue) = self.active_event_queue.as_ref() else {
+            return Ok(false);
+        };
+        let checkpoint = event_queue
+            .pending_event_ack_checkpoint(memory)
+            .map_err(VirtioVsockEventQueueAckError::new)?;
+        self.arm_restored_transport_reset(checkpoint);
+        Ok(true)
     }
 
     fn signal_restored_transport_reset(&mut self) -> VirtioVsockRestoredTransportResetSignal {
-        let already_pending = self.pending_event_ack;
-        let signal = if self.is_activated() {
-            self.pending_event_ack = true;
+        if self.is_activated() && self.pending_event_ack.is_some() {
             VirtioVsockRestoredTransportResetSignal::Signaled
         } else {
             VirtioVsockRestoredTransportResetSignal::Inactive
-        };
-        if !already_pending
-            && matches!(signal, VirtioVsockRestoredTransportResetSignal::Signaled)
-            && let Some(logger) = &self.guest_logger
-        {
-            logger.log_vsock(LoggerVsockOutcome::TransportResetSucceeded);
         }
-        signal
     }
 
     pub fn reset(&mut self) {
@@ -9661,7 +9811,7 @@ impl VirtioVsockDevice {
         self.active_rx_queue = None;
         self.active_tx_queue = None;
         self.active_event_queue = None;
-        self.pending_event_ack = false;
+        self.pending_event_ack = None;
         self.pending_host_connections.clear();
         self.host_connections = VsockHostConnectionTable::new();
         self.host_connections.attach_metrics(self.metrics.clone());
@@ -9877,7 +10027,7 @@ impl VirtioVsockDevice {
         now: Instant,
         dispatch: VirtioVsockRxQueueDispatch,
     ) -> Result<VirtioVsockRxQueueDispatch, VirtioVsockRxQueueDispatchError> {
-        if self.pending_event_ack {
+        if self.pending_event_ack.is_some() {
             return Ok(dispatch);
         }
         let Some(packet) = self.first_pending_rx_packet() else {
@@ -9904,7 +10054,7 @@ impl VirtioVsockDevice {
         memory: &mut GuestMemory,
         now: Instant,
     ) -> Result<VirtioVsockRxQueueDispatch, VirtioVsockRxQueueDispatchError> {
-        if self.pending_event_ack || self.first_pending_rx_packet().is_none() {
+        if self.pending_event_ack.is_some() || self.first_pending_rx_packet().is_none() {
             return Ok(VirtioVsockRxQueueDispatch::new());
         }
 
@@ -9945,7 +10095,6 @@ impl VirtioVsockDevice {
             self.guest_cid,
             now,
         ));
-
         for header in reset_headers {
             let _ = self.queue_guest_reset_packet(header);
         }
@@ -10627,6 +10776,25 @@ impl VirtioVsockDevice {
         result
     }
 
+    fn acknowledge_pending_event_reset(
+        &mut self,
+        memory: &GuestMemory,
+    ) -> Result<(), VirtioVsockEventQueueAckError> {
+        let Some(pending) = self.pending_event_ack else {
+            return Ok(());
+        };
+        let Some(event_queue) = self.active_event_queue.as_ref() else {
+            return Ok(());
+        };
+        let acknowledged = event_queue
+            .acknowledges_pending_event_reset(memory, pending)
+            .map_err(VirtioVsockEventQueueAckError::new)?;
+        if acknowledged {
+            self.pending_event_ack = None;
+        }
+        Ok(())
+    }
+
     fn dispatch_drained_queue_notifications_at_unobserved(
         &mut self,
         memory: &mut GuestMemory,
@@ -10676,8 +10844,15 @@ impl VirtioVsockDevice {
             });
         }
 
-        if drained_notifications.contains(&VIRTIO_VSOCK_EVENT_QUEUE_INDEX) {
-            self.pending_event_ack = false;
+        if event_notified && let Err(source) = self.acknowledge_pending_event_reset(memory) {
+            self.metrics
+                .record_observation(VsockDeviceMetrics::default().with_ev_queue_event_fails(1));
+            return Err(
+                VirtioVsockDeviceNotificationError::EventQueueAcknowledgement {
+                    drained_notifications,
+                    source,
+                },
+            );
         }
 
         self.flush_pending_guest_rw_writes();
@@ -11086,6 +11261,9 @@ impl VsockNotificationObservation {
                     }
                     VirtioVsockDeviceNotificationError::UnsupportedQueue { .. } => {
                         observation.queue_notification_unsupported = true;
+                    }
+                    VirtioVsockDeviceNotificationError::EventQueueAcknowledgement { .. } => {
+                        observation.queue_dispatch_failed = true;
                     }
                     VirtioVsockDeviceNotificationError::TxQueueDispatch {
                         partial_dispatch,
@@ -11746,6 +11924,10 @@ pub enum VirtioVsockDeviceNotificationError {
         drained_notifications: Vec<usize>,
         queue_index: usize,
     },
+    EventQueueAcknowledgement {
+        drained_notifications: Vec<usize>,
+        source: VirtioVsockEventQueueAckError,
+    },
     TxQueueDispatch {
         partial_dispatch: Box<VirtioVsockDeviceNotificationDispatch>,
         source: VirtioVsockTxQueueDispatchError,
@@ -11765,6 +11947,10 @@ impl VirtioVsockDeviceNotificationError {
             | Self::UnsupportedQueue {
                 drained_notifications,
                 ..
+            }
+            | Self::EventQueueAcknowledgement {
+                drained_notifications,
+                ..
             } => drained_notifications,
             Self::TxQueueDispatch {
                 partial_dispatch, ..
@@ -11781,7 +11967,9 @@ impl VirtioVsockDeviceNotificationError {
             Self::RxQueueDispatch {
                 partial_dispatch, ..
             } => partial_dispatch.tx_queue_dispatch(),
-            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+            Self::Inactive { .. }
+            | Self::UnsupportedQueue { .. }
+            | Self::EventQueueAcknowledgement { .. } => None,
         }
     }
 
@@ -11791,7 +11979,9 @@ impl VirtioVsockDeviceNotificationError {
             Self::TxQueueDispatch {
                 partial_dispatch, ..
             } => partial_dispatch.rx_queue_dispatch(),
-            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+            Self::Inactive { .. }
+            | Self::UnsupportedQueue { .. }
+            | Self::EventQueueAcknowledgement { .. } => None,
         }
     }
 }
@@ -11808,6 +11998,9 @@ impl fmt::Display for VirtioVsockDeviceNotificationError {
                     "virtio-vsock queue notification for unsupported queue {queue_index}"
                 )
             }
+            Self::EventQueueAcknowledgement { .. } => {
+                f.write_str("failed to validate virtio-vsock event queue reset acknowledgement")
+            }
             Self::TxQueueDispatch { source, .. } => {
                 write!(f, "failed to dispatch virtio-vsock TX queue: {source}")
             }
@@ -11823,6 +12016,7 @@ impl std::error::Error for VirtioVsockDeviceNotificationError {
         match self {
             Self::TxQueueDispatch { source, .. } => Some(source),
             Self::RxQueueDispatch { source, .. } => Some(source),
+            Self::EventQueueAcknowledgement { source, .. } => Some(source),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
     }
@@ -12716,8 +12910,8 @@ mod tests {
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
-        VIRTQUEUE_DESCRIPTOR_SIZE, VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions,
-        read_descriptor_chain, read_descriptor_chain_with_options,
+        VIRTQUEUE_DESCRIPTOR_SIZE, VirtqueueAvailableRingError, VirtqueueDescriptorChain,
+        VirtqueueDescriptorChainOptions, read_descriptor_chain, read_descriptor_chain_with_options,
     };
 
     use super::{
@@ -13902,6 +14096,28 @@ mod tests {
                 u32::try_from(queue_index).expect("queue index should fit"),
             )
             .expect("queue notification should write");
+    }
+
+    fn arm_restored_vsock_device(device: &mut VirtioVsockDevice, memory: &GuestMemory) {
+        let expected_index = device
+            .active_event_dispatch_queue()
+            .expect("event queue should be active")
+            .pending_event_ack_checkpoint(memory)
+            .expect("test event ring should establish an acknowledgement checkpoint")
+            .available_index();
+        assert!(
+            device
+                .arm_restored_transport_reset_for_test(memory)
+                .expect("test event ring should arm the restored reset")
+        );
+        assert_eq!(
+            device.pending_event_ack_available_index(),
+            Some(expected_index)
+        );
+    }
+
+    fn arm_restored_vsock_handler(handler: &mut VirtioVsockMmioHandler, memory: &GuestMemory) {
+        arm_restored_vsock_device(handler.activation_handler_mut(), memory);
     }
 
     fn configured_vsock_queue_registers(
@@ -19509,6 +19725,13 @@ mod tests {
         assert_eq!(event_queue.used_ring().next_used(), 1);
         assert!(handler.activation_handler().pending_event_ack());
         assert_eq!(
+            handler
+                .activation_handler()
+                .pending_event_ack_available_index(),
+            Some(3),
+            "source publication must checkpoint the guest's post-publication avail.idx"
+        );
+        assert_eq!(
             read_interrupt_status(&handler),
             DeviceInterruptKind::Queue.status().bits()
         );
@@ -19666,6 +19889,13 @@ mod tests {
         assert!(publication.event_idx_would_notify());
         assert!(handler.activation_handler().pending_event_ack());
         assert_eq!(
+            handler
+                .activation_handler()
+                .pending_event_ack_available_index(),
+            Some(2),
+            "disabled EVENT_IDX must still establish the same refill checkpoint"
+        );
+        assert_eq!(
             read_guest_u16(&memory, vsock_event_used_ring_avail_event_address()),
             0x5a5a,
             "disabled EVENT_IDX must leave avail_event untouched"
@@ -19677,6 +19907,13 @@ mod tests {
 
         assert_eq!(repeated, VirtioVsockTransportResetAttempt::AlreadyPending);
         assert!(handler.activation_handler().pending_event_ack());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_event_ack_available_index(),
+            Some(2),
+            "AlreadyPending must preserve the original checkpoint"
+        );
         assert_eq!(read_vsock_event_used_index(&memory), 1);
         assert_eq!(
             handler
@@ -19689,6 +19926,52 @@ mod tests {
             "repeated reset must not consume another guest descriptor"
         );
         assert!(metrics.snapshot().is_empty());
+    }
+
+    #[test]
+    fn virtio_vsock_transport_reset_checkpoints_available_index_across_wraparound() {
+        let mut memory = vsock_tx_memory();
+        let queues = configured_vsock_queue_registers(Some(TEST_VSOCK_QUEUE_SIZE), true);
+        let event_state = *queues
+            .queue(
+                u32::try_from(VIRTIO_VSOCK_EVENT_QUEUE_INDEX)
+                    .expect("event queue index should fit"),
+            )
+            .expect("event queue state should exist");
+        let mut event = super::VirtioVsockEventQueue::from_capture_state(
+            event_state,
+            VirtioVsockQueueCaptureState::new(u16::MAX, u16::MAX, false),
+            false,
+        )
+        .expect("wrapped event queue should rebuild");
+
+        write_vsock_event_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_VSOCK_EVENT_PAYLOAD, 4, None),
+        );
+        write_vsock_event_available_entry(
+            &mut memory,
+            usize::from(u16::MAX % TEST_VSOCK_QUEUE_SIZE),
+            0,
+        );
+        write_vsock_event_available_index(&mut memory, 0);
+        write_guest_u16(&mut memory, vsock_event_used_ring_idx_address(), u16::MAX);
+
+        let prepared = event
+            .publish_transport_reset(&mut memory)
+            .expect("wrapped reset publication should validate")
+            .expect("wrapped event descriptor should publish");
+
+        assert_eq!(prepared.pending_event_ack.available_index(), 0);
+        assert_eq!(prepared.publication.descriptor_head(), 0);
+        assert_eq!(event.available_ring().next_avail(), 0);
+        assert_eq!(event.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_event_used_index(&memory), 0);
+        assert_eq!(
+            read_vsock_event_used_element(&memory, usize::from(u16::MAX % TEST_VSOCK_QUEUE_SIZE)),
+            (0, 4)
+        );
     }
 
     #[test]
@@ -19830,11 +20113,24 @@ mod tests {
         assert!(!inactive.activation_handler().pending_event_ack());
         assert_eq!(
             inactive.signal_restored_vsock_transport_reset(),
+            super::VirtioVsockRestoredTransportResetSignal::Inactive,
+            "re-signaling must not fabricate an acknowledgement checkpoint"
+        );
+        arm_restored_vsock_handler(&mut inactive, &memory);
+        assert_eq!(
+            inactive.signal_restored_vsock_transport_reset(),
             super::VirtioVsockRestoredTransportResetSignal::Signaled
         );
         assert_eq!(
             inactive.signal_restored_vsock_transport_reset(),
             super::VirtioVsockRestoredTransportResetSignal::Signaled
+        );
+        assert_eq!(
+            inactive
+                .activation_handler()
+                .pending_event_ack_available_index(),
+            Some(0),
+            "restored interrupt re-signaling must preserve the original checkpoint"
         );
         assert!(inactive.activation_handler().pending_event_ack());
         assert_eq!(read_vsock_event_used_index(&memory), 0);
@@ -19844,13 +20140,22 @@ mod tests {
         );
 
         notify_vsock_queue(&mut inactive, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+        let stale = inactive
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("unchanged event notification should be a valid no-op");
+        assert_eq!(stale.event_notifications(), 1);
+        assert!(inactive.activation_handler().pending_event_ack());
+
+        write_vsock_event_available_index(&mut memory, 1);
+        notify_vsock_queue(&mut inactive, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
         let acknowledgement = inactive
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect("event-only acknowledgement without RX backlog should succeed");
+            .expect("refilled event buffer should acknowledge the reset");
         assert_eq!(acknowledgement.event_notifications(), 1);
         assert!(!inactive.activation_handler().pending_event_ack());
         assert_eq!(read_vsock_event_used_index(&memory), 0);
 
+        arm_restored_vsock_handler(&mut inactive, &memory);
         assert_eq!(
             inactive.signal_restored_vsock_transport_reset(),
             super::VirtioVsockRestoredTransportResetSignal::Signaled
@@ -20971,8 +21276,10 @@ mod tests {
     fn virtio_vsock_restored_gate_preserves_host_request_until_event_ack() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let metrics = SharedVsockDeviceMetrics::default();
 
         activate_vsock_handler(&mut handler);
+        handler.attach_vsock_metrics(metrics.clone());
         let (accepted, _client, request) =
             accepted_host_connection_with_request("event-gated-request", 4005);
         let key = handler
@@ -20989,6 +21296,7 @@ mod tests {
             ),
         );
         write_vsock_rx_available_heads(&mut memory, &[0]);
+        arm_restored_vsock_handler(&mut handler, &memory);
         assert!(
             handler
                 .signal_restored_vsock_transport_reset()
@@ -21022,6 +21330,21 @@ mod tests {
         assert_eq!(read_interrupt_status(&handler), 0);
 
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+        let stale = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("unchanged event index should retain the RX gate");
+        assert_eq!(stale.event_notifications(), 1);
+        assert!(handler.activation_handler().pending_event_ack());
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 0);
+
+        write_vsock_event_available_index(&mut memory, 1);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
         let acknowledged = handler
             .dispatch_vsock_queue_notifications(&mut memory)
             .expect("event acknowledgement should drain pending RX");
@@ -21040,6 +21363,163 @@ mod tests {
                 .activation_handler()
                 .has_pending_host_request_packet(key)
         );
+
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+        let repeated = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("later ungated event notification should remain a no-op");
+        assert!(repeated.rx_queue_dispatch().is_none());
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn virtio_vsock_restored_gate_accepts_available_index_wraparound() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("event-wrap-request", 4005);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        handler
+            .activation_handler_mut()
+            .arm_restored_transport_reset(super::VirtioVsockPendingEventAck::new(u16::MAX));
+
+        // The current zero index is the refill after a u16::MAX checkpoint.
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+        let acknowledged = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("wrapped event index should acknowledge the reset");
+
+        assert!(!handler.activation_handler().pending_event_ack());
+        assert_eq!(acknowledged.event_notifications(), 1);
+        assert_eq!(
+            acknowledged
+                .rx_queue_dispatch()
+                .expect("wrapped acknowledgement should drain RX")
+                .delivered_requests(),
+            1
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_restored_gate_rejects_malformed_event_refill_fail_closed() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let metrics = SharedVsockDeviceMetrics::default();
+        let capture = LoggerTestCapture::default();
+        let (_logger_state, logger) = capture.configured_guest_logger();
+
+        activate_vsock_handler(&mut handler);
+        handler.attach_vsock_metrics(metrics.clone());
+        handler.attach_guest_logger(logger.clone());
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("event-invalid-request", 4005);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        arm_restored_vsock_handler(&mut handler, &memory);
+        write_vsock_event_available_index(&mut memory, VIRTIO_VSOCK_QUEUE_SIZE + 1);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("oversized event available length must fail closed");
+
+        let source = match &error {
+            super::VirtioVsockDeviceNotificationError::EventQueueAcknowledgement {
+                source, ..
+            } => source,
+            other => panic!("unexpected notification error: {other:?}"),
+        };
+        assert!(matches!(
+            source.ring_error(),
+            VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: VIRTIO_VSOCK_QUEUE_SIZE,
+                available_len,
+            } if *available_len == VIRTIO_VSOCK_QUEUE_SIZE + 1
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
+        );
+        assert!(error.completed_tx_dispatch().is_none());
+        assert!(error.completed_rx_dispatch().is_none());
+        assert!(error.source().is_some());
+        assert!(source.source().is_some());
+        assert_eq!(
+            error.to_string(),
+            "failed to validate virtio-vsock event queue reset acknowledgement"
+        );
+        assert!(!format!("{error:?}").contains("0x3200"));
+        assert!(handler.activation_handler().pending_event_ack());
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 1);
+        super::observe_vsock_notification_result(&logger, Err(&error));
+        assert!(logger.wait_for_delivery_for_test());
+        let logger_output = capture.output();
+        assert!(
+            logger_output.contains("operation=queue-dispatch outcome=failed\n"),
+            "unexpected vsock logger output: {logger_output:?}"
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_restored_gate_rejects_available_index_regression() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let metrics = SharedVsockDeviceMetrics::default();
+
+        activate_vsock_handler(&mut handler);
+        handler.attach_vsock_metrics(metrics.clone());
+        write_vsock_event_available_index(&mut memory, 2);
+        arm_restored_vsock_handler(&mut handler, &memory);
+        write_vsock_event_available_index(&mut memory, 1);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("an event index regression must fail closed");
+
+        let source = match &error {
+            super::VirtioVsockDeviceNotificationError::EventQueueAcknowledgement {
+                source, ..
+            } => source,
+            other => panic!("unexpected notification error: {other:?}"),
+        };
+        assert!(matches!(
+            source.ring_error(),
+            VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: VIRTIO_VSOCK_QUEUE_SIZE,
+                available_len: u16::MAX,
+            }
+        ));
+        assert!(handler.activation_handler().pending_event_ack());
+        assert_eq!(metrics.snapshot().ev_queue_event_fails(), 1);
     }
 
     #[test]
@@ -21076,6 +21556,7 @@ mod tests {
             ),
         );
         write_vsock_rx_available_heads(&mut memory, &[0]);
+        arm_restored_vsock_handler(&mut handler, &memory);
         handler.signal_restored_vsock_transport_reset();
         handler
             .write_register(
@@ -21110,6 +21591,7 @@ mod tests {
             0
         );
 
+        write_vsock_event_available_index(&mut memory, 1);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
         let acknowledged = handler
             .dispatch_vsock_queue_notifications(&mut memory)
@@ -21137,6 +21619,7 @@ mod tests {
         let mut device = VirtioVsockDevice::new();
 
         activate_vsock_device(&mut device);
+        arm_restored_vsock_device(&mut device, &memory);
         assert_eq!(
             device.signal_restored_transport_reset(),
             super::VirtioVsockRestoredTransportResetSignal::Signaled
@@ -21175,6 +21658,7 @@ mod tests {
             ),
         );
         write_vsock_rx_available_heads(&mut memory, &[0]);
+        arm_restored_vsock_handler(&mut handler, &memory);
         assert!(
             handler
                 .signal_restored_vsock_transport_reset()
@@ -21188,6 +21672,7 @@ mod tests {
             .expect("reset interrupt should acknowledge");
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+        write_vsock_event_available_index(&mut memory, 1);
 
         let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
@@ -21238,6 +21723,7 @@ mod tests {
             ),
         );
         write_vsock_tx_available_heads(&mut memory, &[0]);
+        arm_restored_vsock_handler(&mut handler, &memory);
         assert!(
             handler
                 .signal_restored_vsock_transport_reset()
@@ -21261,7 +21747,7 @@ mod tests {
             &[VIRTIO_VSOCK_TX_QUEUE_INDEX, VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
         );
         assert_eq!(notification.event_notifications(), 1);
-        assert!(!handler.activation_handler().pending_event_ack());
+        assert!(handler.activation_handler().pending_event_ack());
         assert!(notification.needs_queue_interrupt());
         assert!(notification.rx_queue_dispatch().is_none());
         let tx = notification
@@ -21282,6 +21768,14 @@ mod tests {
         assert_eq!(active_tx_queue.available_ring().next_avail(), 1);
         assert_eq!(active_tx_queue.used_ring().next_used(), 1);
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
+
+        write_vsock_event_available_index(&mut memory, 1);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+        let acknowledged = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("refilled event queue should clear the gate after mixed TX");
+        assert_eq!(acknowledged.event_notifications(), 1);
+        assert!(!handler.activation_handler().pending_event_ack());
     }
 
     #[test]
@@ -28531,7 +29025,7 @@ mod tests {
         let path = unique_socket_path("restore-live");
         let config = valid_vsock_config(42, path.to_string_lossy());
         let mut source = virtio_vsock_mmio_handler_with_host_socket(42, &path);
-        let memory = vsock_tx_memory();
+        let mut memory = vsock_tx_memory();
         activate_vsock_handler_with_event_idx_and_size(&mut source, TEST_VSOCK_QUEUE_SIZE);
         let (accepted, _client, request) =
             accepted_host_connection_with_request("restore-cursor", 5000);
@@ -28587,6 +29081,11 @@ mod tests {
         assert!(device.is_activated());
         assert_eq!(device.guest_cid(), 42);
         assert!(device.pending_event_ack());
+        assert_eq!(
+            device.pending_event_ack_available_index(),
+            Some(0),
+            "active reconstruction must derive its checkpoint from restored guest memory"
+        );
         assert_eq!(device.pending_host_connection_count(), 0);
         assert!(device.host_connections.is_empty());
         assert!(device.guest_connections.is_empty());
@@ -28643,9 +29142,10 @@ mod tests {
             .raw();
         assert_eq!(next_port, saved_port + 1);
 
+        write_vsock_event_available_index(&mut memory, 1);
         notify_vsock_queue(&mut reconstructed, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
         reconstructed
-            .dispatch_vsock_queue_notifications(&mut vsock_tx_memory())
+            .dispatch_vsock_queue_notifications(&mut memory)
             .expect("event acknowledgement should clear reconstructed RX gate");
         assert!(!reconstructed.activation_handler().pending_event_ack());
 

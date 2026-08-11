@@ -85,8 +85,10 @@ network/backend/packet-I/O/metric/scheduler/route/endpoint/MMDS owners through
 one newly authorized transaction, and reconstructs a fresh vsock
 listener/device from the captured or clone-local overridden selector. Restored
 vsock live work is empty: the guest observes `TRANSPORT_RESET`, RX waits for
-event-queue acknowledgement while TX remains live, and preserved guest
-listeners accept fresh traffic.
+the reset event buffer to be refilled (a validated event-ring `avail.idx`
+advance) while TX remains live, and preserved guest listeners accept fresh
+traffic. The acknowledgement checkpoint is reconstructed from guest memory and
+remains runtime-only; an unrelated event-queue kick cannot release RX.
 `LazyGuestMemory` remains the backend-neutral
 private-anonymous
 coordinator for the external-paging roadmap; it is not the v2 File/COW loader

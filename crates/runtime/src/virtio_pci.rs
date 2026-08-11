@@ -6373,6 +6373,19 @@ mod tests {
         let memory = vsock_event_memory();
         let metrics = SharedVsockDeviceMetrics::default();
 
+        assert!(
+            fixture
+                .endpoint
+                .inner
+                .state
+                .lock()
+                .expect("endpoint state should be healthy")
+                .core
+                .activation
+                .arm_restored_transport_reset_for_test(&memory)
+                .expect("restored event ring should establish a checkpoint")
+        );
+
         let signal = fixture
             .endpoint
             .signal_restored_vsock_transport_reset()
