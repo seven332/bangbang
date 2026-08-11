@@ -7,6 +7,7 @@ use std::os::fd::RawFd;
 pub mod api_listener;
 pub mod block_control;
 pub mod bookmark;
+pub mod credential;
 pub mod grant_registry;
 pub mod grant_transport;
 #[cfg(feature = "elevated-bootstrap-probe")]

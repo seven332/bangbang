@@ -1,6 +1,7 @@
 //! Private launcher-worker session protocol and macOS ownership primitives.
 
 mod codec;
+pub mod credential;
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 #[doc(hidden)]
 pub mod elevated_credential;
