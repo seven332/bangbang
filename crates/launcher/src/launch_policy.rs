@@ -655,7 +655,8 @@ mod tests {
         expected: JailerIsolationArgument,
         private_values: &[&str],
     ) {
-        let error = LaunchCommand::parse(args).expect_err("Linux isolation input should fail");
+        let error =
+            LaunchCommand::parse(args).expect_err("unsupported isolation input should fail");
         assert_eq!(error, LauncherError::UnsupportedJailerIsolation(expected));
         assert_eq!(
             error.to_string(),
@@ -671,9 +672,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_named_linux_isolation_before_consuming_values() {
+    fn rejects_named_unsupported_isolation_before_consuming_values() {
         let worker = Path::new("/fixed/BangbangWorker");
         let arguments = [
+            JailerIsolationArgument::ChrootBaseDirectory,
             JailerIsolationArgument::Cgroup,
             JailerIsolationArgument::CgroupVersion,
             JailerIsolationArgument::ParentCgroup,
@@ -696,6 +698,7 @@ mod tests {
         }
 
         for argument in [
+            JailerIsolationArgument::ChrootBaseDirectory,
             JailerIsolationArgument::Cgroup,
             JailerIsolationArgument::CgroupVersion,
             JailerIsolationArgument::ParentCgroup,
@@ -713,22 +716,30 @@ mod tests {
             assert_unsupported_isolation(separated, argument, &[&private_value]);
         }
 
-        let mut non_utf8_attached = base(worker);
-        non_utf8_attached.insert(
-            non_utf8_attached.len() - 1,
-            OsString::from_vec(b"--netns=private-\xff-path".to_vec()),
-        );
-        assert_unsupported_isolation(
-            non_utf8_attached,
-            JailerIsolationArgument::NetworkNamespace,
-            &[],
-        );
+        for (name, argument) in [
+            (
+                b"--chroot-base-dir=private-\xff-path".as_slice(),
+                JailerIsolationArgument::ChrootBaseDirectory,
+            ),
+            (
+                b"--netns=private-\xff-path".as_slice(),
+                JailerIsolationArgument::NetworkNamespace,
+            ),
+        ] {
+            let mut non_utf8_attached = base(worker);
+            non_utf8_attached.insert(
+                non_utf8_attached.len() - 1,
+                OsString::from_vec(name.to_vec()),
+            );
+            assert_unsupported_isolation(non_utf8_attached, argument, &[]);
+        }
     }
 
     #[test]
-    fn linux_isolation_names_are_exact_and_pre_delimiter_only() {
+    fn unsupported_isolation_names_are_exact_and_pre_delimiter_only() {
         let worker = Path::new("/fixed/BangbangWorker");
         for lookalike in [
+            "--chroot-base-dir-extra",
             "--cgroups",
             "--cgroup-version-extra",
             "--parent-cgroup-child",
@@ -741,6 +752,7 @@ mod tests {
         }
 
         for argument in [
+            JailerIsolationArgument::ChrootBaseDirectory,
             JailerIsolationArgument::Cgroup,
             JailerIsolationArgument::CgroupVersion,
             JailerIsolationArgument::ParentCgroup,

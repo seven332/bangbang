@@ -38,8 +38,9 @@ Each detailed subject has one primary document:
   virtio-MMIO closure while retaining every external handoff.
 - [Wave 8 Platform-Feasible Authority](compat/firecracker/v1.16.0/wave8-certification-contract.md)
   certifies the final seven-domain interaction matrix, all 21 unordered pairs,
-  the historical 30-record platform-exclusion review, the exact uid/gid
-  platform-limit successor, and the retained external evidence boundary.
+  the historical 30-record platform-exclusion review, the exact uid/gid and
+  configurable-chroot platform-limit successors, and the retained external
+  evidence boundary.
 - [Firecracker-shaped Developer Tracing](compat/firecracker/v1.16.0/tracing-contract.md)
   owns the opt-in feature, exact production scope set, record/privacy envelope,
   delivery policy, and explicit nonclaims.
@@ -64,7 +65,8 @@ record pinned upstream identities, dispositions, exclusions, and evidence; the
 human-readable documents above explain current behavior.
 
 The Wave 8 contract explains the scoped gate, its historical 377/8/3/30 phase,
-and the current exact 377/6/3/32 uid/gid-only successor.
+the exact 377/6/3/32 uid/gid successor, and the current exact 377/5/3/33
+configurable-chroot successor.
 See the [Testing Guide](docs/testing.md#wave-8-final-certification) for the
 canonical commands and the checked authority for the machine-derived counts
 and exact nonterminal identities.

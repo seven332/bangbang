@@ -12871,7 +12871,7 @@
     {
       "id": "corpus:jailer",
       "family": "isolation",
-      "summary": "Five production launch-control leaves are implemented; uid/gid and the cgroup, network-namespace, and PID-namespace leaves have terminal macOS exclusions. Continue auditing configurable chroot ownership, remaining arguments, and aggregate jailer behavior.",
+      "summary": "Five production launch-control leaves are implemented; configurable chroot, uid/gid, and the cgroup, network-namespace, and PID-namespace leaves have terminal fixed-topology macOS exclusions. Continue auditing remaining arguments and aggregate jailer behavior.",
       "source_refs": [
         "corpus:jailer"
       ],
@@ -13371,7 +13371,7 @@
     {
       "id": "corpus:production-host",
       "family": "isolation",
-      "summary": "Linux seccomp, cgroup, network-namespace, and PID-namespace identities now have terminal macOS conclusions; continue auditing production brokerage, vmnet live evidence, credential and chroot authority, signing and deployment, recovery, and other host requirements.",
+      "summary": "Linux seccomp, cgroup, network-namespace, and PID-namespace identities plus configurable chroot and uid/gid now have terminal fixed-topology macOS conclusions; continue auditing production brokerage, vmnet live evidence, signing and deployment, recovery, and other host requirements.",
       "source_refs": [
         "corpus:production-host"
       ],
@@ -18021,11 +18021,153 @@
     {
       "id": "tool-argument:jailer/chroot-base-dir",
       "family": "isolation",
-      "summary": "Audit the Firecracker v1.16 public tool argument jailer/chroot-base-dir.",
+      "summary": "Public macOS chroot and spawn-root inheritance exist, but the mandatory separately signed App Sandbox plus Hypervisor/vmnet worker cannot enter chroot directly and did not reach authenticated application entry when spawned inside the bounded staged root. Apple supplies no supported bounded runtime and IPC closure for that fixed topology; the exact pre-entry child cause remains unknown. Reject exact --chroot-base-dir before consuming its path without claiming Linux mount-namespace or pivot_root parity.",
       "source_refs": [
         "tool-argument:jailer/chroot-base-dir"
       ],
-      "disposition": "audit-required"
+      "disposition": "proven-platform-impossible",
+      "exclusion": {
+        "upstream_contract": [
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L14-L145"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/jailer.md#L221-L232"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/docs/prod-host-setup.md#L85-L113"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/chroot.rs#L17-L100"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L156-L168"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/env.rs#L644-L682"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/firecracker-microvm/firecracker/blob/d83d72b710361a10294480131377b1b00b163af8/src/jailer/src/main.rs#L189-L192"
+          }
+        ],
+        "platform_evidence": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md",
+            "anchor": "Capable-host result"
+          },
+          {
+            "kind": "github",
+            "url": "https://github.com/seven332/bangbang/issues/1371#issuecomment-5251101370"
+          },
+          {
+            "kind": "github",
+            "url": "https://github.com/seven332/bangbang/pull/1883"
+          },
+          {
+            "kind": "github",
+            "url": "https://github.com/seven332/bangbang/pull/1886"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/app-sandbox"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/documentation/security/discovering-and-diagnosing-app-sandbox-violations"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/chroot.2.html"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/posix_spawn.2.html"
+          },
+          {
+            "kind": "authoritative",
+            "url": "https://github.com/apple-oss-distributions/dyld/blob/main/doc/dyld4.md"
+          }
+        ],
+        "alternatives": [
+          "Adding a launchd job or privileged helper changes installation, persistence, authorization, supervision, recovery, and the accepted fixed two-process topology while retaining the documented chroot IPC warning.",
+          "Changing the worker entitlement or adding a sandbox extension weakens or replaces the mandatory separately signed App Sandbox boundary.",
+          "Copying the active dyld shared cache or a system library tree creates a large host-build-coupled system-root clone rather than a bounded distributable product dependency.",
+          "Disabling bootstrap IPC with XPC_NULL_BOOTSTRAP conflicts with the required App Sandbox and vmnet system-service behavior and supplies no positive product contract.",
+          "Interpreting chroot-base-dir as a cwd, App Sandbox container, or descriptor grant leaves absolute pathname resolution rooted at the host and changes the Firecracker security meaning.",
+          "Running public chroot in the already-started mandatory worker is denied by its fixed App Sandbox profile in the controlled direct-worker matrix.",
+          "Staging only the complete signed bundle and current Apple dyld permits launcher root entry and child creation but does not provide the runtime and IPC closure needed to reach authenticated application entry."
+        ],
+        "stable_behavior": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/error.rs",
+            "anchor": "pub enum JailerIsolationArgument"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "fn unsupported_jailer_isolation_argument"
+          }
+        ],
+        "focused_tests": [
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "fn rejects_named_unsupported_isolation_before_consuming_values()"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/src/launch_policy.rs",
+            "anchor": "fn unsupported_isolation_names_are_exact_and_pre_delimiter_only()"
+          },
+          {
+            "kind": "local",
+            "path": "crates/launcher/tests/production_bundle_e2e.rs",
+            "anchor": "fn signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker()"
+          }
+        ],
+        "compatibility_docs": [
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/elevated-bootstrap-evidence.md",
+            "anchor": "Configurable chroot fixed-topology platform limit"
+          },
+          {
+            "kind": "local",
+            "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+            "anchor": "Terminal jailer configurable-chroot platform limit"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-compatibility.md",
+            "anchor": "Jailer configurable-chroot platform limit"
+          },
+          {
+            "kind": "local",
+            "path": "docs/firecracker-validation-matrix.md",
+            "anchor": "macOS production isolation"
+          }
+        ],
+        "security_docs": [
+          {
+            "kind": "local",
+            "path": "docs/security.md",
+            "anchor": "Jailer configurable-chroot fixed-topology platform limit"
+          }
+        ],
+        "challenge": {
+          "kind": "github",
+          "url": "https://github.com/seven332/bangbang/issues/1908#issuecomment-5251362795"
+        }
+      }
     },
     {
       "id": "tool-argument:jailer/daemonize",
@@ -19772,7 +19914,7 @@
     {
       "id": "tool-operation:jailer/run",
       "family": "isolation",
-      "summary": "The fixed-code/current-user/resource-limit/daemon leaves are implemented and uid/gid plus Linux cgroup/network/PID namespace inputs have terminal macOS exclusions; continue auditing chroot, remaining arguments, ordering, and the aggregate jailer run contract.",
+      "summary": "The fixed-code/current-user/resource-limit/daemon leaves are implemented and configurable chroot, uid/gid, plus Linux cgroup/network/PID namespace inputs have terminal fixed-topology macOS exclusions; continue auditing remaining arguments, ordering, and the aggregate jailer run contract.",
       "source_refs": [
         "tool-operation:jailer/run"
       ],

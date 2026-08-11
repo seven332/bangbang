@@ -127,7 +127,7 @@ required independent cleanup in the fixed no-helper topology.
 
 The exact post-Wave-8 jailer uid/gid successor is `377/6/3/32`. It moves only
 `tool-argument:jailer/gid` and `tool-argument:jailer/uid` from audit-required to
-proven-platform-impossible. The nine current nonterminal outcomes are:
+proven-platform-impossible. At that phase the nine nonterminal outcomes were:
 
 - four #1373 audit-required outcomes: `corpus:jailer`,
   `corpus:production-host`, `jailer/chroot-base-dir`, and `jailer/run`;
@@ -135,12 +135,30 @@ proven-platform-impossible. The nine current nonterminal outcomes are:
   `semantic.network:virtio-net-vmnet-policy-and-connectivity`; and
 - three #1351 missing-platform-feasible isolation semantics.
 
-The current inventory therefore retains four #1373 rows, not six #1373 rows.
+That inventory retained four #1373 rows, not six #1373 rows.
 The two terminal uid/gid exclusions require their own pinned upstream
 contracts, #1904 platform evidence, five rejected alternatives, stable public
 rejection, focused tests, compatibility/security documentation, and #1905
 Challenge result. They do not complete the broader jailer or production-host
 records.
+
+The later configurable-chroot successor is exactly `377/5/3/33`: 377
+implemented, five audit-required, three missing-platform-feasible, and 33
+proven-platform-impossible. It moves only
+`tool-argument:jailer/chroot-base-dir`. The current eight nonterminal outcomes
+are:
+
+- three #1373 audit-required outcomes: `corpus:jailer`,
+  `corpus:production-host`, and `jailer/run`;
+- the same two #1378 audit-required outcomes; and
+- the same three #1351 missing-platform-feasible isolation semantics.
+
+The chroot exclusion separately requires pinned Firecracker root construction,
+Apple public root/runtime/IPC evidence, the #1373/#1884 controls, reviewed
+alternatives, a stable pre-value rejection, focused portable and signed tests,
+compatibility/security documentation, and #1908 Challenge authority. It
+preserves public chroot and spawn-root inheritance, the unknown inherited child
+sub-cause, and the aggregate records' independent nonterminal state.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -159,12 +177,13 @@ It composes every Wave 7 component authority, the phase-aware Wave 7
 certifier, and the Wave 8 authority. The Wave 7 artifact remains historical at
 376/9/3/30 with one Wave 8 handoff. Its certifier accepts that exact historical
 phase, the exact one-row Wave 8 successor at 377/8/3/30, or the exact uid/gid-
-only successor at 377/6/3/32; it rejects unrelated, count-preserving identity
-swaps, and partial drift.
+only successor at 377/6/3/32, or the exact configurable-chroot-only successor
+at 377/5/3/33; it rejects unrelated, count-preserving identity swaps, and
+partial drift.
 
 The global `--final` mode remains stronger and intentionally fails while the
-six audit-required and three feasible external outcomes remain. Neither Wave 8
-nor its exact uid/gid successor weakens that completion gate.
+five audit-required and three feasible external outcomes remain. Neither Wave
+8 nor either exact later successor weakens that completion gate.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,
 assignment, review threads, pull-request checks, remote branches, merge state,

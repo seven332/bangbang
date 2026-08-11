@@ -358,8 +358,9 @@ tree. The authoritative result is the controlled #1904 issue comment; the
 reproduction instructions below cover the earlier #1900 evidence harness and
 must not be presented as a checked reproducer for the discarded #1904 adapter.
 The #1905 capability transition makes only the two uid/gid argument leaves
-terminal; configurable chroot, the two remaining jailer corpus/run records,
-and `corpus:production-host` remain nonterminal.
+terminal. The later #1908 transition makes only configurable chroot terminal;
+the two remaining jailer corpus/run records and `corpus:production-host`
+remain nonterminal.
 
 ## Supported conclusion and nonclaims
 
@@ -422,6 +423,50 @@ mount/PID/user namespace parity, notarized distribution, or behavior beyond
 the recorded OS/SDK. A changed platform result requires a fresh controlled
 product-topology experiment and ID-by-ID Challenge; rerunning the earlier
 feature wrapper alone is insufficient.
+
+## Configurable chroot fixed-topology platform limit
+
+Firecracker's public `--chroot-base-dir` selects the parent of
+`<base>/<exec>/<id>/root`. Its Linux jailer combines a new mount namespace,
+mount-propagation changes, a self bind mount, `pivot_root`, detached old-root
+removal, `chroot`, in-root resources, and exec. Bangbang does not claim that a
+plain Darwin root change supplies those Linux mechanisms.
+
+Public macOS `chroot(2)` exists and `posix_spawn(2)` inherits the caller's
+root. The direct #1373 matrix therefore separates authority from containment:
+the unsandboxed launcher enters the exact root, while the mandatory separately
+signed App Sandbox + Hypervisor worker validates the same descriptor and
+completes `fchdir` but receives permission denied from its own chroot call.
+#1884 then exercises the credible inherited ordering. The launcher stages and
+validates the complete fixed signed bundle plus current `/usr/lib/dyld`, enters
+and reattests the root, and receives a child PID from `posix_spawn`; the child
+exits before its first authenticated Ready record in every repeated and
+concurrent run. The same unchrooted worker completes real HVF create/destroy.
+The exact inherited child sub-cause remains unknown.
+
+Apple's current launchd RootDirectory contract warns that IPC-using jobs have
+no guaranteed behavior without a system-identical library stack and recommends
+disabling bootstrap IPC. That precaution conflicts with the required App
+Sandbox and vmnet service boundary. The inspected public contracts expose no
+bounded distributable runtime/cache/service closure through preopened
+authority. Copying the active shared cache or a system tree is host-build-
+coupled system material; a launchd job/helper, entitlement change, private API,
+or descriptor/cwd alias changes the accepted topology or semantics.
+
+The supported fixed-topology product result is consequently a stable
+pre-value rejection. Exact, attached, separated, and attached non-UTF-8
+pre-delimiter forms fail before the path is decoded, retained, opened, copied,
+or used for grants, sessions, daemon handoff, or spawn:
+
+`unsupported Firecracker jailer isolation argument on macOS: --chroot-base-dir`
+
+This terminal leaf does not say macOS lacks chroot, identify the #1884 child
+failure, complete `corpus:jailer`, `corpus:production-host`, or `jailer/run`,
+or establish behavior on a changed Apple runtime. A new public support
+contract or accepted product topology requires a fresh Challenge. The
+feature-only reproduction below retains its historical `chroot=unresolved`
+result field because it records the measured harness boundary rather than the
+later supported-product disposition.
 
 ## Reproduction
 

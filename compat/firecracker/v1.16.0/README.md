@@ -123,8 +123,8 @@ reviewed delta.
 | [Targeted formal verification](formal-verification-contract.md) | Terminal one-corpus mapping, exact Kani/toolchain pins, five source/compiled-bijective bounded proofs, retained tests, and explicit whole-system/mechanism nonclaims |
 | [Specification benchmark](specification-benchmark-contract.md) | Terminal three-row reference interpretation, strict signed collector/report/comparison, real FIFO loss/replay evidence, optional fixture boundary, and exact performance nonclaims |
 | [Wave 7 aggregate](observability-tools-specification-contract.md#wave-7-aggregate-certification) | Terminal 93-row parent distribution, exact design/device API/release/tool/MMIO ledgers, and explicit #1351/#1373/#1378/Wave 8 handoffs |
-| [Wave 8 platform-feasible certification](wave8-certification-contract.md) | Final seven-domain/21-pair interaction authority, four historical platform-mechanism reviews, the exact Wave 8 and uid/gid-only successor transitions, and retained external outcomes |
-| [Elevated macOS bootstrap evidence](elevated-bootstrap-evidence.md) | Same-host signed evidence for the chroot boundary, three-class permanent credential/session/grant continuation, real guest/HVF completion, the listener and retired-session results, and the product uid/gid runtime-root platform gate |
+| [Wave 8 platform-feasible certification](wave8-certification-contract.md) | Final seven-domain/21-pair interaction authority, four historical platform-mechanism reviews, the exact Wave 8, uid/gid, and configurable-chroot successor transitions, and retained external outcomes |
+| [Elevated macOS bootstrap evidence](elevated-bootstrap-evidence.md) | Same-host signed evidence for the chroot boundary, three-class permanent credential/session/grant continuation, real guest/HVF completion, the listener and retired-session results, and the product uid/gid and configurable-chroot platform gates |
 
 ## Dispositions
 
@@ -147,8 +147,9 @@ may be retained where they are part of a mechanically checked closure.
 Historical delivery arithmetic belongs in Git and GitHub.
 
 Wave 7 retains its historical handoff snapshot. The phase-aware gates accept
-only the exact Wave 8 one-row successor and the later exact uid/gid-only
-377/6/3/32 successor while retaining the remaining #1351/#1373/#1378 external
+only the exact Wave 8 one-row successor, the later exact uid/gid-only
+377/6/3/32 successor, and the current exact configurable-chroot-only
+377/5/3/33 successor while retaining the remaining #1351/#1373/#1378 external
 outcomes. See the [Wave 8 contract](wave8-certification-contract.md) for the
 checked transitions and [`docs/testing.md`](../../../docs/testing.md#wave-8-final-certification)
 for the canonical commands.

@@ -90,7 +90,6 @@ The following remain under delivery issue
 
 - general dynamic post-Ready brokerage and hard revocation;
 - broader external vmnet connectivity, cleanup, and per-VM network policy;
-- configurable chroot ownership and its deployment policy;
 - automatic restart/reconnect and long-lived broker/service policy;
 - cross-filesystem socket publication; and
 - Developer ID/team possession, notarization, launch constraints, and release
@@ -131,8 +130,37 @@ that abandons linked foreground recovery, or wrapper/launcher-only cleanup
 changes the fixed accepted topology or fails independent worker cleanup.
 Accordingly `tool-argument:jailer/uid` and `tool-argument:jailer/gid` are exact
 `proven-platform-impossible` leaves. This conclusion does not complete
-`corpus:jailer`, `corpus:production-host`, configurable chroot ownership, or
-the aggregate `jailer/run` contract.
+`corpus:jailer`, `corpus:production-host`, or the aggregate `jailer/run`
+contract.
+
+## Terminal jailer configurable-chroot platform limit
+
+Firecracker's `--chroot-base-dir` selects the parent of its constructed jail
+root and participates in Linux mount-namespace, bind-mount, `pivot_root`,
+old-root detachment, chroot, resource, and exec behavior. Public macOS chroot
+and spawn-root inheritance exist, but they do not supply Linux mechanism
+parity.
+
+The exact signed evidence covers both public orderings. In #1373 the
+unsandboxed launcher enters the validated root while the mandatory App Sandbox
++ Hypervisor worker receives permission denied from direct chroot after
+validating and entering the directory by descriptor. In #1884 the launcher
+stages the complete fixed signed bundle plus current dyld, enters and
+reattests the root, and receives a child PID; the worker exits before its first
+authenticated Ready record in every repeated and concurrent case. The
+unchrooted control completes real HVF create/destroy, but the exact inherited
+child sub-cause remains unknown.
+
+Apple gives IPC-using RootDirectory jobs no supported guarantee without a
+system-identical library stack, while its no-bootstrap-IPC precaution conflicts
+with mandatory App Sandbox/vmnet behavior. A shared-cache/system-root copy,
+helper/service, entitlement change, private API, or cwd/descriptor alias is
+host-coupled, changes the fixed topology, or changes the requested semantics.
+The product therefore rejects the exact pre-delimiter option before consuming
+its value with
+`unsupported Firecracker jailer isolation argument on macOS: --chroot-base-dir`.
+The conclusion is limited to the supported fixed topology and does not complete
+the three aggregate records.
 
 ## Certified Linux runtime isolation exclusions
 
@@ -160,6 +188,7 @@ publication, or worker output; post-delimiter worker arguments remain opaque.
 | Typed startup grants and contained resource consumers | `crates/launcher/src/grant_manifest.rs` and the owning VMM/device consumers | focused grant tests plus signed direct and production device/snapshot matrices |
 | Stable Linux-mechanism exclusions | launcher policy parser and process CLI handling | focused unit/process tests, signed production-bundle pre-mutation cases, [compatibility](../../../docs/firecracker-compatibility.md#runtime-isolation-platform-exclusions), and [security](../../../docs/security.md#certified-linux-runtime-isolation-exclusions) |
 | Stable jailer uid/gid platform limit | `crates/launcher/src/launch_policy.rs`, `crates/launcher/src/macos/daemon.rs`, and `crates/launcher/src/supervisor.rs` | launch-identity unit tests, signed exact-help/policy validation, the [controlled platform result](elevated-bootstrap-evidence.md#product-uidgid-runtime-root-platform-gate), [compatibility](../../../docs/firecracker-compatibility.md#jailer-uidgid-platform-limit), and [security](../../../docs/security.md#jailer-uidgid-fixed-topology-platform-limit) |
+| Stable jailer configurable-chroot platform limit | `crates/launcher/src/error.rs` and `crates/launcher/src/launch_policy.rs` | closed parser unit tests, signed pre-mutation rejection, the [controlled platform result](elevated-bootstrap-evidence.md#configurable-chroot-fixed-topology-platform-limit), [compatibility](../../../docs/firecracker-compatibility.md#jailer-configurable-chroot-platform-limit), and [security](../../../docs/security.md#jailer-configurable-chroot-fixed-topology-platform-limit) |
 
 All signed production cases run through
 [`scripts/run-integration-tests.sh`](../../../scripts/run-integration-tests.sh);
@@ -176,5 +205,5 @@ namespace, and PID namespace records are terminal only for the named stable
 macOS exclusions. The offline seccompiler is a separate implemented artifact
 tool and does not enforce runtime seccomp. The three composite records remain
 nonterminal until #1351's broader feasible work is complete. The uid/gid
-argument leaves are separately terminal at the fixed topology above; the four
-remaining #1373 records stay audit-required.
+argument leaves and configurable chroot are separately terminal at the fixed
+topology above; the three remaining #1373 records stay audit-required.

@@ -16,6 +16,8 @@ pub(crate) const WAVE8_SUCCESSOR_ID: &str =
 pub(crate) const JAILER_UID_GID_IDS: [&str; 2] =
     ["tool-argument:jailer/gid", "tool-argument:jailer/uid"];
 
+pub(crate) const JAILER_CHROOT_BASE_DIR_ID: &str = "tool-argument:jailer/chroot-base-dir";
+
 const WAVE8_AUDIT_IDS: [&str; 8] = [
     "corpus:jailer",
     "corpus:network-setup",
@@ -81,6 +83,7 @@ pub(crate) enum InventoryPhase {
     Wave7,
     Wave8,
     JailerUidGidPlatformLimit,
+    JailerChrootPlatformLimit,
 }
 
 impl InventoryPhase {
@@ -90,6 +93,7 @@ impl InventoryPhase {
             Self::Wave7 => "Wave 7 376/9/3/30",
             Self::Wave8 => "Wave 8 377/8/3/30",
             Self::JailerUidGidPlatformLimit => "post-Wave-8 jailer uid/gid 377/6/3/32",
+            Self::JailerChrootPlatformLimit => "post-uid/gid jailer chroot-base-dir 377/5/3/33",
         }
     }
 }
@@ -103,6 +107,7 @@ pub(crate) fn classify_inventory_phase(
         (376, 9, 3, 30) => InventoryPhase::Wave7,
         (377, 8, 3, 30) => InventoryPhase::Wave8,
         (377, 6, 3, 32) => InventoryPhase::JailerUidGidPlatformLimit,
+        (377, 5, 3, 33) => InventoryPhase::JailerChrootPlatformLimit,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -154,8 +159,14 @@ pub(crate) fn expected_nonterminal_ids(phase: InventoryPhase) -> BTreeSet<&'stat
 
 pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
     let mut ids = wave8_historical_impossible_ids();
-    if phase == InventoryPhase::JailerUidGidPlatformLimit {
+    if matches!(
+        phase,
+        InventoryPhase::JailerUidGidPlatformLimit | InventoryPhase::JailerChrootPlatformLimit
+    ) {
         ids.extend(JAILER_UID_GID_IDS);
+    }
+    if phase == InventoryPhase::JailerChrootPlatformLimit {
+        ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
     ids
 }
@@ -196,6 +207,12 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             for id in JAILER_UID_GID_IDS {
                 ids.remove(id);
             }
+        }
+        InventoryPhase::JailerChrootPlatformLimit => {
+            for id in JAILER_UID_GID_IDS {
+                ids.remove(id);
+            }
+            ids.remove(JAILER_CHROOT_BASE_DIR_ID);
         }
     }
     ids
@@ -241,10 +258,21 @@ mod tests {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::JailerChrootPlatformLimit)
+        );
+
+        let mut uid_gid = current.clone();
+        set_disposition(
+            &mut uid_gid,
+            JAILER_CHROOT_BASE_DIR_ID,
+            Disposition::AuditRequired,
+        );
+        assert_eq!(
+            classify_inventory_phase(&uid_gid),
             Ok(InventoryPhase::JailerUidGidPlatformLimit)
         );
 
-        let mut wave8 = current.clone();
+        let mut wave8 = uid_gid;
         for id in JAILER_UID_GID_IDS {
             set_disposition(&mut wave8, id, Disposition::AuditRequired);
         }
@@ -320,9 +348,18 @@ mod tests {
 
     #[test]
     fn partial_uid_gid_successors_do_not_classify() {
+        let mut wave8 = current_inventory();
+        set_disposition(
+            &mut wave8,
+            JAILER_CHROOT_BASE_DIR_ID,
+            Disposition::AuditRequired,
+        );
         for id in JAILER_UID_GID_IDS {
-            let mut partial = current_inventory();
-            set_disposition(&mut partial, id, Disposition::AuditRequired);
+            set_disposition(&mut wave8, id, Disposition::AuditRequired);
+        }
+        for id in JAILER_UID_GID_IDS {
+            let mut partial = wave8.clone();
+            set_disposition(&mut partial, id, Disposition::ProvenPlatformImpossible);
             assert!(
                 classify_inventory_phase(&partial)
                     .expect_err("one terminal jailer identity alone must not classify")
@@ -330,5 +367,18 @@ mod tests {
                 "partial successor unexpectedly classified: {id}"
             );
         }
+    }
+
+    #[test]
+    fn chroot_without_uid_gid_predecessor_does_not_classify() {
+        let mut partial = current_inventory();
+        for id in JAILER_UID_GID_IDS {
+            set_disposition(&mut partial, id, Disposition::AuditRequired);
+        }
+        assert!(
+            classify_inventory_phase(&partial)
+                .expect_err("chroot without terminal uid/gid must not classify")
+                .contains("inventory does not match an exact accepted phase")
+        );
     }
 }

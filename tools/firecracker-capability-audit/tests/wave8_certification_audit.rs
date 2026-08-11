@@ -173,7 +173,11 @@ fn wave8_terminal_transition_is_exact() {
         .expect("terminal Wave 8 transition must certify");
 
     let mut historical_wave8 = inventory.clone();
-    for id in ["tool-argument:jailer/gid", "tool-argument:jailer/uid"] {
+    for id in [
+        "tool-argument:jailer/chroot-base-dir",
+        "tool-argument:jailer/gid",
+        "tool-argument:jailer/uid",
+    ] {
         let capability = historical_wave8
             .capabilities
             .iter_mut()
