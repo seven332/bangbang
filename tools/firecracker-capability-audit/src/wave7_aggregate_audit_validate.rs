@@ -577,14 +577,15 @@ fn validate_scope_and_counts(
             InventoryPhase::Wave7
             | InventoryPhase::Wave8
             | InventoryPhase::JailerUidGidPlatformLimit
-            | InventoryPhase::JailerChrootPlatformLimit,
+            | InventoryPhase::JailerChrootPlatformLimit
+            | InventoryPhase::JailerAggregate,
         ) => {}
         Ok(phase) => errors.push(format!(
             "Wave 7 aggregate inventory cannot use the earlier {} phase",
             phase.name()
         )),
         Err(error) => errors.push(format!(
-            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, or the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor; found {}/{}/{}/{}: {error}",
+            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, or the exact aggregate jailer 379/3/3/33 successor; found {}/{}/{}/{}: {error}",
             counts.0, counts.1, counts.2, counts.3
         )),
     }
@@ -1106,6 +1107,7 @@ fn validate_tools(
         let expected_live = match (prefix, phase) {
             ("jailer/", Some(InventoryPhase::JailerUidGidPlatformLimit)) => (5, 7, 2),
             ("jailer/", Some(InventoryPhase::JailerChrootPlatformLimit)) => (5, 8, 1),
+            ("jailer/", Some(InventoryPhase::JailerAggregate)) => (6, 8, 0),
             _ => (
                 record.counts.implemented,
                 record.counts.proven_platform_impossible,
@@ -1464,7 +1466,8 @@ fn validate_handoffs(
         phase @ (InventoryPhase::Wave7
         | InventoryPhase::Wave8
         | InventoryPhase::JailerUidGidPlatformLimit
-        | InventoryPhase::JailerChrootPlatformLimit),
+        | InventoryPhase::JailerChrootPlatformLimit
+        | InventoryPhase::JailerAggregate),
     ) = phase
     {
         let expected = expected_nonterminal_ids(phase);

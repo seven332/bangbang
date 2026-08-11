@@ -12871,11 +12871,40 @@
     {
       "id": "corpus:jailer",
       "family": "isolation",
-      "summary": "Five production launch-control leaves are implemented; configurable chroot, uid/gid, and the cgroup, network-namespace, and PID-namespace leaves have terminal fixed-topology macOS exclusions. Continue auditing remaining arguments and aggregate jailer behavior.",
+      "summary": "Certify the complete pinned Firecracker v1.16 jailer corpus through an exact checked 13-argument and 16-operation mapping: the fixed signed worker, validation-before-mutation, default-close descriptors, marker-only environment, private runtime namespace, exact resource limits, launcher-owned ID/timing injection, daemon supervision, cancellation, concurrency, and replacement-safe cleanup provide the applicable macOS outcomes, while uid/gid, configurable chroot, cgroup, network-namespace, PID-namespace, and literal Linux device/root mechanisms retain their challenged terminal limits and explicit nonclaims.",
       "source_refs": [
         "corpus:jailer"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-aggregate-audit.json",
+          "anchor": "\"operation_steps\": ["
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-aggregate-contract.md",
+          "anchor": "## Terminal aggregate outcome"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/jailer_aggregate_audit_validate.rs",
+          "anchor": "pub fn validate_jailer_aggregate_audit("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/jailer_aggregate_audit.rs",
+          "anchor": "fn jailer_terminal_transition_is_exact()"
+        }
+      ]
     },
     {
       "id": "corpus:logger",
@@ -19914,11 +19943,40 @@
     {
       "id": "tool-operation:jailer/run",
       "family": "isolation",
-      "summary": "The fixed-code/current-user/resource-limit/daemon leaves are implemented and configurable chroot, uid/gid, plus Linux cgroup/network/PID namespace inputs have terminal fixed-topology macOS exclusions; continue auditing remaining arguments, ordering, and the aggregate jailer run contract.",
+      "summary": "Certify one complete macOS jailer run that parses and validates the exact pinned grammar before mutation, binds and authenticates the fixed signed worker, closes inherited authority, installs exact limits, constructs and locks private state, injects owned identity/timing arguments, executes through the contained HVF boundary, and supervises foreground or detached cleanup; exact Linux-only and fixed-topology credential/root mechanisms remain terminal exclusions rather than false aliases.",
       "source_refs": [
         "tool-operation:jailer/run"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-aggregate-audit.json",
+          "anchor": "\"operation_steps\": ["
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-aggregate-contract.md",
+          "anchor": "## Terminal aggregate outcome"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/jailer_aggregate_audit_validate.rs",
+          "anchor": "pub fn validate_jailer_aggregate_audit("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/jailer_aggregate_audit.rs",
+          "anchor": "fn jailer_terminal_transition_is_exact()"
+        }
+      ]
     },
     {
       "id": "tool-operation:rebase-snap/rebase",

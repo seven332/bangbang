@@ -6,7 +6,9 @@ machines run on Apple's Hypervisor.framework rather than KVM.
 
 The project targets macOS on Apple Silicon. Compatibility is defined by
 observable API and process behavior for documented subsets; it does not imply
-Firecracker binary, snapshot-file, jailer, seccomp, or KVM compatibility. The
+Firecracker binary, snapshot-file, Linux jailer-mechanism, seccomp, or KVM
+compatibility. The observable macOS jailer aggregate is separately certified
+with explicit platform limits and nonclaims. The
 current bangbang-native ceiling is `v2.13.0`: `Full` emits an exact `v2.12.0`
 state plus complete memory image, while `Diff` emits an exact `v2.13.0` state
 plus differential layer. The loader retains the exact older native profiles
@@ -33,6 +35,9 @@ Each detailed subject has one primary document:
   nonclaims.
 - [Firecracker v1.16.0 Capability Inventory](compat/firecracker/v1.16.0/README.md)
   owns the pinned structural scope, reviewed dispositions, and evidence rules.
+- [Aggregate Jailer Contract](compat/firecracker/v1.16.0/jailer-aggregate-contract.md)
+  owns the complete pinned grammar/operation mapping, macOS outcomes, terminal
+  limits, evidence profiles, and exact inventory transition.
 - [Wave 7 Aggregate Authority](compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
   machine-checks the terminal design, device API, release, public-tool, and
   virtio-MMIO closure while retaining every external handoff.
@@ -65,11 +70,11 @@ record pinned upstream identities, dispositions, exclusions, and evidence; the
 human-readable documents above explain current behavior.
 
 The Wave 8 contract explains the scoped gate, its historical 377/8/3/30 phase,
-the exact 377/6/3/32 uid/gid successor, and the current exact 377/5/3/33
-configurable-chroot successor.
-See the [Testing Guide](docs/testing.md#wave-8-final-certification) for the
-canonical commands and the checked authority for the machine-derived counts
-and exact nonterminal identities.
+the exact 377/6/3/32 uid/gid successor, the 377/5/3/33 configurable-chroot
+successor, and the current exact 379/3/3/33 aggregate-jailer successor.
+See the [Testing Guide](docs/testing.md#aggregate-jailer-certification) for the
+canonical command and the checked authority for the machine-derived counts and
+exact nonterminal identities.
 
 ## Workspace Layout
 

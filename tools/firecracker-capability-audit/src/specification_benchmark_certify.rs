@@ -107,7 +107,7 @@ fn validate_totals(inventory: &CapabilityInventory, errors: &mut Vec<String>) {
     if let Err(error) = classify_inventory_phase(inventory) {
         let (implemented, audit_required, missing, impossible) = disposition_counts(inventory);
         errors.push(format!(
-            "specification benchmark terminal totals must be its exact 371/14/3/30 phase, the exact Wave 7 376/9/3/30 successor, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, or the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor; found {implemented}/{audit_required}/{missing}/{impossible}: {error}"
+            "specification benchmark terminal totals must be its exact 371/14/3/30 phase, the exact Wave 7 376/9/3/30 successor, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, or the exact aggregate jailer 379/3/3/33 successor; found {implemented}/{audit_required}/{missing}/{impossible}: {error}"
         ));
     }
 }
@@ -123,6 +123,7 @@ fn validate_contract(contract: &str, errors: &mut Vec<String>) {
         "371 implemented-and-verified",
         "377/6/3/32",
         "377/5/3/33",
+        "379/3/3/33",
     ] {
         if !contract.contains(token) {
             errors.push(format!(
@@ -175,7 +176,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let exact = format!(
-            "SPECIFICATION.md docs/network-performance.md scripts/specification-benchmark.py whole-process RSS logger.missed_metrics_count #1378 371 implemented-and-verified 377/6/3/32 377/5/3/33\n{rows}"
+            "SPECIFICATION.md docs/network-performance.md scripts/specification-benchmark.py whole-process RSS logger.missed_metrics_count #1378 371 implemented-and-verified 377/6/3/32 377/5/3/33 379/3/3/33\n{rows}"
         );
         let mut errors = Vec::new();
         validate_contract(&exact, &mut errors);

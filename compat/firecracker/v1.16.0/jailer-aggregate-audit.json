@@ -1,0 +1,702 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1351",
+  "delivery_issue": "#1912",
+  "upstream_sources": [
+    {
+      "id": "jailer-document",
+      "manifest_id": "corpus:jailer",
+      "path": "docs/jailer.md",
+      "anchor": "entire-file",
+      "git_blob": "fa5e8b4ee769f64ee83a317dce5902ffd0029a1b"
+    },
+    {
+      "id": "jailer-parser-and-entrypoint",
+      "manifest_id": "tool-operation:jailer/run",
+      "path": "src/jailer/src/main.rs",
+      "anchor": "build_arg_parser",
+      "git_blob": "4f87f2563c6f6ef47cecbb2829fe91bf27a6f603"
+    },
+    {
+      "id": "jailer-operation",
+      "manifest_id": null,
+      "path": "src/jailer/src/env.rs",
+      "anchor": "Env::run",
+      "git_blob": "cb3261c039cc6b83932c0bcdb9271faece107e0f"
+    },
+    {
+      "id": "jailer-root-transition",
+      "manifest_id": null,
+      "path": "src/jailer/src/chroot.rs",
+      "anchor": "chroot",
+      "git_blob": "56335c03a747067f81c297ad8b299837bae85d57"
+    }
+  ],
+  "capability_ids": [
+    "corpus:jailer",
+    "tool-operation:jailer/run"
+  ],
+  "previous_counts": {
+    "implemented_and_verified": 377,
+    "audit_required": 5,
+    "missing_platform_feasible": 3,
+    "proven_platform_impossible": 33
+  },
+  "target_counts": {
+    "implemented_and_verified": 379,
+    "audit_required": 3,
+    "missing_platform_feasible": 3,
+    "proven_platform_impossible": 33
+  },
+  "unrelated_inventory_sha256": "ea6de9d4a864a83f8f97709289eab50c9312ae8f9ebb1885152598ad93d274f6",
+  "arguments": [
+    {
+      "capability_id": "tool-argument:jailer/id",
+      "option": "--id",
+      "requirement": "required",
+      "cardinality": "single-value",
+      "upstream_default": null,
+      "outcome": "implemented-and-verified",
+      "evidence_profile": "grammar-and-early-commands"
+    },
+    {
+      "capability_id": "tool-argument:jailer/exec-file",
+      "option": "--exec-file",
+      "requirement": "required",
+      "cardinality": "single-value",
+      "upstream_default": null,
+      "outcome": "implemented-and-verified",
+      "evidence_profile": "fixed-code-and-publication"
+    },
+    {
+      "capability_id": "tool-argument:jailer/uid",
+      "option": "--uid",
+      "requirement": "required",
+      "cardinality": "single-value",
+      "upstream_default": null,
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/gid",
+      "option": "--gid",
+      "requirement": "required",
+      "cardinality": "single-value",
+      "upstream_default": null,
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/chroot-base-dir",
+      "option": "--chroot-base-dir",
+      "requirement": "optional",
+      "cardinality": "single-value",
+      "upstream_default": "/srv/jailer",
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/netns",
+      "option": "--netns",
+      "requirement": "optional",
+      "cardinality": "single-value",
+      "upstream_default": null,
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/daemonize",
+      "option": "--daemonize",
+      "requirement": "optional",
+      "cardinality": "flag",
+      "upstream_default": null,
+      "outcome": "implemented-and-verified",
+      "evidence_profile": "daemon-lifecycle"
+    },
+    {
+      "capability_id": "tool-argument:jailer/new-pid-ns",
+      "option": "--new-pid-ns",
+      "requirement": "optional",
+      "cardinality": "flag",
+      "upstream_default": null,
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/cgroup",
+      "option": "--cgroup",
+      "requirement": "optional",
+      "cardinality": "repeatable-value",
+      "upstream_default": null,
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/resource-limit",
+      "option": "--resource-limit",
+      "requirement": "optional",
+      "cardinality": "repeatable-value",
+      "upstream_default": "no-file=2048",
+      "outcome": "implemented-and-verified",
+      "evidence_profile": "resource-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/cgroup-version",
+      "option": "--cgroup-version",
+      "requirement": "optional",
+      "cardinality": "single-value",
+      "upstream_default": "1",
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/parent-cgroup",
+      "option": "--parent-cgroup",
+      "requirement": "optional",
+      "cardinality": "single-value",
+      "upstream_default": "exec-file basename",
+      "outcome": "proven-platform-impossible",
+      "evidence_profile": "terminal-isolation-limits"
+    },
+    {
+      "capability_id": "tool-argument:jailer/version",
+      "option": "--version",
+      "requirement": "optional",
+      "cardinality": "flag",
+      "upstream_default": null,
+      "outcome": "implemented-and-verified",
+      "evidence_profile": "grammar-and-early-commands"
+    }
+  ],
+  "operation_steps": [
+    {
+      "order": 1,
+      "id": "validate-paths-and-id",
+      "upstream_anchor": "Validate all provided paths and the VM ID",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "grammar-and-early-commands",
+        "validation-and-redaction"
+      ]
+    },
+    {
+      "order": 2,
+      "id": "close-inherited-file-descriptors",
+      "upstream_anchor": "Close all open file descriptors",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "closed-process-boundary"
+      ]
+    },
+    {
+      "order": 3,
+      "id": "clear-inherited-environment",
+      "upstream_anchor": "Cleanup all environment variables",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "closed-process-boundary"
+      ]
+    },
+    {
+      "order": 4,
+      "id": "create-private-runtime-root",
+      "upstream_anchor": "Create the <chroot_base>",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "private-namespace-and-cleanup",
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 5,
+      "id": "bind-isolated-worker-code",
+      "upstream_anchor": "Copy the file specified with --exec-file",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "fixed-code-and-publication"
+      ]
+    },
+    {
+      "order": 6,
+      "id": "install-resource-limits",
+      "upstream_anchor": "Set resource bounds for current process",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "resource-limits"
+      ]
+    },
+    {
+      "order": 7,
+      "id": "configure-cgroups",
+      "upstream_anchor": "Create the cgroup sub-folders",
+      "outcome": "proven-platform-impossible",
+      "evidence_profiles": [
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 8,
+      "id": "enter-contained-root",
+      "upstream_anchor": "Call unshare() into a new mount namespace",
+      "outcome": "proven-platform-impossible",
+      "evidence_profiles": [
+        "private-namespace-and-cleanup",
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 9,
+      "id": "provide-network-device-authority",
+      "upstream_anchor": "Use mknod to create a /dev/net/tun equivalent",
+      "outcome": "platform-inapplicable",
+      "evidence_profiles": [
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 10,
+      "id": "provide-hypervisor-authority",
+      "upstream_anchor": "Use mknod to create a /dev/kvm equivalent",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "signed-guest-execution"
+      ]
+    },
+    {
+      "order": 11,
+      "id": "apply-root-and-device-ownership",
+      "upstream_anchor": "Use chown to change ownership",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 12,
+      "id": "join-network-namespace",
+      "upstream_anchor": "If --netns <netns> is present",
+      "outcome": "proven-platform-impossible",
+      "evidence_profiles": [
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 13,
+      "id": "detach-session-and-standard-streams",
+      "upstream_anchor": "If --daemonize is specified",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "daemon-lifecycle"
+      ]
+    },
+    {
+      "order": 14,
+      "id": "create-pid-namespace",
+      "upstream_anchor": "If --new-pid-ns is specified",
+      "outcome": "proven-platform-impossible",
+      "evidence_profiles": [
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 15,
+      "id": "apply-process-identity",
+      "upstream_anchor": "Drop privileges via setting the provided uid and gid",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "order": 16,
+      "id": "execute-worker-with-owned-arguments",
+      "upstream_anchor": "Exec into",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "grammar-and-early-commands",
+        "fixed-code-and-publication",
+        "signed-guest-execution"
+      ]
+    }
+  ],
+  "corpus_sections": [
+    {
+      "id": "disclaimer",
+      "upstream_anchor": "## Disclaimer",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "fixed-code-and-publication",
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "id": "usage",
+      "upstream_anchor": "## Jailer Usage",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "grammar-and-early-commands",
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "id": "operation",
+      "upstream_anchor": "## Jailer Operation",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "closed-process-boundary",
+        "private-namespace-and-cleanup",
+        "resource-limits",
+        "daemon-lifecycle"
+      ]
+    },
+    {
+      "id": "example-run-and-notes",
+      "upstream_anchor": "## Example Run and Notes",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "grammar-and-early-commands",
+        "signed-guest-execution"
+      ]
+    },
+    {
+      "id": "observations",
+      "upstream_anchor": "### Observations",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "validation-and-redaction",
+        "private-namespace-and-cleanup",
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "id": "known-limitations",
+      "upstream_anchor": "### Known limitations",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "daemon-lifecycle",
+        "terminal-isolation-limits"
+      ]
+    },
+    {
+      "id": "caveats",
+      "upstream_anchor": "## Caveats",
+      "outcome": "platform-inapplicable",
+      "evidence_profiles": [
+        "terminal-isolation-limits"
+      ]
+    }
+  ],
+  "evidence_profiles": [
+    {
+      "id": "grammar-and-early-commands",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn parse_jailer("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn parses_exact_policy_and_injects_owned_arguments()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn rejects_missing_duplicate_unknown_and_forwarded_inputs()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn launcher_exposes_exact_jailer_help_version_and_policy_validation()"
+        }
+      ]
+    },
+    {
+      "id": "validation-and-redaction",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/error.rs",
+          "anchor": "pub enum JailerIsolationArgument"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn unsupported_jailer_isolation_argument("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn rejects_named_unsupported_isolation_before_consuming_values()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn unsupported_isolation_names_are_exact_and_pre_delimiter_only()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker()"
+        }
+      ]
+    },
+    {
+      "id": "fixed-code-and-publication",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/code_sign.rs",
+          "anchor": "pub(crate) fn validate_bundle("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/code_sign.rs",
+          "anchor": "pub(crate) fn validate_worker_process("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/publish.rs",
+          "anchor": "pub(crate) fn publish_exclusive("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/package.rs",
+          "anchor": "fn assemble_bundle_with("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/supervisor.rs",
+          "anchor": "fn launch_prepared("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/package.rs",
+          "anchor": "fn assembles_signs_inspects_and_publishes_fixed_layout()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn launcher_rejects_modified_missing_or_wrongly_signed_worker_before_execution()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn production_bundle_has_exact_nested_signing_contract()"
+        }
+      ]
+    },
+    {
+      "id": "closed-process-boundary",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/spawn.rs",
+          "anchor": "fn environment()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/spawn.rs",
+          "anchor": "libc::POSIX_SPAWN_CLOEXEC_DEFAULT"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    },
+    {
+      "id": "private-namespace-and-cleanup",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn cleanup_namespace_after_worker("
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/runtime.rs",
+          "anchor": "pub fn create(session: SessionId)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/runtime.rs",
+          "anchor": "pub struct WorkerNamespace"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_granted_socket_cleanup_preserves_replacements_in_both_death_orders()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_grant_scopes_cleanup_across_both_process_crash_orders()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    },
+    {
+      "id": "resource-limits",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "fn install_resource_limit("
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "fn install_worker_policy("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn parse_jailer("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "fn exact_limit_never_raises_the_inherited_hard_limit()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    },
+    {
+      "id": "daemon-lifecycle",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/daemon.rs",
+          "anchor": "pub(crate) fn launch_parent("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/spawn.rs",
+          "anchor": "pub(crate) fn spawn_daemon_suspended("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn wait_session_inner("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_daemon_handoff_waits_for_ready_and_keeps_concurrent_supervisors_isolated()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_daemon_parent_loss_before_ack_cancels_worker_and_private_state()"
+        }
+      ]
+    },
+    {
+      "id": "terminal-isolation-limits",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+          "anchor": "## Certified Linux runtime isolation exclusions"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+          "anchor": "## Terminal jailer configurable-chroot platform limit"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+          "anchor": "## Terminal jailer uid/gid platform limit"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/error.rs",
+          "anchor": "pub enum JailerIsolationArgument"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn unsupported_jailer_isolation_argument("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn launch_identity_classifier_covers_current_and_exact_root_targets()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn rejects_named_unsupported_isolation_before_consuming_values()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker()"
+        }
+      ]
+    },
+    {
+      "id": "signed-guest-execution",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/supervisor.rs",
+          "anchor": "fn launch_prepared("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn launcher_runs_real_sandboxed_hvf_guest_to_system_off()"
+        }
+      ]
+    }
+  ],
+  "nonclaims": [
+    "linux-jailer-mechanism-parity",
+    "literal-per-run-executable-copy",
+    "no-shared-read-only-code-pages",
+    "arbitrary-trusted-path-authority",
+    "positive-arbitrary-credential-transition",
+    "positive-configurable-chroot",
+    "linux-cgroup-namespace-or-device-node",
+    "external-vmnet-connectivity",
+    "production-host-deployment",
+    "developer-id-or-notarization",
+    "automatic-restart-or-long-lived-service"
+  ]
+}

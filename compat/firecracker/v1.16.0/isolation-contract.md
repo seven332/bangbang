@@ -130,8 +130,9 @@ that abandons linked foreground recovery, or wrapper/launcher-only cleanup
 changes the fixed accepted topology or fails independent worker cleanup.
 Accordingly `tool-argument:jailer/uid` and `tool-argument:jailer/gid` are exact
 `proven-platform-impossible` leaves. This conclusion does not complete
-`corpus:jailer`, `corpus:production-host`, or the aggregate `jailer/run`
-contract.
+`corpus:production-host`; it did not by itself complete `corpus:jailer` or the
+aggregate `jailer/run`, which #1912 later certifies through the independent
+whole-operation authority below.
 
 ## Terminal jailer configurable-chroot platform limit
 
@@ -160,7 +161,8 @@ The product therefore rejects the exact pre-delimiter option before consuming
 its value with
 `unsupported Firecracker jailer isolation argument on macOS: --chroot-base-dir`.
 The conclusion is limited to the supported fixed topology and does not complete
-the three aggregate records.
+`corpus:production-host`; it did not by itself complete the two jailer
+aggregate records.
 
 ## Certified Linux runtime isolation exclusions
 
@@ -178,6 +180,39 @@ They are not claims that the narrower production boundary is Linux-equivalent:
 surfaces expose only fixed argument names. Rejections occur while parsing the
 pre-delimiter policy, before grants, staging, session creation, spawn,
 publication, or worker output; post-delimiter worker arguments remain opaque.
+
+## Terminal aggregate jailer outcome
+
+#1912 certifies the complete observable pinned jailer grammar and operation
+without weakening any terminal mechanism conclusion. The checked
+[`jailer-aggregate-audit.json`](jailer-aggregate-audit.json) is a bijection over
+all 13 argument leaves, the 16 ordered operations in `docs/jailer.md`, its
+seven document sections, nine exact local evidence profiles, and eleven closed
+nonclaims. It pins the upstream document, parser, environment, and chroot
+source blobs and rejects missing, duplicate, reordered, unknown, stale-anchor,
+or unrelated evidence.
+
+The applicable macOS operation is the existing fixed topology: policy
+validation precedes mutation; the nested worker is separately signed and
+statically/live validated; default-close spawn passes a marker-only environment
+and the closed descriptor allowlist; private no-clobber state, exact
+`RLIMIT_NOFILE`/`RLIMIT_FSIZE`, launcher-owned ID/timing injection, real HVF
+execution, foreground or detached supervision, cancellation, concurrency, and
+replacement-safe cleanup are composed as one run. A fixed immutable signed
+worker is the code-integrity outcome; this is not a claim of a literal per-run
+executable copy or absence of shared read-only code pages.
+
+The exact uid/gid, configurable-chroot, cgroup, network-namespace, and PID-
+namespace leaves above remain terminal platform limits. Linux device nodes,
+arbitrary operator-trusted paths, external vmnet connectivity, production-host
+deployment, Developer ID/notarization, and restart/service policy remain
+explicit nonclaims or independently owned work. The exact transition is
+`377/5/3/33` to `379/3/3/33`; only `corpus:jailer` and
+`tool-operation:jailer/run` move to `implemented-and-verified`, and a checked
+digest pins every unrelated inventory record.
+
+The complete human mapping and scoped command are in the
+[aggregate jailer contract](jailer-aggregate-contract.md).
 
 ## Evidence Map
 
@@ -206,4 +241,6 @@ macOS exclusions. The offline seccompiler is a separate implemented artifact
 tool and does not enforce runtime seccomp. The three composite records remain
 nonterminal until #1351's broader feasible work is complete. The uid/gid
 argument leaves and configurable chroot are separately terminal at the fixed
-topology above; the three remaining #1373 records stay audit-required.
+topology above. The aggregate jailer corpus and run records are now separately
+terminal under #1912; `corpus:production-host`, the two network/vmnet records,
+and all three composite isolation records retain their independent states.

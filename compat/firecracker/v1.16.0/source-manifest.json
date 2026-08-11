@@ -228,6 +228,16 @@
       "extractor": "swagger-v1"
     },
     {
+      "path": "src/jailer/src/chroot.rs",
+      "git_blob": "56335c03a747067f81c297ad8b299837bae85d57",
+      "extractor": "curated-source-v1"
+    },
+    {
+      "path": "src/jailer/src/env.rs",
+      "git_blob": "cb3261c039cc6b83932c0bcdb9271faece107e0f",
+      "extractor": "curated-source-v1"
+    },
+    {
       "path": "src/jailer/src/main.rs",
       "git_blob": "4f87f2563c6f6ef47cecbb2829fe91bf27a6f603",
       "extractor": "curated-source-v1"

@@ -1305,9 +1305,11 @@ The public production behavior therefore remains current non-root uid/gid and
 rejects root-retained or root-transition requests with the fixed redacted
 `invalid production launch policy` result before session creation, spawn, grants, publication, or
 guest work. `tool-argument:jailer/uid` and `tool-argument:jailer/gid` are exact
-terminal platform exclusions. No #1904 adapter was merged; the aggregate
-`corpus:jailer`, `corpus:production-host`, and `jailer/run` records remain
-nonterminal.
+terminal platform exclusions. No #1904 adapter was merged; at that checkpoint
+the aggregate `corpus:jailer`, `corpus:production-host`, and
+`tool-operation:jailer/run` records remained nonterminal. #1912 later
+certifies the two jailer aggregates without changing the independent
+production-host record.
 
 ### Jailer configurable-chroot platform limit
 
@@ -1341,7 +1343,9 @@ daemon, or worker state:
 
 This exact leaf is terminal only for the supported fixed topology. It does not
 claim chroot is absent from macOS, identify the pre-Ready child failure, provide
-Linux isolation parity, or complete the three aggregate jailer/host records.
+Linux isolation parity, or independently complete the three aggregate
+jailer/host records. #1912 later composes it with the other terminal leaves to
+certify the two jailer aggregates.
 
 This is macOS containment, not direct Linux jailer/seccomp equivalence. The
 session namespace itself grants no host resource. The bounded startup channel
@@ -1364,8 +1368,41 @@ work. Positive arbitrary uid/gid transition is the fixed-topology platform
 limit above, not feasible backlog. Configurable chroot is the separate
 fixed-topology platform limit above. The exact Linux seccomp, cgroup,
 network-namespace, and PID-namespace mechanisms now have terminal macOS
-platform exclusions; this does not make the surrounding aggregate jailer or
-production-host records complete.
+platform exclusions. Those leaves alone did not complete the surrounding
+aggregates; #1912 certifies the jailer corpus and operation, while
+`corpus:production-host` remains audit-required.
+
+### Aggregate jailer compatibility
+
+The checked
+[aggregate jailer contract](../compat/firecracker/v1.16.0/jailer-aggregate-contract.md)
+maps the complete pinned Firecracker jailer document and entrypoint into 13
+ordered arguments, 16 ordered operation steps, and seven corpus sections. Its
+versioned `--bangbang-jailer-v1` envelope requires a delimiter, one fixed
+embedded executable, one ID, current credentials, repeatable last-value
+`fsize`/`no-file` limits, optional daemon mode, and opaque forwarded worker
+bytes. Duplicate or launcher-owned forwarded singletons fail before worker
+startup; help and version are mutation-free early commands.
+
+The five implemented leaves are `id`, `exec-file`, `resource-limit`,
+`daemonize`, and `version`. The eight uid/gid, configurable-root, cgroup,
+network-namespace, and PID-namespace leaves retain their separately challenged
+fixed-topology platform exclusions. The aggregate outcome provides fixed
+separately signed code, fail-closed validation, a default-close marker-only
+process boundary, private no-clobber runtime state, exact scalar limits,
+authenticated same-code daemon supervision, Hypervisor authority, and
+replacement-safe cleanup. It does not translate Linux mount, cgroup,
+namespace, device-node, or arbitrary credential mechanisms into macOS aliases.
+
+Exactly `corpus:jailer` and `tool-operation:jailer/run` become
+implemented-and-verified. The transition is `377/5/3/33` to `379/3/3/33`;
+`corpus:production-host`, `corpus:network-setup`, and aggregate vmnet
+connectivity remain audit-required, and the three isolation composites remain
+missing-platform-feasible. The scoped gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-final
+```
 
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
@@ -1419,17 +1456,20 @@ also preserves the independent logger, metrics, tools, corpus, performance,
 formal-verification, and final cross-capability owners rather than promoting
 them through that aggregate result.
 
-The final
+The historical
 [Wave 8 platform-feasible contract](../compat/firecracker/v1.16.0/wave8-certification-contract.md)
-now closes only
+closes only
 `semantic.cross-capability:state-errors-metrics-security-and-snapshots`. Its
 strict authority derives all 21 unordered pairs across seven fixed lifecycle,
 error, observability, resource, device, network/MMDS, and snapshot domains from
-four exact portable and signed product leaves. It also rechecks the current
-30-record platform-exclusion partition and retains the exact eleven
-#1351/#1373/#1378 external outcomes. It does not turn missing credentials,
-root/HVF authority, skipped execution, or a weaker macOS mechanism into
-success or impossibility.
+four exact portable and signed product leaves. It also rechecks the historical
+30-record platform-exclusion partition and originally retained the exact eleven
+#1351/#1373/#1378 external outcomes. Its certifier accepts only the checked
+uid/gid, configurable-chroot, and aggregate-jailer successors. The current
+successor is `379/3/3/33`: one #1373 audit record, two #1378 audit records, and
+three #1351 feasible records remain. It does not turn missing credentials,
+root/HVF authority, skipped execution, or a weaker macOS mechanism into success
+or impossibility.
 
 The independent `corpus:formal-verification` owner is now terminal through the
 [Targeted Formal Verification](formal-verification.md) boundary and checked

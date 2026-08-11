@@ -2044,8 +2044,9 @@ device-table relations, 261 API identities, 21 release entries, 55 public-tool
 leaves, and every supported virtio-MMIO profile. It accepts only its historical
 inventory phase `376/9/3/30` with the Wave 8 row audit-required or the exact
 one-row Wave 8 successor `377/8/3/30`, followed by the exact uid/gid-only
-platform-limit successor `377/6/3/32` and the exact configurable-chroot-only
-successor `377/5/3/33`. Each phase is classified by exact
+platform-limit successor `377/6/3/32`, the exact configurable-chroot-only
+successor `377/5/3/33`, and the exact aggregate-jailer successor
+`379/3/3/33`. Each phase is classified by exact
 identity sets, not counts. It does not execute Kani, sign binaries, run HVF, or
 collect an environment report inside the Rust process: run the targeted Kani
 job, the full signed integration wrapper, and the specification collector
@@ -2089,18 +2090,55 @@ snapshot suites. The historical Wave 8 authority independently groups its 30
 impossible records into exact x86 CPUID/MSR (13), Linux KVM feature/template
 (7), Linux hugetlbfs `2M` (2), and Linux runtime-isolation (8) reviews. Per-ID
 exclusions remain mandatory. The later uid/gid-only successor adds two
-separately challenged fixed-topology exclusions, and the current chroot-only
-successor adds one more, without rewriting that historical partition.
+separately challenged fixed-topology exclusions, and the chroot-only successor
+adds one more, without rewriting that historical partition. The aggregate
+jailer successor changes no leaf disposition or historical partition.
 
 At Wave 8, exactly six #1373 audit rows, two #1378 audit rows, and three #1351
 feasible rows remained. The uid/gid `377/6/3/32` phase retained four #1373
-rows. The current `377/5/3/33` phase retains exactly three #1373 audit rows
-(`corpus:jailer`, `corpus:production-host`, and `jailer/run`), the same two
-#1378 audit rows, and the same three #1351 feasible rows. The global `--final`
-command deliberately continues to fail on those five audit and three feasible
-records. The Rust
-command is offline; live GitHub hierarchy, reviews, CI, branches, merge state,
-and merged-main OID are checked and recorded by the pull-request workflow.
+rows, and the configurable-chroot `377/5/3/33` phase retained three. The
+current aggregate-jailer `379/3/3/33` phase retains exactly one #1373 audit row
+(`corpus:production-host`), the same two #1378 audit rows, and the same three
+#1351 feasible rows. The global `--final` command deliberately continues to
+fail on those three audit and three feasible records. The Rust command is
+offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
+merged-main OID are checked and recorded by the pull-request workflow.
+
+## Aggregate jailer certification
+
+The scoped #1912 gate consumes the checked
+[`jailer-aggregate-audit.json`](../compat/firecracker/v1.16.0/jailer-aggregate-audit.json)
+and certifies exactly `corpus:jailer` and `tool-operation:jailer/run`:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-final
+cargo test -p bangbang-firecracker-capability-audit --test jailer_aggregate_audit --locked
+```
+
+The validator pins the upstream document, parser, operation, and root-transition
+blobs; requires 13 ordered arguments, 16 ordered operation steps, seven corpus
+sections, and exact evidence profiles; resolves every local path and anchor;
+checks the unrelated-record digest; and accepts only the `377/5/3/33` to
+`379/3/3/33` transition. Mutation tests cover missing, duplicate, reordered,
+unknown, stale-anchor, partial-transition, unrelated-record, and contract drift.
+
+Run the seven signed production producers through the wrapper without
+`--allow-unsupported` when diagnosing the aggregate:
+
+```sh
+scripts/run-integration-tests.sh --test production_bundle -- launcher_exposes_exact_jailer_help_version_and_policy_validation --exact
+scripts/run-integration-tests.sh --test production_bundle -- signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker --exact
+scripts/run-integration-tests.sh --test production_bundle -- signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits --exact
+scripts/run-integration-tests.sh --test production_bundle -- signed_daemon_handoff_waits_for_ready_and_keeps_concurrent_supervisors_isolated --exact
+scripts/run-integration-tests.sh --test production_bundle -- signed_daemon_parent_loss_before_ack_cancels_worker_and_private_state --exact
+scripts/run-integration-tests.sh --test production_bundle -- launcher_rejects_modified_missing_or_wrongly_signed_worker_before_execution --exact
+scripts/run-integration-tests.sh --test production_bundle -- launcher_runs_real_sandboxed_hvf_guest_to_system_off --exact
+```
+
+The full `scripts/run-integration-tests.sh` invocation remains the release gate
+because it composes the supporting launcher, worker, grant, lifecycle, cleanup,
+and HVF evidence. This aggregate adds no Linux jailer-mechanism claim and needs
+no sudo; root-only historical topology experiments remain separately gated.
 
 ## Explicit Elevated Bootstrap Evidence
 
@@ -2317,6 +2355,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-te
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --cpu-template-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

@@ -161,9 +161,11 @@ entitlement or extension weakens the mandatory boundary; an account-derived or
 configurable root adds ambient authority; early unlink removes the accepted
 linked recovery contract; wrapper/launcher-only cleanup cannot converge after
 launcher loss. The two uid/gid argument identities are therefore terminal
-platform exclusions, while `corpus:jailer`, `corpus:production-host`, and
-`jailer/run` remain nonterminal. No #1904 product
-adapter or new elevated runtime path was merged.
+platform exclusions. That leaf transition did not by itself complete
+`corpus:jailer`, `corpus:production-host`, or `jailer/run`; #1912 later
+certifies the two jailer aggregates from the complete argument, operation, and
+corpus authority, while `corpus:production-host` remains independent. No #1904
+product adapter or new elevated runtime path was merged.
 
 ## Jailer configurable-chroot fixed-topology platform limit
 
@@ -193,9 +195,46 @@ The launcher consequently classifies the exact ASCII option name before value
 access and returns
 `unsupported Firecracker jailer isolation argument on macOS: --chroot-base-dir`.
 Attached, separated, and attached non-UTF-8 values cannot enter diagnostics or
-launch state. The conclusion is bound to the fixed topology, preserves the
-unknown child cause, and leaves `corpus:jailer`, `corpus:production-host`, and
-`jailer/run` audit-required.
+launch state. The conclusion is bound to the fixed topology and preserves the
+unknown child cause. This leaf transition did not by itself complete
+`corpus:jailer`, `corpus:production-host`, or `jailer/run`; #1912 later
+certifies the two jailer aggregates, while `corpus:production-host` remains
+audit-required.
+
+## Aggregate Jailer Certification
+
+The checked
+[aggregate jailer contract](../compat/firecracker/v1.16.0/jailer-aggregate-contract.md)
+binds the entire pinned Firecracker jailer document and entrypoint to 13
+ordered argument leaves, 16 ordered operation steps, and seven corpus
+sections. Missing, duplicate, reordered, or unknown records fail closed. The
+production envelope validates fixed code, IDs, resource limits, daemon mode,
+and forwarded arguments before grant parsing, private staging, session
+creation, spawn, publication, or worker output; unsupported path-bearing
+arguments are classified from option bytes without decoding or retaining their
+values.
+
+The applicable operation outcome is now explicit: the nested worker is fixed,
+separately signed, statically and live-code validated, and resumed only after
+validation; spawn inheritance is default-close with a marker-only environment;
+the mode-0700 runtime namespace is no-clobber and replacement-safe;
+`RLIMIT_NOFILE` and `RLIMIT_FSIZE` are installed and read back without raising
+hard limits; same-code daemon re-exec authenticates Ready/PID/Ack while
+retaining supervision, parent-loss cancellation, signal handling, reap, and
+cleanup; and the App Sandbox plus Hypervisor worker executes real HVF guests.
+
+The authority composes the five implemented argument leaves with the eight
+terminal fixed-topology exclusions. It does not claim Linux cgroup,
+mount/chroot, network-namespace, PID-namespace, device-node, or arbitrary
+credential-transition mechanisms; a literal executable copy; absence of
+shared read-only code pages; arbitrary trusted paths; vmnet connectivity;
+production-host deployment; Developer ID/notarization; or automatic restart
+and long-lived service behavior. Exactly `corpus:jailer` and
+`tool-operation:jailer/run` become implemented-and-verified, moving the
+inventory from `377/5/3/33` to `379/3/3/33`. The remaining audit records are
+`corpus:network-setup`, `corpus:production-host`, and the aggregate vmnet
+connectivity identity; the three isolation composites remain
+missing-platform-feasible.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -3550,11 +3589,13 @@ At that Wave 8 checkpoint, six #1373 outcomes remained audit entries; two
 #1378 outcomes required caller-owned Apple-approved signing/profile authority
 and an isolated vmnet fixture; three #1351 isolation semantics remained
 platform-feasible. The later exact uid/gid transition leaves four #1373 rows
-at 377/6/3/32. The subsequent exact configurable-chroot transition leaves
+at `377/6/3/32`. The subsequent exact configurable-chroot transition leaves
 three #1373 rows, the same two #1378 rows, and the same three #1351 rows, for
-current totals 377/5/3/33. Missing authority or credentials alone is not an
-impossibility proof. Global `--final` stays blocked until the remaining
-external outcomes complete.
+totals `377/5/3/33`. #1912 then certifies the jailer corpus and operation
+aggregates, leaving one #1373 production-host row, the same two #1378 rows,
+and the same three #1351 rows at the current `379/3/3/33` successor. Missing
+authority or credentials alone is not an impossibility proof. Global `--final`
+stays blocked until the remaining external outcomes complete.
 
 The elevated same-host gates have now been executed rather than inferred from
 split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root
@@ -3715,8 +3756,10 @@ post-launcher-loss worker cleanup blocker described in
 [Jailer uid/gid fixed-topology platform limit](#jailer-uidgid-fixed-topology-platform-limit).
 #1905 makes exactly the uid/gid leaves terminal at that rejection. #1908 later
 makes exactly configurable chroot terminal at the separately documented
-fixed-topology result, leaving three #1373 audit outcomes. The earlier evidence
-harness is test-only and statically
+fixed-topology result, leaving three #1373 audit outcomes. #1912 then certifies
+the jailer corpus and operation aggregates from all terminal leaf results,
+leaving only `corpus:production-host` in #1373. The earlier evidence harness is
+test-only and statically
 absent from normal launcher and worker builds; its daemon path is not a root
 service, public jailer/daemon mode, setuid helper, or ambient path authority.
 
