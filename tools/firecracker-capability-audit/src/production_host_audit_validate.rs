@@ -83,11 +83,27 @@ pub fn validate_production_host_upstream_source(
 ) -> Result<(), ValidationErrors> {
     let mut errors = Vec::new();
     validate_source_clauses(audit, &mut errors);
-    if audit.upstream_source.path != "docs/prod-host-setup.md" {
-        errors
-            .push("production-host upstream comparison requires the exact source path".to_string());
+    let expected_source = (
+        "production-host-setup",
+        "corpus:production-host",
+        "docs/prod-host-setup.md",
+        "entire-file",
+        "8939b56a965963d8df1c44c583dcd38361197347",
+    );
+    let actual_source = (
+        audit.upstream_source.id.as_str(),
+        audit.upstream_source.manifest_id.as_str(),
+        audit.upstream_source.path.as_str(),
+        audit.upstream_source.anchor.as_str(),
+        audit.upstream_source.git_blob.as_str(),
+    );
+    if actual_source != expected_source {
+        errors.push(
+            "production-host upstream comparison requires the exact pinned source identity"
+                .to_string(),
+        );
     } else {
-        match std::fs::read_to_string(firecracker_root.join("docs/prod-host-setup.md")) {
+        match std::fs::read_to_string(firecracker_root.join(expected_source.2)) {
             Ok(source) => validate_upstream_anchors(&audit.source_clauses, &source, &mut errors),
             Err(error) => errors.push(format!(
                 "production-host upstream source is unreadable: {error}"
@@ -107,13 +123,31 @@ fn validate_upstream_anchors(
     source: &str,
     errors: &mut Vec<String>,
 ) {
+    let mut previous = None;
     for clause in clauses {
-        if !source.contains(&clause.upstream_anchor) {
+        let mut matches = source.match_indices(&clause.upstream_anchor);
+        let Some((position, _)) = matches.next() else {
             errors.push(format!(
                 "production-host upstream anchor is absent for clause: {}",
                 clause.id
             ));
+            continue;
+        };
+        if matches.next().is_some() {
+            errors.push(format!(
+                "production-host upstream anchor is not unique for clause: {}",
+                clause.id
+            ));
         }
+        if let Some((previous_id, previous_position)) = previous
+            && position <= previous_position
+        {
+            errors.push(format!(
+                "production-host upstream clause order drifted: {previous_id} must precede {}",
+                clause.id
+            ));
+        }
+        previous = Some((clause.id.as_str(), position));
     }
 }
 
@@ -1070,6 +1104,32 @@ mod tests {
         assert_eq!(
             errors,
             ["production-host upstream anchor is absent for clause: missing"]
+        );
+    }
+
+    #[test]
+    fn upstream_comparison_rejects_duplicate_and_reordered_clause_anchors() {
+        let clause = |order, id: &str, upstream_anchor: &str| crate::ProductionHostSourceClause {
+            order,
+            id: id.to_string(),
+            upstream_anchor: upstream_anchor.to_string(),
+            outcome: ProductionHostClauseOutcome::OperatorOwnedOutcome,
+            evidence_profiles: vec![ProductionHostEvidenceProfileId::HostAndHardwarePolicy],
+        };
+        let clauses = [clause(1, "first", "first"), clause(2, "second", "second")];
+
+        let mut errors = Vec::new();
+        validate_upstream_anchors(&clauses, "first second first", &mut errors);
+        assert_eq!(
+            errors,
+            ["production-host upstream anchor is not unique for clause: first"]
+        );
+
+        let mut errors = Vec::new();
+        validate_upstream_anchors(&clauses, "second first", &mut errors);
+        assert_eq!(
+            errors,
+            ["production-host upstream clause order drifted: first must precede second"]
         );
     }
 }
