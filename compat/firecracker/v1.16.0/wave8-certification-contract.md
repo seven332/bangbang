@@ -208,9 +208,9 @@ final #1351 jailer/seccomp/macOS-containment semantic. The checked
 30 clauses, the exact 17-role/five-access surface, current-tree evidence,
 terminal and external dependencies, residuals, and every nonclaim.
 
-## Exact jailer/seccomp containment successor
+## Exact jailer/seccomp containment and production-host successors
 
-The current containment successor is exactly `382/3/0/33`: 382 implemented,
+The containment successor is exactly `382/3/0/33`: 382 implemented,
 three audit-required, zero missing-platform-feasible, and 33
 proven-platform-impossible. It moves only
 `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes` to
@@ -220,6 +220,11 @@ and two #1378 network/vmnet audit-required records. The checked
 [containment contract](jailer-seccomp-containment-contract.md) pins five
 sources, 46 clauses, terminal and external dependencies, current-tree
 evidence, residual classifications, and every nonclaim.
+
+The current production-host successor is exactly `383/2/0/33`: #1920 moves
+only `corpus:production-host` to implemented-and-verified through complete
+31-clause source accounting. The two #1378 network/vmnet records remain
+audit-required, and all 33 platform exclusions remain unchanged.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -242,11 +247,12 @@ only successor at 377/6/3/32, or the exact configurable-chroot-only successor
 at 377/5/3/33, the exact aggregate-jailer successor at 379/3/3/33, or the exact
 multiprocess-isolation successor at 380/3/2/33, the exact
 host-resource-authority successor at 381/3/1/33, or the exact containment
-successor at 382/3/0/33; it
+successor at 382/3/0/33, or the exact production-host successor at
+383/2/0/33; it
 rejects unrelated, count-preserving identity swaps, and partial drift.
 
 The global `--final` mode remains stronger and intentionally fails while the
-three audit-required external outcomes remain. Neither Wave
+two #1378 audit-required external outcomes remain. Neither Wave
 8 nor any exact later successor weakens that completion gate.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,

@@ -70,7 +70,7 @@ fn authoritative_reference(url: &str) -> Reference {
 fn jailer_uid_gid_platform_limit_is_terminal_and_fail_closed() {
     const TERMINAL_IDS: [&str; 2] = ["tool-argument:jailer/gid", "tool-argument:jailer/uid"];
     const LATER_AGGREGATE_IDS: [&str; 2] = ["corpus:jailer", "tool-operation:jailer/run"];
-    const RETAINED_AUDIT_ID: &str = "corpus:production-host";
+    const PRODUCTION_HOST_ID: &str = "corpus:production-host";
     const CHALLENGE_URL: &str =
         "https://github.com/seven332/bangbang/issues/1905#issuecomment-5249781101";
 
@@ -231,11 +231,16 @@ fn jailer_uid_gid_platform_limit_is_terminal_and_fail_closed() {
         assert_eq!(exclusion.challenge, github_reference(CHALLENGE_URL));
     }
 
-    let retained = by_id
-        .get(RETAINED_AUDIT_ID)
+    let production_host = by_id
+        .get(PRODUCTION_HOST_ID)
         .expect("production-host sibling must exist");
-    assert_eq!(retained.disposition, Disposition::AuditRequired);
-    assert!(retained.exclusion.is_none());
+    assert_eq!(
+        production_host.disposition,
+        Disposition::ImplementedAndVerified
+    );
+    assert!(!production_host.implementation.is_empty());
+    assert!(!production_host.validation.is_empty());
+    assert!(production_host.exclusion.is_none());
     for id in LATER_AGGREGATE_IDS {
         let capability = by_id.get(id).expect("later jailer aggregate must exist");
         assert_eq!(capability.disposition, Disposition::ImplementedAndVerified);
@@ -268,7 +273,7 @@ fn jailer_uid_gid_platform_limit_is_terminal_and_fail_closed() {
 fn jailer_chroot_platform_limit_is_terminal_and_fail_closed() {
     const ID: &str = "tool-argument:jailer/chroot-base-dir";
     const LATER_AGGREGATE_IDS: [&str; 2] = ["corpus:jailer", "tool-operation:jailer/run"];
-    const RETAINED_AUDIT_ID: &str = "corpus:production-host";
+    const PRODUCTION_HOST_ID: &str = "corpus:production-host";
     const CHALLENGE_URL: &str =
         "https://github.com/seven332/bangbang/issues/1908#issuecomment-5251362795";
 
@@ -440,12 +445,16 @@ fn jailer_chroot_platform_limit_is_terminal_and_fail_closed() {
     );
     assert_eq!(exclusion.challenge, github_reference(CHALLENGE_URL));
 
-    let retained = by_id
-        .get(RETAINED_AUDIT_ID)
+    let production_host = by_id
+        .get(PRODUCTION_HOST_ID)
         .expect("production-host aggregate must exist");
-    assert_eq!(retained.disposition, Disposition::AuditRequired);
-    assert!(retained.exclusion.is_none());
-    assert!(retained.summary.contains("configurable chroot"));
+    assert_eq!(
+        production_host.disposition,
+        Disposition::ImplementedAndVerified
+    );
+    assert!(!production_host.implementation.is_empty());
+    assert!(!production_host.validation.is_empty());
+    assert!(production_host.exclusion.is_none());
     for id in LATER_AGGREGATE_IDS {
         let aggregate = by_id.get(id).expect("later jailer aggregate must exist");
         assert_eq!(aggregate.disposition, Disposition::ImplementedAndVerified);
@@ -1203,7 +1212,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        382
+        383
     );
     assert_eq!(
         inventory
@@ -1211,7 +1220,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| capability.disposition == Disposition::AuditRequired)
             .count(),
-        3
+        2
     );
     assert_eq!(
         inventory
@@ -2322,6 +2331,7 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
             !matches!(
                 *id,
                 WAVE8_ID
+                    | "corpus:production-host"
                     | "corpus:jailer"
                     | "tool-argument:jailer/chroot-base-dir"
                     | "tool-argument:jailer/gid"
@@ -4008,8 +4018,8 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
-    assert_eq!(count(Disposition::AuditRequired), 3);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::AuditRequired), 2);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
@@ -4738,8 +4748,8 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
-    assert_eq!(count(Disposition::AuditRequired), 3);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::AuditRequired), 2);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
@@ -5035,8 +5045,8 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
-    assert_eq!(count(Disposition::AuditRequired), 3);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::AuditRequired), 2);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
@@ -5184,8 +5194,8 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
-    assert_eq!(count(Disposition::AuditRequired), 3);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::AuditRequired), 2);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
@@ -5432,8 +5442,8 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
-    assert_eq!(count(Disposition::AuditRequired), 3);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::AuditRequired), 2);
     assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 

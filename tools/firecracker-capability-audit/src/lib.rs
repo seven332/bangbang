@@ -40,6 +40,9 @@ mod model;
 mod multiprocess_isolation_audit_model;
 mod multiprocess_isolation_audit_validate;
 mod multiprocess_isolation_certify;
+mod production_host_audit_model;
+mod production_host_audit_validate;
+mod production_host_certify;
 mod specification_benchmark_audit_model;
 mod specification_benchmark_audit_validate;
 mod specification_benchmark_certify;
@@ -202,6 +205,19 @@ pub use multiprocess_isolation_audit_validate::{
     MULTIPROCESS_ISOLATION_CAPABILITY_ID, validate_multiprocess_isolation_audit,
 };
 pub use multiprocess_isolation_certify::validate_multiprocess_isolation_compatibility;
+pub use production_host_audit_model::{
+    ProductionHostAudit, ProductionHostClauseOutcome, ProductionHostDispositionCounts,
+    ProductionHostEvidenceProfile, ProductionHostEvidenceProfileId,
+    ProductionHostExternalDependency, ProductionHostNonclaim, ProductionHostPinnedSource,
+    ProductionHostResidualClassification, ProductionHostResidualRecord, ProductionHostSourceClause,
+    ProductionHostTerminalDependency,
+};
+pub use production_host_audit_validate::{
+    PRODUCTION_HOST_AUDIT_PATH, PRODUCTION_HOST_AUDIT_SCHEMA_VERSION,
+    PRODUCTION_HOST_CAPABILITY_ID, validate_production_host_audit,
+    validate_production_host_upstream_source,
+};
+pub use production_host_certify::validate_production_host_compatibility;
 pub use specification_benchmark_audit_model::{
     SpecificationBenchmarkAudit, SpecificationBenchmarkEvidence, SpecificationBenchmarkMeasurement,
     SpecificationBenchmarkNonclaim, SpecificationBenchmarkPolicy,
@@ -504,6 +520,15 @@ pub fn read_jailer_seccomp_containment_audit(
     })
 }
 
+/// Read and parse the checked production-host authority.
+pub fn read_production_host_audit(path: &Path) -> Result<ProductionHostAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read production-host audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AuditError::new(format!("failed to parse production-host audit: {error}")))
+}
+
 /// Read and parse the checked targeted formal-verification authority.
 pub fn read_formal_verification_audit(path: &Path) -> Result<FormalVerificationAudit, AuditError> {
     let bytes = std::fs::read(path).map_err(|error| {
@@ -663,6 +688,11 @@ pub fn jailer_seccomp_containment_audit_json(
     audit: &JailerSeccompContainmentAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "jailer/seccomp containment audit")
+}
+
+/// Serialize the checked production-host authority using canonical pretty JSON.
+pub fn production_host_audit_json(audit: &ProductionHostAudit) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "production-host audit")
 }
 
 /// Serialize the checked targeted formal-verification authority using canonical pretty JSON.

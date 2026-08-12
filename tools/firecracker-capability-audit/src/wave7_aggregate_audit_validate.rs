@@ -581,14 +581,15 @@ fn validate_scope_and_counts(
             | InventoryPhase::JailerAggregate
             | InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
-            | InventoryPhase::JailerSeccompContainment,
+            | InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost,
         ) => {}
         Ok(phase) => errors.push(format!(
             "Wave 7 aggregate inventory cannot use the earlier {} phase",
             phase.name()
         )),
         Err(error) => errors.push(format!(
-            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, the exact aggregate jailer 379/3/3/33 successor, the exact multiprocess isolation 380/3/2/33 successor, the exact host-resource authority 381/3/1/33 successor, or the exact jailer/seccomp containment 382/3/0/33 successor; found {}/{}/{}/{}: {error}",
+            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, the exact aggregate jailer 379/3/3/33 successor, the exact multiprocess isolation 380/3/2/33 successor, the exact host-resource authority 381/3/1/33 successor, the exact jailer/seccomp containment 382/3/0/33 successor, or the exact production-host 383/2/0/33 successor; found {}/{}/{}/{}: {error}",
             counts.0, counts.1, counts.2, counts.3
         )),
     }
@@ -883,13 +884,18 @@ fn validate_release(
     }
     let capabilities = capability_map(inventory);
     for entry in &audit.release_entries {
-        let expected = match entry.outcome {
+        let historical_expected = match entry.outcome {
             Wave7ReleaseOutcome::Implemented | Wave7ReleaseOutcome::Arm64Rejected => {
                 Disposition::ImplementedAndVerified
             }
             Wave7ReleaseOutcome::ProvenPlatformImpossible => Disposition::ProvenPlatformImpossible,
             Wave7ReleaseOutcome::LinuxHostHandoff1373 => Disposition::AuditRequired,
         };
+        let expected = classify_inventory_phase(inventory)
+            .ok()
+            .map_or(historical_expected, |phase| {
+                expected_disposition(phase, &entry.producer_capability_id)
+            });
         if capabilities
             .get(entry.producer_capability_id.as_str())
             .is_none_or(|capability| capability.disposition != expected)
@@ -1119,7 +1125,8 @@ fn validate_tools(
                     InventoryPhase::JailerAggregate
                     | InventoryPhase::MultiprocessIsolation
                     | InventoryPhase::HostResourceAuthority
-                    | InventoryPhase::JailerSeccompContainment,
+                    | InventoryPhase::JailerSeccompContainment
+                    | InventoryPhase::ProductionHost,
                 ),
             ) => (6, 8, 0),
             _ => (
@@ -1487,7 +1494,8 @@ fn validate_handoffs(
         | InventoryPhase::JailerAggregate
         | InventoryPhase::MultiprocessIsolation
         | InventoryPhase::HostResourceAuthority
-        | InventoryPhase::JailerSeccompContainment),
+        | InventoryPhase::JailerSeccompContainment
+        | InventoryPhase::ProductionHost),
     ) = phase
     {
         let expected = expected_nonterminal_ids(phase);

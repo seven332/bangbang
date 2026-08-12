@@ -264,9 +264,10 @@ producing the 380/3/2/33 phase with one #1373, two #1378, and two #1351
 outcomes still nonterminal. The host-resource-authority review then moves
 exactly its one #1351 semantic row, producing 381/3/1/33 with one #1373, two
 #1378, and one #1351 outcome still nonterminal. The containment review finally
-moves that last #1351 row, producing the current 382/3/0/33 phase with only the
-three audit-required #1373/#1378 outcomes. Any other identity or count
-transition fails the Wave 7 gate.
+moves that last #1351 row, producing 382/3/0/33 with one #1373 and two #1378
+audit-required outcomes. #1920 then moves only the production-host row,
+producing the current 383/2/0/33 phase with the two #1378 outcomes. Any other
+identity or count transition fails the Wave 7 gate.
 
 The historical public-tool ledger derives 46 implemented leaves, five terminal
 Linux-only jailer exclusions, and four #1373 jailer handoffs. Its uid/gid
@@ -401,7 +402,7 @@ its cross-capability row; #1905 later makes only `jailer/gid` and `jailer/uid`
 terminal platform exclusions, and #1908 later makes only
 `jailer/chroot-base-dir` terminal. #1912 later makes `corpus:jailer` and
 `jailer/run` implemented-and-verified from the checked aggregate authority.
-Only `corpus:production-host` remains audit-required among the historical
+#1920 later certifies `corpus:production-host`, completing the historical
 #1373 rows; both #1378 rows remain audit-required.
 
 ## Disposition accounting

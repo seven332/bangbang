@@ -162,13 +162,16 @@ The predecessor is exactly `380/3/2/33`; the successor is exactly
 also repairs its source set by adding `corpus:design`, whose checked Wave 7
 threat-containment mapping points to this composite.
 
-`corpus:network-setup`, `corpus:production-host`, and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity` remain
-audit-required. The sole remaining #1351 feasible row is
+At the original #1916 checkpoint, `corpus:network-setup`,
+`corpus:production-host`, and
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` remained
+audit-required. The sole remaining #1351 feasible row was
 `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`.
 
 At the later exact `382/3/0/33` successor, #1918 certifies that containment row
 without changing this #1916 transition or its terminal host-resource claim.
+At `383/2/0/33`, #1920 separately certifies the production-host corpus; only
+the two #1378 records remain audit-required.
 
 ## Terminal host-resource authority outcome
 

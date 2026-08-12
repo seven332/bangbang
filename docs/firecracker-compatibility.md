@@ -1371,8 +1371,9 @@ limit above, not feasible backlog. Configurable chroot is the separate
 fixed-topology platform limit above. The exact Linux seccomp, cgroup,
 network-namespace, and PID-namespace mechanisms now have terminal macOS
 platform exclusions. Those leaves alone did not complete the surrounding
-aggregates; #1912 certifies the jailer corpus and operation, while
-`corpus:production-host` remains audit-required.
+aggregates; #1912 certifies the jailer corpus and operation. #1920 later
+certifies the complete production-host corpus without treating operator policy
+or positive vmnet evidence as product implementation.
 
 ### Aggregate jailer compatibility
 
@@ -1490,6 +1491,24 @@ owned. The scoped gate is:
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-seccomp-containment-final
 ```
 
+### Terminal production-host corpus accounting
+
+The checked
+[production-host contract](../compat/firecracker/v1.16.0/production-host-contract.md)
+accounts for all 31 stable groups in pinned `docs/prod-host-setup.md`. Each is
+an implemented macOS outcome, an implemented result with a terminal literal
+mechanism limit, a platform/architecture limit, an operator-owned result, an
+implementation-specific nonrequirement, or the exact external #1378 evidence
+boundary. This is exhaustive source coverage, not host maintenance,
+Developer ID/notarization, hardware certification, or positive vmnet proof.
+
+Only `corpus:production-host` moves, producing `383/2/0/33`; the two #1378
+network/vmnet records remain audit-required. The scoped gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-host-final
+```
+
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
 socket, host-path, HVF entitlement, guest-data, and multi-process boundaries, and
@@ -1553,8 +1572,9 @@ four exact portable and signed product leaves. It also rechecks the historical
 #1351/#1373/#1378 external outcomes. Its certifier accepts only the checked
 uid/gid, configurable-chroot, aggregate-jailer, multiprocess-isolation,
 host-resource-authority, and containment successors. The current successor is
-`382/3/0/33`: one #1373 audit record and two #1378 audit records remain, with
-no missing-platform-feasible records. It does not turn missing credentials,
+extended by the production-host phase at `383/2/0/33`: only the two #1378
+audit records remain, with no missing-platform-feasible records. It does not
+turn missing credentials,
 root/HVF authority, skipped
 execution, or a weaker macOS mechanism into success or impossibility.
 

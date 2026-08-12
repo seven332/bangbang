@@ -107,7 +107,7 @@ fn validate_totals(inventory: &CapabilityInventory, errors: &mut Vec<String>) {
     if let Err(error) = classify_inventory_phase(inventory) {
         let (implemented, audit_required, missing, impossible) = disposition_counts(inventory);
         errors.push(format!(
-            "specification benchmark terminal totals must be its exact 371/14/3/30 phase, the exact Wave 7 376/9/3/30 successor, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, the exact aggregate jailer 379/3/3/33 successor, the exact multiprocess isolation 380/3/2/33 successor, the exact host-resource authority 381/3/1/33 successor, or the exact jailer/seccomp containment 382/3/0/33 successor; found {implemented}/{audit_required}/{missing}/{impossible}: {error}"
+            "specification benchmark terminal totals must be its exact 371/14/3/30 phase, the exact Wave 7 376/9/3/30 successor, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, the exact aggregate jailer 379/3/3/33 successor, the exact multiprocess isolation 380/3/2/33 successor, the exact host-resource authority 381/3/1/33 successor, the exact jailer/seccomp containment 382/3/0/33 successor, or the exact production-host 383/2/0/33 successor; found {implemented}/{audit_required}/{missing}/{impossible}: {error}"
         ));
     }
 }
