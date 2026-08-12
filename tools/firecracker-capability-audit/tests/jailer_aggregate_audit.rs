@@ -194,7 +194,7 @@ fn jailer_terminal_transition_is_exact() {
             validate_jailer_aggregate_compatibility(&manifest, &partial, &audit, &root)
                 .expect_err("partial aggregate transition must fail")
                 .to_string()
-                .contains("379/3/3/33")
+                .contains("inexact successor phase")
         );
     }
 

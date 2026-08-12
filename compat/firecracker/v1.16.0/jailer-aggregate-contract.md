@@ -125,8 +125,9 @@ The #1912 transition is exactly `377/5/3/33` to `379/3/3/33`. A checked digest
 pins every unrelated capability record, so changing an unrelated summary,
 source, disposition, ownership marker, or evidence fails even when cardinality
 is preserved. At the exact `380/3/2/33` multiprocess successor,
-`381/3/1/33` host-resource successor, and `382/3/0/33` containment successor,
-the checked digest advances to include those independently certified rows
+`381/3/1/33` host-resource successor, `382/3/0/33` containment successor, and
+`383/2/0/33` production-host successor, the checked digest advances to include
+those independently certified rows
 while the two #1912 rows and their original transition remain unchanged.
 
 | Capability | Owner | Disposition |
@@ -134,13 +135,14 @@ while the two #1912 rows and their original transition remain unchanged.
 | `corpus:jailer` | #1912 | `implemented-and-verified` |
 | `tool-operation:jailer/run` | #1912 | `implemented-and-verified` |
 
-The three remaining audit-required records are `corpus:network-setup`,
-`corpus:production-host`, and
+At the original #1912 checkpoint, the three remaining audit-required records
+were `corpus:network-setup`, `corpus:production-host`, and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity`. The multiprocess
 and host-resource composites are separately terminal under #1914 and #1916.
 The final jailer/seccomp/macOS-containment composite is terminal under #1918;
-no feasible record remains, and the 33 exact platform exclusions remain
-unchanged.
+#1920 then certifies the production-host corpus. Only the two #1378 network
+records remain audit-required; no feasible record remains, and the 33 exact
+platform exclusions remain unchanged.
 
 This outcome explicitly does not claim Linux jailer mechanism parity, a
 literal per-run executable copy, absence of shared read-only code pages,
@@ -163,6 +165,6 @@ transition, unrelated-record digest, and the two checked contract rows. The
 ordinary delivery command also validates the authority structure.
 
 The global `--final` mode remains stronger and intentionally fails while the
-three audit-required records remain. The
+two #1378 audit-required records remain. The
 signed producer scenarios run through `scripts/run-integration-tests.sh`
 without `--allow-unsupported`; no sudo is required by this aggregate slice.

@@ -23,7 +23,7 @@ pub const MULTIPROCESS_ISOLATION_AUDIT_PATH: &str =
 pub const MULTIPROCESS_ISOLATION_CAPABILITY_ID: &str = MULTIPROCESS_ISOLATION_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "166723906d7afad4eabdce7a3ab7645e558a0c9224775be0ccee063ec8644a9d";
+    "f4562ad6c7ae542bfbc77d486c979df5c1671c3d9c6774783e735ff58808c2b1";
 
 const PROFILE_IDS: [MultiprocessEvidenceProfileId; 8] = [
     MultiprocessEvidenceProfileId::ProcessPerVmBoundary,
@@ -197,10 +197,10 @@ fn validate_inventory_transition(
     }
     if !matches!(
         disposition_counts(inventory),
-        (380, 3, 2, 33) | (381, 3, 1, 33) | (382, 3, 0, 33)
+        (380, 3, 2, 33) | (381, 3, 1, 33) | (382, 3, 0, 33) | (383, 2, 0, 33)
     ) {
         errors.push(
-            "multiprocess isolation live inventory must be exactly 380/3/2/33, its 381/3/1/33 host-resource successor, or its 382/3/0/33 containment successor"
+            "multiprocess isolation live inventory must be exactly 380/3/2/33, its 381/3/1/33 host-resource successor, its 382/3/0/33 containment successor, or its 383/2/0/33 production-host successor"
                 .to_string(),
         );
     }
@@ -208,7 +208,8 @@ fn validate_inventory_transition(
         classify_inventory_phase(inventory),
         Ok(InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
-            | InventoryPhase::JailerSeccompContainment)
+            | InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost)
     ) {
         errors.push(
             "multiprocess isolation live inventory has an inexact successor phase".to_string(),

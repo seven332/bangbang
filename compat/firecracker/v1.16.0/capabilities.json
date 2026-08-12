@@ -13400,11 +13400,35 @@
     {
       "id": "corpus:production-host",
       "family": "isolation",
-      "summary": "Linux seccomp, cgroup, network-namespace, and PID-namespace identities plus configurable chroot and uid/gid now have terminal fixed-topology macOS conclusions; continue auditing production brokerage, vmnet live evidence, signing and deployment, recovery, and other host requirements.",
+      "summary": "Account for every stable recommendation in the pinned Firecracker production-host source through implemented macOS behavior, an explicit terminal platform or architecture limit, an operator-owned outcome, an implementation-specific nonrequirement, or the separately owned #1378 vmnet gate.",
       "source_refs": [
         "corpus:production-host"
       ],
-      "disposition": "audit-required"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-host-audit.json",
+          "anchor": "\"source_clauses\": ["
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-host-contract.md",
+          "anchor": "## Terminal production-host corpus outcome"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/production_host_audit_validate.rs",
+          "anchor": "pub fn validate_production_host_audit("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/production_host_audit.rs",
+          "anchor": "fn production_host_terminal_transition_is_exact()"
+        }
+      ]
     },
     {
       "id": "corpus:release-changelog",

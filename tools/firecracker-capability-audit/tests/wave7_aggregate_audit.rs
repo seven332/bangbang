@@ -264,6 +264,14 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
     wave8.disposition = Disposition::AuditRequired;
     wave8.implementation.clear();
     wave8.validation.clear();
+    let production_host = historical
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == "corpus:production-host")
+        .expect("production-host successor capability must exist");
+    production_host.disposition = Disposition::AuditRequired;
+    production_host.implementation.clear();
+    production_host.validation.clear();
     validate_wave7_aggregate_compatibility(&manifest, &historical, &audit, &root)
         .expect("historical 376/9/3/30 Wave 7 phase must remain valid");
 

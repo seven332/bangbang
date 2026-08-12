@@ -2048,7 +2048,8 @@ platform-limit successor `377/6/3/32`, the exact configurable-chroot-only
 successor `377/5/3/33`, and the exact aggregate-jailer successor
 `379/3/3/33`, followed by the exact multiprocess-isolation successor
 `380/3/2/33`, followed by the exact host-resource-authority successor
-`381/3/1/33`, followed by the exact containment successor `382/3/0/33`. Each
+`381/3/1/33`, followed by the exact containment successor `382/3/0/33`, then
+the exact production-host successor `383/2/0/33`. Each
 phase is classified by exact
 identity sets, not counts. It does not execute Kani, sign binaries, run HVF, or
 collect an environment report inside the Rust process: run the targeted Kani
@@ -2104,11 +2105,12 @@ rows, and the configurable-chroot `377/5/3/33` phase retained three. The
 aggregate-jailer `379/3/3/33` phase retained exactly one #1373 audit row
 (`corpus:production-host`), the same two #1378 audit rows, and three #1351
 feasible rows. The multiprocess-isolation `380/3/2/33` successor retained
-those three audit rows and two #1351 feasible rows. The current
-host-resource-authority `381/3/1/33` successor retains those three audit rows
-and one #1351 feasible row. The current containment `382/3/0/33` successor
-retains only the three audit rows. The global `--final` command deliberately
-continues to fail on those three audit records. The Rust
+those three audit rows and two #1351 feasible rows. The
+host-resource-authority `381/3/1/33` successor retained those three audit rows
+and one #1351 feasible row. The containment `382/3/0/33` successor retained
+only those three audit rows. The current production-host `383/2/0/33`
+successor retains only the two #1378 rows. The global `--final` command
+deliberately continues to fail on those two audit records. The Rust
 command is offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
 merged-main OID are checked and recorded by the pull-request workflow.
 
@@ -2128,8 +2130,9 @@ blobs; requires 13 ordered arguments, 16 ordered operation steps, seven corpus
 sections, and exact evidence profiles; resolves every local path and anchor;
 checks the unrelated-record digest; and accepts only the `377/5/3/33` to
 `379/3/3/33` transition, its exact `380/3/2/33` multiprocess-isolation
-successor, its exact `381/3/1/33` host-resource-authority successor, or its
-exact `382/3/0/33` containment successor.
+successor, its exact `381/3/1/33` host-resource-authority successor, its exact
+`382/3/0/33` containment successor, or its exact `383/2/0/33`
+production-host successor.
 Mutation tests cover missing, duplicate, reordered,
 unknown, stale-anchor, partial-transition, unrelated-record, and contract drift.
 
@@ -4135,9 +4138,9 @@ ext4 image.
 
 The final fixed jailer/seccomp/macOS containment composition has its own
 scoped terminal gate. It validates the canonical five-source, 46-clause
-authority, current tracked signed evidence, exact `382/3/0/33` inventory
-phase, terminal Linux mechanism boundaries, portable seccompiler outcome, and
-independent vmnet/production-host ownership:
+authority, current tracked signed evidence, its exact `382/3/0/33` transition
+or later exact successor, terminal Linux mechanism boundaries, portable
+seccompiler outcome, and independent vmnet/production-host ownership:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-seccomp-containment-final
@@ -4145,6 +4148,19 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer
 
 This scoped gate does not replace global `--final`, which remains expected to
 fail while independently owned audit-required records remain open.
+
+## Production-host corpus certification
+
+The scoped #1920 production-host gate consumes the complete pinned
+`docs/prod-host-setup.md` authority and certifies the exact `383/2/0/33`
+successor while retaining only the two #1378 vmnet records:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-host-final
+```
+
+This is exhaustive source accounting, including explicit operator and platform
+boundaries; it is not positive production-vmnet or deployment evidence.
 
 ## PR Expectations
 

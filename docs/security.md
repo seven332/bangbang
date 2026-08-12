@@ -238,9 +238,10 @@ inventory from `377/5/3/33` to `379/3/3/33`. The remaining audit records are
 connectivity identity. #1914 then certifies the multiprocess isolation
 composite at `380/3/2/33`, and #1916 certifies the host-resource authority
 composite at `381/3/1/33`. #1918 certifies the final
-jailer/seccomp/macOS-containment isolation composite at `382/3/0/33`. Only
-the three independently owned production/network records remain
-audit-required; no platform-feasible isolation record remains.
+jailer/seccomp/macOS-containment isolation composite at `382/3/0/33`. #1920
+then certifies the complete production-host corpus at `383/2/0/33`. Only the
+two #1378 network records remain audit-required; no platform-feasible
+isolation record remains.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -3630,10 +3631,11 @@ and the same three #1351 rows at `379/3/3/33`. #1914 then certifies exactly the
 multiprocess isolation row, leaving those three audit rows and two #1351 rows
 at `380/3/2/33`. #1916 then certifies exactly the host-resource authority row,
 leaving those three audit rows and one #1351 row at `381/3/1/33`. #1918 then
-certifies exactly the final containment row, leaving the three audit rows at
-the current `382/3/0/33` successor. Missing authority or credentials alone is not an impossibility
-proof. Global `--final` stays blocked until the remaining external outcomes
-complete.
+certifies exactly the final containment row, leaving three audit rows at
+`382/3/0/33`. #1920 then certifies the production-host corpus, producing the
+current `383/2/0/33` successor with only the two #1378 rows. Missing authority
+or credentials alone is not an impossibility proof. Global `--final` stays
+blocked until those external outcomes complete.
 
 The elevated same-host gates have now been executed rather than inferred from
 split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root
@@ -3808,6 +3810,11 @@ certifies the five-source containment composition from the same topology,
 portable seccompiler, terminal Linux platform limits, and explicit
 external/operator boundaries; it adds no runtime mechanism, entitlement,
 credential, helper, or service.
+
+#1920 then certifies all 31 stable production-host source groups as exact macOS,
+terminal platform/architecture, operator-owned, implementation-specific, or
+external outcomes. It adds no runtime path, host mutation, credential, or
+deployment claim; only #1378's two positive vmnet records remain nonterminal.
 
 ## Current Non-Goals
 

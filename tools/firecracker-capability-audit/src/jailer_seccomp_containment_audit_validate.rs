@@ -23,7 +23,7 @@ pub const JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH: &str =
 pub const JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID: &str = JAILER_SECCOMP_CONTAINMENT_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "7aecea3b00a8bdcb2870ea57f37cd7c07cbfbace08e7926360c13786731db1d1";
+    "c779cbe54179c2b2185024fa6cb84d3bf24c6013ec97e698bc333b0ca8502b1e";
 
 const PROFILE_IDS: [ContainmentEvidenceProfileId; 8] = [
     ContainmentEvidenceProfileId::SignedCodeAndEntitlements,
@@ -224,12 +224,18 @@ fn validate_inventory_transition(
             "jailer/seccomp containment target counts must be exactly 382/3/0/33".to_string(),
         );
     }
-    if disposition_counts(inventory) != (382, 3, 0, 33) {
+    if !matches!(
+        disposition_counts(inventory),
+        (382, 3, 0, 33) | (383, 2, 0, 33)
+    ) {
         errors.push(
-            "jailer/seccomp containment live inventory must be exactly 382/3/0/33".to_string(),
+            "jailer/seccomp containment live inventory must be exactly 382/3/0/33 or its 383/2/0/33 production-host successor".to_string(),
         );
     }
-    if classify_inventory_phase(inventory) != Ok(InventoryPhase::JailerSeccompContainment) {
+    if !matches!(
+        classify_inventory_phase(inventory),
+        Ok(InventoryPhase::JailerSeccompContainment | InventoryPhase::ProductionHost)
+    ) {
         errors.push(
             "jailer/seccomp containment live inventory has an inexact successor phase".to_string(),
         );
@@ -871,6 +877,7 @@ fn validate_external_dependencies(
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
+    let phase = classify_inventory_phase(inventory).ok();
     for (index, (record, expected)) in audit
         .external_dependencies
         .iter()
@@ -891,11 +898,20 @@ fn validate_external_dependencies(
                 "jailer/seccomp containment external dependency[{index}] drifted"
             ));
         }
+        let completed_production_host = expected.capability_id == "corpus:production-host"
+            && phase == Some(InventoryPhase::ProductionHost);
         match capabilities.get(expected.capability_id) {
             Some(capability)
                 if capability.disposition == expected.disposition
                     && capability.implementation.is_empty()
                     && capability.validation.is_empty()
+                    && capability.delivery_issue.is_none()
+                    && capability.exclusion.is_none() => {}
+            Some(capability)
+                if completed_production_host
+                    && capability.disposition == Disposition::ImplementedAndVerified
+                    && !capability.implementation.is_empty()
+                    && !capability.validation.is_empty()
                     && capability.delivery_issue.is_none()
                     && capability.exclusion.is_none() => {}
             Some(_) => errors.push(format!(

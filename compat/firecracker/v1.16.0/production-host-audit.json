@@ -1,0 +1,677 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1351",
+  "delivery_issue": "#1920",
+  "upstream_source": {
+    "id": "production-host-setup",
+    "manifest_id": "corpus:production-host",
+    "path": "docs/prod-host-setup.md",
+    "anchor": "entire-file",
+    "git_blob": "8939b56a965963d8df1c44c583dcd38361197347"
+  },
+  "capability_id": "corpus:production-host",
+  "previous_counts": {
+    "implemented_and_verified": 382,
+    "audit_required": 3,
+    "missing_platform_feasible": 0,
+    "proven_platform_impossible": 33
+  },
+  "target_counts": {
+    "implemented_and_verified": 383,
+    "audit_required": 2,
+    "missing_platform_feasible": 0,
+    "proven_platform_impossible": 33
+  },
+  "unrelated_inventory_sha256": "7d856c4f0a437618268e601ff024f3495f9955c0149b3557aef8abb4ebb81c86",
+  "source_clauses": [
+    {
+      "order": 1,
+      "id": "kernel-and-microcode-patching",
+      "upstream_anchor": "The host and guest kernels and host microcode must be",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "host-and-hardware-policy"
+      ]
+    },
+    {
+      "order": 2,
+      "id": "restrictive-seccomp-production-default",
+      "upstream_anchor": "Production usage of the `--seccomp-filter` or `--no-seccomp` parameters is not",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 3,
+      "id": "bounded-serial-output",
+      "upstream_anchor": "responsible for handling the memory and storage usage of the Firecracker process",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "output-and-observability"
+      ]
+    },
+    {
+      "order": 4,
+      "id": "serial-production-disable-policy",
+      "upstream_anchor": "we do not recommend that users enable",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "output-and-observability"
+      ]
+    },
+    {
+      "order": 5,
+      "id": "nonblocking-serial-data-loss",
+      "upstream_anchor": "any subsequent writes will fail, resulting in data loss, until",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "output-and-observability"
+      ]
+    },
+    {
+      "order": 6,
+      "id": "bounded-log-retention",
+      "upstream_anchor": "consuming and storing this data safely.",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "output-and-observability"
+      ]
+    },
+    {
+      "order": 7,
+      "id": "linux-host-logging-performance",
+      "upstream_anchor": "We recommend adding `quiet loglevel=1` to the host kernel command line",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "host-and-hardware-policy"
+      ]
+    },
+    {
+      "order": 8,
+      "id": "firecracker-signal-handler-deadlock",
+      "upstream_anchor": "The custom signal handlers used by Firecracker are not async-signal-safe",
+      "outcome": "implementation-specific-nonrequirement",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 9,
+      "id": "external-overwatcher-sigkill",
+      "upstream_anchor": "customers have an overwatcher process on the host",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 10,
+      "id": "jailer-equivalent-production-constraints",
+      "upstream_anchor": "executed under process constraints equal or more restrictive",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 11,
+      "id": "linux-jailer-mechanisms",
+      "upstream_anchor": "namespace isolation and drops privileges of the Firecracker process.",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 12,
+      "id": "trusted-jailer-paths",
+      "upstream_anchor": "by unprivileged users. The jailer treats all its inputs as trusted",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 13,
+      "id": "least-privilege-resource-identity",
+      "upstream_anchor": "Firecracker should be owned by this user and group. Apply least privilege to",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 14,
+      "id": "unique-per-instance-uid-gid",
+      "upstream_anchor": "recommended that each runs with its unique `uid` and `gid`",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 15,
+      "id": "workload-specific-resource-policy",
+      "upstream_anchor": "memory or CPU because these are highly dependent on the workload type and",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "resource-controls"
+      ]
+    },
+    {
+      "order": 16,
+      "id": "linux-block-io-controller",
+      "upstream_anchor": "which allows users to control I/O operations through the following files:",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "resource-controls"
+      ]
+    },
+    {
+      "order": 17,
+      "id": "file-size-and-descriptor-limits",
+      "upstream_anchor": "Jailer's `resource-limit` provides control on the disk usage",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "resource-controls"
+      ]
+    },
+    {
+      "order": 18,
+      "id": "linux-memory-cgroup-controls",
+      "upstream_anchor": "to allow setting upper limits to memory usage:",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "resource-controls"
+      ]
+    },
+    {
+      "order": 19,
+      "id": "linux-cpu-cgroup-controls",
+      "upstream_anchor": "can guarantee a minimum number of CPU shares when a system is busy",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "resource-controls"
+      ]
+    },
+    {
+      "order": 20,
+      "id": "x86-kvm-pit-overhead-controls",
+      "upstream_anchor": "guest injects timer interrupts with the help of kvm-pit kernel thread.",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "timer-and-architecture"
+      ]
+    },
+    {
+      "order": 21,
+      "id": "network-flooding-controls",
+      "upstream_anchor": "configuring rate limiters for the network interface",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "resource-controls"
+      ]
+    },
+    {
+      "order": 22,
+      "id": "host-egress-firewall",
+      "upstream_anchor": "Firewall rules should therefore be implemented on the host",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 23,
+      "id": "storage-contention-controls",
+      "upstream_anchor": "Rate limiting functionality is supported for both networking",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "resource-controls"
+      ]
+    },
+    {
+      "order": 24,
+      "id": "host-swap-remanence-policy",
+      "upstream_anchor": "Disabling swap mitigates data remanence issues",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "host-and-hardware-policy"
+      ]
+    },
+    {
+      "order": 25,
+      "id": "host-hardware-vulnerability-policy",
+      "upstream_anchor": "Firecracker is not able to mitigate host's hardware vulnerabilities.",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "host-and-hardware-policy"
+      ]
+    },
+    {
+      "order": 26,
+      "id": "single-tenant-process-boundary",
+      "upstream_anchor": "each Firecracker process corresponds to a workload of a single tenant.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "containment-and-identity"
+      ]
+    },
+    {
+      "order": 27,
+      "id": "firmware-and-microcode-maintenance",
+      "upstream_anchor": "microcode as soon as possible. Aside from keeping the system firmware",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "host-and-hardware-policy"
+      ]
+    },
+    {
+      "order": 28,
+      "id": "side-channel-host-policy",
+      "upstream_anchor": "Specific mitigations for side channel issues are constantly evolving",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "host-and-hardware-policy"
+      ]
+    },
+    {
+      "order": 29,
+      "id": "arm-kvm-physical-counter-offset",
+      "upstream_anchor": "KVM_CAP_COUNTER_OFFSET",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "timer-and-architecture"
+      ]
+    },
+    {
+      "order": 30,
+      "id": "host-vulnerability-verification",
+      "upstream_anchor": "spectre-meltdown-checker script",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "host-and-hardware-policy"
+      ]
+    },
+    {
+      "order": 31,
+      "id": "x86-linux-6-1-kvm-cgroup-regressions",
+      "upstream_anchor": "Linux 6.1 introduced some regressions in the time it takes to boot a VM",
+      "outcome": "terminal-platform-or-architecture-limit",
+      "evidence_profiles": [
+        "timer-and-architecture"
+      ]
+    }
+  ],
+  "terminal_dependencies": [
+    {
+      "capability_id": "api-property:Drive.rate_limiter",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "api-property:NetworkInterface.rx_rate_limiter",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "api-property:NetworkInterface.tx_rate_limiter",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "corpus:jailer",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "corpus:seccomp",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "firecracker-argument:no-seccomp",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "firecracker-argument:seccomp-filter",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "semantic.device:rtc-vmclock-vmgenid-and-pvtime",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.device:serial-stdin-stdout-rx-and-restore",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.isolation:host-resource-authority-and-brokerage",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.process:signals-exits-fd-and-cleanup",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.storage:block-sync-async-vhost-and-limits",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/cgroup",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/cgroup-version",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/chroot-base-dir",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/gid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/netns",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/new-pid-ns",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/parent-cgroup",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/resource-limit",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/uid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-operation:jailer/run",
+      "disposition": "implemented-and-verified"
+    }
+  ],
+  "external_dependencies": [
+    {
+      "capability_id": "corpus:network-setup",
+      "disposition": "audit-required",
+      "owner_issue": "#1378",
+      "owned_outcomes": [
+        "positive-production-vmnet-connectivity",
+        "credentialed-service-cleanup-and-concurrency"
+      ]
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "disposition": "audit-required",
+      "owner_issue": "#1378",
+      "owned_outcomes": [
+        "approved-apple-vmnet-credential",
+        "real-start-packets-connectivity-teardown-and-reclamation"
+      ]
+    }
+  ],
+  "evidence_profiles": [
+    {
+      "id": "containment-and-identity",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/host-resource-authority-contract.md",
+          "anchor": "## Terminal host-resource authority outcome"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-seccomp-containment-contract.md",
+          "anchor": "## Terminal jailer/seccomp containment outcome"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/multiprocess-isolation-contract.md",
+          "anchor": "## Terminal multiprocess isolation outcome"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_sessions_remain_independent_when_one_worker_crashes()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    },
+    {
+      "id": "output-and-observability",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/logger-contract.md",
+          "anchor": "## Delivery and limiter policy"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/serial-contract.md",
+          "anchor": "## Destination endpoint and continuation policy"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "pub struct SharedSerialOutput"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn terminal_logger_failure_is_counted_before_final_metrics_and_preserves_result()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn shared_serial_output_counts_rate_limited_dropped_bytes()"
+        }
+      ]
+    },
+    {
+      "id": "resource-controls",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/host-resource-authority-contract.md",
+          "anchor": "## Fixed authority behavior"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/network-mmds-contract.md",
+          "anchor": "## Observable live contract"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/storage-contract.md",
+          "anchor": "## Observable storage contract"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_rate_limiter_rolls_back_ops_when_bandwidth_throttles()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn network_rate_limiter_rolls_back_ops_when_bandwidth_throttles()"
+        }
+      ]
+    },
+    {
+      "id": "network-and-operator-boundary",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/network-mmds-contract.md",
+          "anchor": "## Explicit nonclaims and handoffs"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/codec.rs",
+          "anchor": "pub struct VmnetAuthority"
+        },
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "## Current Non-Goals"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()"
+        }
+      ]
+    },
+    {
+      "id": "host-and-hardware-policy",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-host-contract.md",
+          "anchor": "## Operator, hardware, and deployment boundaries"
+        },
+        {
+          "kind": "local",
+          "path": "docs/security.md",
+          "anchor": "## Current Non-Goals"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/production_host_audit.rs",
+          "anchor": "fn checked_production_host_audit_is_canonical_and_fail_closed()"
+        }
+      ]
+    },
+    {
+      "id": "timer-and-architecture",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/time-identity-contract.md",
+          "anchor": "## Certification boundary"
+        },
+        {
+          "kind": "local",
+          "path": "docs/snapshot-feasibility.md",
+          "anchor": "Native arm64 timer and VMGenID restore policy"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/hvf/src/runner.rs",
+          "anchor": "fn captures_arm64_physical_timer_state_on_runner_thread()"
+        }
+      ]
+    },
+    {
+      "id": "external-vmnet",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/network-mmds-contract.md",
+          "anchor": "## Explicit nonclaims and handoffs"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/preflight-production-vmnet.sh",
+          "anchor": "bangbang vmnet preflight: blocked"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()"
+        }
+      ]
+    }
+  ],
+  "residuals": [
+    {
+      "id": "literal-linux-host-mechanisms",
+      "classification": "terminal-platform-or-architecture-limit",
+      "evidence_profile": "containment-and-identity"
+    },
+    {
+      "id": "operator-maintenance-and-host-policy",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "host-and-hardware-policy"
+    },
+    {
+      "id": "output-retention-and-monitoring",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "output-and-observability"
+    },
+    {
+      "id": "host-firewall-capacity-and-admission",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "network-and-operator-boundary"
+    },
+    {
+      "id": "firecracker-specific-signal-handler-hazard",
+      "classification": "implementation-specific-nonrequirement",
+      "evidence_profile": "containment-and-identity"
+    },
+    {
+      "id": "positive-vmnet-and-approved-credentials",
+      "classification": "external-dependency",
+      "evidence_profile": "external-vmnet"
+    },
+    {
+      "id": "developer-id-notarization-and-deployment",
+      "classification": "independently-owned-outcome",
+      "evidence_profile": "network-and-operator-boundary"
+    },
+    {
+      "id": "physical-host-hardware-certification",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "host-and-hardware-policy"
+    }
+  ],
+  "nonclaims": [
+    "literal-linux-kvm-cgroup-namespace-and-module-mechanisms",
+    "host-kernel-guest-kernel-microcode-and-firmware-maintenance",
+    "host-firewall-swap-capacity-admission-and-fleet-policy",
+    "output-retention-monitoring-restart-and-long-lived-service",
+    "hardware-side-channel-and-physical-host-certification",
+    "developer-id-notarization-and-deployment",
+    "positive-vmnet-connectivity-or-approved-credentials",
+    "firecracker-specific-signal-handler-hazard"
+  ]
+}

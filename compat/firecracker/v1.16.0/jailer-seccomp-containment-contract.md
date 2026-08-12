@@ -54,7 +54,8 @@ mechanisms.
 
 ## External and operator boundaries
 
-The three audit-required records remain exact external dependencies:
+At the #1918 transition, three audit-required records remained exact external
+dependencies:
 
 - `corpus:network-setup` and
   `semantic.network:virtio-net-vmnet-policy-and-connectivity` retain #1378
@@ -81,8 +82,9 @@ deployment are explicit nonclaims or independent outcomes.
 The predecessor is exactly `381/3/1/33`; the successor is exactly
 `382/3/0/33`. A SHA-256 digest pins every unrelated capability record. Only the
 #1918 row repairs its source set, clears delivery ownership, and gains terminal
-evidence. The three audit-required rows and all 33 platform exclusions remain
-unchanged.
+evidence. Those three audit-required rows and all 33 platform exclusions were
+unchanged by #1918. #1920 later certifies only `corpus:production-host`,
+producing the exact `383/2/0/33` successor while preserving the two #1378 rows.
 
 ## Terminal jailer/seccomp containment outcome
 
@@ -100,4 +102,4 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer
 ```
 
 The global `--final` gate remains intentionally stronger and continues to fail
-while the three independently owned audit-required records remain open.
+while the two independently owned #1378 audit-required records remain open.

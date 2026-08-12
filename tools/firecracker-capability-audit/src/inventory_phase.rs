@@ -29,6 +29,8 @@ pub(crate) const HOST_RESOURCE_AUTHORITY_ID: &str =
 pub(crate) const JAILER_SECCOMP_CONTAINMENT_ID: &str =
     "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes";
 
+pub(crate) const PRODUCTION_HOST_ID: &str = "corpus:production-host";
+
 const WAVE8_AUDIT_IDS: [&str; 8] = [
     "corpus:jailer",
     "corpus:network-setup",
@@ -99,6 +101,7 @@ pub(crate) enum InventoryPhase {
     MultiprocessIsolation,
     HostResourceAuthority,
     JailerSeccompContainment,
+    ProductionHost,
 }
 
 impl InventoryPhase {
@@ -113,6 +116,7 @@ impl InventoryPhase {
             Self::MultiprocessIsolation => "multiprocess isolation 380/3/2/33",
             Self::HostResourceAuthority => "host-resource authority 381/3/1/33",
             Self::JailerSeccompContainment => "jailer/seccomp containment 382/3/0/33",
+            Self::ProductionHost => "production-host corpus 383/2/0/33",
         }
     }
 }
@@ -131,6 +135,7 @@ pub(crate) fn classify_inventory_phase(
         (380, 3, 2, 33) => InventoryPhase::MultiprocessIsolation,
         (381, 3, 1, 33) => InventoryPhase::HostResourceAuthority,
         (382, 3, 0, 33) => InventoryPhase::JailerSeccompContainment,
+        (383, 2, 0, 33) => InventoryPhase::ProductionHost,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -190,6 +195,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost
     ) {
         ids.extend(JAILER_UID_GID_IDS);
     }
@@ -200,6 +206,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost
     ) {
         ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
@@ -252,13 +259,17 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         InventoryPhase::JailerAggregate
         | InventoryPhase::MultiprocessIsolation
         | InventoryPhase::HostResourceAuthority
-        | InventoryPhase::JailerSeccompContainment => {
+        | InventoryPhase::JailerSeccompContainment
+        | InventoryPhase::ProductionHost => {
             for id in JAILER_UID_GID_IDS {
                 ids.remove(id);
             }
             ids.remove(JAILER_CHROOT_BASE_DIR_ID);
             for id in JAILER_AGGREGATE_IDS {
                 ids.remove(id);
+            }
+            if phase == InventoryPhase::ProductionHost {
+                ids.remove(PRODUCTION_HOST_ID);
             }
         }
     }
@@ -274,16 +285,22 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost
     ) {
         ids.remove(MULTIPROCESS_ISOLATION_ID);
     }
     if matches!(
         phase,
-        InventoryPhase::HostResourceAuthority | InventoryPhase::JailerSeccompContainment
+        InventoryPhase::HostResourceAuthority
+            | InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost
     ) {
         ids.remove(HOST_RESOURCE_AUTHORITY_ID);
     }
-    if phase == InventoryPhase::JailerSeccompContainment {
+    if matches!(
+        phase,
+        InventoryPhase::JailerSeccompContainment | InventoryPhase::ProductionHost
+    ) {
         ids.remove(JAILER_SECCOMP_CONTAINMENT_ID);
     }
     ids
@@ -345,10 +362,21 @@ mod tests {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::ProductionHost)
+        );
+
+        let mut containment = current.clone();
+        set_disposition(
+            &mut containment,
+            PRODUCTION_HOST_ID,
+            Disposition::AuditRequired,
+        );
+        assert_eq!(
+            classify_inventory_phase(&containment),
             Ok(InventoryPhase::JailerSeccompContainment)
         );
 
-        let mut host_resource = current.clone();
+        let mut host_resource = containment;
         restore_containment_handoff(&mut host_resource);
         assert_eq!(
             classify_inventory_phase(&host_resource),

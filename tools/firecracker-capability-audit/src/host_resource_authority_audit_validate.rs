@@ -25,7 +25,7 @@ pub const HOST_RESOURCE_AUTHORITY_AUDIT_PATH: &str =
 pub const HOST_RESOURCE_AUTHORITY_CAPABILITY_ID: &str = HOST_RESOURCE_AUTHORITY_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "a7fd940ba7391610e860dd2d955bb6c5e7176424c568103bccb4a04d9f4e0830";
+    "5fd5317191891ea4191c873007672b302f4e35a2613269c2110488361591689e";
 
 const PROFILE_IDS: [HostResourceEvidenceProfileId; 11] = [
     HostResourceEvidenceProfileId::ManifestPreflight,
@@ -221,16 +221,18 @@ fn validate_inventory_transition(
     }
     if !matches!(
         disposition_counts(inventory),
-        (381, 3, 1, 33) | (382, 3, 0, 33)
+        (381, 3, 1, 33) | (382, 3, 0, 33) | (383, 2, 0, 33)
     ) {
         errors.push(
-            "host-resource authority live inventory must be exactly 381/3/1/33 or its 382/3/0/33 containment successor"
+            "host-resource authority live inventory must be exactly 381/3/1/33, its 382/3/0/33 containment successor, or its 383/2/0/33 production-host successor"
                 .to_string(),
         );
     }
     if !matches!(
         classify_inventory_phase(inventory),
-        Ok(InventoryPhase::HostResourceAuthority | InventoryPhase::JailerSeccompContainment)
+        Ok(InventoryPhase::HostResourceAuthority
+            | InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost)
     ) {
         errors.push(
             "host-resource authority live inventory has an inexact successor phase".to_string(),
@@ -975,9 +977,13 @@ fn validate_external_dependencies(
                 "host-resource authority external dependency[{index}] drifted"
             ));
         }
-        let completed_containment_successor = expected.capability_id
-            == JAILER_SECCOMP_CONTAINMENT_ID
-            && phase == Some(InventoryPhase::JailerSeccompContainment);
+        let completed_successor = (expected.capability_id == JAILER_SECCOMP_CONTAINMENT_ID
+            && matches!(
+                phase,
+                Some(InventoryPhase::JailerSeccompContainment | InventoryPhase::ProductionHost)
+            ))
+            || (expected.capability_id == "corpus:production-host"
+                && phase == Some(InventoryPhase::ProductionHost));
         match capabilities.get(expected.capability_id) {
             Some(capability)
                 if capability.disposition == expected.disposition
@@ -985,7 +991,7 @@ fn validate_external_dependencies(
                     && capability.validation.is_empty()
                     && capability.exclusion.is_none() => {}
             Some(capability)
-                if completed_containment_successor
+                if completed_successor
                     && capability.disposition == Disposition::ImplementedAndVerified
                     && !capability.implementation.is_empty()
                     && !capability.validation.is_empty()

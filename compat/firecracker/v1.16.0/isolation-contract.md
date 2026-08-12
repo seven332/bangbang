@@ -267,10 +267,25 @@ claimed; all exact Linux mechanism identities retain their terminal platform
 limits.
 
 Positive vmnet execution and approved credentials remain under #1378, while
-deployment and broad host/operator policy remain in `corpus:production-host`.
+deployment and broad host/operator policy remain explicit nonclaims or
+operator-owned boundaries in the later `corpus:production-host` authority.
 The exact transition is `381/3/1/33` to `382/3/0/33`; the complete source map,
 dependencies, residual classifications, nonclaims, and scoped command are in
 the [jailer/seccomp containment contract](jailer-seccomp-containment-contract.md).
+
+## Terminal production-host corpus outcome
+
+#1920 certifies all 31 stable groups in the pinned production-host source.
+Exact macOS outcomes compose the containment, typed-authority, output,
+limiter, timer, cleanup, and concurrency producers above. Literal Linux/KVM
+mechanisms retain terminal platform/architecture limits; maintenance,
+firewall, swap, monitoring, hardware, side-channel, and deployment policy stay
+operator-owned or explicit nonclaims; positive vmnet evidence stays under
+#1378.
+
+Only `corpus:production-host` changes, moving `382/3/0/33` to `383/2/0/33`.
+The canonical authority and scoped command are in the
+[production-host contract](production-host-contract.md).
 
 ## Evidence Map
 
@@ -301,6 +316,6 @@ under #1918. The uid/gid
 argument leaves and configurable chroot are separately terminal at the fixed
 topology above. The aggregate jailer corpus and run records are separately
 terminal under #1912, and the multiprocess aggregate is terminal under #1914;
-the host-resource authority is terminal under #1916. `corpus:production-host`
-and the two network/vmnet records retain their independent audit-required
-states.
+the host-resource authority is terminal under #1916, and the complete
+production-host corpus is terminal under #1920. Only the two #1378
+network/vmnet records retain independent audit-required states.
