@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    CAPABILITY_INVENTORY_PATH, Disposition, JAILER_AGGREGATE_CAPABILITY_IDS,
-    MULTIPROCESS_ISOLATION_CAPABILITY_ID, Reference, SOURCE_MANIFEST_PATH,
-    WAVE8_CERTIFICATION_AUDIT_PATH, WAVE8_CERTIFICATION_CAPABILITY_ID, WAVE8_OWNED_CAPABILITY_IDS,
-    Wave8CertificationAudit, Wave8HandoffOwner, read_capability_inventory, read_source_manifest,
-    read_wave8_certification_audit, validate_wave8_certification_audit,
-    validate_wave8_certification_compatibility, wave8_certification_audit_json,
+    CAPABILITY_INVENTORY_PATH, Disposition, HOST_RESOURCE_AUTHORITY_CAPABILITY_ID,
+    JAILER_AGGREGATE_CAPABILITY_IDS, MULTIPROCESS_ISOLATION_CAPABILITY_ID, Reference,
+    SOURCE_MANIFEST_PATH, WAVE8_CERTIFICATION_AUDIT_PATH, WAVE8_CERTIFICATION_CAPABILITY_ID,
+    WAVE8_OWNED_CAPABILITY_IDS, Wave8CertificationAudit, Wave8HandoffOwner,
+    read_capability_inventory, read_source_manifest, read_wave8_certification_audit,
+    validate_wave8_certification_audit, validate_wave8_certification_compatibility,
+    wave8_certification_audit_json,
 };
 
 fn repository_root() -> PathBuf {
@@ -174,6 +175,21 @@ fn wave8_terminal_transition_is_exact() {
         .expect("terminal Wave 8 transition must certify");
 
     let mut historical_wave8 = inventory.clone();
+    let host_resource = historical_wave8
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == HOST_RESOURCE_AUTHORITY_CAPABILITY_ID)
+        .expect("host-resource-authority successor capability must exist");
+    host_resource.source_refs = vec![
+        "corpus:jailer".to_string(),
+        "corpus:network-setup".to_string(),
+        "corpus:production-host".to_string(),
+    ];
+    host_resource.disposition = Disposition::MissingPlatformFeasible;
+    host_resource.implementation.clear();
+    host_resource.validation.clear();
+    host_resource.delivery_issue =
+        Some("https://github.com/seven332/bangbang/issues/1351".to_string());
     let multiprocess = historical_wave8
         .capabilities
         .iter_mut()

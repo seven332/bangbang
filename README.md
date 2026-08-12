@@ -41,6 +41,9 @@ Each detailed subject has one primary document:
 - [Multiprocess Isolation Contract](compat/firecracker/v1.16.0/multiprocess-isolation-contract.md)
   owns the 13-clause process/tenant mapping, failure-atomic and concurrent
   evidence, terminal identity composition, residuals, and nonclaims.
+- [Host-Resource Authority Contract](compat/firecracker/v1.16.0/host-resource-authority-contract.md)
+  owns the four-source obligation map, exact 17-role/five-access grant surface,
+  fixed broker facets, operator/external boundaries, residuals, and nonclaims.
 - [Wave 7 Aggregate Authority](compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
   machine-checks the terminal design, device API, release, public-tool, and
   virtio-MMIO closure while retaining every external handoff.
@@ -74,9 +77,10 @@ human-readable documents above explain current behavior.
 
 The Wave 8 contract explains the scoped gate, its historical 377/8/3/30 phase,
 the exact 377/6/3/32 uid/gid successor, the 377/5/3/33 configurable-chroot
-successor, the 379/3/3/33 aggregate-jailer successor, and the current exact
-380/3/2/33 multiprocess-isolation successor.
-See the [Testing Guide](docs/testing.md#multiprocess-isolation-certification) for the
+successor, the 379/3/3/33 aggregate-jailer successor, the 380/3/2/33
+multiprocess-isolation successor, and the current exact 381/3/1/33
+host-resource-authority successor.
+See the [Testing Guide](docs/testing.md#host-resource-authority-certification) for the
 canonical command and the checked authority for the machine-derived counts and
 exact nonterminal identities.
 
@@ -213,7 +217,8 @@ portable CPU-template strip,
 platform-tagged CPU-fingerprint dump, deterministic fingerprint compare,
 aggregate CPU-template workflow,
 69-field API/process,
-231-field device, ten-scenario aggregate metrics, and multiprocess isolation
+231-field device, ten-scenario aggregate metrics, multiprocess isolation, and
+host-resource authority
 scopes have separate
 fail-closed certification gates:
 
@@ -229,6 +234,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multiprocess-isolation-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --host-resource-authority-final
 ```
 
 On Linux with the exact pinned Kani setup, compile, inventory, and execute all

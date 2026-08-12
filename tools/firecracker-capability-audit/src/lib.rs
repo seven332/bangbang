@@ -9,6 +9,9 @@ mod formal_verification_certify;
 mod guest_workflow_audit_model;
 mod guest_workflow_audit_validate;
 mod guest_workflow_certify;
+mod host_resource_authority_audit_model;
+mod host_resource_authority_audit_validate;
+mod host_resource_authority_certify;
 mod inventory_phase;
 mod jailer_aggregate_audit_model;
 mod jailer_aggregate_audit_validate;
@@ -99,6 +102,19 @@ pub use guest_workflow_audit_validate::{
 pub use guest_workflow_certify::{
     GUEST_WORKFLOW_COMPATIBILITY_CAPABILITY_IDS, validate_guest_workflow_compatibility,
 };
+pub use host_resource_authority_audit_model::{
+    HostResourceAccess, HostResourceAuthorityAudit, HostResourceClauseOutcome,
+    HostResourceDispositionCounts, HostResourceEvidenceProfile, HostResourceEvidenceProfileId,
+    HostResourceExternalDependency, HostResourceLifetime, HostResourceNonclaim,
+    HostResourceObjectKind, HostResourcePinnedSource, HostResourceRecord,
+    HostResourceResidualClassification, HostResourceResidualRecord, HostResourceRole,
+    HostResourceSourceClause, HostResourceTerminalDependency,
+};
+pub use host_resource_authority_audit_validate::{
+    HOST_RESOURCE_AUTHORITY_AUDIT_PATH, HOST_RESOURCE_AUTHORITY_AUDIT_SCHEMA_VERSION,
+    HOST_RESOURCE_AUTHORITY_CAPABILITY_ID, validate_host_resource_authority_audit,
+};
+pub use host_resource_authority_certify::validate_host_resource_authority_compatibility;
 pub use jailer_aggregate_audit_model::{
     JailerAggregateAudit, JailerAggregateNonclaim, JailerArgumentCardinality,
     JailerArgumentOutcome, JailerArgumentRecord, JailerArgumentRequirement, JailerCorpusSection,
@@ -442,6 +458,22 @@ pub fn read_multiprocess_isolation_audit(
     })
 }
 
+/// Read and parse the checked host-resource authority.
+pub fn read_host_resource_authority_audit(
+    path: &Path,
+) -> Result<HostResourceAuthorityAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read host-resource authority audit: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse host-resource authority audit: {error}"
+        ))
+    })
+}
+
 /// Read and parse the checked targeted formal-verification authority.
 pub fn read_formal_verification_audit(path: &Path) -> Result<FormalVerificationAudit, AuditError> {
     let bytes = std::fs::read(path).map_err(|error| {
@@ -587,6 +619,13 @@ pub fn multiprocess_isolation_audit_json(
     audit: &MultiprocessIsolationAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "multiprocess isolation audit")
+}
+
+/// Serialize the checked host-resource authority using canonical pretty JSON.
+pub fn host_resource_authority_audit_json(
+    audit: &HostResourceAuthorityAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "host-resource authority audit")
 }
 
 /// Serialize the checked targeted formal-verification authority using canonical pretty JSON.

@@ -164,7 +164,7 @@ fn multiprocess_terminal_transition_is_exact() {
         validate_multiprocess_isolation_compatibility(&manifest, &partial, &audit, &root)
             .expect_err("partial multiprocess transition must fail")
             .to_string()
-            .contains("380/3/2/33")
+            .contains("multiprocess isolation capability is not terminal")
     );
 
     let mut evidence_drift = inventory.clone();

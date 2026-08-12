@@ -112,6 +112,7 @@ fn validate_contract(repository_root: &Path, errors: &mut Vec<String>) {
         "three #1351",
         "379/3/3/33",
         "380/3/2/33",
+        "381/3/1/33",
         "three audit-required",
         "one #1373",
         "two #1351",

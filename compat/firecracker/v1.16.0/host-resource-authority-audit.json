@@ -1,0 +1,1230 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1351",
+  "delivery_issue": "#1916",
+  "upstream_sources": [
+    {
+      "id": "firecracker-design",
+      "manifest_id": "corpus:design",
+      "path": "docs/design.md",
+      "anchor": "entire-file",
+      "git_blob": "143fef76410e4f7e45b32d3986e0d78eedf5175a"
+    },
+    {
+      "id": "jailer",
+      "manifest_id": "corpus:jailer",
+      "path": "docs/jailer.md",
+      "anchor": "entire-file",
+      "git_blob": "fa5e8b4ee769f64ee83a317dce5902ffd0029a1b"
+    },
+    {
+      "id": "network-setup",
+      "manifest_id": "corpus:network-setup",
+      "path": "docs/network-setup.md",
+      "anchor": "entire-file",
+      "git_blob": "c161b6661d4362a49d1978e0cafc5e7a6e5cebf6"
+    },
+    {
+      "id": "production-host-setup",
+      "manifest_id": "corpus:production-host",
+      "path": "docs/prod-host-setup.md",
+      "anchor": "entire-file",
+      "git_blob": "8939b56a965963d8df1c44c583dcd38361197347"
+    }
+  ],
+  "capability_id": "semantic.isolation:host-resource-authority-and-brokerage",
+  "previous_counts": {
+    "implemented_and_verified": 380,
+    "audit_required": 3,
+    "missing_platform_feasible": 2,
+    "proven_platform_impossible": 33
+  },
+  "target_counts": {
+    "implemented_and_verified": 381,
+    "audit_required": 3,
+    "missing_platform_feasible": 1,
+    "proven_platform_impossible": 33
+  },
+  "unrelated_inventory_sha256": "a40bb2ed7bbb19138cce75ea5476b2b834628b0a4b2aae8b05f53a94ecb89eff",
+  "source_clauses": [
+    {
+      "order": 1,
+      "id": "host-network-tap-backing",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Firecracker emulated network devices are backed by TAP devices on the host.",
+      "outcome": "external-evidence-outcome",
+      "evidence_profiles": [
+        "network-policy-boundary"
+      ]
+    },
+    {
+      "order": 2,
+      "id": "block-host-file-backing",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Firecracker emulated block devices are backed by files on the host.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "storage-runtime-authority"
+      ]
+    },
+    {
+      "order": 3,
+      "id": "network-barrier-rate-limiting",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "I/O rate limiting is applied at this point.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "network-policy-boundary",
+        "limits-and-fairness"
+      ]
+    },
+    {
+      "order": 4,
+      "id": "host-egress-filtering",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "should be filtered at the host-level.",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 5,
+      "id": "per-device-fair-rate-limiters",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "rate limiters to each volume and network interface",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "limits-and-fairness"
+      ]
+    },
+    {
+      "order": 6,
+      "id": "vhost-user-backend-rate-limiting",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "customers should implement rate limiting on the side of the vhost-user backend",
+      "outcome": "backend-owned-outcome",
+      "evidence_profiles": [
+        "socket-vsock-vhost-authority",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 7,
+      "id": "privileged-third-party-resource-grants",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "access resources that a privileged third-party grants access to",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "manifest-preflight",
+        "atomic-grant-transport"
+      ]
+    },
+    {
+      "order": 8,
+      "id": "cgroup-affinity-and-cpu-quota",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "have its own dedicated quota of the CPU time",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "limits-and-fairness",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 9,
+      "id": "jailer-validation-before-mutation",
+      "source_id": "jailer",
+      "upstream_anchor": "Validate **all provided paths** and the VM ID.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "manifest-preflight"
+      ]
+    },
+    {
+      "order": 10,
+      "id": "jailer-fsize-and-no-file-limits",
+      "source_id": "jailer",
+      "upstream_anchor": "Current available resources that can be limited",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "limits-and-fairness"
+      ]
+    },
+    {
+      "order": 11,
+      "id": "trusted-input-path-ownership",
+      "source_id": "jailer",
+      "upstream_anchor": "All inputs to the jailer are considered trusted",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "manifest-preflight",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 12,
+      "id": "resource-copy-link-and-permissions",
+      "source_id": "jailer",
+      "upstream_anchor": "The user must create hard links for (or copy) any resources",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "boot-and-input-authority",
+        "storage-runtime-authority",
+        "output-and-rate-bounds"
+      ]
+    },
+    {
+      "order": 13,
+      "id": "operator-cgroup-partitioning",
+      "source_id": "jailer",
+      "upstream_anchor": "user must manage any fine tuning of resource partitioning via cgroups",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 14,
+      "id": "operator-cleanup-and-crash-race",
+      "source_id": "jailer",
+      "upstream_anchor": "It’s up to the user to handle cleanup after running the jailer.",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "failure-cleanup-and-concurrency",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 15,
+      "id": "bounded-serial-output",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Users are responsible for handling the memory and storage usage",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "output-and-rate-bounds",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 16,
+      "id": "bounded-log-output",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Users are responsible for consuming and storing this data safely.",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "output-and-rate-bounds",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 17,
+      "id": "external-overwatcher-sigkill",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "customers have an overwatcher process on the host",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "failure-cleanup-and-concurrency",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 18,
+      "id": "production-trusted-paths",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "their parent directories are not writable by unprivileged users",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "manifest-preflight",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 19,
+      "id": "least-privilege-resource-identity",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "All file system resources used for Firecracker should be owned by this user and group.",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "atomic-grant-transport",
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 20,
+      "id": "workload-specific-resource-policy",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "highly dependent on the workload type and usecase",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 21,
+      "id": "disk-resource-controls",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Jailer's `resource-limit` provides control on the disk usage",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "storage-runtime-authority",
+        "limits-and-fairness"
+      ]
+    },
+    {
+      "order": 22,
+      "id": "memory-and-cpu-cgroup-controls",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "can guarantee a minimum number of CPU shares when a system is busy",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 23,
+      "id": "network-flood-rate-controls",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "configuring rate limiters for the network interface",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "network-policy-boundary",
+        "limits-and-fairness"
+      ]
+    },
+    {
+      "order": 24,
+      "id": "production-host-egress-firewall",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Firewall rules should therefore be implemented on the host",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 25,
+      "id": "storage-contention-controls",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Rate limiting functionality is supported for both networking and storage devices",
+      "outcome": "implemented-with-terminal-limit",
+      "evidence_profiles": [
+        "storage-runtime-authority",
+        "limits-and-fairness"
+      ]
+    },
+    {
+      "order": 26,
+      "id": "network-guide-operator-adaptation",
+      "source_id": "network-setup",
+      "upstream_anchor": "modifying this setup to accommodate your specific needs",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 27,
+      "id": "per-vm-host-interface-and-tap",
+      "source_id": "network-setup",
+      "upstream_anchor": "Each microVM requires a host network interface",
+      "outcome": "external-evidence-outcome",
+      "evidence_profiles": [
+        "network-policy-boundary"
+      ]
+    },
+    {
+      "order": 28,
+      "id": "configured-host-device-name",
+      "source_id": "network-setup",
+      "upstream_anchor": "\"host_dev_name\": \"tap0\"",
+      "outcome": "external-evidence-outcome",
+      "evidence_profiles": [
+        "network-policy-boundary"
+      ]
+    },
+    {
+      "order": 29,
+      "id": "multi-guest-address-and-rule-allocation",
+      "source_id": "network-setup",
+      "upstream_anchor": "Each microVM has its own subnet",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 30,
+      "id": "bridge-creation-and-cleanup",
+      "source_id": "network-setup",
+      "upstream_anchor": "make sure to delete the bridge",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "terminal-and-operator-boundary"
+      ]
+    }
+  ],
+  "resource_surface": [
+    {
+      "order": 1,
+      "role": "startup-config",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "startup-config-parser",
+      "evidence_profiles": [
+        "boot-and-input-authority"
+      ]
+    },
+    {
+      "order": 2,
+      "role": "startup-metadata",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "startup-metadata-parser",
+      "evidence_profiles": [
+        "boot-and-input-authority"
+      ]
+    },
+    {
+      "order": 3,
+      "role": "kernel-image",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "guest-kernel-loader",
+      "evidence_profiles": [
+        "boot-and-input-authority"
+      ]
+    },
+    {
+      "order": 4,
+      "role": "initrd-image",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "guest-initrd-loader",
+      "evidence_profiles": [
+        "boot-and-input-authority"
+      ]
+    },
+    {
+      "order": 5,
+      "role": "drive-backing",
+      "object_kinds": [
+        "regular-file",
+        "block-device"
+      ],
+      "access": [
+        "read-only",
+        "read-write"
+      ],
+      "lifetime": "runtime-transactional",
+      "consumer": "block-startup-hotplug-replace-and-restore",
+      "evidence_profiles": [
+        "storage-runtime-authority"
+      ]
+    },
+    {
+      "order": 6,
+      "role": "pmem-backing",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only",
+        "read-write"
+      ],
+      "lifetime": "runtime-transactional",
+      "consumer": "pmem-startup-hotplug-replace-and-restore",
+      "evidence_profiles": [
+        "storage-runtime-authority"
+      ]
+    },
+    {
+      "order": 7,
+      "role": "api-socket-directory",
+      "object_kinds": [
+        "directory"
+      ],
+      "access": [
+        "create-children"
+      ],
+      "lifetime": "session-retained",
+      "consumer": "api-socket-publication-and-cleanup",
+      "evidence_profiles": [
+        "socket-vsock-vhost-authority"
+      ]
+    },
+    {
+      "order": 8,
+      "role": "vsock-socket-directory",
+      "object_kinds": [
+        "directory"
+      ],
+      "access": [
+        "create-children"
+      ],
+      "lifetime": "session-retained",
+      "consumer": "vsock-listener-publication-and-connect",
+      "evidence_profiles": [
+        "socket-vsock-vhost-authority"
+      ]
+    },
+    {
+      "order": 9,
+      "role": "logger-sink",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "write-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "logger-output",
+      "evidence_profiles": [
+        "output-and-rate-bounds"
+      ]
+    },
+    {
+      "order": 10,
+      "role": "metrics-sink",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "write-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "metrics-output",
+      "evidence_profiles": [
+        "output-and-rate-bounds"
+      ]
+    },
+    {
+      "order": 11,
+      "role": "serial-sink",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "write-only"
+      ],
+      "lifetime": "runtime-transactional",
+      "consumer": "serial-output-and-restore",
+      "evidence_profiles": [
+        "output-and-rate-bounds"
+      ]
+    },
+    {
+      "order": 12,
+      "role": "snapshot-describe-input",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "snapshot-describe",
+      "evidence_profiles": [
+        "snapshot-and-pager-authority"
+      ]
+    },
+    {
+      "order": 13,
+      "role": "snapshot-state-input",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "snapshot-state-restore",
+      "evidence_profiles": [
+        "snapshot-and-pager-authority"
+      ]
+    },
+    {
+      "order": 14,
+      "role": "snapshot-memory-input",
+      "object_kinds": [
+        "regular-file"
+      ],
+      "access": [
+        "read-only"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "snapshot-memory-restore",
+      "evidence_profiles": [
+        "snapshot-and-pager-authority"
+      ]
+    },
+    {
+      "order": 15,
+      "role": "snapshot-output-directory",
+      "object_kinds": [
+        "directory"
+      ],
+      "access": [
+        "create-children"
+      ],
+      "lifetime": "runtime-transactional",
+      "consumer": "snapshot-state-memory-and-staging-publication",
+      "evidence_profiles": [
+        "snapshot-and-pager-authority"
+      ]
+    },
+    {
+      "order": 16,
+      "role": "vhost-user-socket-directory",
+      "object_kinds": [
+        "directory"
+      ],
+      "access": [
+        "connect-children"
+      ],
+      "lifetime": "session-retained",
+      "consumer": "vhost-user-exact-child-connection",
+      "evidence_profiles": [
+        "socket-vsock-vhost-authority"
+      ]
+    },
+    {
+      "order": 17,
+      "role": "snapshot-pager-stream",
+      "object_kinds": [
+        "connected-unix-stream"
+      ],
+      "access": [
+        "read-write"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "snapshot-userfault-pager",
+      "evidence_profiles": [
+        "snapshot-and-pager-authority"
+      ]
+    }
+  ],
+  "terminal_dependencies": [
+    {
+      "capability_id": "api-property:NetworkInterface.rx_rate_limiter",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "api-property:NetworkInterface.tx_rate_limiter",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "api-property:Pmem.rate_limiter",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "corpus:jailer",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.device:serial-stdin-stdout-rx-and-restore",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.process:signals-exits-fd-and-cleanup",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.storage:block-sync-async-vhost-and-limits",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/cgroup",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/chroot-base-dir",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/gid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/resource-limit",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/uid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-operation:jailer/run",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "api-property:Drive.rate_limiter",
+      "disposition": "implemented-and-verified"
+    }
+  ],
+  "external_dependencies": [
+    {
+      "capability_id": "corpus:network-setup",
+      "disposition": "audit-required",
+      "owner_issue": "#1378",
+      "owned_outcomes": [
+        "positive-production-vmnet-connectivity",
+        "credentialed-failure-cleanup-and-concurrency"
+      ]
+    },
+    {
+      "capability_id": "corpus:production-host",
+      "disposition": "audit-required",
+      "owner_issue": "#1351",
+      "owned_outcomes": [
+        "production-host-signing-deployment-and-host-policy-aggregate"
+      ]
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "disposition": "audit-required",
+      "owner_issue": "#1378",
+      "owned_outcomes": [
+        "approved-apple-vmnet-credential",
+        "real-start-packets-connectivity-teardown-and-reclamation"
+      ]
+    },
+    {
+      "capability_id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
+      "disposition": "missing-platform-feasible",
+      "owner_issue": "#1351",
+      "owned_outcomes": [
+        "final-jailer-seccomp-and-macos-containment-composition"
+      ]
+    }
+  ],
+  "evidence_profiles": [
+    {
+      "id": "manifest-preflight",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/grant_manifest.rs",
+          "anchor": "pub(crate) struct PreparedGrantBatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "pub(crate) struct LaunchRequest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/grant.rs",
+          "anchor": "pub enum GrantAccess"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/grant.rs",
+          "anchor": "pub enum ResourceRole"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/grant_manifest.rs",
+          "anchor": "fn manifest_enforces_roles_access_cardinality_and_bounds()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/grant_manifest.rs",
+          "anchor": "fn safe_open_rejects_symlinks_types_missing_resources_and_aliases()"
+        }
+      ]
+    },
+    {
+      "id": "atomic-grant-transport",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "pub struct GrantRegistry"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "pub struct StagedGrantBatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_transport.rs",
+          "anchor": "pub struct ReceivedGrant"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "fn directory_registry_batch_adoption_is_failure_atomic()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "fn file_registry_batch_adoption_is_failure_atomic()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "fn receiver_rejects_cross_class_descriptor_aliases_and_closes_the_whole_batch()"
+        }
+      ]
+    },
+    {
+      "id": "boot-and-input-authority",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "pub(crate) struct GrantAuthority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/grant_manifest.rs",
+          "anchor": "pub(crate) struct PreparedGrantBatch"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_delays_boot_claim_until_api_and_keeps_opened_identity()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_grants_external_config_metadata_and_boot_inputs_to_real_guest()"
+        }
+      ]
+    },
+    {
+      "id": "storage-runtime-authority",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "pub struct DriveConfigs"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/pmem.rs",
+          "anchor": "pub struct PmemConfigs"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/block_control.rs",
+          "anchor": "pub struct BlockControlTarget"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_adopts_delayed_block_and_pmem_grants_by_descriptor_identity()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_enforces_read_only_drive_grant_against_guest_writes()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_hotplugs_flushes_and_reuses_runtime_pmem_from_exact_unused_grants()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_live_async_block_grant_swap_uses_preauthorized_open_file()"
+        }
+      ]
+    },
+    {
+      "id": "output-and-rate-bounds",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "pub(crate) struct GrantAuthority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "pub struct SerialRateLimiterConfig"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/grant.rs",
+          "anchor": "pub enum ResourceRole"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_adopts_delayed_output_grants_by_descriptor_identity()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_adopts_output_grants_from_config_file_and_startup_cli()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_keeps_concurrent_output_grant_sessions_isolated()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/serial.rs",
+          "anchor": "fn rate_limited_output_drops_exhausted_bytes_without_output_error()"
+        }
+      ]
+    },
+    {
+      "id": "socket-vsock-vhost-authority",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/anchored_socket.rs",
+          "anchor": "pub(crate) struct BoundAnchoredSocket"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/socket_broker.rs",
+          "anchor": "pub enum SocketBrokerMessage"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/vhost_user_broker.rs",
+          "anchor": "pub enum VhostUserBrokerMessage"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_brokers_multiple_contained_vhost_user_children_without_helpers()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_granted_socket_cleanup_preserves_replacements_in_both_death_orders()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_routes_host_vsock_through_supplied_granted_listener()"
+        }
+      ]
+    },
+    {
+      "id": "snapshot-and-pager-authority",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "pub(crate) struct ContainedSnapshotRestoreTransaction"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/snapshot_restore_resources.rs",
+          "anchor": "pub(crate) struct PreparedSnapshotRestoreResources"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/grant.rs",
+          "anchor": "pub enum ResourceRole"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn normal_bundle_adopts_native_v2_snapshot_grants_for_create_describe_and_restore()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_pager_grant_completes_and_repeats_under_unchanged_entitlements()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_restore_transaction_covers_logical_abort_cancellation_and_commit_phases()"
+        }
+      ]
+    },
+    {
+      "id": "network-policy-boundary",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/vmnet.rs",
+          "anchor": "pub struct VmnetInterfaceConfig"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "pub(crate) struct LaunchRequest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/codec.rs",
+          "anchor": "pub struct VmnetAuthority"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/codec.rs",
+          "anchor": "fn vmnet_authority_debug_and_errors_do_not_reveal_policy_values()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/codec.rs",
+          "anchor": "fn vmnet_authority_validates_exact_bounded_modes_and_names()"
+        }
+      ]
+    },
+    {
+      "id": "limits-and-fairness",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "fn install_resource_limit("
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "pub struct VirtioBlockRateLimiter"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "pub struct VirtioNetworkRateLimiter"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/block.rs",
+          "anchor": "fn block_device_retries_rate_limited_sync_queue_without_another_notification()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_rx_rate_limit_throttles_without_side_effects_and_retries()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/network.rs",
+          "anchor": "fn virtio_network_tx_rate_limit_throttles_without_side_effects_and_retries()"
+        }
+      ]
+    },
+    {
+      "id": "failure-cleanup-and-concurrency",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn cleanup_namespace_after_worker("
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "pub struct StagedGrantBatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/runtime.rs",
+          "anchor": "pub struct SocketOwnershipRecord"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_signed_grant_sessions_keep_authority_noninterchangeable()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signal_cancels_an_incomplete_grant_phase_without_waiting_for_timeout()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_grant_mismatch_fails_closed_without_mutation()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_grant_scopes_cleanup_across_both_process_crash_orders()"
+        }
+      ]
+    },
+    {
+      "id": "terminal-and-operator-boundary",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+          "anchor": "## Terminal jailer uid/gid platform limit"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-aggregate-contract.md",
+          "anchor": "## Terminal aggregate outcome"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/multiprocess-isolation-contract.md",
+          "anchor": "## Terminal multiprocess isolation outcome"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    }
+  ],
+  "residuals": [
+    {
+      "id": "general-dynamic-resource-broker",
+      "classification": "generic-nonrequirement",
+      "evidence_profile": "atomic-grant-transport"
+    },
+    {
+      "id": "hard-revocation",
+      "classification": "generic-nonrequirement",
+      "evidence_profile": "atomic-grant-transport"
+    },
+    {
+      "id": "cross-filesystem-atomic-socket-publication",
+      "classification": "implementation-specific-nonclaim",
+      "evidence_profile": "socket-vsock-vhost-authority"
+    },
+    {
+      "id": "global-cross-launcher-allocation",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "terminal-and-operator-boundary"
+    },
+    {
+      "id": "real-vmnet-connectivity-and-cleanup",
+      "classification": "external-dependency",
+      "evidence_profile": "network-policy-boundary"
+    },
+    {
+      "id": "repository-owned-approved-vmnet-credentials",
+      "classification": "external-dependency",
+      "evidence_profile": "network-policy-boundary"
+    },
+    {
+      "id": "host-tap-routing-firewall-and-addresses",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "terminal-and-operator-boundary"
+    },
+    {
+      "id": "cpu-memory-and-blkio-cgroups",
+      "classification": "terminal-platform-limit",
+      "evidence_profile": "terminal-and-operator-boundary"
+    },
+    {
+      "id": "positive-arbitrary-per-instance-uid-gid",
+      "classification": "terminal-platform-limit",
+      "evidence_profile": "terminal-and-operator-boundary"
+    },
+    {
+      "id": "automatic-restart-or-reconnect",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "failure-cleanup-and-concurrency"
+    },
+    {
+      "id": "vhost-user-backend-rate-limiting",
+      "classification": "backend-owned-outcome",
+      "evidence_profile": "socket-vsock-vhost-authority"
+    },
+    {
+      "id": "aggressive-universal-resource-quotas",
+      "classification": "generic-nonrequirement",
+      "evidence_profile": "limits-and-fairness"
+    },
+    {
+      "id": "developer-id-notarization-and-deployment",
+      "classification": "independently-owned-outcome",
+      "evidence_profile": "terminal-and-operator-boundary"
+    },
+    {
+      "id": "remaining-resource-specific-mutation-and-cleanup",
+      "classification": "already-implemented",
+      "evidence_profile": "failure-cleanup-and-concurrency"
+    }
+  ],
+  "nonclaims": [
+    "general-dynamic-resource-broker",
+    "hard-revocation",
+    "cross-filesystem-atomic-socket-publication",
+    "global-cross-launcher-resource-allocation",
+    "positive-vmnet-connectivity-or-credentials",
+    "host-tap-routing-firewall-or-address-management",
+    "linux-cgroup-namespace-or-chroot-parity",
+    "positive-arbitrary-per-instance-uid-gid",
+    "automatic-restart-or-reconnect",
+    "vhost-user-backend-rate-limiting",
+    "aggressive-universal-resource-quotas",
+    "developer-id-notarization-or-deployment"
+  ]
+}
