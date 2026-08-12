@@ -124,10 +124,10 @@ because Bangbang does not build Linux mount/cgroup hierarchies.
 The #1912 transition is exactly `377/5/3/33` to `379/3/3/33`. A checked digest
 pins every unrelated capability record, so changing an unrelated summary,
 source, disposition, ownership marker, or evidence fails even when cardinality
-is preserved. At the exact `380/3/2/33` multiprocess successor and
-`381/3/1/33` host-resource successor, the checked digest advances to include
-those independently certified rows while the two #1912 rows and their
-original transition remain unchanged.
+is preserved. At the exact `380/3/2/33` multiprocess successor,
+`381/3/1/33` host-resource successor, and `382/3/0/33` containment successor,
+the checked digest advances to include those independently certified rows
+while the two #1912 rows and their original transition remain unchanged.
 
 | Capability | Owner | Disposition |
 | --- | --- | --- |
@@ -137,9 +137,9 @@ original transition remain unchanged.
 The three remaining audit-required records are `corpus:network-setup`,
 `corpus:production-host`, and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity`. The multiprocess
-and host-resource composites are separately terminal under
-#1914 and #1916. Only the final jailer/seccomp/macOS-containment composite
-remains `missing-platform-feasible`; the 33 exact platform exclusions remain
+and host-resource composites are separately terminal under #1914 and #1916.
+The final jailer/seccomp/macOS-containment composite is terminal under #1918;
+no feasible record remains, and the 33 exact platform exclusions remain
 unchanged.
 
 This outcome explicitly does not claim Linux jailer mechanism parity, a
@@ -163,6 +163,6 @@ transition, unrelated-record digest, and the two checked contract rows. The
 ordinary delivery command also validates the authority structure.
 
 The global `--final` mode remains stronger and intentionally fails while the
-three audit-required and three missing-platform-feasible records remain. The
+three audit-required records remain. The
 signed producer scenarios run through `scripts/run-integration-tests.sh`
 without `--allow-unsupported`; no sudo is required by this aggregate slice.

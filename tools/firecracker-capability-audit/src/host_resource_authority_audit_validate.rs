@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::inventory_phase::{
-    HOST_RESOURCE_AUTHORITY_ID, InventoryPhase, classify_inventory_phase, disposition_counts,
+    HOST_RESOURCE_AUTHORITY_ID, InventoryPhase, JAILER_SECCOMP_CONTAINMENT_ID,
+    classify_inventory_phase, disposition_counts,
 };
 use crate::validate::{tracked_repository_files, validate_reference};
 use crate::{
@@ -24,7 +25,7 @@ pub const HOST_RESOURCE_AUTHORITY_AUDIT_PATH: &str =
 pub const HOST_RESOURCE_AUTHORITY_CAPABILITY_ID: &str = HOST_RESOURCE_AUTHORITY_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "a40bb2ed7bbb19138cce75ea5476b2b834628b0a4b2aae8b05f53a94ecb89eff";
+    "a7fd940ba7391610e860dd2d955bb6c5e7176424c568103bccb4a04d9f4e0830";
 
 const PROFILE_IDS: [HostResourceEvidenceProfileId; 11] = [
     HostResourceEvidenceProfileId::ManifestPreflight,
@@ -218,11 +219,19 @@ fn validate_inventory_transition(
     {
         errors.push("host-resource authority target counts must be exactly 381/3/1/33".to_string());
     }
-    if disposition_counts(inventory) != (381, 3, 1, 33) {
-        errors
-            .push("host-resource authority live inventory must be exactly 381/3/1/33".to_string());
+    if !matches!(
+        disposition_counts(inventory),
+        (381, 3, 1, 33) | (382, 3, 0, 33)
+    ) {
+        errors.push(
+            "host-resource authority live inventory must be exactly 381/3/1/33 or its 382/3/0/33 containment successor"
+                .to_string(),
+        );
     }
-    if classify_inventory_phase(inventory) != Ok(InventoryPhase::HostResourceAuthority) {
+    if !matches!(
+        classify_inventory_phase(inventory),
+        Ok(InventoryPhase::HostResourceAuthority | InventoryPhase::JailerSeccompContainment)
+    ) {
         errors.push(
             "host-resource authority live inventory has an inexact successor phase".to_string(),
         );
@@ -945,6 +954,7 @@ fn validate_external_dependencies(
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
+    let phase = classify_inventory_phase(inventory).ok();
     for (index, (record, expected)) in audit
         .external_dependencies
         .iter()
@@ -965,11 +975,21 @@ fn validate_external_dependencies(
                 "host-resource authority external dependency[{index}] drifted"
             ));
         }
+        let completed_containment_successor = expected.capability_id
+            == JAILER_SECCOMP_CONTAINMENT_ID
+            && phase == Some(InventoryPhase::JailerSeccompContainment);
         match capabilities.get(expected.capability_id) {
             Some(capability)
                 if capability.disposition == expected.disposition
                     && capability.implementation.is_empty()
                     && capability.validation.is_empty()
+                    && capability.exclusion.is_none() => {}
+            Some(capability)
+                if completed_containment_successor
+                    && capability.disposition == Disposition::ImplementedAndVerified
+                    && !capability.implementation.is_empty()
+                    && !capability.validation.is_empty()
+                    && capability.delivery_issue.is_none()
                     && capability.exclusion.is_none() => {}
             Some(_) => errors.push(format!(
                 "host-resource authority external dependency changed disposition or evidence: {}",

@@ -16,6 +16,9 @@ mod inventory_phase;
 mod jailer_aggregate_audit_model;
 mod jailer_aggregate_audit_validate;
 mod jailer_aggregate_certify;
+mod jailer_seccomp_containment_audit_model;
+mod jailer_seccomp_containment_audit_validate;
+mod jailer_seccomp_containment_certify;
 mod logger_certify;
 mod logger_model;
 mod logger_upstream;
@@ -126,6 +129,17 @@ pub use jailer_aggregate_audit_validate::{
     JAILER_AGGREGATE_CAPABILITY_IDS, validate_jailer_aggregate_audit,
 };
 pub use jailer_aggregate_certify::validate_jailer_aggregate_compatibility;
+pub use jailer_seccomp_containment_audit_model::{
+    ContainmentClauseOutcome, ContainmentDispositionCounts, ContainmentEvidenceProfile,
+    ContainmentEvidenceProfileId, ContainmentExternalDependency, ContainmentNonclaim,
+    ContainmentPinnedSource, ContainmentResidualClassification, ContainmentResidualRecord,
+    ContainmentSourceClause, ContainmentTerminalDependency, JailerSeccompContainmentAudit,
+};
+pub use jailer_seccomp_containment_audit_validate::{
+    JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH, JAILER_SECCOMP_CONTAINMENT_AUDIT_SCHEMA_VERSION,
+    JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID, validate_jailer_seccomp_containment_audit,
+};
+pub use jailer_seccomp_containment_certify::validate_jailer_seccomp_containment_compatibility;
 pub use logger_certify::{LOGGER_COMPATIBILITY_CAPABILITY_IDS, validate_logger_compatibility};
 pub use logger_model::{
     LoggerClassDisposition, LoggerCompiledEvent, LoggerDeliveryPolicy, LoggerField,
@@ -474,6 +488,22 @@ pub fn read_host_resource_authority_audit(
     })
 }
 
+/// Read and parse the checked jailer/seccomp containment composition.
+pub fn read_jailer_seccomp_containment_audit(
+    path: &Path,
+) -> Result<JailerSeccompContainmentAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read jailer/seccomp containment audit: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse jailer/seccomp containment audit: {error}"
+        ))
+    })
+}
+
 /// Read and parse the checked targeted formal-verification authority.
 pub fn read_formal_verification_audit(path: &Path) -> Result<FormalVerificationAudit, AuditError> {
     let bytes = std::fs::read(path).map_err(|error| {
@@ -626,6 +656,13 @@ pub fn host_resource_authority_audit_json(
     audit: &HostResourceAuthorityAudit,
 ) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "host-resource authority audit")
+}
+
+/// Serialize the checked jailer/seccomp containment composition using canonical pretty JSON.
+pub fn jailer_seccomp_containment_audit_json(
+    audit: &JailerSeccompContainmentAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "jailer/seccomp containment audit")
 }
 
 /// Serialize the checked targeted formal-verification authority using canonical pretty JSON.

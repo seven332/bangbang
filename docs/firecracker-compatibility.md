@@ -1464,6 +1464,32 @@ missing-platform-feasible to implemented-and-verified, producing the exact
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --host-resource-authority-final
 ```
 
+### Terminal jailer/seccomp and macOS containment composition
+
+The checked
+[jailer/seccomp containment contract](../compat/firecracker/v1.16.0/jailer-seccomp-containment-contract.md)
+composes 46 ordered clauses from the pinned Firecracker design, jailer,
+production-host, seccomp, and seccompiler sources. It certifies the fixed
+separately signed App Sandbox/HVF worker, authenticated validation-before-
+mutation lifecycle, closed environment and descriptor inheritance, private
+namespace, exact limits, typed resource authority, redaction, supervision,
+cancellation, replacement-safe cleanup, and concurrent noninterchangeability.
+The portable seccompiler remains an offline artifact generator; macOS runtime
+seccomp installation, Linux namespaces/cgroups, arbitrary uid/gid, and
+configurable chroot are not claimed as native aliases.
+
+Exactly
+`semantic.isolation:jailer-seccomp-and-macos-containment-outcomes` moves from
+missing-platform-feasible to implemented-and-verified, producing the exact
+`381/3/1/33` to `382/3/0/33` transition. Positive vmnet execution and approved
+credentials remain owned by #1378. Deployment, firewall/capacity, monitoring,
+retention, restart, and global allocation policy remain external or operator
+owned. The scoped gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-seccomp-containment-final
+```
+
 The macOS host security baseline is documented separately in
 [macOS Host Security Model](security.md). That document records the current
 socket, host-path, HVF entitlement, guest-data, and multi-process boundaries, and
@@ -1525,10 +1551,11 @@ error, observability, resource, device, network/MMDS, and snapshot domains from
 four exact portable and signed product leaves. It also rechecks the historical
 30-record platform-exclusion partition and originally retained the exact eleven
 #1351/#1373/#1378 external outcomes. Its certifier accepts only the checked
-uid/gid, configurable-chroot, aggregate-jailer, multiprocess-isolation, and
-host-resource-authority successors. The current successor is `381/3/1/33`:
-one #1373 audit record, two #1378 audit records, and one #1351 feasible record
-remain. It does not turn missing credentials, root/HVF authority, skipped
+uid/gid, configurable-chroot, aggregate-jailer, multiprocess-isolation,
+host-resource-authority, and containment successors. The current successor is
+`382/3/0/33`: one #1373 audit record and two #1378 audit records remain, with
+no missing-platform-feasible records. It does not turn missing credentials,
+root/HVF authority, skipped
 execution, or a weaker macOS mechanism into success or impossibility.
 
 The independent `corpus:formal-verification` owner is now terminal through the

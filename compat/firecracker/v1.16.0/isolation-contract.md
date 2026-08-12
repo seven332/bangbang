@@ -83,15 +83,15 @@ The exact implementation and security rules are maintained in:
 - [vmnet Host Policy Boundary](../../../docs/security.md#vmnet-host-policy-boundary)
 - [Multi-Process Operation](../../../docs/security.md#multi-process-operation)
 
-## Remaining Feasible Isolation Work
+## Remaining External Isolation Work
 
 The following independent outcomes remain under delivery issue
 [#1351](https://github.com/seven332/bangbang/issues/1351):
 
 - broader external vmnet connectivity, cleanup, and per-VM network policy under
   #1378;
-- final composition of the terminal jailer, seccomp, resource-authority, and
-  macOS containment results; and
+- positive production vmnet execution and approved credentials under #1378;
+  and
 - Developer ID/team possession, notarization, launch constraints, and release
   policy.
 
@@ -99,10 +99,9 @@ General dynamic brokerage, hard revocation, cross-filesystem atomic socket
 publication, and automatic restart are explicit nonclaims or operator-owned
 product choices rather than unimplemented Firecracker compatibility producers.
 
-The remaining composition keeps one isolation record
-`missing-platform-feasible`:
-
-- `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`
+The final jailer/seccomp/macOS containment composition is terminal under
+#1918. No isolation record remains `missing-platform-feasible`; the three
+external records above remain `audit-required`.
 
 ## Terminal jailer uid/gid platform limit
 
@@ -254,6 +253,25 @@ The exact transition is `380/3/2/33` to `381/3/1/33`; the complete authority,
 resource map, residual classification, nonclaims, and scoped command are in
 the [host-resource authority contract](host-resource-authority-contract.md).
 
+## Terminal jailer/seccomp containment outcome
+
+#1918 certifies
+`semantic.isolation:jailer-seccomp-and-macos-containment-outcomes` from 46
+ordered clauses in the pinned design, jailer, production-host, seccomp, and
+seccompiler documents. It composes the immutable signed App Sandbox/HVF
+worker topology, authenticated lifecycle, closed environment and descriptors,
+private namespace, limits, typed resource authority, redaction, supervision,
+cleanup, cancellation, and concurrent noninterchangeability. Portable
+seccompiler generation is real, but macOS Linux-filter installation is not
+claimed; all exact Linux mechanism identities retain their terminal platform
+limits.
+
+Positive vmnet execution and approved credentials remain under #1378, while
+deployment and broad host/operator policy remain in `corpus:production-host`.
+The exact transition is `381/3/1/33` to `382/3/0/33`; the complete source map,
+dependencies, residual classifications, nonclaims, and scoped command are in
+the [jailer/seccomp containment contract](jailer-seccomp-containment-contract.md).
+
 ## Evidence Map
 
 | Claim | Implementation | Validation |
@@ -278,11 +296,11 @@ The checked inventory is authoritative for the exact isolation leaves,
 evidence references, and dispositions. Linux seccomp, cgroup, network
 namespace, and PID namespace records are terminal only for the named stable
 macOS exclusions. The offline seccompiler is a separate implemented artifact
-tool and does not enforce runtime seccomp. The one remaining composite record
-stays nonterminal until #1351's final composition is complete. The uid/gid
+tool and does not enforce runtime seccomp. The final composition is terminal
+under #1918. The uid/gid
 argument leaves and configurable chroot are separately terminal at the fixed
 topology above. The aggregate jailer corpus and run records are separately
 terminal under #1912, and the multiprocess aggregate is terminal under #1914;
-the host-resource authority is terminal under #1916. `corpus:production-host`,
-the two network/vmnet records, and one composite isolation record retain their
-independent states.
+the host-resource authority is terminal under #1916. `corpus:production-host`
+and the two network/vmnet records retain their independent audit-required
+states.
