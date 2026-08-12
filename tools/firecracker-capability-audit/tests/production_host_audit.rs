@@ -31,6 +31,38 @@ fn checked_production_host_audit_is_canonical_and_fail_closed() {
     validate_production_host_audit(&audit, &manifest, &inventory, &root)
         .expect("checked production-host audit must validate");
 
+    let mut schema_drift = audit.clone();
+    schema_drift.schema_version += 1;
+    assert!(
+        validate_production_host_audit(&schema_drift, &manifest, &inventory, &root)
+            .expect_err("schema version drift must fail")
+            .to_string()
+            .contains("schema_version")
+    );
+    let mut baseline_drift = audit.clone();
+    baseline_drift.baseline.commit = "0".repeat(40);
+    assert!(
+        validate_production_host_audit(&baseline_drift, &manifest, &inventory, &root)
+            .expect_err("baseline drift must fail")
+            .to_string()
+            .contains("baseline is not the pinned release")
+    );
+    let mut ownership_drift = audit.clone();
+    ownership_drift.parent_issue = "#1348".to_string();
+    assert!(
+        validate_production_host_audit(&ownership_drift, &manifest, &inventory, &root)
+            .expect_err("authority ownership drift must fail")
+            .to_string()
+            .contains("ownership must be #1351/#1920")
+    );
+    let mut capability_drift = audit.clone();
+    capability_drift.capability_id = "corpus:network-setup".to_string();
+    assert!(
+        validate_production_host_audit(&capability_drift, &manifest, &inventory, &root)
+            .expect_err("owned capability drift must fail")
+            .to_string()
+            .contains("exact #1920 capability")
+    );
     let mut source_drift = audit.clone();
     source_drift.upstream_source.git_blob = "0".repeat(40);
     assert!(
@@ -97,6 +129,30 @@ fn checked_production_host_audit_is_canonical_and_fail_closed() {
             .contains("source clause[0]")
     );
 
+    let mut previous_count_drift = audit.clone();
+    previous_count_drift.previous_counts.audit_required -= 1;
+    assert!(
+        validate_production_host_audit(&previous_count_drift, &manifest, &inventory, &root)
+            .expect_err("previous count drift must fail")
+            .to_string()
+            .contains("previous counts must be exactly 382/3/0/33")
+    );
+    let mut target_count_drift = audit.clone();
+    target_count_drift.target_counts.implemented_and_verified -= 1;
+    assert!(
+        validate_production_host_audit(&target_count_drift, &manifest, &inventory, &root)
+            .expect_err("target count drift must fail")
+            .to_string()
+            .contains("target counts must be exactly 383/2/0/33")
+    );
+    let mut digest_authority_drift = audit.clone();
+    digest_authority_drift.unrelated_inventory_sha256 = "0".repeat(64);
+    assert!(
+        validate_production_host_audit(&digest_authority_drift, &manifest, &inventory, &root)
+            .expect_err("digest authority drift must fail")
+            .to_string()
+            .contains("digest authority drifted")
+    );
     let mut dependency_drift = audit.clone();
     dependency_drift.terminal_dependencies[0].disposition = Disposition::AuditRequired;
     assert!(
