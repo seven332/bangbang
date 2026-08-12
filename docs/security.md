@@ -237,9 +237,10 @@ inventory from `377/5/3/33` to `379/3/3/33`. The remaining audit records are
 `corpus:network-setup`, `corpus:production-host`, and the aggregate vmnet
 connectivity identity. #1914 then certifies the multiprocess isolation
 composite at `380/3/2/33`, and #1916 certifies the host-resource authority
-composite at `381/3/1/33`. Only the final
-jailer/seccomp/macOS-containment isolation composite remains
-missing-platform-feasible.
+composite at `381/3/1/33`. #1918 certifies the final
+jailer/seccomp/macOS-containment isolation composite at `382/3/0/33`. Only
+the three independently owned production/network records remain
+audit-required; no platform-feasible isolation record remains.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -3628,8 +3629,9 @@ aggregates, leaving one #1373 production-host row, the same two #1378 rows,
 and the same three #1351 rows at `379/3/3/33`. #1914 then certifies exactly the
 multiprocess isolation row, leaving those three audit rows and two #1351 rows
 at `380/3/2/33`. #1916 then certifies exactly the host-resource authority row,
-leaving those three audit rows and one #1351 row at the current `381/3/1/33`
-successor. Missing authority or credentials alone is not an impossibility
+leaving those three audit rows and one #1351 row at `381/3/1/33`. #1918 then
+certifies exactly the final containment row, leaving the three audit rows at
+the current `382/3/0/33` successor. Missing authority or credentials alone is not an impossibility
 proof. Global `--final` stays blocked until the remaining external outcomes
 complete.
 
@@ -3801,7 +3803,11 @@ service, public jailer/daemon mode, setuid helper, or ambient path authority.
 #1914 subsequently certifies the exact multiprocess aggregate without adding a
 new executable, helper, privilege, or topology. #1916 then certifies the fixed
 host-resource authority from the existing portable and signed producers,
-without adding a new executable path or broadening that topology.
+without adding a new executable path or broadening that topology. #1918
+certifies the five-source containment composition from the same topology,
+portable seccompiler, terminal Linux platform limits, and explicit
+external/operator boundaries; it adds no runtime mechanism, entitlement,
+credential, helper, or service.
 
 ## Current Non-Goals
 

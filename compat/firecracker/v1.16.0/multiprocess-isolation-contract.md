@@ -98,16 +98,16 @@ The predecessor is exactly `379/3/3/33`; the successor is exactly
 `380/3/2/33`. A checked digest pins every unrelated inventory record. The only
 changed disposition is the row above.
 
-At the exact `381/3/1/33` host-resource successor, the checked unrelated-row
-digest advances to include #1916 while this #1914 row and its original
-transition remain unchanged.
+At the exact `381/3/1/33` host-resource successor and `382/3/0/33` containment
+successor, the checked unrelated-row digest advances to include #1916 and
+#1918 while this #1914 row and its original transition remain unchanged.
 
 `corpus:production-host` remains independently audit-required, as do
 `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity`. #1916 separately
-certifies host-resource authority/brokerage; the sole remaining #1351 feasible
-record is the aggregate jailer/seccomp/macOS-containment outcome. This scoped
-result does not retroactively certify that later row.
+certifies host-resource authority/brokerage; #1918 separately certifies the
+aggregate jailer/seccomp/macOS-containment outcome. This scoped result does not
+retroactively claim either later transition.
 
 ## Terminal multiprocess isolation outcome
 

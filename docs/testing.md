@@ -2048,7 +2048,8 @@ platform-limit successor `377/6/3/32`, the exact configurable-chroot-only
 successor `377/5/3/33`, and the exact aggregate-jailer successor
 `379/3/3/33`, followed by the exact multiprocess-isolation successor
 `380/3/2/33`, followed by the exact host-resource-authority successor
-`381/3/1/33`. Each phase is classified by exact
+`381/3/1/33`, followed by the exact containment successor `382/3/0/33`. Each
+phase is classified by exact
 identity sets, not counts. It does not execute Kani, sign binaries, run HVF, or
 collect an environment report inside the Rust process: run the targeted Kani
 job, the full signed integration wrapper, and the specification collector
@@ -2105,8 +2106,9 @@ aggregate-jailer `379/3/3/33` phase retained exactly one #1373 audit row
 feasible rows. The multiprocess-isolation `380/3/2/33` successor retained
 those three audit rows and two #1351 feasible rows. The current
 host-resource-authority `381/3/1/33` successor retains those three audit rows
-and one #1351 feasible row. The global `--final` command deliberately
-continues to fail on those three audit and one feasible record. The Rust
+and one #1351 feasible row. The current containment `382/3/0/33` successor
+retains only the three audit rows. The global `--final` command deliberately
+continues to fail on those three audit records. The Rust
 command is offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
 merged-main OID are checked and recorded by the pull-request workflow.
 
@@ -2126,7 +2128,8 @@ blobs; requires 13 ordered arguments, 16 ordered operation steps, seven corpus
 sections, and exact evidence profiles; resolves every local path and anchor;
 checks the unrelated-record digest; and accepts only the `377/5/3/33` to
 `379/3/3/33` transition, its exact `380/3/2/33` multiprocess-isolation
-successor, or its exact `381/3/1/33` host-resource-authority successor.
+successor, its exact `381/3/1/33` host-resource-authority successor, or its
+exact `382/3/0/33` containment successor.
 Mutation tests cover missing, duplicate, reordered,
 unknown, stale-anchor, partial-transition, unrelated-record, and contract drift.
 
@@ -2175,9 +2178,9 @@ replacement-safe recovery, same-ID noninterchangeability, and concurrent peer
 survival. This certification adds no new executable path and does not require
 sudo.
 
-At the later exact `381/3/1/33` host-resource successor, the multiprocess
-authority's unrelated-row digest advances while its original #1914 transition
-and terminal claim remain unchanged.
+At the later exact `381/3/1/33` host-resource and `382/3/0/33` containment
+successors, the multiprocess authority's unrelated-row digest advances while
+its original #1914 transition and terminal claim remain unchanged.
 
 ## Host-resource authority certification
 
@@ -4127,6 +4130,21 @@ may use a separate guest-test selector only to choose fixture assertions.
 Set `is_read_only=true` when attaching the cached squashfs rootfs so the guest
 receives `ro`. Use writable root mode only with a scratch copy of the generated
 ext4 image.
+
+## Jailer/seccomp containment certification
+
+The final fixed jailer/seccomp/macOS containment composition has its own
+scoped terminal gate. It validates the canonical five-source, 46-clause
+authority, current tracked signed evidence, exact `382/3/0/33` inventory
+phase, terminal Linux mechanism boundaries, portable seccompiler outcome, and
+independent vmnet/production-host ownership:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-seccomp-containment-final
+```
+
+This scoped gate does not replace global `--final`, which remains expected to
+fail while independently owned audit-required records remain open.
 
 ## PR Expectations
 

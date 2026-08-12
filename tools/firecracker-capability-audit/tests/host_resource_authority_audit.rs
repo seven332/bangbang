@@ -237,7 +237,7 @@ fn host_resource_terminal_transition_is_exact() {
         validate_host_resource_authority_compatibility(&manifest, &partial, &audit, &root)
             .expect_err("partial host-resource transition must fail")
             .to_string()
-            .contains("381/3/1/33")
+            .contains("host-resource authority capability is not terminal")
     );
 
     let mut evidence_drift = inventory.clone();

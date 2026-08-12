@@ -150,16 +150,19 @@ Wave 7 retains its historical handoff snapshot. The phase-aware gates accept
 only the exact Wave 8 one-row successor, the later exact uid/gid-only
 377/6/3/32 successor, the exact configurable-chroot-only 377/5/3/33 successor,
 the aggregate-jailer 379/3/3/33 successor, the multiprocess-isolation
-380/3/2/33 successor, and the current host-resource-authority 381/3/1/33
-successor while retaining the remaining
+380/3/2/33 successor, the host-resource-authority 381/3/1/33 successor, and
+the current jailer/seccomp-containment 382/3/0/33 successor while retaining
+the remaining
 #1351/#1373/#1378 external outcomes. See the
 [Wave 8 contract](wave8-certification-contract.md) for the checked transitions,
 the [aggregate jailer contract](jailer-aggregate-contract.md) for its two-row
 transition, the [multiprocess isolation contract](multiprocess-isolation-contract.md)
 for its one-row transition, the
 [host-resource authority contract](host-resource-authority-contract.md) for
-the current one-row transition, and
-[`docs/testing.md`](../../../docs/testing.md#host-resource-authority-certification)
+its one-row transition, the
+[jailer/seccomp containment contract](jailer-seccomp-containment-contract.md)
+for the current one-row transition, and
+[`docs/testing.md`](../../../docs/testing.md#jailerseccomp-containment-certification)
 for the canonical commands.
 
 ## Guest workflow artifact authority

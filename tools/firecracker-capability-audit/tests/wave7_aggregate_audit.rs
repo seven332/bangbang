@@ -187,6 +187,25 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
         .expect("terminal Wave 7 aggregate must certify");
 
     let mut historical = inventory.clone();
+    let containment = historical
+        .capabilities
+        .iter_mut()
+        .find(|capability| {
+            capability.id == "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes"
+        })
+        .expect("containment successor capability must exist");
+    containment.source_refs = vec![
+        "corpus:jailer".to_string(),
+        "corpus:production-host".to_string(),
+        "corpus:seccomp".to_string(),
+        "corpus:seccompiler".to_string(),
+    ];
+    containment.disposition = Disposition::MissingPlatformFeasible;
+    containment.implementation.clear();
+    containment.validation.clear();
+    containment.delivery_issue =
+        Some("https://github.com/seven332/bangbang/issues/1351".to_string());
+    containment.exclusion = None;
     let host_resource = historical
         .capabilities
         .iter_mut()

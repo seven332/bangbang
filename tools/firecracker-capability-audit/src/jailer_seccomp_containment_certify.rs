@@ -1,23 +1,24 @@
 use std::path::Path;
 
 use crate::{
-    AuditMode, CapabilityInventory, Disposition, MULTIPROCESS_ISOLATION_AUDIT_PATH,
-    MULTIPROCESS_ISOLATION_CAPABILITY_ID, MultiprocessIsolationAudit, Reference, SourceManifest,
-    ValidationErrors, validate, validate_multiprocess_isolation_audit,
+    AuditMode, CapabilityInventory, Disposition, JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH,
+    JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID, JailerSeccompContainmentAudit, Reference,
+    SourceManifest, ValidationErrors, validate, validate_jailer_seccomp_containment_audit,
 };
 
-const CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/multiprocess-isolation-contract.md";
+const CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/jailer-seccomp-containment-contract.md";
 const VALIDATOR_PATH: &str =
-    "tools/firecracker-capability-audit/src/multiprocess_isolation_audit_validate.rs";
-const TEST_PATH: &str = "tools/firecracker-capability-audit/tests/multiprocess_isolation_audit.rs";
+    "tools/firecracker-capability-audit/src/jailer_seccomp_containment_audit_validate.rs";
+const TEST_PATH: &str =
+    "tools/firecracker-capability-audit/tests/jailer_seccomp_containment_audit.rs";
 const SIGNED_TEST_PATH: &str = "crates/launcher/tests/production_bundle_e2e.rs";
 
-/// Certify the exact #1914 multiprocess isolation transition without requiring
-/// independently owned production-host, network, or broader isolation records.
-pub fn validate_multiprocess_isolation_compatibility(
+/// Certify #1918 without requiring independently owned positive vmnet or
+/// production-host aggregate evidence.
+pub fn validate_jailer_seccomp_containment_compatibility(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,
-    audit: &MultiprocessIsolationAudit,
+    audit: &JailerSeccompContainmentAudit,
     repository_root: &Path,
 ) -> Result<(), ValidationErrors> {
     let mut errors = Vec::new();
@@ -27,7 +28,7 @@ pub fn validate_multiprocess_isolation_compatibility(
         errors.extend(validation_errors.messages().iter().cloned());
     }
     if let Err(validation_errors) =
-        validate_multiprocess_isolation_audit(audit, manifest, inventory, repository_root)
+        validate_jailer_seccomp_containment_audit(audit, manifest, inventory, repository_root)
     {
         errors.extend(validation_errors.messages().iter().cloned());
     }
@@ -47,54 +48,71 @@ fn validate_capability_transition(inventory: &CapabilityInventory, errors: &mut 
     let Some(capability) = inventory
         .capabilities
         .iter()
-        .find(|capability| capability.id == MULTIPROCESS_ISOLATION_CAPABILITY_ID)
+        .find(|capability| capability.id == JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID)
     else {
-        errors.push("multiprocess isolation capability is missing".to_string());
+        errors.push("jailer/seccomp containment capability is missing".to_string());
         return;
     };
 
     let expected_implementation = [
-        (MULTIPROCESS_ISOLATION_AUDIT_PATH, "\"source_clauses\": ["),
-        (CONTRACT_PATH, "## Terminal multiprocess isolation outcome"),
+        (
+            JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH,
+            "\"source_clauses\": [",
+        ),
+        (
+            CONTRACT_PATH,
+            "## Terminal jailer/seccomp containment outcome",
+        ),
         (
             VALIDATOR_PATH,
-            "pub fn validate_multiprocess_isolation_audit(",
+            "pub fn validate_jailer_seccomp_containment_audit(",
         ),
     ];
     let expected_validation = [
         (
             SIGNED_TEST_PATH,
-            "fn concurrent_sessions_remain_independent_when_one_worker_crashes()",
+            "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()",
         ),
-        (TEST_PATH, "fn multiprocess_terminal_transition_is_exact()"),
+        (
+            TEST_PATH,
+            "fn jailer_seccomp_containment_terminal_transition_is_exact()",
+        ),
     ];
 
     if capability.family != "isolation"
         || capability.disposition != Disposition::ImplementedAndVerified
         || capability.delivery_issue.is_some()
         || capability.exclusion.is_some()
-        || capability.source_refs != ["corpus:design", "corpus:production-host"]
+        || capability.source_refs
+            != [
+                "corpus:design",
+                "corpus:jailer",
+                "corpus:production-host",
+                "corpus:seccomp",
+                "corpus:seccompiler",
+            ]
     {
         errors.push(
-            "multiprocess isolation capability is not terminal with exact ownership".to_string(),
+            "jailer/seccomp containment capability is not terminal with exact ownership"
+                .to_string(),
         );
     }
     if !matches_local_reference_pairs(&capability.implementation, &expected_implementation) {
-        errors.push("multiprocess isolation implementation evidence drifted".to_string());
+        errors.push("jailer/seccomp containment implementation evidence drifted".to_string());
     }
     if !matches_local_reference_pairs(&capability.validation, &expected_validation) {
-        errors.push("multiprocess isolation validation evidence drifted".to_string());
+        errors.push("jailer/seccomp containment validation evidence drifted".to_string());
     }
 
     for unrelated in &inventory.capabilities {
-        if unrelated.id != MULTIPROCESS_ISOLATION_CAPABILITY_ID
+        if unrelated.id != JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID
             && unrelated
                 .delivery_issue
                 .as_deref()
-                .is_some_and(|issue| issue == "#1914" || issue.ends_with("/issues/1914"))
+                .is_some_and(|issue| issue == "#1918" || issue.ends_with("/issues/1918"))
         {
             errors.push(format!(
-                "multiprocess isolation certification found unrelated #1914 ownership: {}",
+                "jailer/seccomp containment certification found unrelated #1918 ownership: {}",
                 unrelated.id
             ));
         }
@@ -119,7 +137,7 @@ fn matches_local_reference_pairs(references: &[Reference], expected: &[(&str, &s
 
 fn validate_contract(repository_root: &Path, errors: &mut Vec<String>) {
     let Ok(contract) = std::fs::read_to_string(repository_root.join(CONTRACT_PATH)) else {
-        errors.push("multiprocess isolation contract is unreadable".to_string());
+        errors.push("jailer/seccomp containment contract is unreadable".to_string());
         return;
     };
     validate_contract_contents(&contract, errors);
@@ -129,46 +147,44 @@ fn validate_contract_contents(contract: &str, errors: &mut Vec<String>) {
     let normalized = contract.split_whitespace().collect::<Vec<_>>().join(" ");
     for token in [
         "## Pinned source identity",
-        "13 ordered source clauses",
-        "379/3/3/33",
-        "380/3/2/33",
+        "46 ordered source clauses",
         "381/3/1/33",
         "382/3/0/33",
-        "validate --multiprocess-isolation-final",
-        "one and only one microVM",
-        "privileged third-party",
-        "overwatcher",
-        "unique `uid` and `gid`",
-        "general dynamic resource broker",
-        "simultaneous uncatchable",
+        "validate --jailer-seccomp-containment-final",
+        "corpus:design",
+        "portable seccompiler",
+        "Linux seccomp",
+        "positive vmnet connectivity",
+        "General dynamic resource brokerage",
+        "Developer ID/notarization",
         "corpus:production-host",
         "global `--final`",
     ] {
         if !normalized.contains(token) {
             errors.push(format!(
-                "multiprocess isolation contract omits required token: {token}"
+                "jailer/seccomp containment contract omits required token: {token}"
             ));
         }
     }
 
     let rows = contract
         .lines()
-        .filter(|line| line.starts_with("| `") && line.contains("| #1914 |"))
+        .filter(|line| line.starts_with("| `") && line.contains("| #1918 |"))
         .collect::<Vec<_>>();
     if !matches!(
         rows.as_slice(),
         [row]
-            if row.contains(MULTIPROCESS_ISOLATION_CAPABILITY_ID)
+            if row.contains(JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID)
                 && row.contains("| `implemented-and-verified` |")
     ) {
         errors.push(
-            "multiprocess isolation contract requires the exact terminal #1914 row".to_string(),
+            "jailer/seccomp containment contract requires the exact terminal #1918 row".to_string(),
         );
     }
 }
 
 fn validate_documented_command(repository_root: &Path, errors: &mut Vec<String>) {
-    let command = "cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multiprocess-isolation-final";
+    let command = "cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-seccomp-containment-final";
     for path in [CONTRACT_PATH, "docs/testing.md"] {
         match std::fs::read_to_string(repository_root.join(path)) {
             Ok(contents)
@@ -178,10 +194,10 @@ fn validate_documented_command(repository_root: &Path, errors: &mut Vec<String>)
                     .join(" ")
                     .contains(command) => {}
             Ok(_) => errors.push(format!(
-                "multiprocess isolation final command is missing from {path}"
+                "jailer/seccomp containment final command is missing from {path}"
             )),
             Err(_) => errors.push(format!(
-                "multiprocess isolation command owner is unreadable: {path}"
+                "jailer/seccomp containment command owner is unreadable: {path}"
             )),
         }
     }
@@ -194,27 +210,31 @@ mod tests {
     #[test]
     fn exact_contract_scope_is_fail_closed() {
         let row = format!(
-            "| `{MULTIPROCESS_ISOLATION_CAPABILITY_ID}` | #1914 | `implemented-and-verified` |"
+            "| `{JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID}` | #1918 | `implemented-and-verified` |"
         );
         let contract = format!(
-            "## Pinned source identity 13 ordered source clauses 379/3/3/33 380/3/2/33 381/3/1/33 382/3/0/33 validate --multiprocess-isolation-final one and only one microVM privileged third-party overwatcher unique `uid` and `gid` general dynamic resource broker simultaneous uncatchable corpus:production-host global `--final`\n{row}"
+            "## Pinned source identity 46 ordered source clauses 381/3/1/33 382/3/0/33 validate --jailer-seccomp-containment-final corpus:design portable seccompiler Linux seccomp positive vmnet connectivity General dynamic resource brokerage Developer ID/notarization corpus:production-host global `--final`\n{row}"
         );
         let mut errors = Vec::new();
         validate_contract_contents(&contract, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
 
         let extra =
-            format!("{contract}\n| `corpus:unrelated` | #1914 | `implemented-and-verified` |");
+            format!("{contract}\n| `corpus:unrelated` | #1918 | `implemented-and-verified` |");
         let mut errors = Vec::new();
         validate_contract_contents(&extra, &mut errors);
         assert_eq!(
             errors,
-            ["multiprocess isolation contract requires the exact terminal #1914 row"]
+            ["jailer/seccomp containment contract requires the exact terminal #1918 row"]
         );
 
-        let missing = contract.replace("overwatcher", "watcher");
+        let missing = contract.replace("portable seccompiler", "compiler");
         let mut errors = Vec::new();
         validate_contract_contents(&missing, &mut errors);
-        assert!(errors.iter().any(|error| error.contains("overwatcher")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("portable seccompiler"))
+        );
     }
 }

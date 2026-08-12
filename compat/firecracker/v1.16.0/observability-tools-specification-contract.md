@@ -262,9 +262,11 @@ the 377/5/3/33 phase. The aggregate-jailer review then moves exactly
 multiprocess-isolation review then moves exactly its one #1351 semantic row,
 producing the 380/3/2/33 phase with one #1373, two #1378, and two #1351
 outcomes still nonterminal. The host-resource-authority review then moves
-exactly its one #1351 semantic row, producing the current 381/3/1/33 phase with
-one #1373, two #1378, and one #1351 outcome still nonterminal. Any other
-identity or count transition fails the Wave 7 gate.
+exactly its one #1351 semantic row, producing 381/3/1/33 with one #1373, two
+#1378, and one #1351 outcome still nonterminal. The containment review finally
+moves that last #1351 row, producing the current 382/3/0/33 phase with only the
+three audit-required #1373/#1378 outcomes. Any other identity or count
+transition fails the Wave 7 gate.
 
 The historical public-tool ledger derives 46 implemented leaves, five terminal
 Linux-only jailer exclusions, and four #1373 jailer handoffs. Its uid/gid
@@ -446,10 +448,12 @@ missing-platform-feasible, and 30 proven-platform-impossible. The historical
 Wave 8 successor is exactly 377/eight/three/30; the uid/gid-only successor is
 exactly 377/6/3/32, the configurable-chroot-only successor is exactly
 377/5/3/33, the aggregate-jailer successor is exactly 379/3/3/33, the
-multiprocess-isolation successor is exactly 380/3/2/33, and the current
-host-resource-authority successor is exactly 381/3/1/33.
+multiprocess-isolation successor is exactly 380/3/2/33, the
+host-resource-authority successor is exactly 381/3/1/33, and the current
+containment successor is exactly 382/3/0/33.
 These are exact consequences of the corresponding row sets, not quotas;
 authoritative current totals remain derived from `capabilities.json` and are
-rechecked by `validate --wave8-final`, `validate --jailer-final`, and
-`validate --multiprocess-isolation-final`, and
-`validate --host-resource-authority-final`.
+rechecked by `validate --wave8-final`, `validate --jailer-final`,
+`validate --multiprocess-isolation-final`,
+`validate --host-resource-authority-final`, and
+`validate --jailer-seccomp-containment-final`.

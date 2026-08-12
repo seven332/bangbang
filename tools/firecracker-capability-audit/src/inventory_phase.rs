@@ -26,6 +26,9 @@ pub(crate) const MULTIPROCESS_ISOLATION_ID: &str =
 pub(crate) const HOST_RESOURCE_AUTHORITY_ID: &str =
     "semantic.isolation:host-resource-authority-and-brokerage";
 
+pub(crate) const JAILER_SECCOMP_CONTAINMENT_ID: &str =
+    "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes";
+
 const WAVE8_AUDIT_IDS: [&str; 8] = [
     "corpus:jailer",
     "corpus:network-setup",
@@ -95,6 +98,7 @@ pub(crate) enum InventoryPhase {
     JailerAggregate,
     MultiprocessIsolation,
     HostResourceAuthority,
+    JailerSeccompContainment,
 }
 
 impl InventoryPhase {
@@ -108,6 +112,7 @@ impl InventoryPhase {
             Self::JailerAggregate => "aggregate jailer 379/3/3/33",
             Self::MultiprocessIsolation => "multiprocess isolation 380/3/2/33",
             Self::HostResourceAuthority => "host-resource authority 381/3/1/33",
+            Self::JailerSeccompContainment => "jailer/seccomp containment 382/3/0/33",
         }
     }
 }
@@ -125,6 +130,7 @@ pub(crate) fn classify_inventory_phase(
         (379, 3, 3, 33) => InventoryPhase::JailerAggregate,
         (380, 3, 2, 33) => InventoryPhase::MultiprocessIsolation,
         (381, 3, 1, 33) => InventoryPhase::HostResourceAuthority,
+        (382, 3, 0, 33) => InventoryPhase::JailerSeccompContainment,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -183,6 +189,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::JailerAggregate
             | InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
+            | InventoryPhase::JailerSeccompContainment
     ) {
         ids.extend(JAILER_UID_GID_IDS);
     }
@@ -192,6 +199,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::JailerAggregate
             | InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
+            | InventoryPhase::JailerSeccompContainment
     ) {
         ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
@@ -243,7 +251,8 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         }
         InventoryPhase::JailerAggregate
         | InventoryPhase::MultiprocessIsolation
-        | InventoryPhase::HostResourceAuthority => {
+        | InventoryPhase::HostResourceAuthority
+        | InventoryPhase::JailerSeccompContainment => {
             for id in JAILER_UID_GID_IDS {
                 ids.remove(id);
             }
@@ -262,12 +271,20 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         .collect::<BTreeSet<_>>();
     if matches!(
         phase,
-        InventoryPhase::MultiprocessIsolation | InventoryPhase::HostResourceAuthority
+        InventoryPhase::MultiprocessIsolation
+            | InventoryPhase::HostResourceAuthority
+            | InventoryPhase::JailerSeccompContainment
     ) {
         ids.remove(MULTIPROCESS_ISOLATION_ID);
     }
-    if phase == InventoryPhase::HostResourceAuthority {
+    if matches!(
+        phase,
+        InventoryPhase::HostResourceAuthority | InventoryPhase::JailerSeccompContainment
+    ) {
         ids.remove(HOST_RESOURCE_AUTHORITY_ID);
+    }
+    if phase == InventoryPhase::JailerSeccompContainment {
+        ids.remove(JAILER_SECCOMP_CONTAINMENT_ID);
     }
     ids
 }
@@ -303,15 +320,42 @@ mod tests {
             .disposition = disposition;
     }
 
+    fn restore_containment_handoff(inventory: &mut CapabilityInventory) {
+        let capability = inventory
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == JAILER_SECCOMP_CONTAINMENT_ID)
+            .expect("containment successor capability must exist");
+        capability.source_refs = vec![
+            "corpus:jailer".to_string(),
+            "corpus:production-host".to_string(),
+            "corpus:seccomp".to_string(),
+            "corpus:seccompiler".to_string(),
+        ];
+        capability.disposition = Disposition::MissingPlatformFeasible;
+        capability.implementation.clear();
+        capability.validation.clear();
+        capability.delivery_issue =
+            Some("https://github.com/seven332/bangbang/issues/1351".to_string());
+        capability.exclusion = None;
+    }
+
     #[test]
     fn exact_inventory_phases_are_closed() {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::JailerSeccompContainment)
+        );
+
+        let mut host_resource = current.clone();
+        restore_containment_handoff(&mut host_resource);
+        assert_eq!(
+            classify_inventory_phase(&host_resource),
             Ok(InventoryPhase::HostResourceAuthority)
         );
 
-        let mut multiprocess = current.clone();
+        let mut multiprocess = host_resource;
         set_disposition(
             &mut multiprocess,
             HOST_RESOURCE_AUTHORITY_ID,
@@ -430,6 +474,7 @@ mod tests {
     #[test]
     fn partial_uid_gid_successors_do_not_classify() {
         let mut wave8 = current_inventory();
+        restore_containment_handoff(&mut wave8);
         set_disposition(
             &mut wave8,
             HOST_RESOURCE_AUTHORITY_ID,
@@ -463,6 +508,7 @@ mod tests {
     #[test]
     fn chroot_without_uid_gid_predecessor_does_not_classify() {
         let mut partial = current_inventory();
+        restore_containment_handoff(&mut partial);
         set_disposition(
             &mut partial,
             HOST_RESOURCE_AUTHORITY_ID,

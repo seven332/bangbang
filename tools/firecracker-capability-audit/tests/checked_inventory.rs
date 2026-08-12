@@ -974,7 +974,7 @@ fn checked_logger_compatibility_is_terminal_and_fail_closed() {
             .any(|capability| capability.disposition == Disposition::AuditRequired)
     );
     assert!(
-        inventory
+        !inventory
             .capabilities
             .iter()
             .any(|capability| { capability.disposition == Disposition::MissingPlatformFeasible })
@@ -1203,7 +1203,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        381
+        382
     );
     assert_eq!(
         inventory
@@ -1219,7 +1219,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::MissingPlatformFeasible })
             .count(),
-        1
+        0
     );
     assert_eq!(
         inventory
@@ -4008,9 +4008,9 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 381);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
     assert_eq!(count(Disposition::AuditRequired), 3);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 1);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -4738,9 +4738,9 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 381);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
     assert_eq!(count(Disposition::AuditRequired), 3);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 1);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -5035,9 +5035,9 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 381);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
     assert_eq!(count(Disposition::AuditRequired), 3);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 1);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -5184,9 +5184,9 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 381);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
     assert_eq!(count(Disposition::AuditRequired), 3);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 1);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -5432,9 +5432,9 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 381);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 382);
     assert_eq!(count(Disposition::AuditRequired), 3);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 1);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 
     for id in IMPLEMENTED_ORIGINAL {

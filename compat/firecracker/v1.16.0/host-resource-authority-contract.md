@@ -167,6 +167,9 @@ threat-containment mapping points to this composite.
 audit-required. The sole remaining #1351 feasible row is
 `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`.
 
+At the later exact `382/3/0/33` successor, #1918 certifies that containment row
+without changing this #1916 transition or its terminal host-resource claim.
+
 ## Terminal host-resource authority outcome
 
 The complete applicable result is a validation-before-mutation, bounded,

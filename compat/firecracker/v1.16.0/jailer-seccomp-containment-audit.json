@@ -1,0 +1,932 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1351",
+  "delivery_issue": "#1918",
+  "upstream_sources": [
+    {
+      "id": "firecracker-design",
+      "manifest_id": "corpus:design",
+      "path": "docs/design.md",
+      "anchor": "entire-file",
+      "git_blob": "143fef76410e4f7e45b32d3986e0d78eedf5175a"
+    },
+    {
+      "id": "jailer",
+      "manifest_id": "corpus:jailer",
+      "path": "docs/jailer.md",
+      "anchor": "entire-file",
+      "git_blob": "fa5e8b4ee769f64ee83a317dce5902ffd0029a1b"
+    },
+    {
+      "id": "production-host-setup",
+      "manifest_id": "corpus:production-host",
+      "path": "docs/prod-host-setup.md",
+      "anchor": "entire-file",
+      "git_blob": "8939b56a965963d8df1c44c583dcd38361197347"
+    },
+    {
+      "id": "seccomp",
+      "manifest_id": "corpus:seccomp",
+      "path": "docs/seccomp.md",
+      "anchor": "entire-file",
+      "git_blob": "0611fd8d602a08deaa3e5174a4b32953427c9dc9"
+    },
+    {
+      "id": "seccompiler",
+      "manifest_id": "corpus:seccompiler",
+      "path": "docs/seccompiler.md",
+      "anchor": "entire-file",
+      "git_blob": "50f44097cece19d2538e054ee7e3b6ba457c7a55"
+    }
+  ],
+  "capability_id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
+  "previous_counts": {
+    "implemented_and_verified": 381,
+    "audit_required": 3,
+    "missing_platform_feasible": 1,
+    "proven_platform_impossible": 33
+  },
+  "target_counts": {
+    "implemented_and_verified": 382,
+    "audit_required": 3,
+    "missing_platform_feasible": 0,
+    "proven_platform_impossible": 33
+  },
+  "unrelated_inventory_sha256": "7aecea3b00a8bdcb2870ea57f37cd7c07cbfbace08e7926360c13786731db1d1",
+  "source_clauses": [
+    {
+      "order": 1,
+      "id": "different-customer-workloads",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Firecracker can safely run workloads from different customers on the same machine.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "failure-cleanup-and-concurrency"
+      ]
+    },
+    {
+      "order": 2,
+      "id": "one-process-one-microvm",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Each Firecracker process encapsulates one and only one microVM.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "lifecycle-and-private-namespace"
+      ]
+    },
+    {
+      "order": 3,
+      "id": "malicious-vcpu-code",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "all vCPU threads are considered to be running malicious code",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "signed-code-and-entitlements"
+      ]
+    },
+    {
+      "order": 4,
+      "id": "nested-trust-zones",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Containment is achieved by nesting several trust zones",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "signed-code-and-entitlements"
+      ]
+    },
+    {
+      "order": 5,
+      "id": "device-io-rate-barrier",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "I/O rate limiting is applied at this point.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "jailer-operation-and-limits"
+      ]
+    },
+    {
+      "order": 6,
+      "id": "host-egress-filtering",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "should be filtered at the host-level.",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 7,
+      "id": "process-level-defense-in-depth",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "Firecracker should only run constrained at the process level.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "signed-code-and-entitlements"
+      ]
+    },
+    {
+      "order": 8,
+      "id": "per-thread-seccomp-before-guest",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "The filters are loaded in the Firecracker process, on a per-thread basis, before executing any guest code.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 9,
+      "id": "privileged-third-party-resource-grants",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "access resources that a privileged third-party grants access to",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "typed-resource-authority"
+      ]
+    },
+    {
+      "order": 10,
+      "id": "cgroup-cpu-quota-and-fairness",
+      "source_id": "firecracker-design",
+      "upstream_anchor": "have its own dedicated quota of the CPU time",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits",
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 11,
+      "id": "validate-paths-and-vm-id",
+      "source_id": "jailer",
+      "upstream_anchor": "Validate **all provided paths** and the VM ID.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "jailer-operation-and-limits"
+      ]
+    },
+    {
+      "order": 12,
+      "id": "close-open-descriptors",
+      "source_id": "jailer",
+      "upstream_anchor": "Close all open file descriptors based on `/proc/<jailer-pid>/fd` except input, output and error.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "lifecycle-and-private-namespace"
+      ]
+    },
+    {
+      "order": 13,
+      "id": "clean-parent-environment",
+      "source_id": "jailer",
+      "upstream_anchor": "Cleanup all environment variables received from the parent process.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "lifecycle-and-private-namespace"
+      ]
+    },
+    {
+      "order": 14,
+      "id": "create-private-root",
+      "source_id": "jailer",
+      "upstream_anchor": "Create the `<chroot_base>/<exec_file_name>/<id>/root` folder",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "lifecycle-and-private-namespace"
+      ]
+    },
+    {
+      "order": 15,
+      "id": "fix-executable-code-identity",
+      "source_id": "jailer",
+      "upstream_anchor": "Copy the file specified with `--exec-file` to `<chroot_dir>/<exec_file_name>`.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "signed-code-and-entitlements"
+      ]
+    },
+    {
+      "order": 16,
+      "id": "set-resource-bounds",
+      "source_id": "jailer",
+      "upstream_anchor": "Set resource bounds for current process and its children through `--resource-limit` argument",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "jailer-operation-and-limits"
+      ]
+    },
+    {
+      "order": 17,
+      "id": "create-cgroup-subfolders",
+      "source_id": "jailer",
+      "upstream_anchor": "Create the cgroup sub-folders.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 18,
+      "id": "unshare-pivot-and-chroot",
+      "source_id": "jailer",
+      "upstream_anchor": "Call `unshare()` into a new mount namespace, use `pivot_root()`",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 19,
+      "id": "create-tun-device",
+      "source_id": "jailer",
+      "upstream_anchor": "Use `mknod` to create a `/dev/net/tun` equivalent inside the jail.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 20,
+      "id": "create-kvm-device",
+      "source_id": "jailer",
+      "upstream_anchor": "Use `mknod` to create a `/dev/kvm` equivalent inside the jail.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 21,
+      "id": "chown-root-and-devices",
+      "source_id": "jailer",
+      "upstream_anchor": "Use `chown` to change ownership of the `<chroot_dir>`",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 22,
+      "id": "join-network-namespace",
+      "source_id": "jailer",
+      "upstream_anchor": "attempt to join the specified network namespace.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 23,
+      "id": "daemon-session-and-standard-streams",
+      "source_id": "jailer",
+      "upstream_anchor": "call `setsid()` and redirect `STDIN`, `STDOUT`, and `STDERR` to `/dev/null`.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "lifecycle-and-private-namespace",
+        "jailer-operation-and-limits"
+      ]
+    },
+    {
+      "order": 24,
+      "id": "clone-pid-namespace",
+      "source_id": "jailer",
+      "upstream_anchor": "call `clone()` with `CLONE_NEWPID` flag",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 25,
+      "id": "drop-uid-and-gid",
+      "source_id": "jailer",
+      "upstream_anchor": "Drop privileges via setting the provided `uid` and `gid`.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 26,
+      "id": "exec-with-injected-identity-and-times",
+      "source_id": "jailer",
+      "upstream_anchor": "<exec_file_name> --id=<id> --start-time-us=<opaque> --start-time-cpu-us=<opaque>",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "lifecycle-and-private-namespace",
+        "jailer-operation-and-limits"
+      ]
+    },
+    {
+      "order": 27,
+      "id": "production-default-seccomp-policy",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Production usage of the `--seccomp-filter` or `--no-seccomp` parameters is not recommended.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 28,
+      "id": "bounded-serial-output",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Users are responsible for handling the memory and storage usage",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "jailer-operation-and-limits",
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 29,
+      "id": "bounded-log-output",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Users are responsible for consuming and storing this data safely.",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 30,
+      "id": "external-overwatcher",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "customers have an overwatcher process on the host",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "failure-cleanup-and-concurrency",
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 31,
+      "id": "jailer-equivalent-production-constraints",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "executed under process constraints equal or more restrictive than those in the jailer.",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "signed-code-and-entitlements",
+        "jailer-operation-and-limits"
+      ]
+    },
+    {
+      "order": 32,
+      "id": "trusted-production-paths",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "their parent directories are not writable by unprivileged users",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "signed-code-and-entitlements",
+        "typed-resource-authority"
+      ]
+    },
+    {
+      "order": 33,
+      "id": "dedicated-posix-identity",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Create a dedicated non-privileged POSIX user and group",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 34,
+      "id": "unique-per-instance-uid-gid",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "recommended that each runs with its unique `uid` and `gid`",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 35,
+      "id": "workload-specific-resource-policy",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "highly dependent on the workload type and usecase",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 36,
+      "id": "disk-resource-limits",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Jailer's `resource-limit` provides control on the disk usage",
+      "outcome": "implemented-macos-outcome",
+      "evidence_profiles": [
+        "jailer-operation-and-limits"
+      ]
+    },
+    {
+      "order": 37,
+      "id": "cgroup-cpu-and-memory-controls",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "can guarantee a minimum number of CPU shares when a system is busy",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits",
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 38,
+      "id": "production-host-firewall",
+      "source_id": "production-host-setup",
+      "upstream_anchor": "Firewall rules should therefore be implemented on the host",
+      "outcome": "operator-owned-outcome",
+      "evidence_profiles": [
+        "network-and-operator-boundary"
+      ]
+    },
+    {
+      "order": 39,
+      "id": "minimal-default-filters",
+      "source_id": "seccomp",
+      "upstream_anchor": "The default filters only allow the bare minimum set of system calls",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 40,
+      "id": "per-thread-filter-installation",
+      "source_id": "seccomp",
+      "upstream_anchor": "The filters are loaded in the Firecracker process, on a per-thread basis",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 41,
+      "id": "compiled-default-filter-artifact",
+      "source_id": "seccomp",
+      "upstream_anchor": "serialized binary file, using seccompiler-bin, and gets embedded in the Firecracker binary.",
+      "outcome": "implemented-portable-tool-outcome",
+      "evidence_profiles": [
+        "portable-seccompiler",
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 42,
+      "id": "dangerous-custom-filter-override",
+      "source_id": "seccomp",
+      "upstream_anchor": "misconfiguration can result in abruptly terminating the process",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 43,
+      "id": "disabled-filter-production-boundary",
+      "source_id": "seccomp",
+      "upstream_anchor": "Do **not** use in production.",
+      "outcome": "terminal-platform-limit",
+      "evidence_profiles": [
+        "linux-isolation-limits"
+      ]
+    },
+    {
+      "order": 44,
+      "id": "json-to-bpf-compilation",
+      "source_id": "seccompiler",
+      "upstream_anchor": "compiles seccomp filters expressed as JSON files",
+      "outcome": "implemented-portable-tool-outcome",
+      "evidence_profiles": [
+        "portable-seccompiler"
+      ]
+    },
+    {
+      "order": 45,
+      "id": "bitcode-thread-map-output",
+      "source_id": "seccompiler",
+      "upstream_anchor": "output file contains a bitcode-serialized map of thread names",
+      "outcome": "implemented-portable-tool-outcome",
+      "evidence_profiles": [
+        "portable-seccompiler"
+      ]
+    },
+    {
+      "order": 46,
+      "id": "thread-category-json-schema",
+      "source_id": "seccompiler",
+      "upstream_anchor": "At the top level, the file requires an object that maps thread categories",
+      "outcome": "implemented-portable-tool-outcome",
+      "evidence_profiles": [
+        "portable-seccompiler"
+      ]
+    }
+  ],
+  "terminal_dependencies": [
+    {
+      "capability_id": "corpus:jailer",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "corpus:seccomp",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "corpus:seccompiler",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "firecracker-argument:no-seccomp",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "firecracker-argument:seccomp-filter",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "semantic.isolation:host-resource-authority-and-brokerage",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/cgroup",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/cgroup-version",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/chroot-base-dir",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/daemonize",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/gid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/netns",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/new-pid-ns",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/parent-cgroup",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-argument:jailer/resource-limit",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-argument:jailer/uid",
+      "disposition": "proven-platform-impossible"
+    },
+    {
+      "capability_id": "tool-operation:jailer/run",
+      "disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "tool-operation:seccompiler/compile",
+      "disposition": "implemented-and-verified"
+    }
+  ],
+  "external_dependencies": [
+    {
+      "capability_id": "corpus:network-setup",
+      "disposition": "audit-required",
+      "owner_issue": "#1378",
+      "owned_outcomes": [
+        "positive-production-vmnet-connectivity",
+        "credentialed-failure-cleanup-and-concurrency"
+      ]
+    },
+    {
+      "capability_id": "corpus:production-host",
+      "disposition": "audit-required",
+      "owner_issue": "#1351",
+      "owned_outcomes": [
+        "production-host-signing-deployment-and-host-policy-aggregate"
+      ]
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "disposition": "audit-required",
+      "owner_issue": "#1378",
+      "owned_outcomes": [
+        "approved-apple-vmnet-credential",
+        "real-start-packets-connectivity-teardown-and-reclamation"
+      ]
+    }
+  ],
+  "evidence_profiles": [
+    {
+      "id": "signed-code-and-entitlements",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/code_sign.rs",
+          "anchor": "pub(crate) fn validate_bundle("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/package.rs",
+          "anchor": "pub fn build_bundle("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn assert_exact_networkless_bundle_entitlements(bundle: &Path)"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn production_bundle_has_exact_nested_signing_contract()"
+        }
+      ]
+    },
+    {
+      "id": "lifecycle-and-private-namespace",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "pub(crate) struct LaunchRequest"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/spawn.rs",
+          "anchor": "pub(crate) struct SuspendedWorker"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn cleanup_namespace_after_worker("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn launcher_preserves_sandbox_outside_path_denial_and_redaction()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        }
+      ]
+    },
+    {
+      "id": "jailer-operation-and-limits",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-aggregate-contract.md",
+          "anchor": "## Terminal aggregate outcome"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "pub(crate) struct LaunchRequest"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker()"
+        }
+      ]
+    },
+    {
+      "id": "typed-resource-authority",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/host-resource-authority-contract.md",
+          "anchor": "## Terminal host-resource authority outcome"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/grant_manifest.rs",
+          "anchor": "pub(crate) struct PreparedGrantBatch"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/grant_registry.rs",
+          "anchor": "pub struct GrantRegistry"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_grants_authorize_only_typed_read_write_and_directory_operations()"
+        }
+      ]
+    },
+    {
+      "id": "linux-isolation-limits",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/isolation-contract.md",
+          "anchor": "## Certified Linux runtime isolation exclusions"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/main.rs",
+          "anchor": "fn unsupported_firecracker_arg("
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/error.rs",
+          "anchor": "pub enum JailerIsolationArgument"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/process_e2e.rs",
+          "anchor": "fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_rejects_unsupported_isolation_before_grants_sessions_and_worker()"
+        }
+      ]
+    },
+    {
+      "id": "portable-seccompiler",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/artifact.rs",
+          "anchor": "pub(super) fn publish("
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/lib.rs",
+          "anchor": "pub fn compile_json("
+        },
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/src/tool.rs",
+          "anchor": "pub(super) fn run("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "tools/seccompiler/tests/cli.rs",
+          "anchor": "fn split_and_basic_outputs_preserve_compiled_filter_semantics()"
+        }
+      ]
+    },
+    {
+      "id": "failure-cleanup-and-concurrency",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/multiprocess-isolation-contract.md",
+          "anchor": "## Terminal multiprocess isolation outcome"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/supervise.rs",
+          "anchor": "fn cleanup_namespace_after_worker("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn concurrent_sessions_remain_independent_when_one_worker_crashes()"
+        }
+      ]
+    },
+    {
+      "id": "network-and-operator-boundary",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/host-resource-authority-contract.md",
+          "anchor": "## Terminal host-resource authority outcome"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/codec.rs",
+          "anchor": "pub struct VmnetAuthority"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()"
+        }
+      ]
+    }
+  ],
+  "residuals": [
+    {
+      "id": "literal-linux-mechanism-parity",
+      "classification": "terminal-platform-limit",
+      "evidence_profile": "linux-isolation-limits"
+    },
+    {
+      "id": "caller-defined-runtime-sandbox-policy",
+      "classification": "terminal-platform-limit",
+      "evidence_profile": "signed-code-and-entitlements"
+    },
+    {
+      "id": "general-dynamic-resource-broker",
+      "classification": "generic-nonrequirement",
+      "evidence_profile": "typed-resource-authority"
+    },
+    {
+      "id": "hard-revocation",
+      "classification": "generic-nonrequirement",
+      "evidence_profile": "typed-resource-authority"
+    },
+    {
+      "id": "cross-filesystem-atomic-publication",
+      "classification": "implementation-specific-nonclaim",
+      "evidence_profile": "failure-cleanup-and-concurrency"
+    },
+    {
+      "id": "global-cross-launcher-allocation",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "network-and-operator-boundary"
+    },
+    {
+      "id": "positive-vmnet-and-approved-credentials",
+      "classification": "external-dependency",
+      "evidence_profile": "network-and-operator-boundary"
+    },
+    {
+      "id": "host-firewall-capacity-and-admission-policy",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "network-and-operator-boundary"
+    },
+    {
+      "id": "positive-arbitrary-per-instance-uid-gid",
+      "classification": "terminal-platform-limit",
+      "evidence_profile": "linux-isolation-limits"
+    },
+    {
+      "id": "automatic-restart-or-long-lived-service",
+      "classification": "operator-owned-outcome",
+      "evidence_profile": "failure-cleanup-and-concurrency"
+    },
+    {
+      "id": "malicious-same-bundle-sibling-isolation",
+      "classification": "implementation-specific-nonclaim",
+      "evidence_profile": "signed-code-and-entitlements"
+    },
+    {
+      "id": "developer-id-notarization-and-deployment",
+      "classification": "independently-owned-outcome",
+      "evidence_profile": "network-and-operator-boundary"
+    }
+  ],
+  "nonclaims": [
+    "linux-mechanism-parity",
+    "caller-defined-runtime-sandbox-policy",
+    "general-dynamic-resource-broker",
+    "hard-revocation",
+    "cross-filesystem-atomic-publication",
+    "global-cross-launcher-allocation",
+    "positive-vmnet-connectivity-or-credentials",
+    "host-firewall-capacity-or-admission-policy",
+    "positive-arbitrary-per-instance-uid-gid",
+    "automatic-restart-or-long-lived-service",
+    "malicious-same-bundle-sibling-isolation",
+    "developer-id-notarization-or-deployment"
+  ]
+}

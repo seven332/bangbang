@@ -70,8 +70,9 @@ platform-limit transition changes exactly that one identity to reach
 `corpus:jailer` and `tool-operation:jailer/run` to reach 379/3/3/33. The
 multiprocess-isolation transition then changes its one exact semantic row to
 reach 380/3/2/33. The host-resource-authority transition changes its one exact
-semantic row to reach the current 381/3/1/33 endpoint. The scoped gate accepts
-only those eight exact phases and
+semantic row to reach 381/3/1/33. The containment transition changes its one
+exact semantic row to reach the current 382/3/0/33 endpoint. The scoped gate
+accepts only those nine exact phases and
 derives every identity-checked difference; none of the totals is a delivery
 quota.
 

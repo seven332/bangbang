@@ -36,7 +36,7 @@
     "missing_platform_feasible": 2,
     "proven_platform_impossible": 33
   },
-  "unrelated_inventory_sha256": "21309eca409cb0348616e774f6bf8d1d9c3b24dcc32b1c61a122f7b8476bce59",
+  "unrelated_inventory_sha256": "166723906d7afad4eabdce7a3ab7645e558a0c9224775be0ccee063ec8644a9d",
   "source_clauses": [
     {
       "order": 1,
@@ -455,7 +455,7 @@
         {
           "kind": "local",
           "path": "compat/firecracker/v1.16.0/isolation-contract.md",
-          "anchor": "## Remaining Feasible Isolation Work"
+          "anchor": "## Remaining External Isolation Work"
         },
         {
           "kind": "local",

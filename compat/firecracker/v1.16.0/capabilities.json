@@ -15580,15 +15580,44 @@
     {
       "id": "semantic.isolation:jailer-seccomp-and-macos-containment-outcomes",
       "family": "isolation",
-      "summary": "The fixed separately signed App Sandbox plus Hypervisor worker has a closed environment and default-close standard/lifecycle/grant/vsock-broker/vhost-user-broker descriptor allowlist, authenticated lifecycle v5 credential/resource-limit/vmnet launch policy, exact worker-only RLIMIT_FSIZE/RLIMIT_NOFILE, current-credential and session verification, a descriptor-entered locked private namespace, and exact contained consumption of granted file, create-children socket/snapshot, and connect-only vhost-user authority. The canonical vmnet policy is immutable and redacted, and final contained InstanceStart enforces complete resource and network preflight before backend construction or the first vhost broker request. A signed same-code launcher re-exec provides detached readiness, PID, signal, supervision, and cleanup ownership without exposing an orphaned worker. Normal signed execution proves outside-container descriptors and anchored directories work through launcher-preauthorized identities, native snapshot create/describe/restore reaches a real guest, snapshot staging recovery preserves replacements, both real vsock initiation directions work, two exact vhost-user children share one retained directory grant without a helper or entitlement change, active PATCH reuses its stream, and networkless vmnet requests are rejected. A disposable feature-gated signed bundle further proves coherent root-plus-vsock restore authority, reverse abort and reuse, deterministic cancellation, one-time adoption, replacement-safe and independent-death cleanup, concurrent same-ID isolation, unchanged entitlements, no ambient worker path, and no ready-state helper; the normal bundle excludes the probe. The exact uid/gid, configurable-chroot, Linux seccomp, cgroup, network-namespace, and PID-namespace contracts have terminal macOS platform outcomes rather than false native aliases. The fixed host-resource authority is terminal under #1916; general brokerage and hard revocation, cross-filesystem atomic publication, and global allocation are explicit nonclaims rather than feasible compatibility gaps. Real vmnet start/connectivity/cleanup evidence, repository-owned approved credentials, deployment outcomes, and the final jailer/seccomp/macOS-containment composition remain independent work under their existing owners.",
+      "summary": "Certify the complete Firecracker v1.16 jailer, seccomp, seccompiler, production-host, and design containment composition through 46 ordered source clauses. The implemented macOS result is the immutable separately signed App Sandbox/HVF worker, entitlement-free launcher, authenticated validation-before-mutation lifecycle, closed environment and descriptor inheritance, locked private namespace, exact limits, typed resource authority without ambient fallback, redaction, supervision, cancellation, replacement-safe cleanup, and concurrent noninterchangeability. Portable seccompiler artifact generation is implemented without claiming macOS runtime filter installation. Linux seccomp, cgroup, network/PID namespace, arbitrary uid/gid, and configurable-chroot identities retain their exact terminal platform limits rather than false native aliases. Positive vmnet execution and approved credentials remain owned by #1378; deployment, host firewall/capacity, monitoring, retention, and other production-host policy remain external or operator-owned. Dynamic general brokerage, hard revocation, cross-filesystem atomic publication, global allocation, caller-defined sandbox policy, privileged services, automatic restart, malicious same-bundle sibling isolation, and Developer ID/notarization are explicit nonclaims or independent outcomes.",
       "source_refs": [
+        "corpus:design",
         "corpus:jailer",
         "corpus:production-host",
         "corpus:seccomp",
         "corpus:seccompiler"
       ],
-      "disposition": "missing-platform-feasible",
-      "delivery_issue": "https://github.com/seven332/bangbang/issues/1351"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-seccomp-containment-audit.json",
+          "anchor": "\"source_clauses\": ["
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/jailer-seccomp-containment-contract.md",
+          "anchor": "## Terminal jailer/seccomp containment outcome"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/src/jailer_seccomp_containment_audit_validate.rs",
+          "anchor": "pub fn validate_jailer_seccomp_containment_audit("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "crates/launcher/tests/production_bundle_e2e.rs",
+          "anchor": "fn signed_jailer_policy_enforces_empty_environment_private_root_and_exact_limits()"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/jailer_seccomp_containment_audit.rs",
+          "anchor": "fn jailer_seccomp_containment_terminal_transition_is_exact()"
+        }
+      ]
     },
     {
       "id": "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity",
