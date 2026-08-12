@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
 use bangbang_firecracker_capability_audit::{
-    CAPABILITY_INVENTORY_PATH, Disposition, JAILER_AGGREGATE_CAPABILITY_IDS,
-    MULTIPROCESS_ISOLATION_CAPABILITY_ID, Reference, SOURCE_MANIFEST_PATH,
-    WAVE7_AGGREGATE_AUDIT_PATH, WAVE7_AGGREGATE_CAPABILITY_IDS, WAVE7_OWNED_CAPABILITY_IDS,
-    WAVE7_PLATFORM_IMPOSSIBLE_CAPABILITY_IDS, Wave7AggregateAudit, Wave7AggregateNonclaim,
-    Wave7HandoffOwner, read_capability_inventory, read_source_manifest, read_wave7_aggregate_audit,
-    validate_wave7_aggregate_audit, validate_wave7_aggregate_compatibility,
-    wave7_aggregate_audit_json,
+    CAPABILITY_INVENTORY_PATH, Disposition, HOST_RESOURCE_AUTHORITY_CAPABILITY_ID,
+    JAILER_AGGREGATE_CAPABILITY_IDS, MULTIPROCESS_ISOLATION_CAPABILITY_ID, Reference,
+    SOURCE_MANIFEST_PATH, WAVE7_AGGREGATE_AUDIT_PATH, WAVE7_AGGREGATE_CAPABILITY_IDS,
+    WAVE7_OWNED_CAPABILITY_IDS, WAVE7_PLATFORM_IMPOSSIBLE_CAPABILITY_IDS, Wave7AggregateAudit,
+    Wave7AggregateNonclaim, Wave7HandoffOwner, read_capability_inventory, read_source_manifest,
+    read_wave7_aggregate_audit, validate_wave7_aggregate_audit,
+    validate_wave7_aggregate_compatibility, wave7_aggregate_audit_json,
 };
 
 fn repository_root() -> PathBuf {
@@ -187,6 +187,21 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
         .expect("terminal Wave 7 aggregate must certify");
 
     let mut historical = inventory.clone();
+    let host_resource = historical
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == HOST_RESOURCE_AUTHORITY_CAPABILITY_ID)
+        .expect("host-resource-authority successor capability must exist");
+    host_resource.source_refs = vec![
+        "corpus:jailer".to_string(),
+        "corpus:network-setup".to_string(),
+        "corpus:production-host".to_string(),
+    ];
+    host_resource.disposition = Disposition::MissingPlatformFeasible;
+    host_resource.implementation.clear();
+    host_resource.validation.clear();
+    host_resource.delivery_issue =
+        Some("https://github.com/seven332/bangbang/issues/1351".to_string());
     let multiprocess = historical
         .capabilities
         .iter_mut()

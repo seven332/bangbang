@@ -183,7 +183,7 @@ three isolation composites at that historical phase.
 
 ## Exact multiprocess-isolation successor
 
-The current multiprocess-isolation successor is exactly `380/3/2/33`: 380
+The multiprocess-isolation successor is exactly `380/3/2/33`: 380
 implemented, three audit-required, two missing-platform-feasible, and 33
 proven-platform-impossible. It moves only
 `semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity`
@@ -193,6 +193,20 @@ two #1351 missing-platform-feasible isolation semantics. The checked
 [multiprocess isolation contract](multiprocess-isolation-contract.md) pins 13
 ordered design/production-host clauses, current-tree evidence, terminal
 dependencies, residual classifications, and every explicit nonclaim.
+
+## Exact host-resource-authority successor
+
+The current host-resource-authority successor is exactly `381/3/1/33`: 381
+implemented, three audit-required, one missing-platform-feasible, and 33
+proven-platform-impossible. It moves only
+`semantic.isolation:host-resource-authority-and-brokerage` to
+implemented-and-verified and repairs its Wave 7-owned `corpus:design` source
+mapping. The four remaining nonterminal outcomes are one #1373
+audit-required outcome, the same two #1378 audit-required outcomes, and the
+final #1351 jailer/seccomp/macOS-containment semantic. The checked
+[host-resource authority contract](host-resource-authority-contract.md) pins
+30 clauses, the exact 17-role/five-access surface, current-tree evidence,
+terminal and external dependencies, residuals, and every nonclaim.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -213,11 +227,12 @@ certifier, and the Wave 8 authority. The Wave 7 artifact remains historical at
 phase, the exact one-row Wave 8 successor at 377/8/3/30, or the exact uid/gid-
 only successor at 377/6/3/32, or the exact configurable-chroot-only successor
 at 377/5/3/33, the exact aggregate-jailer successor at 379/3/3/33, or the exact
-multiprocess-isolation successor at 380/3/2/33; it
+multiprocess-isolation successor at 380/3/2/33, or the exact
+host-resource-authority successor at 381/3/1/33; it
 rejects unrelated, count-preserving identity swaps, and partial drift.
 
 The global `--final` mode remains stronger and intentionally fails while the
-three audit-required and two feasible external outcomes remain. Neither Wave
+three audit-required and one feasible external outcome remain. Neither Wave
 8 nor any exact later successor weakens that completion gate.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,

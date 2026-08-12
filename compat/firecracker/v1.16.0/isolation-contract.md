@@ -85,20 +85,23 @@ The exact implementation and security rules are maintained in:
 
 ## Remaining Feasible Isolation Work
 
-The following remain under delivery issue
+The following independent outcomes remain under delivery issue
 [#1351](https://github.com/seven332/bangbang/issues/1351):
 
-- general dynamic post-Ready brokerage and hard revocation;
-- broader external vmnet connectivity, cleanup, and per-VM network policy;
-- automatic restart/reconnect and long-lived broker/service policy;
-- cross-filesystem socket publication; and
+- broader external vmnet connectivity, cleanup, and per-VM network policy under
+  #1378;
+- final composition of the terminal jailer, seccomp, resource-authority, and
+  macOS containment results; and
 - Developer ID/team possession, notarization, launch constraints, and release
   policy.
 
-These gaps keep two composite isolation records
+General dynamic brokerage, hard revocation, cross-filesystem atomic socket
+publication, and automatic restart are explicit nonclaims or operator-owned
+product choices rather than unimplemented Firecracker compatibility producers.
+
+The remaining composition keeps one isolation record
 `missing-platform-feasible`:
 
-- `semantic.isolation:host-resource-authority-and-brokerage`
 - `semantic.isolation:jailer-seccomp-and-macos-containment-outcomes`
 
 ## Terminal jailer uid/gid platform limit
@@ -230,6 +233,27 @@ The exact transition is `379/3/3/33` to `380/3/2/33`; the complete authority,
 residual classification, nonclaims, and scoped command are in the
 [multiprocess isolation contract](multiprocess-isolation-contract.md).
 
+## Terminal host-resource authority outcome
+
+#1916 separately certifies
+`semantic.isolation:host-resource-authority-and-brokerage` from 30 ordered
+clauses in the pinned design, jailer, network-setup, and production-host
+documents. Strict no-follow preflight, the exact 17-role/five-access grant
+surface, failure-atomic descriptor and anchored-directory adoption, fixed
+session broker facets, transactional storage/snapshot authority, output and
+device bounds, replacement-safe cleanup, cancellation, and concurrent
+noninterchangeability provide the applicable fixed macOS result.
+
+The checked mapping adds the Wave 7-owned `corpus:design` source, preserves
+#1378's positive vmnet evidence as independent, composes the terminal Linux
+mechanism conclusions, and classifies general brokerage, hard revocation,
+cross-filesystem publication, host allocation, restart, and deployment at
+their exact nonclaim/operator/external boundaries.
+
+The exact transition is `380/3/2/33` to `381/3/1/33`; the complete authority,
+resource map, residual classification, nonclaims, and scoped command are in
+the [host-resource authority contract](host-resource-authority-contract.md).
+
 ## Evidence Map
 
 | Claim | Implementation | Validation |
@@ -254,10 +278,11 @@ The checked inventory is authoritative for the exact isolation leaves,
 evidence references, and dispositions. Linux seccomp, cgroup, network
 namespace, and PID namespace records are terminal only for the named stable
 macOS exclusions. The offline seccompiler is a separate implemented artifact
-tool and does not enforce runtime seccomp. The two remaining composite records
-stay nonterminal until #1351's broader feasible work is complete. The uid/gid
+tool and does not enforce runtime seccomp. The one remaining composite record
+stays nonterminal until #1351's final composition is complete. The uid/gid
 argument leaves and configurable chroot are separately terminal at the fixed
 topology above. The aggregate jailer corpus and run records are separately
 terminal under #1912, and the multiprocess aggregate is terminal under #1914;
-`corpus:production-host`, the two network/vmnet records, and two composite
-isolation records retain their independent states.
+the host-resource authority is terminal under #1916. `corpus:production-host`,
+the two network/vmnet records, and one composite isolation record retain their
+independent states.

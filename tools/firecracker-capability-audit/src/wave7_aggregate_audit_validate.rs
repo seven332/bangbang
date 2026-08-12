@@ -579,14 +579,15 @@ fn validate_scope_and_counts(
             | InventoryPhase::JailerUidGidPlatformLimit
             | InventoryPhase::JailerChrootPlatformLimit
             | InventoryPhase::JailerAggregate
-            | InventoryPhase::MultiprocessIsolation,
+            | InventoryPhase::MultiprocessIsolation
+            | InventoryPhase::HostResourceAuthority,
         ) => {}
         Ok(phase) => errors.push(format!(
             "Wave 7 aggregate inventory cannot use the earlier {} phase",
             phase.name()
         )),
         Err(error) => errors.push(format!(
-            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, the exact aggregate jailer 379/3/3/33 successor, or the exact multiprocess isolation 380/3/2/33 successor; found {}/{}/{}/{}: {error}",
+            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, the exact aggregate jailer 379/3/3/33 successor, the exact multiprocess isolation 380/3/2/33 successor, or the exact host-resource authority 381/3/1/33 successor; found {}/{}/{}/{}: {error}",
             counts.0, counts.1, counts.2, counts.3
         )),
     }
@@ -1113,7 +1114,11 @@ fn validate_tools(
             ("jailer/", Some(InventoryPhase::JailerChrootPlatformLimit)) => (5, 8, 1),
             (
                 "jailer/",
-                Some(InventoryPhase::JailerAggregate | InventoryPhase::MultiprocessIsolation),
+                Some(
+                    InventoryPhase::JailerAggregate
+                    | InventoryPhase::MultiprocessIsolation
+                    | InventoryPhase::HostResourceAuthority,
+                ),
             ) => (6, 8, 0),
             _ => (
                 record.counts.implemented,
@@ -1478,7 +1483,8 @@ fn validate_handoffs(
         | InventoryPhase::JailerUidGidPlatformLimit
         | InventoryPhase::JailerChrootPlatformLimit
         | InventoryPhase::JailerAggregate
-        | InventoryPhase::MultiprocessIsolation),
+        | InventoryPhase::MultiprocessIsolation
+        | InventoryPhase::HostResourceAuthority),
     ) = phase
     {
         let expected = expected_nonterminal_ids(phase);

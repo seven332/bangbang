@@ -124,9 +124,10 @@ because Bangbang does not build Linux mount/cgroup hierarchies.
 The #1912 transition is exactly `377/5/3/33` to `379/3/3/33`. A checked digest
 pins every unrelated capability record, so changing an unrelated summary,
 source, disposition, ownership marker, or evidence fails even when cardinality
-is preserved. At the exact `380/3/2/33` multiprocess successor, the checked
-digest advances to include that independently certified row while the two
-#1912 rows and their original transition remain unchanged.
+is preserved. At the exact `380/3/2/33` multiprocess successor and
+`381/3/1/33` host-resource successor, the checked digest advances to include
+those independently certified rows while the two #1912 rows and their
+original transition remain unchanged.
 
 | Capability | Owner | Disposition |
 | --- | --- | --- |
@@ -135,9 +136,11 @@ digest advances to include that independently certified row while the two
 
 The three remaining audit-required records are `corpus:network-setup`,
 `corpus:production-host`, and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity`. The three
-`semantic.isolation:*` composites remain `missing-platform-feasible`; the 33
-exact platform exclusions remain unchanged.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity`. The multiprocess
+and host-resource composites are separately terminal under
+#1914 and #1916. Only the final jailer/seccomp/macOS-containment composite
+remains `missing-platform-feasible`; the 33 exact platform exclusions remain
+unchanged.
 
 This outcome explicitly does not claim Linux jailer mechanism parity, a
 literal per-run executable copy, absence of shared read-only code pages,

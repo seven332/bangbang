@@ -86,8 +86,10 @@ block, pmem, logger, metrics, serial, snapshot input/output/root, API-socket,
 and vsock-socket consumers use granted identities or exact retained anchors
 without reopening their tagged path strings. Arbitrary numeric uid/gid is a
 terminal fixed-topology platform limit with a stable prelaunch rejection.
-Configurable chroot is a separate fixed-topology platform limit; general
-dynamic post-Ready delivery and hard revocation still need dedicated designs.
+Configurable chroot is a separate fixed-topology platform limit. General
+dynamic post-Ready delivery and hard revocation are explicit nonclaims of the
+fixed authority; any future product surface would require a separately
+challenged design.
 
 The elevated evidence result is intentionally narrower than product support.
 For mapped, retained-root, and SDK-maximum unmapped identities, the signed
@@ -234,7 +236,9 @@ and long-lived service behavior. Exactly `corpus:jailer` and
 inventory from `377/5/3/33` to `379/3/3/33`. The remaining audit records are
 `corpus:network-setup`, `corpus:production-host`, and the aggregate vmnet
 connectivity identity. #1914 then certifies the multiprocess isolation
-composite at `380/3/2/33`; the other two isolation composites remain
+composite at `380/3/2/33`, and #1916 certifies the host-resource authority
+composite at `381/3/1/33`. Only the final
+jailer/seccomp/macOS-containment isolation composite remains
 missing-platform-feasible.
 
 ## Certified Linux Runtime Isolation Exclusions
@@ -654,7 +658,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, vhost-user sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized create-children directory and safe child; contained vhost-user use requires one exact preauthorized connect-only directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
-| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; general dynamic delivery still requires explicit design. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, and connect-only vhost-user-socket authority form the current contained mode. Lifecycle v5 binds vmnet policy to exact networkless or caller-approved vmnet signature profiles. | The real restricted-entitlement credential and connectivity evidence remain operator-owned gates; any optional general dynamic delivery surface requires a separately challenged design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; uid/gid root-retained/root-transition and configurable-chroot requests have separate terminal fixed-topology rejections; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep the uid/gid and configurable-chroot exclusions fail-closed unless a fresh public-platform Challenge changes the accepted topology result; keep seccomp, namespaces, cgroups, and parent-cgroup controls rejected. |
 
@@ -745,9 +749,10 @@ never falls back to an ambient path. Unadopted values drop on cancellation,
 terminal exit, disconnect, bootstrap failure, or process exit. SCM_RIGHTS creates
 an independent descriptor reference, so closing the launcher's copy is cleanup,
 not revocation. The initial grant batch remains immutable after acknowledgment.
-General-purpose dynamic grants and hard revocation require a later broker
-design. The fixed vsock and vhost-user facets derive only connected streams
-from authority already fixed in the immutable startup batch.
+General-purpose dynamic grants and hard revocation are outside this fixed
+authority contract; any future broker design must be challenged separately.
+The fixed vsock and vhost-user facets derive only connected streams from
+authority already fixed in the immutable startup batch.
 
 Contained mode recognizes only the exact, case-sensitive
 `bangbang-grant:<GrantId>` form. The direct CLI treats the same text as an
@@ -955,7 +960,8 @@ restore claim, and it cannot remove the simultaneous uncatchable launcher and
 worker death limit above.
 
 General dynamic post-Ready delivery, hard revocation, and cross-filesystem
-socket publication do not yet consume or extend their declared authority.
+socket publication are explicit nonclaims and do not consume or extend the
+declared fixed authority.
 
 ## App Sandbox Validation Boundary
 
@@ -3575,6 +3581,20 @@ allocation operator-owned; composes the terminal uid/gid result; and does not
 claim malicious same-bundle sibling isolation, immediate zero residue after
 dual SIGKILL, a general dynamic broker, or hard revocation.
 
+The checked #1916
+[host-resource authority contract](../compat/firecracker/v1.16.0/host-resource-authority-contract.md)
+then maps 30 exact clauses from the pinned design, jailer, network-setup, and
+production-host documents onto 17 fixed resource roles and five access modes.
+It certifies strict no-follow preparation, typed descriptor and
+anchored-directory authority, failure-atomic one-time adoption, fixed session-bound
+facets, transactional storage/snapshot authority, exact output and
+process/device bounds, replacement-safe cleanup, cancellation, and concurrent
+noninterchangeability. Positive vmnet credentials/connectivity remain under
+#1378; host networking, deployment, restart, and cross-launcher allocation
+policy remain externally owned. General dynamic brokerage, hard revocation,
+cross-filesystem atomic publication, and global allocation are explicit
+nonclaims rather than missing Firecracker v1.16 producers.
+
 ## Wave 8 Cross-Capability Security Composition
 
 The checked
@@ -3607,9 +3627,11 @@ totals `377/5/3/33`. #1912 then certifies the jailer corpus and operation
 aggregates, leaving one #1373 production-host row, the same two #1378 rows,
 and the same three #1351 rows at `379/3/3/33`. #1914 then certifies exactly the
 multiprocess isolation row, leaving those three audit rows and two #1351 rows
-at the current `380/3/2/33` successor. Missing
-authority or credentials alone is not an impossibility proof. Global `--final`
-stays blocked until the remaining external outcomes complete.
+at `380/3/2/33`. #1916 then certifies exactly the host-resource authority row,
+leaving those three audit rows and one #1351 row at the current `381/3/1/33`
+successor. Missing authority or credentials alone is not an impossibility
+proof. Global `--final` stays blocked until the remaining external outcomes
+complete.
 
 The elevated same-host gates have now been executed rather than inferred from
 split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root
@@ -3777,7 +3799,9 @@ test-only and statically
 absent from normal launcher and worker builds; its daemon path is not a root
 service, public jailer/daemon mode, setuid helper, or ambient path authority.
 #1914 subsequently certifies the exact multiprocess aggregate without adding a
-new executable, helper, privilege, or topology.
+new executable, helper, privilege, or topology. #1916 then certifies the fixed
+host-resource authority from the existing portable and signed producers,
+without adding a new executable path or broadening that topology.
 
 ## Current Non-Goals
 

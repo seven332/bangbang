@@ -1361,10 +1361,12 @@ launcher facet with no guest bytes or outgoing-network entitlement. Snapshot
 describe/state/memory consumers adopt exact files, and frozen native-v1 load
 may additionally adopt its persisted root; create retains
 repeatable output anchors with bounded children and strict crash-cleanup
-records. General dynamic post-Ready delivery, hard revocation, cross-filesystem
-socket publication, vmnet provisioning and policy, launch constraints,
-Developer ID possession, automatic restart, and notarization remain later
-work. Positive arbitrary uid/gid transition is the fixed-topology platform
+records. General dynamic post-Ready delivery, hard revocation, and
+cross-filesystem socket publication are outside the pinned fixed authority and
+remain optional product designs, not unresolved compatibility producers. vmnet
+provisioning and policy, launch constraints, Developer ID possession,
+automatic restart, and notarization remain later work. Positive arbitrary
+uid/gid transition is the fixed-topology platform
 limit above, not feasible backlog. Configurable chroot is the separate
 fixed-topology platform limit above. The exact Linux seccomp, cgroup,
 network-namespace, and PID-namespace mechanisms now have terminal macOS
@@ -1398,7 +1400,8 @@ Exactly `corpus:jailer` and `tool-operation:jailer/run` become
 implemented-and-verified. The transition is `377/5/3/33` to `379/3/3/33`;
 `corpus:production-host`, `corpus:network-setup`, and aggregate vmnet
 connectivity remain audit-required. #1914 later closes the multiprocess
-isolation composite, leaving two isolation composites
+isolation composite, and #1916 closes the fixed host-resource authority
+composite, leaving only the jailer/seccomp/macOS-containment composite
 missing-platform-feasible. The scoped jailer gate is:
 
 ```sh
@@ -1430,6 +1433,35 @@ the exact `379/3/3/33` to `380/3/2/33` transition. The scoped gate is:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multiprocess-isolation-final
+```
+
+### Host-resource authority compatibility
+
+The checked
+[host-resource authority contract](../compat/firecracker/v1.16.0/host-resource-authority-contract.md)
+maps 30 ordered clauses from the pinned Firecracker design, jailer,
+network-setup, and production-host documents onto the exact 17-role/five-access
+production surface. Strict no-follow manifest preparation, typed descriptors
+and anchored directories, failure-atomic one-time adoption, fixed
+session-bound socket/vsock/vhost-user/block facets, transactional
+storage/snapshot authority, exact output and process/device bounds,
+replacement-safe cleanup, cancellation, and concurrent noninterchangeability
+provide the applicable fixed macOS result.
+
+Canonical vmnet policy and admission are part of that fixed authority;
+Apple-approved credentials and positive connectivity remain independently
+owned by #1378. Host TAP/NAT/bridge/firewall/address, cgroup/capacity,
+deployment, restart, and cross-launcher allocation policy remain operator or
+independently owned. General dynamic brokerage, hard revocation,
+cross-filesystem atomic publication, and a global allocator are explicit
+nonclaims rather than missing Firecracker v1.16 producers.
+
+Exactly `semantic.isolation:host-resource-authority-and-brokerage` moves from
+missing-platform-feasible to implemented-and-verified, producing the exact
+`380/3/2/33` to `381/3/1/33` transition. The scoped gate is:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --host-resource-authority-final
 ```
 
 The macOS host security baseline is documented separately in
@@ -1493,11 +1525,11 @@ error, observability, resource, device, network/MMDS, and snapshot domains from
 four exact portable and signed product leaves. It also rechecks the historical
 30-record platform-exclusion partition and originally retained the exact eleven
 #1351/#1373/#1378 external outcomes. Its certifier accepts only the checked
-uid/gid, configurable-chroot, aggregate-jailer, and multiprocess-isolation
-successors. The current successor is `380/3/2/33`: one #1373 audit record, two
-#1378 audit records, and two #1351 feasible records remain. It does not turn missing credentials,
-root/HVF authority, skipped execution, or a weaker macOS mechanism into success
-or impossibility.
+uid/gid, configurable-chroot, aggregate-jailer, multiprocess-isolation, and
+host-resource-authority successors. The current successor is `381/3/1/33`:
+one #1373 audit record, two #1378 audit records, and one #1351 feasible record
+remain. It does not turn missing credentials, root/HVF authority, skipped
+execution, or a weaker macOS mechanism into success or impossibility.
 
 The independent `corpus:formal-verification` owner is now terminal through the
 [Targeted Formal Verification](formal-verification.md) boundary and checked
@@ -5274,7 +5306,8 @@ surviving helper, and unchanged entitlements.
 Snapshot path consumers use exact state/memory and repeatable output grants;
 frozen native-v1 loads additionally adopt an exact persisted root grant.
 General dynamic brokerage, cross-filesystem socket publication, and hard
-revocation remain incomplete. Lifecycle v5 carries a canonical
+revocation are explicit nonclaims of this fixed authority and would require
+separately challenged product designs. Lifecycle v5 carries a canonical
 bounded host/shared/exact-bridge allowlist plus a separate 1-through-4 active
 limit, retains it immutably in contained workers, and applies it to the complete
 non-MMDS-only interface set before any startup resource or vmnet backend is

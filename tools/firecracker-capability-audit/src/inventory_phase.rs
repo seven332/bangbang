@@ -23,6 +23,9 @@ pub(crate) const JAILER_AGGREGATE_IDS: [&str; 2] = ["corpus:jailer", "tool-opera
 pub(crate) const MULTIPROCESS_ISOLATION_ID: &str =
     "semantic.isolation:multiprocess-concurrency-redaction-and-failure-atomicity";
 
+pub(crate) const HOST_RESOURCE_AUTHORITY_ID: &str =
+    "semantic.isolation:host-resource-authority-and-brokerage";
+
 const WAVE8_AUDIT_IDS: [&str; 8] = [
     "corpus:jailer",
     "corpus:network-setup",
@@ -91,6 +94,7 @@ pub(crate) enum InventoryPhase {
     JailerChrootPlatformLimit,
     JailerAggregate,
     MultiprocessIsolation,
+    HostResourceAuthority,
 }
 
 impl InventoryPhase {
@@ -103,6 +107,7 @@ impl InventoryPhase {
             Self::JailerChrootPlatformLimit => "post-uid/gid jailer chroot-base-dir 377/5/3/33",
             Self::JailerAggregate => "aggregate jailer 379/3/3/33",
             Self::MultiprocessIsolation => "multiprocess isolation 380/3/2/33",
+            Self::HostResourceAuthority => "host-resource authority 381/3/1/33",
         }
     }
 }
@@ -119,6 +124,7 @@ pub(crate) fn classify_inventory_phase(
         (377, 5, 3, 33) => InventoryPhase::JailerChrootPlatformLimit,
         (379, 3, 3, 33) => InventoryPhase::JailerAggregate,
         (380, 3, 2, 33) => InventoryPhase::MultiprocessIsolation,
+        (381, 3, 1, 33) => InventoryPhase::HostResourceAuthority,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -176,6 +182,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::JailerChrootPlatformLimit
             | InventoryPhase::JailerAggregate
             | InventoryPhase::MultiprocessIsolation
+            | InventoryPhase::HostResourceAuthority
     ) {
         ids.extend(JAILER_UID_GID_IDS);
     }
@@ -184,6 +191,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
         InventoryPhase::JailerChrootPlatformLimit
             | InventoryPhase::JailerAggregate
             | InventoryPhase::MultiprocessIsolation
+            | InventoryPhase::HostResourceAuthority
     ) {
         ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
@@ -233,7 +241,9 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             }
             ids.remove(JAILER_CHROOT_BASE_DIR_ID);
         }
-        InventoryPhase::JailerAggregate | InventoryPhase::MultiprocessIsolation => {
+        InventoryPhase::JailerAggregate
+        | InventoryPhase::MultiprocessIsolation
+        | InventoryPhase::HostResourceAuthority => {
             for id in JAILER_UID_GID_IDS {
                 ids.remove(id);
             }
@@ -250,8 +260,14 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
     let mut ids = MISSING_PLATFORM_FEASIBLE_IDS
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if phase == InventoryPhase::MultiprocessIsolation {
+    if matches!(
+        phase,
+        InventoryPhase::MultiprocessIsolation | InventoryPhase::HostResourceAuthority
+    ) {
         ids.remove(MULTIPROCESS_ISOLATION_ID);
+    }
+    if phase == InventoryPhase::HostResourceAuthority {
+        ids.remove(HOST_RESOURCE_AUTHORITY_ID);
     }
     ids
 }
@@ -292,10 +308,21 @@ mod tests {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::HostResourceAuthority)
+        );
+
+        let mut multiprocess = current.clone();
+        set_disposition(
+            &mut multiprocess,
+            HOST_RESOURCE_AUTHORITY_ID,
+            Disposition::MissingPlatformFeasible,
+        );
+        assert_eq!(
+            classify_inventory_phase(&multiprocess),
             Ok(InventoryPhase::MultiprocessIsolation)
         );
 
-        let mut aggregate = current.clone();
+        let mut aggregate = multiprocess;
         set_disposition(
             &mut aggregate,
             MULTIPROCESS_ISOLATION_ID,
@@ -405,6 +432,11 @@ mod tests {
         let mut wave8 = current_inventory();
         set_disposition(
             &mut wave8,
+            HOST_RESOURCE_AUTHORITY_ID,
+            Disposition::MissingPlatformFeasible,
+        );
+        set_disposition(
+            &mut wave8,
             MULTIPROCESS_ISOLATION_ID,
             Disposition::MissingPlatformFeasible,
         );
@@ -431,6 +463,11 @@ mod tests {
     #[test]
     fn chroot_without_uid_gid_predecessor_does_not_classify() {
         let mut partial = current_inventory();
+        set_disposition(
+            &mut partial,
+            HOST_RESOURCE_AUTHORITY_ID,
+            Disposition::MissingPlatformFeasible,
+        );
         set_disposition(
             &mut partial,
             MULTIPROCESS_ISOLATION_ID,

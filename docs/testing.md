@@ -2047,7 +2047,8 @@ one-row Wave 8 successor `377/8/3/30`, followed by the exact uid/gid-only
 platform-limit successor `377/6/3/32`, the exact configurable-chroot-only
 successor `377/5/3/33`, and the exact aggregate-jailer successor
 `379/3/3/33`, followed by the exact multiprocess-isolation successor
-`380/3/2/33`. Each phase is classified by exact
+`380/3/2/33`, followed by the exact host-resource-authority successor
+`381/3/1/33`. Each phase is classified by exact
 identity sets, not counts. It does not execute Kani, sign binaries, run HVF, or
 collect an environment report inside the Rust process: run the targeted Kani
 job, the full signed integration wrapper, and the specification collector
@@ -2093,19 +2094,20 @@ impossible records into exact x86 CPUID/MSR (13), Linux KVM feature/template
 exclusions remain mandatory. The later uid/gid-only successor adds two
 separately challenged fixed-topology exclusions, and the chroot-only successor
 adds one more, without rewriting that historical partition. The aggregate
-jailer and multiprocess-isolation successors change no reviewed
-platform-impossible leaf or historical partition.
+jailer, multiprocess-isolation, and host-resource-authority successors change
+no reviewed platform-impossible leaf or historical partition.
 
 At Wave 8, exactly six #1373 audit rows, two #1378 audit rows, and three #1351
 feasible rows remained. The uid/gid `377/6/3/32` phase retained four #1373
 rows, and the configurable-chroot `377/5/3/33` phase retained three. The
 aggregate-jailer `379/3/3/33` phase retained exactly one #1373 audit row
 (`corpus:production-host`), the same two #1378 audit rows, and three #1351
-feasible rows. The current multiprocess-isolation `380/3/2/33` successor
-retains those three audit rows and two #1351 feasible rows. The global
-`--final` command deliberately continues to fail on those three audit and two
-feasible records. The Rust command is
-offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
+feasible rows. The multiprocess-isolation `380/3/2/33` successor retained
+those three audit rows and two #1351 feasible rows. The current
+host-resource-authority `381/3/1/33` successor retains those three audit rows
+and one #1351 feasible row. The global `--final` command deliberately
+continues to fail on those three audit and one feasible record. The Rust
+command is offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
 merged-main OID are checked and recorded by the pull-request workflow.
 
 ## Aggregate jailer certification
@@ -2123,8 +2125,9 @@ The validator pins the upstream document, parser, operation, and root-transition
 blobs; requires 13 ordered arguments, 16 ordered operation steps, seven corpus
 sections, and exact evidence profiles; resolves every local path and anchor;
 checks the unrelated-record digest; and accepts only the `377/5/3/33` to
-`379/3/3/33` transition or its exact `380/3/2/33` multiprocess-isolation
-successor. Mutation tests cover missing, duplicate, reordered,
+`379/3/3/33` transition, its exact `380/3/2/33` multiprocess-isolation
+successor, or its exact `381/3/1/33` host-resource-authority successor.
+Mutation tests cover missing, duplicate, reordered,
 unknown, stale-anchor, partial-transition, unrelated-record, and contract drift.
 
 Run the seven signed production producers through the wrapper without
@@ -2171,6 +2174,45 @@ before mutation, cancellation/deadlines, both process-death orders,
 replacement-safe recovery, same-ID noninterchangeability, and concurrent peer
 survival. This certification adds no new executable path and does not require
 sudo.
+
+At the later exact `381/3/1/33` host-resource successor, the multiprocess
+authority's unrelated-row digest advances while its original #1914 transition
+and terminal claim remain unchanged.
+
+## Host-resource authority certification
+
+The scoped #1916 gate consumes the checked
+[`host-resource-authority-audit.json`](../compat/firecracker/v1.16.0/host-resource-authority-audit.json)
+and certifies exactly
+`semantic.isolation:host-resource-authority-and-brokerage`:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --host-resource-authority-final
+cargo test -p bangbang-firecracker-capability-audit --test host_resource_authority_audit --locked
+```
+
+The validator pins the design, jailer, network-setup, and production-host
+blobs; requires 30 ordered clauses, 17 ordered resource roles, five access
+modes, 15 terminal dependencies, four independent nonterminal dependencies,
+11 closed evidence profiles, 14 residual classifications, 12 nonclaims, and
+the exact `380/3/2/33` to `381/3/1/33` transition. It resolves every local
+path and anchor, checks canonical JSON and a digest over every unrelated
+inventory record, and requires the exact repaired `corpus:design` source map.
+
+Mutation tests cover unknown/duplicate schema fields; source/blob drift;
+missing, duplicate, reordered, or invented clauses and resource roles;
+unsupported dependency dispositions; external-owner drift; stale anchors;
+residual/nonclaim drift; evidence substitution; partial transition;
+count-preserving unrelated changes; and unrelated #1916 ownership.
+
+The portable producers cover strict no-follow manifest preparation,
+failure-atomic registry adoption, alias rejection, resource-specific runtime
+transactions, exact limiters, and canonical vmnet policy. Signed producers
+cover every fixed boot/storage/output/socket/snapshot role, read-only backing,
+preflight-before-mutation, cancellation/deadlines, replacement-safe cleanup,
+both death orders, and concurrent noninterchangeability. Positive vmnet
+connectivity and credentials remain under #1378. The certification adds no
+runtime path and itself does not require sudo.
 
 ## Explicit Elevated Bootstrap Evidence
 
@@ -2389,6 +2431,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave7-
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --wave8-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multiprocess-isolation-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --host-resource-authority-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-schema-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-process-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metrics-device-final

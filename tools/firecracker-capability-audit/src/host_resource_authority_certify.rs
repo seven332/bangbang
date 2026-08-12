@@ -1,23 +1,23 @@
 use std::path::Path;
 
 use crate::{
-    AuditMode, CapabilityInventory, Disposition, MULTIPROCESS_ISOLATION_AUDIT_PATH,
-    MULTIPROCESS_ISOLATION_CAPABILITY_ID, MultiprocessIsolationAudit, Reference, SourceManifest,
-    ValidationErrors, validate, validate_multiprocess_isolation_audit,
+    AuditMode, CapabilityInventory, Disposition, HOST_RESOURCE_AUTHORITY_AUDIT_PATH,
+    HOST_RESOURCE_AUTHORITY_CAPABILITY_ID, HostResourceAuthorityAudit, Reference, SourceManifest,
+    ValidationErrors, validate, validate_host_resource_authority_audit,
 };
 
-const CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/multiprocess-isolation-contract.md";
+const CONTRACT_PATH: &str = "compat/firecracker/v1.16.0/host-resource-authority-contract.md";
 const VALIDATOR_PATH: &str =
-    "tools/firecracker-capability-audit/src/multiprocess_isolation_audit_validate.rs";
-const TEST_PATH: &str = "tools/firecracker-capability-audit/tests/multiprocess_isolation_audit.rs";
+    "tools/firecracker-capability-audit/src/host_resource_authority_audit_validate.rs";
+const TEST_PATH: &str = "tools/firecracker-capability-audit/tests/host_resource_authority_audit.rs";
 const SIGNED_TEST_PATH: &str = "crates/launcher/tests/production_bundle_e2e.rs";
 
-/// Certify the exact #1914 multiprocess isolation transition without requiring
-/// independently owned production-host, network, or broader isolation records.
-pub fn validate_multiprocess_isolation_compatibility(
+/// Certify the exact #1916 host-resource transition without requiring
+/// independently owned production-host or positive vmnet evidence.
+pub fn validate_host_resource_authority_compatibility(
     manifest: &SourceManifest,
     inventory: &CapabilityInventory,
-    audit: &MultiprocessIsolationAudit,
+    audit: &HostResourceAuthorityAudit,
     repository_root: &Path,
 ) -> Result<(), ValidationErrors> {
     let mut errors = Vec::new();
@@ -27,7 +27,7 @@ pub fn validate_multiprocess_isolation_compatibility(
         errors.extend(validation_errors.messages().iter().cloned());
     }
     if let Err(validation_errors) =
-        validate_multiprocess_isolation_audit(audit, manifest, inventory, repository_root)
+        validate_host_resource_authority_audit(audit, manifest, inventory, repository_root)
     {
         errors.extend(validation_errors.messages().iter().cloned());
     }
@@ -47,54 +47,60 @@ fn validate_capability_transition(inventory: &CapabilityInventory, errors: &mut 
     let Some(capability) = inventory
         .capabilities
         .iter()
-        .find(|capability| capability.id == MULTIPROCESS_ISOLATION_CAPABILITY_ID)
+        .find(|capability| capability.id == HOST_RESOURCE_AUTHORITY_CAPABILITY_ID)
     else {
-        errors.push("multiprocess isolation capability is missing".to_string());
+        errors.push("host-resource authority capability is missing".to_string());
         return;
     };
 
     let expected_implementation = [
-        (MULTIPROCESS_ISOLATION_AUDIT_PATH, "\"source_clauses\": ["),
-        (CONTRACT_PATH, "## Terminal multiprocess isolation outcome"),
+        (HOST_RESOURCE_AUTHORITY_AUDIT_PATH, "\"source_clauses\": ["),
+        (CONTRACT_PATH, "## Terminal host-resource authority outcome"),
         (
             VALIDATOR_PATH,
-            "pub fn validate_multiprocess_isolation_audit(",
+            "pub fn validate_host_resource_authority_audit(",
         ),
     ];
     let expected_validation = [
         (
             SIGNED_TEST_PATH,
-            "fn concurrent_sessions_remain_independent_when_one_worker_crashes()",
+            "fn signed_grants_authorize_only_typed_read_write_and_directory_operations()",
         ),
-        (TEST_PATH, "fn multiprocess_terminal_transition_is_exact()"),
+        (TEST_PATH, "fn host_resource_terminal_transition_is_exact()"),
     ];
 
     if capability.family != "isolation"
         || capability.disposition != Disposition::ImplementedAndVerified
         || capability.delivery_issue.is_some()
         || capability.exclusion.is_some()
-        || capability.source_refs != ["corpus:design", "corpus:production-host"]
+        || capability.source_refs
+            != [
+                "corpus:design",
+                "corpus:jailer",
+                "corpus:network-setup",
+                "corpus:production-host",
+            ]
     {
         errors.push(
-            "multiprocess isolation capability is not terminal with exact ownership".to_string(),
+            "host-resource authority capability is not terminal with exact ownership".to_string(),
         );
     }
     if !matches_local_reference_pairs(&capability.implementation, &expected_implementation) {
-        errors.push("multiprocess isolation implementation evidence drifted".to_string());
+        errors.push("host-resource authority implementation evidence drifted".to_string());
     }
     if !matches_local_reference_pairs(&capability.validation, &expected_validation) {
-        errors.push("multiprocess isolation validation evidence drifted".to_string());
+        errors.push("host-resource authority validation evidence drifted".to_string());
     }
 
     for unrelated in &inventory.capabilities {
-        if unrelated.id != MULTIPROCESS_ISOLATION_CAPABILITY_ID
+        if unrelated.id != HOST_RESOURCE_AUTHORITY_CAPABILITY_ID
             && unrelated
                 .delivery_issue
                 .as_deref()
-                .is_some_and(|issue| issue == "#1914" || issue.ends_with("/issues/1914"))
+                .is_some_and(|issue| issue == "#1916" || issue.ends_with("/issues/1916"))
         {
             errors.push(format!(
-                "multiprocess isolation certification found unrelated #1914 ownership: {}",
+                "host-resource authority certification found unrelated #1916 ownership: {}",
                 unrelated.id
             ));
         }
@@ -119,7 +125,7 @@ fn matches_local_reference_pairs(references: &[Reference], expected: &[(&str, &s
 
 fn validate_contract(repository_root: &Path, errors: &mut Vec<String>) {
     let Ok(contract) = std::fs::read_to_string(repository_root.join(CONTRACT_PATH)) else {
-        errors.push("multiprocess isolation contract is unreadable".to_string());
+        errors.push("host-resource authority contract is unreadable".to_string());
         return;
     };
     validate_contract_contents(&contract, errors);
@@ -129,45 +135,45 @@ fn validate_contract_contents(contract: &str, errors: &mut Vec<String>) {
     let normalized = contract.split_whitespace().collect::<Vec<_>>().join(" ");
     for token in [
         "## Pinned source identity",
-        "13 ordered source clauses",
-        "379/3/3/33",
+        "30 ordered source clauses",
+        "17 resource roles",
+        "five access modes",
         "380/3/2/33",
         "381/3/1/33",
-        "validate --multiprocess-isolation-final",
-        "one and only one microVM",
+        "validate --host-resource-authority-final",
         "privileged third-party",
-        "overwatcher",
-        "unique `uid` and `gid`",
+        "vhost-user backend",
         "general dynamic resource broker",
-        "simultaneous uncatchable",
+        "positive vmnet connectivity",
+        "corpus:design",
         "corpus:production-host",
         "global `--final`",
     ] {
         if !normalized.contains(token) {
             errors.push(format!(
-                "multiprocess isolation contract omits required token: {token}"
+                "host-resource authority contract omits required token: {token}"
             ));
         }
     }
 
     let rows = contract
         .lines()
-        .filter(|line| line.starts_with("| `") && line.contains("| #1914 |"))
+        .filter(|line| line.starts_with("| `") && line.contains("| #1916 |"))
         .collect::<Vec<_>>();
     if !matches!(
         rows.as_slice(),
         [row]
-            if row.contains(MULTIPROCESS_ISOLATION_CAPABILITY_ID)
+            if row.contains(HOST_RESOURCE_AUTHORITY_CAPABILITY_ID)
                 && row.contains("| `implemented-and-verified` |")
     ) {
         errors.push(
-            "multiprocess isolation contract requires the exact terminal #1914 row".to_string(),
+            "host-resource authority contract requires the exact terminal #1916 row".to_string(),
         );
     }
 }
 
 fn validate_documented_command(repository_root: &Path, errors: &mut Vec<String>) {
-    let command = "cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multiprocess-isolation-final";
+    let command = "cargo run -p bangbang-firecracker-capability-audit --locked -- validate --host-resource-authority-final";
     for path in [CONTRACT_PATH, "docs/testing.md"] {
         match std::fs::read_to_string(repository_root.join(path)) {
             Ok(contents)
@@ -177,10 +183,10 @@ fn validate_documented_command(repository_root: &Path, errors: &mut Vec<String>)
                     .join(" ")
                     .contains(command) => {}
             Ok(_) => errors.push(format!(
-                "multiprocess isolation final command is missing from {path}"
+                "host-resource authority final command is missing from {path}"
             )),
             Err(_) => errors.push(format!(
-                "multiprocess isolation command owner is unreadable: {path}"
+                "host-resource authority command owner is unreadable: {path}"
             )),
         }
     }
@@ -193,27 +199,31 @@ mod tests {
     #[test]
     fn exact_contract_scope_is_fail_closed() {
         let row = format!(
-            "| `{MULTIPROCESS_ISOLATION_CAPABILITY_ID}` | #1914 | `implemented-and-verified` |"
+            "| `{HOST_RESOURCE_AUTHORITY_CAPABILITY_ID}` | #1916 | `implemented-and-verified` |"
         );
         let contract = format!(
-            "## Pinned source identity 13 ordered source clauses 379/3/3/33 380/3/2/33 381/3/1/33 validate --multiprocess-isolation-final one and only one microVM privileged third-party overwatcher unique `uid` and `gid` general dynamic resource broker simultaneous uncatchable corpus:production-host global `--final`\n{row}"
+            "## Pinned source identity 30 ordered source clauses 17 resource roles five access modes 380/3/2/33 381/3/1/33 validate --host-resource-authority-final privileged third-party vhost-user backend general dynamic resource broker positive vmnet connectivity corpus:design corpus:production-host global `--final`\n{row}"
         );
         let mut errors = Vec::new();
         validate_contract_contents(&contract, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
 
         let extra =
-            format!("{contract}\n| `corpus:unrelated` | #1914 | `implemented-and-verified` |");
+            format!("{contract}\n| `corpus:unrelated` | #1916 | `implemented-and-verified` |");
         let mut errors = Vec::new();
         validate_contract_contents(&extra, &mut errors);
         assert_eq!(
             errors,
-            ["multiprocess isolation contract requires the exact terminal #1914 row"]
+            ["host-resource authority contract requires the exact terminal #1916 row"]
         );
 
-        let missing = contract.replace("overwatcher", "watcher");
+        let missing = contract.replace("vhost-user backend", "backend");
         let mut errors = Vec::new();
         validate_contract_contents(&missing, &mut errors);
-        assert!(errors.iter().any(|error| error.contains("overwatcher")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("vhost-user backend"))
+        );
     }
 }

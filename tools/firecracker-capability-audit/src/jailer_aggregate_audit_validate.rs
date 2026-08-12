@@ -23,7 +23,7 @@ pub const JAILER_AGGREGATE_CAPABILITY_IDS: [&str; 2] =
     ["corpus:jailer", "tool-operation:jailer/run"];
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "5d88c4ad5e4bcff378d7be6aa8e482ac2541ff903752a063b5a64282d5530da5";
+    "55b63f0633245792f8c8d02c8c6d0075d51cec407a335fc83d10a350f173d10e";
 
 const PROFILE_IDS: [JailerEvidenceProfileId; 9] = [
     JailerEvidenceProfileId::GrammarAndEarlyCommands,
@@ -215,16 +215,18 @@ fn validate_inventory_transition(
     }
     if !matches!(
         disposition_counts(inventory),
-        (379, 3, 3, 33) | (380, 3, 2, 33)
+        (379, 3, 3, 33) | (380, 3, 2, 33) | (381, 3, 1, 33)
     ) {
         errors.push(
-            "jailer aggregate live inventory must be exactly 379/3/3/33 or its 380/3/2/33 successor"
+            "jailer aggregate live inventory must be exactly 379/3/3/33, its 380/3/2/33 multiprocess successor, or its 381/3/1/33 host-resource successor"
                 .to_string(),
         );
     }
     if !matches!(
         classify_inventory_phase(inventory),
-        Ok(InventoryPhase::JailerAggregate | InventoryPhase::MultiprocessIsolation)
+        Ok(InventoryPhase::JailerAggregate
+            | InventoryPhase::MultiprocessIsolation
+            | InventoryPhase::HostResourceAuthority)
     ) {
         errors.push("jailer aggregate live inventory has an inexact successor phase".to_string());
     }

@@ -260,9 +260,11 @@ The later configurable-chroot review moves only that one identity, producing
 the 377/5/3/33 phase. The aggregate-jailer review then moves exactly
 `corpus:jailer` and `tool-operation:jailer/run`, producing 379/3/3/33. The
 multiprocess-isolation review then moves exactly its one #1351 semantic row,
-producing the current 380/3/2/33 phase with one #1373, two #1378, and two #1351
-outcomes still nonterminal. Any other identity or count transition fails the
-Wave 7 gate.
+producing the 380/3/2/33 phase with one #1373, two #1378, and two #1351
+outcomes still nonterminal. The host-resource-authority review then moves
+exactly its one #1351 semantic row, producing the current 381/3/1/33 phase with
+one #1373, two #1378, and one #1351 outcome still nonterminal. Any other
+identity or count transition fails the Wave 7 gate.
 
 The historical public-tool ledger derives 46 implemented leaves, five terminal
 Linux-only jailer exclusions, and four #1373 jailer handoffs. Its uid/gid
@@ -443,9 +445,11 @@ inventory was therefore exactly 376 implemented, nine audit-required, three
 missing-platform-feasible, and 30 proven-platform-impossible. The historical
 Wave 8 successor is exactly 377/eight/three/30; the uid/gid-only successor is
 exactly 377/6/3/32, the configurable-chroot-only successor is exactly
-377/5/3/33, the aggregate-jailer successor is exactly 379/3/3/33, and the
-current multiprocess-isolation successor is exactly 380/3/2/33.
+377/5/3/33, the aggregate-jailer successor is exactly 379/3/3/33, the
+multiprocess-isolation successor is exactly 380/3/2/33, and the current
+host-resource-authority successor is exactly 381/3/1/33.
 These are exact consequences of the corresponding row sets, not quotas;
 authoritative current totals remain derived from `capabilities.json` and are
 rechecked by `validate --wave8-final`, `validate --jailer-final`, and
-`validate --multiprocess-isolation-final`.
+`validate --multiprocess-isolation-final`, and
+`validate --host-resource-authority-final`.
