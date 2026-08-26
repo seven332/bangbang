@@ -1248,6 +1248,45 @@ current-host AMFI gate succeeds. Networkless packaging creates no probe and
 never executes the supplied worker; vmnet packaging also never executes that
 worker.
 
+### Production vmnet certification trust and private-data channels
+
+The first #1378 certification slice defines a credential-free protocol
+foundation, not a positive run. Its canonical config is an absolute,
+current-owner, one-link regular file with mode `0600`; it is the only source of
+the caller's signing identity, provisioning profile, exact fixture executable
+and digest, optional case authority, bridge selector, and timeouts. The command
+does not enumerate keychains, profiles, interfaces, endpoints, or replacement
+fixtures. The placeholder example is deliberately unusable.
+
+The configured fixture is caller-trusted external code. Bangbang pins its
+device, inode, size, timestamps, and SHA-256 before direct no-shell execution,
+gives it a private working directory, minimal environment, bounded pipes and
+process group, and rechecks it after clean exit. Its canonical retained session
+can privately return an endpoint and independently observe nonce-bound traffic.
+It cannot assert Bangbang authorization, a vmnet service error, or Bangbang
+process/interface cleanup. Protocol disagreement, stderr, extra output,
+replacement, interruption, or uncertain cleanup fails closed.
+
+Private guest input does not use argv, environment, boot-argument values, or
+MMDS. The generated direct-rootfs init already publishes its command line, and
+MMDS would add a second network dependency. A later runner instead grants one
+read-only exact 512-byte `/dev/vdb` control sector through the existing
+descriptor-rooted drive authority. The sector binds mode, endpoint, port, and a
+nonzero 32-byte nonce with fixed fields, reserved-zero bytes, SHA-256, and zero
+padding. The only boot argument is the non-sensitive fixed selector. The guest
+emits fixed phase markers and performs strict DHCP plus one exact nonce-bound
+TCP exchange without printing MACs, addresses, routes, endpoints, nonces,
+payloads, or raw socket errors.
+
+The public result is categorical: it contains source/platform categories,
+three entitlement assertions, the complete fixed 21-case ledger, cleanup, and
+verdict. It contains no identity, path, fingerprint, bridge/interface,
+endpoint, address, nonce, traffic, PID/session, or raw output and is published
+through a mode-`0600` same-directory no-clobber transaction. Service-condition
+rows can pass only from a future real Bangbang result; fixture state alone is
+never evidence. The current validation-only command opens no vmnet interface
+and leaves both #1378 capability rows `audit-required`.
+
 The vmnet path requires the host to satisfy macOS vmnet authorization,
 entitlement, and code-signing requirements. Apple's
 [`com.apple.vm.networking`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.vm.networking)

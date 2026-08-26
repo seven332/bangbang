@@ -56,6 +56,13 @@ not confer the restricted entitlement. `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` remain
 `audit-required`.
 
+#1378 now has a credential-free protocol foundation: strict private config and
+redacted result validation, a retained digest-pinned fixture exchange, and a
+direct-rootfs-v110 DHCP/TCP guest oracle. That foundation does not build or run
+the production package and cannot turn fixture state into authorization,
+service-error, connectivity, or cleanup evidence, so this contract's external
+handoff and inventory totals are unchanged.
+
 ## Exact inventory transition
 
 | Capability | Delivery | Disposition |

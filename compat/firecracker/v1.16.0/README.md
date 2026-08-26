@@ -183,6 +183,13 @@ digest/size, and a successful `e2fsck -fn`. The sidecar is committed last as a
 validity marker; the image and sidecar are not claimed to be one crash-atomic
 transaction.
 
+The current direct recipe identity is `rootfs-ext4-direct-boot-v110`. It adds
+the exact mode-`0555` production-vmnet guest DHCP/TCP oracle as a tracked input
+alongside the two static Rust helpers and generated init. The new helper bytes
+are not aliased onto historical `direct-boot-v109`; current policy and sidecar
+validation reject that old variant. This recipe transition is protocol
+foundation only and does not change either #1378 capability disposition.
+
 Runtime sidecars stay under the ignored cache root and never count as checked
 inventory or terminal workflow evidence.
 

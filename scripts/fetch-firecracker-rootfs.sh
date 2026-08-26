@@ -16,8 +16,9 @@ Options:
                    Add a deterministic bangbang direct-rootfs boot init script
                    to the generated ext4 image. The init emits serial markers,
                    writes an optional /dev/vdb marker when that drive exists,
-                   and can fetch MMDS when requested by boot args. Only valid
-                   with --format ext4.
+                   can fetch MMDS, and can select the checked production-vmnet
+                   guest oracle when requested by boot args. Only valid with
+                   --format ext4.
   -h, --help       Show this help.
 
 Environment:
@@ -119,7 +120,7 @@ if [[ "${BASH_REMATCH[1]}" =~ ^0+$ ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-direct_boot_variant="direct-boot-v109"
+direct_boot_variant="direct-boot-v110"
 extract_dir=""
 
 validate_static_arm64_guest_helper() {
@@ -283,6 +284,38 @@ install_static_arm64_guest_helpers() {
     "${repo_root}/scripts/guest/specification-benchmark.rs" \
     "${extract_dir}/bangbang-specification-benchmark" \
     "arm64 specification benchmark workload"
+}
+
+install_production_vmnet_certification_helper() {
+  local helper_source="${repo_root}/scripts/guest/production_vmnet_certification.py"
+  local helper_path="${extract_dir}/bangbang-production-vmnet-certification"
+
+  if [[ ! -f "$helper_source" || -L "$helper_source" ]]; then
+    echo "production vmnet certification guest helper source is missing or unsafe" >&2
+    exit 1
+  fi
+  install -m 0555 "$helper_source" "$helper_path"
+  if ! python3 - "$helper_source" "$helper_path" <<'PY'
+import os
+import stat
+import sys
+
+source, installed = sys.argv[1:]
+metadata = os.lstat(installed)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or stat.S_ISLNK(metadata.st_mode)
+    or stat.S_IMODE(metadata.st_mode) != 0o555
+):
+    raise SystemExit("installed helper type or mode drifted")
+with open(source, "rb") as source_file, open(installed, "rb") as installed_file:
+    if source_file.read() != installed_file.read():
+        raise SystemExit("installed helper content drifted")
+PY
+  then
+    echo "production vmnet certification guest helper installation drifted" >&2
+    exit 1
+  fi
 }
 
 install_direct_boot_init() {
@@ -5250,6 +5283,12 @@ elif cmdline_has bangbang.vsock-host-connect=1; then
   fetch_host_vsock_marker
 elif cmdline_has bangbang.vsock-host-multistream=1; then
   fetch_multi_host_vsock_marker
+elif cmdline_has bangbang.production-vmnet-certification=1; then
+  if [ -x /bangbang-production-vmnet-certification ]; then
+    /bangbang-production-vmnet-certification || true
+  else
+    emit_line BANGBANG_PRODUCTION_VMNET_CERTIFICATION_FAIL_INTERNAL
+  fi
 else
   write_vdb_marker BANGBANG_DIRECT_ROOTFS_BLOCK_OK
 fi
@@ -5278,6 +5317,7 @@ if [[ -n "$internal_populate_dir" ]]; then
   fi
   extract_dir="$internal_populate_dir"
   install_static_arm64_guest_helpers
+  install_production_vmnet_certification_helper
   install_direct_boot_init
   extract_dir=""
   exit 0

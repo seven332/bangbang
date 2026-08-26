@@ -1303,7 +1303,7 @@ def prepare_artifacts(config: BenchmarkConfig) -> PreparedArtifacts:
     rootfs_sha256 = _sha256(rootfs)
     if (
         sidecar["schema_version"] != 1
-        or sidecar["variant"] != "direct-boot-v109"
+        or sidecar["variant"] != "direct-boot-v110"
         or sidecar["requested_size_bytes"] != 512 * 1024 * 1024
         or sidecar["filesystem_check"] != "e2fsck -fn"
         or sidecar["output_size_bytes"] != rootfs_metadata.st_size

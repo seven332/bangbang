@@ -5390,6 +5390,26 @@ credential/chroot authority, remaining Linux
 jailer controls, seccomp outcome classification, and deployment signing policy
 remain later #1351 work.
 
+The credential-free production-vmnet certification foundation now fixes the
+next external gate's private config, complete 21-row redacted result, retained
+digest-pinned fixture session, and independent guest oracle. The current
+direct-rootfs recipe is `direct-boot-v110`; it installs an exact mode-`0555`
+Python helper selected by the non-sensitive
+`bangbang.production-vmnet-certification=1` argument. A read-only 512-byte
+control drive privately carries one endpoint and nonce. The helper discovers
+virtio-net, performs strict bounded DHCP without an installed DHCP client,
+applies and later removes the accepted address/default route, and requires an
+exact nonce-bound TCP request, response, and EOF. Its output contains only
+fixed phase markers. Historical v109 sidecars cannot identify these bytes.
+
+This slice has no `run` operation: it validates contracts and exercises only
+portable injected boundaries. It does not build the package, construct grants,
+drive the API/process/death matrix, open real vmnet, accept fixture-declared
+service outcomes, record external evidence, or promote either #1378 row.
+`corpus:network-setup` and
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` therefore remain
+`audit-required`.
+
 ## Validation Expectations
 
 Every future compatibility change should choose validation appropriate to its
