@@ -579,9 +579,7 @@ fn path_to_cstring(path: &Path) -> io::Result<CString> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::snapshot::{SnapshotVsockOverride, resolve_snapshot_vsock_selectors};

@@ -2089,7 +2089,6 @@ fn cvt_spawn(result: libc::c_int) -> Result<(), AnchoredSocketError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{Read as _, Write as _};
     use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
