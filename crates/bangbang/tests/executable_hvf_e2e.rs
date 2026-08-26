@@ -11596,6 +11596,8 @@ mod macos_arm64 {
             },
             transport,
             &source,
+            &source_api,
+            &source_metrics,
         );
         assert_eq!(
             source_host_ports,
@@ -12232,6 +12234,8 @@ mod macos_arm64 {
         exchange: SnapshotVsockExchange,
         context: &str,
         process: &BangbangProcess,
+        api_socket: &Path,
+        metrics_path: &Path,
     ) -> (Vec<UnixStream>, Vec<u32>) {
         let SnapshotVsockExchange {
             request_kind,
@@ -12272,9 +12276,20 @@ mod macos_arm64 {
                 .expect("source host stream payload should write");
             let expected = snapshot_vsock_payload(response_kind, index, response_size);
             let mut received = vec![0_u8; expected.len()];
-            stream
-                .read_exact(&mut received)
-                .expect("source host stream acknowledgement should read");
+            stream.read_exact(&mut received).unwrap_or_else(|error| {
+                let flush = http_put_json(
+                    api_socket,
+                    "/actions",
+                    r#"{"action_type":"FlushMetrics"}"#,
+                );
+                let metrics = fs::read_to_string(metrics_path)
+                    .unwrap_or_else(|metrics_error| format!("<unavailable: {metrics_error}>"));
+                panic!(
+                    "{context} source host stream {index} acknowledgement should read: {:?}; metrics flush:\n{flush}\nmetrics:\n{metrics}\nstdout:\n{}",
+                    error.kind(),
+                    process.stdout_snapshot()
+                )
+            });
             assert_eq!(
                 received, expected,
                 "{context} source host stream {index} acknowledgement should match"

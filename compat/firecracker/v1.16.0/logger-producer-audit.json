@@ -1649,7 +1649,7 @@
         "outcome"
       ],
       "disposition": "implemented",
-      "rationale": "All mapped upstream calls converge on one bounded vsock queue, connection, reset, or interrupt outcome per nonzero notification-batch category. The device-owned observer covers MMIO and product PCI, emits failure categories before success categories, and discards sockets, paths, connection keys, ports, packet headers, payloads, errors, descriptors, addresses, byte counts, and guest values.",
+      "rationale": "All mapped upstream calls converge on one bounded vsock queue, connection, reset, or interrupt outcome per nonzero notification-batch category. The device-owned observer covers MMIO and product PCI, emits failure categories before success categories, and discards sockets, paths, connection keys, ports, packet headers, payloads, errors, descriptors, addresses, byte counts, and guest values. Fixed local-stream EOF/read and connection-deadline outcomes use an additional bounded logger-rate.vsock.endpoint-outcome sub-budget so ordinary data-plane success records cannot hide the first endpoint-lifecycle observation.",
       "compiled_events": [
         "vsock"
       ],
@@ -1672,7 +1672,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/logger/rate_limiter.rs",
-          "anchor": "independent vsock outcome limiter identity"
+          "anchor": "independent vsock outcome and endpoint-evidence limiter identities"
         },
         {
           "kind": "local",

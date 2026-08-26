@@ -39,6 +39,9 @@ const BINDER_COMMAND_VERSION: u8 = 1;
 const RESPONSE_BYTES: usize = 24;
 const RESPONSE_MAGIC: [u8; 4] = *b"BBB1";
 const RESPONSE_VERSION: u8 = 1;
+const BINDER_ACK_BYTES: usize = 24;
+const BINDER_ACK_MAGIC: [u8; 4] = *b"BBA1";
+const BINDER_ACK_VERSION: u8 = 1;
 const HELLO_BYTES: usize = 8;
 const HELLO_MAGIC: [u8; 4] = *b"BBH1";
 const HELLO_VERSION: u8 = 1;
@@ -387,6 +390,14 @@ fn run_binder_inner() -> Result<(), AnchoredSocketError> {
     if let Err(error) = send_listener(&socket, role, identity, listener.as_raw_fd()) {
         let _ = unlink_relative_if_socket(staging, Some(identity));
         return Err(error);
+    }
+    let mut acknowledgment = [0_u8; BINDER_ACK_BYTES];
+    if socket.read_exact(&mut acknowledgment).is_err()
+        || parse_binder_ack(&acknowledgment) != Ok((role, identity))
+        || verify_peer(socket.as_raw_fd(), parent).is_err()
+    {
+        let _ = unlink_relative_if_socket(staging, Some(identity));
+        return Err(AnchoredSocketError::Binder);
     }
     Ok(())
 }
@@ -807,6 +818,8 @@ fn spawn_binder(
         return Err(AnchoredSocketError::Invalid);
     }
     validate_listener_descriptor(listener.as_raw_fd(), role)?;
+    verify_peer(parent.as_raw_fd(), pid).map_err(|_| AnchoredSocketError::Binder)?;
+    send_exact_frame(&parent, &binder_ack(role, identity)?)?;
     binder.wait_until(BINDER_TIMEOUT)?;
     Ok((listener, identity))
 }
@@ -1372,6 +1385,46 @@ fn parse_response(bytes: &[u8]) -> Result<(ResourceRole, ObjectIdentity), Anchor
     if bytes.len() != RESPONSE_BYTES
         || bytes.get(..4) != Some(RESPONSE_MAGIC.as_slice())
         || bytes.get(4) != Some(&RESPONSE_VERSION)
+        || bytes.get(6..8) != Some([0, 0].as_slice())
+    {
+        return Err(AnchoredSocketError::Invalid);
+    }
+    let role = socket_role(*bytes.get(5).ok_or(AnchoredSocketError::Invalid)?)
+        .ok_or(AnchoredSocketError::Invalid)?;
+    let device = u64::from_be_bytes(
+        bytes
+            .get(8..16)
+            .ok_or(AnchoredSocketError::Invalid)?
+            .try_into()
+            .map_err(|_| AnchoredSocketError::Invalid)?,
+    );
+    let inode = u64::from_be_bytes(
+        bytes
+            .get(16..24)
+            .ok_or(AnchoredSocketError::Invalid)?
+            .try_into()
+            .map_err(|_| AnchoredSocketError::Invalid)?,
+    );
+    Ok((role, ObjectIdentity { device, inode }))
+}
+
+fn binder_ack(
+    role: ResourceRole,
+    identity: ObjectIdentity,
+) -> Result<[u8; BINDER_ACK_BYTES], AnchoredSocketError> {
+    let mut acknowledgment = [0_u8; BINDER_ACK_BYTES];
+    acknowledgment[..4].copy_from_slice(&BINDER_ACK_MAGIC);
+    acknowledgment[4] = BINDER_ACK_VERSION;
+    acknowledgment[5] = role_byte(role)?;
+    acknowledgment[8..16].copy_from_slice(&identity.device.to_be_bytes());
+    acknowledgment[16..24].copy_from_slice(&identity.inode.to_be_bytes());
+    Ok(acknowledgment)
+}
+
+fn parse_binder_ack(bytes: &[u8]) -> Result<(ResourceRole, ObjectIdentity), AnchoredSocketError> {
+    if bytes.len() != BINDER_ACK_BYTES
+        || bytes.get(..4) != Some(BINDER_ACK_MAGIC.as_slice())
+        || bytes.get(4) != Some(&BINDER_ACK_VERSION)
         || bytes.get(6..8) != Some([0, 0].as_slice())
     {
         return Err(AnchoredSocketError::Invalid);
@@ -2083,6 +2136,15 @@ mod tests {
             listener.as_raw_fd(),
         )
         .expect("elevated listener should transfer");
+        let mut acknowledgment = [0_u8; BINDER_ACK_BYTES];
+        let mut transport_reader = &transport;
+        transport_reader
+            .read_exact(&mut acknowledgment)
+            .expect("elevated listener adoption should be acknowledged");
+        assert_eq!(
+            parse_binder_ack(&acknowledgment),
+            Ok((ResourceRole::ApiSocketDirectory, identity))
+        );
     }
 
     #[cfg(feature = "elevated-bootstrap-probe")]
@@ -2128,6 +2190,12 @@ mod tests {
         let (listener, role, identity) =
             receive_listener(&parent).expect("relative listener child should return one listener");
         assert_eq!(role, ResourceRole::ApiSocketDirectory);
+        send_exact_frame(
+            &parent,
+            &binder_ack(ResourceRole::ApiSocketDirectory, identity)
+                .expect("listener acknowledgment should encode"),
+        )
+        .expect("relative listener child should receive adoption acknowledgment");
         assert!(
             process
                 .wait()
@@ -2364,6 +2432,14 @@ mod tests {
             };
             let encoded = response(role, identity).expect("response should encode");
             assert_eq!(parse_response(&encoded), Ok((role, identity)));
+            let acknowledgment = binder_ack(role, identity).expect("acknowledgment should encode");
+            assert_eq!(parse_binder_ack(&acknowledgment), Ok((role, identity)));
+            let mut malformed_acknowledgment = acknowledgment;
+            malformed_acknowledgment[6] = 1;
+            assert_eq!(
+                parse_binder_ack(&malformed_acknowledgment),
+                Err(AnchoredSocketError::Invalid)
+            );
             let command = binder_command(role, identity).expect("binder command should encode");
             assert_eq!(parse_binder_command(&command), Ok((role, identity)));
 

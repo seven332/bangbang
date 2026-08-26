@@ -11794,7 +11794,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/vsock.rs",
-          "anchor": "fn observe_host_readiness(&self, readiness: &[VsockHostReadiness], poll_failed: bool) {"
+          "anchor": "fn observe_host_readiness(&mut self, readiness: &[VsockHostReadiness], poll_failed: bool) {"
         }
       ],
       "validation": [
@@ -11876,7 +11876,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/vsock.rs",
-          "anchor": "fn expire_connections(&mut self, now: Instant) {"
+          "anchor": "fn expire_connections(&mut self, now: Instant) -> VirtioVsockConnectionLifecycleDispatch {"
         }
       ],
       "validation": [
@@ -12040,7 +12040,7 @@
         {
           "kind": "local",
           "path": "crates/runtime/src/vsock.rs",
-          "anchor": "fn observe_host_readiness(&self, readiness: &[VsockHostReadiness], poll_failed: bool) {"
+          "anchor": "fn observe_host_readiness(&mut self, readiness: &[VsockHostReadiness], poll_failed: bool) {"
         }
       ],
       "validation": [

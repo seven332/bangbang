@@ -112,8 +112,8 @@ use crate::vsock::{
     VirtioVsockCaptureValidation, VirtioVsockDeviceCaptureError,
     VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
     VirtioVsockMmioCaptureState, VirtioVsockMmioHandler, VirtioVsockTransportResetAttempt,
-    VirtioVsockTransportResetError, VsockConfig, VsockMmioDeviceRegistration, VsockMmioLayout,
-    VsockMmioRegistrationError,
+    VirtioVsockTransportResetError, VsockConfig, VsockHostReadinessRegistration,
+    VsockMmioDeviceRegistration, VsockMmioLayout, VsockMmioRegistrationError,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -705,6 +705,8 @@ pub struct Arm64BootVsockWakeup {
     host_read_fds: Vec<RawFd>,
     host_write_fds: Vec<RawFd>,
     deadline: Option<Instant>,
+    readiness_generation: u64,
+    read_registrations: Vec<VsockHostReadinessRegistration>,
 }
 
 impl Arm64BootVsockWakeup {
@@ -713,6 +715,8 @@ impl Arm64BootVsockWakeup {
             host_read_fds: Vec::new(),
             host_write_fds: Vec::new(),
             deadline: None,
+            readiness_generation: 0,
+            read_registrations: Vec::new(),
         }
     }
 
@@ -720,11 +724,15 @@ impl Arm64BootVsockWakeup {
         host_read_fds: Vec<RawFd>,
         host_write_fds: Vec<RawFd>,
         deadline: Option<Instant>,
+        readiness_generation: u64,
+        read_registrations: Vec<VsockHostReadinessRegistration>,
     ) -> Self {
         Self {
             host_read_fds,
             host_write_fds,
             deadline,
+            readiness_generation,
+            read_registrations,
         }
     }
 
@@ -740,8 +748,26 @@ impl Arm64BootVsockWakeup {
         self.deadline
     }
 
-    pub fn into_parts(self) -> (Vec<RawFd>, Vec<RawFd>, Option<Instant>) {
-        (self.host_read_fds, self.host_write_fds, self.deadline)
+    pub const fn readiness_generation(&self) -> u64 {
+        self.readiness_generation
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<RawFd>,
+        Vec<RawFd>,
+        Option<Instant>,
+        u64,
+        Vec<VsockHostReadinessRegistration>,
+    ) {
+        (
+            self.host_read_fds,
+            self.host_write_fds,
+            self.deadline,
+            self.readiness_generation,
+            self.read_registrations,
+        )
     }
 }
 
@@ -3649,9 +3675,17 @@ impl Arm64BootRuntimeResources {
         handler
             .activation_handler()
             .host_wakeup()
-            .map(|(read_fds, write_fds, deadline)| {
-                Arm64BootVsockWakeup::new(read_fds, write_fds, deadline)
-            })
+            .map(
+                |(read_fds, write_fds, deadline, readiness_generation, read_registrations)| {
+                    Arm64BootVsockWakeup::new(
+                        read_fds,
+                        write_fds,
+                        deadline,
+                        readiness_generation,
+                        read_registrations,
+                    )
+                },
+            )
             .map_err(|source| Arm64BootVsockWakeupFdsError::ResultAllocation { source })
     }
 

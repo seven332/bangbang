@@ -673,6 +673,28 @@ impl VsockOutcomeLogRateLimiter {
     }
 }
 
+/// Keeps the bounded endpoint-close evidence budget independent from frequent
+/// successful vsock data-plane records. A guest can still exhaust this budget,
+/// but ordinary RX/TX traffic cannot hide the first local EOF or read failure.
+#[derive(Debug, Clone, Default)]
+struct VsockEndpointOutcomeLogRateLimiter {
+    inner: LoggerRateLimiters,
+}
+
+impl VsockEndpointOutcomeLogRateLimiter {
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
+        Self {
+            inner: LoggerRateLimiters::with_clock(clock),
+        }
+    }
+
+    fn check(&self) -> LogRateLimitDecision {
+        self.inner
+            .check(LoggerRateLimitIdentity::VsockEndpointOutcome)
+    }
+}
+
 impl ObservabilityWorkerLogRateLimiter {
     #[cfg(test)]
     fn with_clock(clock: Arc<dyn LogRateLimiterClock>) -> Self {
@@ -876,6 +898,7 @@ struct GuestLoggerInner {
     serial_rate_limiter: SerialOutcomeLogRateLimiter,
     time_identity_rate_limiter: TimeIdentityOutcomeLogRateLimiter,
     vsock_rate_limiter: VsockOutcomeLogRateLimiter,
+    vsock_endpoint_rate_limiter: VsockEndpointOutcomeLogRateLimiter,
 }
 
 impl fmt::Debug for GuestLogger {
@@ -905,6 +928,10 @@ impl fmt::Debug for GuestLogger {
                 &self.inner.time_identity_rate_limiter,
             )
             .field("vsock_rate_limiter", &self.inner.vsock_rate_limiter)
+            .field(
+                "vsock_endpoint_rate_limiter",
+                &self.inner.vsock_endpoint_rate_limiter,
+            )
             .finish()
     }
 }
@@ -960,7 +987,7 @@ impl GuestLogger {
             outcomes
                 .into_iter()
                 .map(|outcome| (outcome.level(), LoggerEvent::Balloon(outcome))),
-            || self.inner.balloon_rate_limiter.check(),
+            |_| self.inner.balloon_rate_limiter.check(),
         );
     }
 
@@ -993,7 +1020,7 @@ impl GuestLogger {
             outcomes
                 .into_iter()
                 .map(|outcome| (outcome.level(), LoggerEvent::Entropy(outcome))),
-            || self.inner.entropy_rate_limiter.check(),
+            |_| self.inner.entropy_rate_limiter.check(),
         );
     }
 
@@ -1016,7 +1043,7 @@ impl GuestLogger {
             outcomes
                 .into_iter()
                 .map(|outcome| (outcome.level(), LoggerEvent::MemoryHotplug(outcome))),
-            || self.inner.memory_hotplug_rate_limiter.check(),
+            |_| self.inner.memory_hotplug_rate_limiter.check(),
         );
     }
 
@@ -1062,11 +1089,18 @@ impl GuestLogger {
 
     #[track_caller]
     pub fn log_vsock(&self, outcome: LoggerVsockOutcome) {
+        let check_limiter = || {
+            if outcome.uses_endpoint_rate_limiter() {
+                self.inner.vsock_endpoint_rate_limiter.check()
+            } else {
+                self.inner.vsock_rate_limiter.check()
+            }
+        };
         self.log_limited(
             outcome.level(),
             DEVICE_LOG_MODULE,
             LoggerEvent::Vsock(outcome),
-            || self.inner.vsock_rate_limiter.check(),
+            check_limiter,
         );
     }
 
@@ -1076,7 +1110,12 @@ impl GuestLogger {
             outcomes
                 .into_iter()
                 .map(|outcome| (outcome.level(), LoggerEvent::Vsock(outcome))),
-            || self.inner.vsock_rate_limiter.check(),
+            |event| match event {
+                LoggerEvent::Vsock(outcome) if outcome.uses_endpoint_rate_limiter() => {
+                    self.inner.vsock_endpoint_rate_limiter.check()
+                }
+                _ => self.inner.vsock_rate_limiter.check(),
+            },
         );
     }
 
@@ -1136,7 +1175,7 @@ impl GuestLogger {
     fn log_limited_summary(
         &self,
         events: impl IntoIterator<Item = (LoggerLevel, LoggerEvent)>,
-        mut check_limiter: impl FnMut() -> LogRateLimitDecision,
+        mut check_limiter: impl FnMut(&LoggerEvent) -> LogRateLimitDecision,
     ) {
         if !module_filter_allows(self.inner.module.as_deref(), DEVICE_LOG_MODULE) {
             return;
@@ -1151,7 +1190,7 @@ impl GuestLogger {
             if !self.inner.level.allows(level) {
                 continue;
             }
-            match check_limiter() {
+            match check_limiter(&event) {
                 LogRateLimitDecision::Admitted {
                     suppressed: recovered,
                 } => {
@@ -1221,6 +1260,7 @@ pub struct LoggerState {
     serial_rate_limiter: SerialOutcomeLogRateLimiter,
     time_identity_rate_limiter: TimeIdentityOutcomeLogRateLimiter,
     vsock_rate_limiter: VsockOutcomeLogRateLimiter,
+    vsock_endpoint_rate_limiter: VsockEndpointOutcomeLogRateLimiter,
     delivery_config: LoggerDeliveryConfig,
 }
 
@@ -1256,6 +1296,10 @@ impl fmt::Debug for LoggerState {
                 &self.time_identity_rate_limiter,
             )
             .field("vsock_rate_limiter", &self.vsock_rate_limiter)
+            .field(
+                "vsock_endpoint_rate_limiter",
+                &self.vsock_endpoint_rate_limiter,
+            )
             .field("delivery_config", &self.delivery_config)
             .finish()
     }
@@ -1309,6 +1353,7 @@ impl LoggerState {
             serial_rate_limiter: SerialOutcomeLogRateLimiter::default(),
             time_identity_rate_limiter: TimeIdentityOutcomeLogRateLimiter::default(),
             vsock_rate_limiter: VsockOutcomeLogRateLimiter::default(),
+            vsock_endpoint_rate_limiter: VsockEndpointOutcomeLogRateLimiter::default(),
             delivery_config: LoggerDeliveryConfig::default(),
         }
     }
@@ -1619,6 +1664,7 @@ impl LoggerState {
                 serial_rate_limiter: self.serial_rate_limiter.clone(),
                 time_identity_rate_limiter: self.time_identity_rate_limiter.clone(),
                 vsock_rate_limiter: self.vsock_rate_limiter.clone(),
+                vsock_endpoint_rate_limiter: self.vsock_endpoint_rate_limiter.clone(),
             }),
         }
     }
@@ -1784,7 +1830,7 @@ mod tests {
         NetworkOutcomeLogRateLimiter, ObservabilityWorkerLogRateLimiter, PmemOutcomeLogRateLimiter,
         ProcessStartupOutcome, ProcessTerminalCategory, SerialOutcomeLogRateLimiter,
         SharedLoggerMetrics, TimeIdentityOutcomeLogRateLimiter, TransportOutcomeLogRateLimiter,
-        VsockOutcomeLogRateLimiter,
+        VsockEndpointOutcomeLogRateLimiter, VsockOutcomeLogRateLimiter,
     };
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
 
@@ -2379,9 +2425,9 @@ mod tests {
         let logger = state.guest_logger();
 
         logger.log_vsock_summary([
-            LoggerVsockOutcome::GuestConnectionDropped,
-            LoggerVsockOutcome::TxSucceeded,
-            LoggerVsockOutcome::ConnectionResetQueued,
+            LoggerVsockOutcome::HostStreamGuestConnectionReadFailed,
+            LoggerVsockOutcome::GuestRwHostConnectionMissing,
+            LoggerVsockOutcome::ConnectionResetDelivered,
         ]);
         gate.wait_until_entered();
         assert_eq!(
@@ -2394,10 +2440,50 @@ mod tests {
         assert!(logger.wait_for_delivery_for_test());
         assert_eq!(
             *output.lock().expect("output lock should succeed"),
-            b"device-kind=vsock operation=guest-connection outcome=dropped\n\
-              device-kind=vsock operation=tx outcome=succeeded\n\
-              device-kind=vsock operation=connection-reset outcome=queued\n"
+            b"device-kind=vsock operation=host-stream-guest-connection outcome=read-failed\n\
+              device-kind=vsock operation=guest-rw-host-connection outcome=missing\n\
+              device-kind=vsock operation=connection-reset outcome=delivered\n"
         );
+    }
+
+    #[test]
+    fn vsock_endpoint_summary_survives_saturated_data_plane_limiter() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SharedLoggerMetrics::default();
+        let clock = Arc::new(TestClock::default());
+        let mut state = LoggerState::with_shared_metrics(metrics.clone());
+        state.vsock_rate_limiter = VsockOutcomeLogRateLimiter::with_clock(clock.clone());
+        state.vsock_endpoint_rate_limiter = VsockEndpointOutcomeLogRateLimiter::with_clock(clock);
+        state.configure_test_writer(SharedWriter(output.clone()));
+        let logger = state.guest_logger();
+
+        for _ in 0..10 {
+            logger.log_vsock(LoggerVsockOutcome::RxSucceeded);
+        }
+        logger.log_vsock_summary([
+            LoggerVsockOutcome::HostStreamHostConnectionClosed,
+            LoggerVsockOutcome::GuestConnectionClosed,
+            LoggerVsockOutcome::TxSucceeded,
+        ]);
+
+        assert!(logger.wait_for_delivery_for_test());
+        let output = String::from_utf8(output.lock().expect("output lock should succeed").clone())
+            .expect("vsock output should be UTF-8");
+        assert_eq!(
+            output
+                .matches("device-kind=vsock operation=rx outcome=succeeded\n")
+                .count(),
+            10
+        );
+        assert_eq!(
+            output
+                .matches("device-kind=vsock operation=host-stream-host-connection outcome=closed\n")
+                .count(),
+            1
+        );
+        assert!(!output.contains("operation=guest-connection outcome=closed"));
+        assert!(!output.contains("operation=tx outcome=succeeded"));
+        assert_eq!(metrics.rate_limited_log_count(), 2);
     }
 
     #[test]
