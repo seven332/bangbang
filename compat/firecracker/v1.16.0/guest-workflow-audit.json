@@ -94,10 +94,10 @@
       }
     },
     {
-      "id": "rootfs-ext4-direct-boot-v109",
+      "id": "rootfs-ext4-direct-boot-v110",
       "source_artifact": "rootfs",
-      "variant": "direct-boot-v109",
-      "filename_template": "ubuntu-24.04-{size}-direct-boot-v109.ext4",
+      "variant": "direct-boot-v110",
+      "filename_template": "ubuntu-24.04-{size}-direct-boot-v110.ext4",
       "default_size": "512M",
       "minimum_size_bytes": 1024,
       "classification": "recipe-deterministic",
@@ -111,6 +111,7 @@
         "compat/firecracker/v1.16.0/guest-workflow-audit.json",
         "scripts/fetch-firecracker-rootfs.sh",
         "scripts/guest/arm64-id-register-report.rs",
+        "scripts/guest/production_vmnet_certification.py",
         "scripts/guest/specification-benchmark.rs",
         "scripts/guest_artifact_policy.py"
       ],

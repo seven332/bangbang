@@ -1,0 +1,24 @@
+{
+  "fixture": {
+    "executable": "/private/path/to/production-vmnet-fixture",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "optional_cases": {
+    "bridged_interface": null,
+    "host_connectivity": false,
+    "not_authorized": false,
+    "sharing_service_busy": false
+  },
+  "provisioning_profile": "/private/path/to/approved.provisionprofile",
+  "schema_version": 1,
+  "signing_identity": "REPLACE WITH AN APPLE-APPROVED SIGNING IDENTITY",
+  "timeouts": {
+    "artifact_seconds": 600,
+    "build_seconds": 900,
+    "fixture_seconds": 120,
+    "guest_seconds": 60,
+    "request_seconds": 5,
+    "startup_seconds": 30,
+    "terminate_seconds": 5
+  }
+}

@@ -8,12 +8,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, os.fspath(REPOSITORY_ROOT / "scripts"))
 
 import specification_workload as workload  # noqa: E402
+import guest_artifact_policy as artifact_policy  # noqa: E402
 
 
 STORAGE_CHECKSUM = 12_345_678_901
@@ -218,10 +220,28 @@ else:
 
             report = populate / "bangbang-arm64-id-register-report"
             benchmark = populate / "bangbang-specification-benchmark"
+            vmnet = populate / "bangbang-production-vmnet-certification"
+            init = populate / "bangbang-direct-rootfs-init"
             self.assertTrue(report.is_file())
             self.assertTrue(benchmark.is_file())
+            self.assertTrue(vmnet.is_file())
             self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o755)
             self.assertEqual(stat.S_IMODE(benchmark.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(vmnet.stat().st_mode), 0o555)
+            self.assertEqual(
+                vmnet.read_bytes(),
+                (
+                    REPOSITORY_ROOT
+                    / "scripts/guest/production_vmnet_certification.py"
+                ).read_bytes(),
+            )
+            init_text = init.read_text(encoding="utf-8")
+            selector = "cmdline_has bangbang.production-vmnet-certification=1"
+            self.assertEqual(init_text.count(selector), 1)
+            self.assertLess(
+                init_text.index(selector),
+                init_text.index("write_vdb_marker BANGBANG_DIRECT_ROOTFS_BLOCK_OK"),
+            )
 
             invocations = [
                 json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
@@ -280,7 +300,7 @@ else:
         direct = next(
             recipe
             for recipe in manifest["ext4_recipes"]
-            if recipe["id"] == "rootfs-ext4-direct-boot-v109"
+            if recipe["id"] == "rootfs-ext4-direct-boot-v110"
         )
         self.assertEqual(
             direct["tracked_inputs"],
@@ -288,10 +308,27 @@ else:
                 "compat/firecracker/v1.16.0/guest-workflow-audit.json",
                 "scripts/fetch-firecracker-rootfs.sh",
                 "scripts/guest/arm64-id-register-report.rs",
+                "scripts/guest/production_vmnet_certification.py",
                 "scripts/guest/specification-benchmark.rs",
                 "scripts/guest_artifact_policy.py",
             ],
         )
+
+        parsed = artifact_policy.load_manifest()
+        recipe = parsed.recipes["rootfs-ext4-direct-boot-v110"]
+        baseline = artifact_policy._recipe_digest(recipe)
+        helper = REPOSITORY_ROOT / "scripts/guest/production_vmnet_certification.py"
+        real_sha256 = artifact_policy._sha256
+
+        def changed_helper(path: Path) -> str:
+            if path == helper:
+                return "f" * 64
+            return real_sha256(path)
+
+        with mock.patch.object(
+            artifact_policy, "_sha256", side_effect=changed_helper
+        ):
+            self.assertNotEqual(artifact_policy._recipe_digest(recipe), baseline)
 
 
 if __name__ == "__main__":

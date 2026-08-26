@@ -154,6 +154,12 @@ metadata can change bytes, so this is recipe-deterministic—not a byte-identica
 or crash-atomic image/sidecar claim. The ext4 output is not substituted into the
 two public workflow profiles.
 
+Tests that request `--direct-boot-init` use the separate current
+`direct-boot-v110` recipe. V110 tracks and installs the mode-`0555`
+production-vmnet guest oracle in addition to the existing helpers; it does not
+reuse historical v109 sidecars. The public workflow above never selects that
+oracle and remains networkless.
+
 ## Troubleshooting
 
 - `the macOS guest workflow requires Apple Silicon`: run on Darwin arm64; cross

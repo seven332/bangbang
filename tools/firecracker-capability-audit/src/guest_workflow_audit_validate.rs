@@ -19,7 +19,7 @@ pub const GUEST_WORKFLOW_AUDIT_PATH: &str = "compat/firecracker/v1.16.0/guest-wo
 /// Exact ordered artifact identities owned by the authority.
 pub const GUEST_ARTIFACT_IDS: [&str; 2] = ["kernel", "rootfs"];
 /// Exact ordered ext4 recipe identities owned by the authority.
-pub const GUEST_EXT4_RECIPE_IDS: [&str; 2] = ["rootfs-ext4", "rootfs-ext4-direct-boot-v109"];
+pub const GUEST_EXT4_RECIPE_IDS: [&str; 2] = ["rootfs-ext4", "rootfs-ext4-direct-boot-v110"];
 /// Exact ordered planned workflow identities reserved for the completion slice.
 pub const GUEST_WORKFLOW_PROFILE_IDS: [&str; 2] =
     ["macos-api-rootfs-smoke", "macos-no-api-rootfs-smoke"];
@@ -276,13 +276,14 @@ fn validate_ext4_recipes(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
             )
         } else {
             (
-                "direct-boot-v109",
-                "ubuntu-24.04-{size}-direct-boot-v109.ext4",
+                "direct-boot-v110",
+                "ubuntu-24.04-{size}-direct-boot-v110.ext4",
                 "512M",
                 &[
                     GUEST_WORKFLOW_AUDIT_PATH,
                     "scripts/fetch-firecracker-rootfs.sh",
                     "scripts/guest/arm64-id-register-report.rs",
+                    "scripts/guest/production_vmnet_certification.py",
                     "scripts/guest/specification-benchmark.rs",
                     "scripts/guest_artifact_policy.py",
                 ],
@@ -698,7 +699,7 @@ fn validate_source_tokens(repository_root: &Path, errors: &mut Vec<String>) {
         ),
         (
             "scripts/fetch-firecracker-rootfs.sh",
-            &["direct-boot-v109", "guest_artifact_policy.py"][..],
+            &["direct-boot-v110", "guest_artifact_policy.py"][..],
         ),
         (
             "scripts/build-guest-boot-initrd.py",

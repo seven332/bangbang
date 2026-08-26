@@ -2790,6 +2790,78 @@ probe—not the supplied worker—is the only executable handed to the
 authorization runner. None of those tests claim `vmnet_start_interface` or
 packet connectivity; that positive signed matrix remains #1378.
 
+### Production vmnet certification foundation
+
+The credential-free first #1378 slice defines the inputs and oracles for a
+later production runner without building a bundle or opening vmnet. The host
+module intentionally exposes only validation commands:
+
+```sh
+python3 scripts/production_vmnet_certification.py validate-config \
+  --config /absolute/private/config.json
+python3 scripts/production_vmnet_certification.py validate-result \
+  --result /absolute/private/result.json
+python3 -m unittest \
+  scripts.tests.test_production_vmnet_certification \
+  scripts.tests.test_production_vmnet_guest
+```
+
+The example
+[`scripts/production-vmnet-certification-config.example.json`](../scripts/production-vmnet-certification-config.example.json)
+contains placeholders only. A real config must be canonical JSON in an
+absolute, current-owner, one-link, regular non-symlink file with mode `0600`.
+It names exactly one non-ad-hoc signing identity, one private provisioning
+profile, one absolute executable fixture plus its SHA-256, four closed optional
+case selectors, and seven bounded timeouts. The command discovers no keychain,
+profile, bridge, endpoint, or alternate fixture. Paths, identity, interface,
+digest, endpoint, nonce, traffic, process/session values, and raw tool output
+never enter its fixed errors or the result.
+
+One fixture session rechecks the configured executable's device, inode, size,
+timestamps, and digest, then launches that exact path directly with no
+arguments or shell. It receives a private `0700` working directory, exact
+minimal environment, a separate process group, bounded pipes and lifetime, and
+the canonical v1
+`prepare -> ready -> observed -> cleanup -> complete` exchange. Connectivity
+`ready` returns a private endpoint; `observed` remains an independent fixture
+assertion. A service-condition fixture may prepare host state but cannot
+declare Bangbang's result. Any replay, wrong case/nonce/state, stderr, extra
+line, timeout, early exit, executable replacement, or uncertain cleanup fails.
+
+The guest helper is installed as the exact mode-`0555`
+`/bangbang-production-vmnet-certification` input of the current
+`direct-boot-v110` recipe. The non-sensitive
+`bangbang.production-vmnet-certification=1` boot selector invokes it without
+private arguments. A later runner will attach one read-only 512-byte `/dev/vdb`
+control sector carrying the mode, private endpoint, port, and nonce under a
+SHA-256 binding. The helper discovers exactly one virtio-net interface, performs
+strict interface-bound DHCPv4 under one 30-second deadline, applies only the
+accepted address/default route, completes one exact nonce-bound bidirectional
+TCP exchange, and reverses guest network configuration. Serial output is
+limited to:
+
+```text
+BANGBANG_PRODUCTION_VMNET_CERTIFICATION_BEGIN
+BANGBANG_PRODUCTION_VMNET_CERTIFICATION_OK
+BANGBANG_PRODUCTION_VMNET_CERTIFICATION_FAIL_<FIXED_PHASE>
+```
+
+The canonical result contains the source/platform categories, three
+entitlement assertions, all 21 fixed case rows, cleanup state, and a coherent
+categorical verdict. Publication uses a private same-directory stage and an
+atomic no-replace commit; neither validation command produces a result. The
+historical `direct-boot-v109` identity is not reused for the new helper bytes:
+current preparation accepts only `direct-boot-v110`, so v109 invocation and
+sidecar identities are stale and rejected.
+
+These portable tests use fake DHCP/TCP/kernel-command boundaries and a local
+fixture process. They launch no Bangbang production bundle, create no vmnet
+interface, use no Apple credentials, and promote no capability. Until the
+subsequent orchestration and caller-approved external execution slices finish,
+`corpus:network-setup` and
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` remain
+`audit-required` and the global final gate remains expected to fail on them.
+
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
 absent final paths. Its producer captures the complete non-memory state and
@@ -3642,16 +3714,19 @@ operator preparation and reproducibility boundary remain in the owner guide.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v109.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v110.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script plus static
 `/bangbang-arm64-id-register-report` and
-`/bangbang-specification-benchmark` helpers added before image creation. Both
-Rust helpers use the same closed `aarch64-unknown-linux-musl`, `rust-lld`,
-path-remapping, static-link, relocation, and stripping flags. Their checked
-sources are direct-rootfs recipe-digest inputs, so changing or omitting either
-source invalidates the sidecar-verified cache. The test
+`/bangbang-specification-benchmark` helpers and the exact mode-`0555`
+`/bangbang-production-vmnet-certification` Python helper added before image
+creation. The two Rust helpers use the same closed
+`aarch64-unknown-linux-musl`, `rust-lld`, path-remapping, static-link,
+relocation, and stripping flags. All three checked helper sources are
+direct-rootfs recipe-digest inputs, so changing or omitting any source
+invalidates the sidecar-verified cache. The v110 recipe supersedes rather than
+aliases historical v109 bytes. The test
 boots without the tiny initrd, attaches that ext4 image as a read-only root
 drive, and passes `init=/bangbang-direct-rootfs-init`. The `guest_boot` target
 expects deterministic serial markers plus Ubuntu os-release content from
