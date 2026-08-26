@@ -51,11 +51,11 @@ Each detailed subject has one primary document:
 - [Production Host Contract](compat/firecracker/v1.16.0/production-host-contract.md)
   owns the complete 31-clause production-host source accounting, terminal
   macOS/platform outcomes, operator boundaries, and exact #1378 handoff.
-- [Production vmnet certification foundation](docs/testing.md#production-vmnet-certification-foundation)
-  owns the credential-free private config, retained fixture, guest DHCP/TCP
-  oracle, redacted result, and direct-rootfs v110 contracts that a later
-  production runner will compose. It deliberately exposes validation only and
-  does not claim a real vmnet run.
+- [Production vmnet certification runner](docs/testing.md#production-vmnet-certification-foundation)
+  owns the private config, retained fixture, guest DHCP/TCP oracle, two-package
+  inspection, descriptor-grant assembly, fixed 21-case production matrix, and
+  redacted result. Portable validation does not substitute for the final
+  caller-approved credentialed execution or promote its two capability rows.
 - [Wave 7 Aggregate Authority](compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
   machine-checks the terminal design, device API, release, public-tool, and
   virtio-MMIO closure while retaining every external handoff.

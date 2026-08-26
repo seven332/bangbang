@@ -158,6 +158,23 @@ jobs:
             exit 1
           fi
 
+      - name: Verify production vmnet certification fails closed without credentials
+        run: |
+          certification_result="$RUNNER_TEMP/production-vmnet-result.json"
+          set +e
+          certification_output="$(python3 scripts/production_vmnet_certification.py \
+            run \
+            --config "$GITHUB_WORKSPACE/scripts/production-vmnet-certification-config.example.json" \
+            --result "$certification_result" 2>&1)"
+          certification_status=$?
+          set -e
+          if [[ "$certification_status" -ne 3 \
+            || "$certification_output" != "bangbang production vmnet run: blocked category=config" \
+            || -e "$certification_result" ]]; then
+            echo "production vmnet certification did not fail closed before publication" >&2
+            exit 1
+          fi
+
       - name: Run HVF unit tests
         run: cargo test -p bangbang-hvf --lib --all-features --locked
 

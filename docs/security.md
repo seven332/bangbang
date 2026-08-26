@@ -1250,8 +1250,8 @@ worker.
 
 ### Production vmnet certification trust and private-data channels
 
-The first #1378 certification slice defines a credential-free protocol
-foundation, not a positive run. Its canonical config is an absolute,
+The #1378 certification foundation and checked production runner still do not
+constitute a positive credentialed run. The canonical config is an absolute,
 current-owner, one-link regular file with mode `0600`; it is the only source of
 the caller's signing identity, provisioning profile, exact fixture executable
 and digest, optional case authority, bridge selector, and timeouts. The command
@@ -1269,7 +1269,7 @@ replacement, interruption, or uncertain cleanup fails closed.
 
 Private guest input does not use argv, environment, boot-argument values, or
 MMDS. The generated direct-rootfs init already publishes its command line, and
-MMDS would add a second network dependency. A later runner instead grants one
+MMDS would add a second network dependency. The runner instead grants one
 read-only exact 512-byte `/dev/vdb` control sector through the existing
 descriptor-rooted drive authority. The sector binds mode, endpoint, port, and a
 nonzero 32-byte nonce with fixed fields, reserved-zero bytes, SHA-256, and zero
@@ -1278,14 +1278,33 @@ emits fixed phase markers and performs strict DHCP plus one exact nonce-bound
 TCP exchange without printing MACs, addresses, routes, endpoints, nonces,
 payloads, or raw socket errors.
 
+The system driver requires a clean source tree, including no non-ignored
+untracked inputs, and exact host platform, prepares only the pinned kernel and
+`direct-boot-v110` rootfs, and uses the existing production builder for
+separate networkless and approved vmnet packages. It checks bundle layout,
+signatures, the entitlement-free
+outer launchers, and both exact nested-worker profiles before running a case.
+It launches only the outer process. Kernel, rootfs, control sector, serial sink,
+and API socket enter the worker exclusively through canonical descriptor-rooted
+grants and the authenticated session policy. Private config values are not
+copied to child environments, diagnostics, captures, or the result; bounded raw
+tool and process output is used only for closed checks and is never emitted.
+Process inspection requests only pid/ppid/state/comm. Every API connection
+rechecks the socket device/inode and requires Darwin's peer PID to be the exact
+contained worker discovered under the outer launcher.
+
 The public result is categorical: it contains source/platform categories,
 three entitlement assertions, the complete fixed 21-case ledger, cleanup, and
 verdict. It contains no identity, path, fingerprint, bridge/interface,
 endpoint, address, nonce, traffic, PID/session, or raw output and is published
 through a mode-`0600` same-directory no-clobber transaction. Service-condition
-rows can pass only from a future real Bangbang result; fixture state alone is
-never evidence. The current validation-only command opens no vmnet interface
-and leaves both #1378 capability rows `audit-required`.
+rows pass only from Bangbang's own typed API result after caller-authorized
+fixture preparation; fixture state alone is never evidence. Setup failures
+publish nothing. Once setup succeeds, a case failure can publish only a failed
+ledger after driver and session cleanup; uncertain cleanup is marked incomplete
+and takes precedence over success. The checked runner has not been invoked with
+repository-owned restricted credentials, so it leaves both #1378 capability
+rows `audit-required`.
 
 The vmnet path requires the host to satisfy macOS vmnet authorization,
 entitlement, and code-signing requirements. Apple's

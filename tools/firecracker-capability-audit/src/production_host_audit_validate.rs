@@ -952,11 +952,21 @@ fn expected_evidence(
                     "scripts/preflight-production-vmnet.sh",
                     "bangbang vmnet preflight: blocked",
                 ),
+                (
+                    "scripts/production_vmnet_certification.py",
+                    "def run_certification(",
+                ),
             ],
-            &[(
-                "crates/launcher/tests/production_bundle_e2e.rs",
-                "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()",
-            )],
+            &[
+                (
+                    "crates/launcher/tests/production_bundle_e2e.rs",
+                    "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()",
+                ),
+                (
+                    "scripts/tests/test_production_vmnet_orchestration.py",
+                    "class ProductionVmnetOrchestrationTests",
+                ),
+            ],
         ),
     }
 }
