@@ -67,7 +67,7 @@ read-only, write-only, read-write, create-children, and connect-children.
 | `initrd-image` | regular file, read-only | One-time guest initrd load |
 | `drive-backing` | regular file or block device, read-only/read-write | Transactional startup, hotplug, replacement, and restore |
 | `pmem-backing` | regular file, read-only/read-write | Transactional startup, hotplug, replacement, and restore |
-| `api-socket-directory` | directory, create-children | Session-retained bind/publication/cleanup |
+| `api-socket-directory` | directory, create-children | Worker claim, launcher staged bind/publication, record-backed cleanup |
 | `vsock-socket-directory` | directory, create-children | Session-retained listener/publication/connect |
 | `logger-sink` | regular file, write-only | One-time output adoption |
 | `metrics-sink` | regular file, write-only | One-time output adoption |
@@ -90,7 +90,10 @@ file and directory population before one commit exposes authority.
 Contained consumers use opened identities or retained anchored scopes; no
 tagged path string becomes ambient authority. Startup and restore preflight
 complete before mutation. Storage and snapshot transactions return unused
-authority on abort and consume it exactly on commit. API/vsock publication,
+authority on abort and consume it exactly on commit. Ordinary API publication
+uses one authenticated worker request, launcher-owned private staging, a
+durable record before exclusive rename, and one exact listener reply; later
+vsock activation carries the same broker sequence. API/vsock publication,
 vhost-user exact-child connects, retained block control, and pager streams each
 use separate bounded session/sequence protocols rather than a general dynamic
 resource broker.

@@ -879,34 +879,49 @@ Direct mode continues treating the identical bytes as an ordinary path. Claims
 are singleton, require exact `CreateChildren` role/access, and consume only
 after complete consumer validation. No-API mode never claims the API role.
 
-The owner thread retains the resolved scope and exact directory anchor. A
-short-lived default-close instance of the already signed worker authenticates
-its parent, receives only its control endpoint at fd5 and the exact private
-namespace anchor at fd6, enters that anchor, binds one fixed role-specific
-staging name, validates the listener, and transfers its descriptor. It retains
+The owner thread retains the resolved scope and exact directory anchor. For an
+ordinary granted API socket, the App Sandbox worker claims the safe child and
+uses the existing authenticated descriptor-5 socket broker to send one
+session/sequence-bound `PublishApi` request. The launcher duplicates the live
+validated private namespace, enters it through the serialized cwd boundary,
+binds only the fixed API staging name, applies close-on-exec, nonblocking,
+owner-only listener state, and writes the fixed durable ownership record before
+an fd-relative `renameatx_np(RENAME_EXCL)` into the exact grant anchor. Only
+after final path, record, listener, owner, mode, link, and identity revalidation
+does it send `ApiPublished` with exactly one descriptor. A backpressured reply
+retains the same listener alias, identity, sequence, and absolute deadline; it
+never repeats bind, record creation, or rename. The worker requires that exact
+record and validates the final path and received listener before API readiness,
+then restores the same broker endpoint at its advanced sequence. Direct API
+paths and no-API startup do not use this transaction.
+
+The short-lived default-close instance of the already signed worker remains
+the vsock staging binder. It authenticates its parent, receives only its control
+endpoint at fd5 and the exact private namespace anchor at fd6, binds the fixed
+vsock staging name, validates it, and transfers exactly one listener. It retains
 the listener until the authenticated parent returns one fixed adoption
-acknowledgment bound to the role and socket device/inode; the parent sends that
-acknowledgment only after validating the received descriptor. This keeps the
-listener externally reachable until `SCM_RIGHTS` externalization completes,
+acknowledgment bound to the vsock role and socket device/inode; the parent sends
+that acknowledgment only after validating the received descriptor. This keeps
+the listener externally reachable until `SCM_RIGHTS` externalization completes,
 rather than leaving its last reference only in an in-flight Unix-domain
-message. The main worker then verifies the namespace inode and listener
-identity, writes one fixed bounded record containing only role, safe child, and
-socket device/inode, and publishes the live vnode exclusively with fd-relative
-`renameatx_np(RENAME_EXCL)` to the grant anchor. Cross-filesystem publication,
-an existing target, symlink or pathname replacement, role/identity mismatch,
-malformed acknowledgment, and extra rights fail closed and value-redacted. The
-binder is killed and reaped on every failure and is always reaped before API
-readiness or VM-start success.
+message. The main worker verifies the namespace and listener identity, writes
+the fixed durable ownership record, and exclusively publishes that listener
+before VM-start success. Cross-filesystem publication, an existing target,
+symlink or pathname replacement, role/identity mismatch, malformed
+acknowledgment, and extra rights fail closed and value-redacted. The binder is
+killed and reaped on every failure and is always reaped before VM-start
+success.
 
 The supplied API listener preserves owner-only mode, no-clobber publication,
 readiness timing, and identity-aware cleanup. The supplied vsock main listener
 is retained through the VM lifetime and serves host-initiated Firecracker-style
 connections. For guest-initiated connections, contained vsock consumes the
 fixed descriptor-5 broker endpoint exactly once. `Activate` binds lifecycle
-SessionId, sequence 1, and the validated safe child; the launcher requires the
-retained exact `VsockSocketDirectory` anchor, enters it with `fchdir`, rechecks
-cwd identity, and cannot change the child afterward. Subsequent requests carry
-only a monotonic sequence and `u32` port. The launcher constructs only relative
+SessionId, the next carried sequence (one for vsock-only; two after API
+publication), and the validated safe child; the launcher requires the retained
+exact `VsockSocketDirectory` anchor, enters it with `fchdir`, rechecks cwd
+identity, and cannot change the child afterward. Subsequent requests carry only
+a monotonic sequence and `u32` port. The launcher constructs only relative
 `<SocketChild>_<port>`, validates the target before and after a nonblocking Unix
 connect, and returns at most one validated connected stream descriptor. Closed
 framing, exact rights counts, peer PID, lifecycle state, shutdown, EOF, and

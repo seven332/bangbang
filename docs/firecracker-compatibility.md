@@ -1271,6 +1271,18 @@ endpoints retain and validate only the locked open directory, and the feature
 namespace rejects ownership records. Ordinary foreground and daemon sessions
 remain linked and record-bearing.
 
+#1907 changes only ordinary rootless granted-API publication. The worker still
+claims the exact directory/child, but the authenticated socket broker now asks
+the unsandboxed launcher to bind the fixed private staging listener, durably
+write the ordinary ownership record, exclusively rename into the grant anchor,
+and return exactly one descriptor. The worker validates that record, final
+path, descriptor, peer, session, and sequence before readiness, then restores
+the same broker authority for a possible later vsock activation. A signed
+production regression completes 5,000 fresh HTTP 200 connections and exact
+signal/socket/record/staging/session cleanup. Direct and no-API modes, the
+vsock binder, and the separate feature-only record-free evidence above are
+unchanged.
+
 API and no-API daemons complete for mapped, retained-root/no-drop, and SDK-
 maximum unmapped identities. Every retirement fault, both single-endpoint death
 orders for both workloads, supervisor SIGINT/SIGTERM, worker SIGHUP, same-name
@@ -1355,9 +1367,10 @@ strings. Block and pmem consumers similarly adopt exact repeatable grants with
 access derived from device intent at config-file, API startup, and the existing
 live block replacement seam. Logger, metrics, and serial consume singleton
 write-only grants. API and vsock consume exact singleton directory anchors plus
-one bounded safe child; short-lived binders perform same-filesystem exclusive
-publication, while guest-initiated vsock connections use one fixed port-only
-launcher facet with no guest bytes or outgoing-network entitlement. Snapshot
+one bounded safe child. Ordinary API uses launcher-owned staged
+same-filesystem publication; vsock retains the short-lived binder, while
+guest-initiated connections use one fixed port-only launcher facet with no
+guest bytes or outgoing-network entitlement. Snapshot
 describe/state/memory consumers adopt exact files, and frozen native-v1 load
 may additionally adopt its persisted root; create retains
 repeatable output anchors with bounded children and strict crash-cleanup
@@ -5342,10 +5355,11 @@ identity after pathname replacement, redacted failure-atomic mismatch handling,
 guest block I/O, read-only rejection, pmem read/flush, logger records, initial
 and terminal metrics, guest serial bytes, concurrent output isolation, and live
 block swap. API and vsock consumers now adopt exact singleton directory grants
-plus a bounded safe child, use short-lived signed binders for same-filesystem
-anchored exclusive publication, retain supplied listeners and identity-aware
-cleanup, and keep guest-initiated vsock connects on one fixed session-bound
-launcher port facet without guest payloads or an outgoing-network entitlement.
+plus a bounded safe child. Ordinary API uses launcher-owned staged
+same-filesystem publication; vsock retains its short-lived signed binder. Both
+retain supplied listeners and identity-aware cleanup, and guest-initiated
+vsock connects stay on one fixed session-bound launcher port facet without
+guest payloads or an outgoing-network entitlement.
 Signed normal-bundle proof covers outside-container API clients, real guest- and
 host-initiated vsock traffic, two contained vhost-user children from one
 connect-only directory grant, active CONFIG refresh on the retained stream, no

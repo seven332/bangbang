@@ -2427,6 +2427,7 @@ mod platform {
         pub(crate) socket: UnixDatagram,
         pub(crate) session: SessionId,
         pub(crate) launcher_pid: libc::pid_t,
+        pub(crate) next_sequence: u64,
         pub(crate) wakeup: Option<Rc<UnixStream>>,
     }
 
@@ -2458,6 +2459,21 @@ mod platform {
                 return Err(GrantClaimError);
             }
             self.endpoint.as_ref().ok_or(GrantClaimError)
+        }
+
+        pub(crate) fn endpoint_mut(
+            &mut self,
+        ) -> Result<&mut SocketBrokerEndpoint, GrantClaimError> {
+            if !self
+                .authority
+                .state
+                .try_borrow()
+                .map_err(|_| GrantClaimError)?
+                .active
+            {
+                return Err(GrantClaimError);
+            }
+            self.endpoint.as_mut().ok_or(GrantClaimError)
         }
 
         pub(crate) fn commit(mut self) -> Result<SocketBrokerEndpoint, GrantClaimError> {
@@ -2499,6 +2515,19 @@ mod platform {
         pub(crate) fn abort(mut self) -> Result<(), GrantClaimError> {
             self.restore()
         }
+
+        pub(crate) fn restore_after_exchange(mut self) -> Result<(), GrantClaimError> {
+            if self.restore().is_err() {
+                self.authority.invalidate();
+                return Err(GrantClaimError);
+            }
+            Ok(())
+        }
+
+        pub(crate) fn invalidate(mut self) {
+            self.endpoint.take();
+            self.authority.invalidate();
+        }
     }
 
     impl Drop for PreparedSocketBrokerEndpoint {
@@ -2531,6 +2560,7 @@ mod platform {
                 .field("socket", &"<owned>")
                 .field("session", &"<redacted>")
                 .field("launcher_pid", &"<redacted>")
+                .field("next_sequence", &"<redacted>")
                 .field("wakeup", &self.wakeup.as_ref().map(|_| "<borrowed>"))
                 .finish()
         }
@@ -2559,6 +2589,7 @@ mod platform {
                         socket,
                         session,
                         launcher_pid,
+                        next_sequence: 1,
                         wakeup: None,
                     }),
                     active: true,
@@ -5636,8 +5667,9 @@ mod platform {
         TestContainedRestoreAuthority, TestDirectory as TestVhostDirectory,
         contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
         empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-        root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-        snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
+        ordinary_api_directory_authority_for_test, root_file_grant_authority_for_test,
+        snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
+        snapshot_storage_grant_authority_for_test, socket_broker_authority_for_test,
         vhost_directory_authority_for_test, vsock_directory_authority_for_test,
     };
 
@@ -7300,6 +7332,25 @@ mod platform {
             )
         }
 
+        pub(crate) fn ordinary_api_directory_authority_for_test()
+        -> (DirectoryGrantAuthority, TestDirectory) {
+            let (mut registry, directory) =
+                directory_registry("api-directory", ResourceRole::ApiSocketDirectory);
+            (
+                DirectoryGrantAuthority::new(registry.take_directory_registry()),
+                directory,
+            )
+        }
+
+        pub(crate) fn socket_broker_authority_for_test()
+        -> (SocketBrokerAuthority, UnixDatagram, SessionId) {
+            let session = next_restore_session();
+            let (worker, launcher) = UnixDatagram::pair().expect("broker pair should create");
+            // SAFETY: Both broker endpoints belong to this test process.
+            let authority = SocketBrokerAuthority::new(worker, session, unsafe { libc::getpid() });
+            (authority, launcher, session)
+        }
+
         #[cfg(feature = "elevated-bootstrap-probe")]
         pub(crate) fn api_directory_authority_for_test() -> (DirectoryGrantAuthority, TestDirectory)
         {
@@ -7875,6 +7926,33 @@ mod platform {
             assert!(authority.prepare_endpoint().is_err());
             assert!(!format!("{prepared:?}").contains("91"));
             drop(prepared);
+
+            let mut exchanged = authority
+                .prepare_endpoint()
+                .expect("restored endpoint should reserve for an exchange");
+            exchanged
+                .endpoint_mut()
+                .expect("reserved endpoint should remain active")
+                .next_sequence = 7;
+            exchanged
+                .restore_after_exchange()
+                .expect("successful exchange should restore authority");
+            let carried = authority
+                .prepare_endpoint()
+                .expect("restored exchange should remain reservable");
+            assert_eq!(
+                carried
+                    .endpoint()
+                    .expect("carried endpoint should remain active")
+                    .next_sequence,
+                7
+            );
+            let debug = format!("{:?}", carried.endpoint().expect("endpoint"));
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("next_sequence: 7"));
+            carried
+                .abort()
+                .expect("carried endpoint should restore after inspection");
 
             let committed = authority
                 .prepare_endpoint()
@@ -8650,7 +8728,8 @@ pub(crate) use platform::{
     ContainedSnapshotRestoreDriveRequest, TestContainedRestoreAuthority, TestVhostDirectory,
     contained_restore_authority_for_test, contained_restore_authority_with_grants_for_test,
     empty_grant_authority_for_vhost_test, file_grant_authority_for_test,
-    root_file_grant_authority_for_test, snapshot_file_grant_authority_for_test,
-    snapshot_root_file_grant_authority_for_test, snapshot_storage_grant_authority_for_test,
+    ordinary_api_directory_authority_for_test, root_file_grant_authority_for_test,
+    snapshot_file_grant_authority_for_test, snapshot_root_file_grant_authority_for_test,
+    snapshot_storage_grant_authority_for_test, socket_broker_authority_for_test,
     vhost_directory_authority_for_test, vsock_directory_authority_for_test,
 };

@@ -25,7 +25,7 @@ use super::block_control::LauncherBlockControlBroker;
 use super::daemon::{NotifierEvent, SessionNotifier};
 #[cfg(feature = "elevated-bootstrap-probe")]
 use super::elevated_guest::ElevatedGuestSupervisor;
-use super::socket_broker::{LauncherSocketBroker, SocketBrokerDrainStatus};
+use super::socket_broker::{ApiPublicationContext, LauncherSocketBroker, SocketBrokerDrainStatus};
 use super::spawn::OwnedWorker;
 use super::vhost_user_broker::LauncherVhostUserBroker;
 use crate::LauncherError;
@@ -859,6 +859,12 @@ fn wait_session_inner(
             0,
         ),
         event(
+            broker_fd,
+            libc::EVFILT_WRITE,
+            libc::EV_ADD | libc::EV_DISABLE | libc::EV_CLEAR,
+            0,
+        ),
+        event(
             vhost_broker_fd,
             libc::EVFILT_READ,
             libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
@@ -904,6 +910,7 @@ fn wait_session_inner(
     let mut grant_send = GrantSendState::new(grants, lifecycle.session());
     let mut broker = LauncherSocketBroker::new(lifecycle.session());
     let mut broker_complete = false;
+    let mut broker_write_enabled = false;
     let mut vhost_broker = LauncherVhostUserBroker::new(lifecycle.session());
     let mut block_control = LauncherBlockControlBroker::new(lifecycle.session());
     #[cfg(feature = "elevated-bootstrap-probe")]
@@ -914,6 +921,7 @@ fn wait_session_inner(
             cancellation_deadline,
             exit_deadline,
             grant_send.deadline(),
+            broker.deadline(),
             notifier_deadline,
             #[cfg(feature = "elevated-bootstrap-probe")]
             guest.as_ref().and_then(ElevatedGuestSupervisor::deadline),
@@ -1031,15 +1039,6 @@ fn wait_session_inner(
             .close()?;
         }
 
-        if observation.readiness.is_some()
-            && let Some(notifier) = notifier.as_deref_mut()
-            && notifier.is_awaiting_ready()
-        {
-            // SAFETY: `getpid` has no pointer or ownership contract.
-            let supervisor_pid = unsafe { libc::getpid() };
-            notifier.notify_ready(supervisor_pid)?;
-        }
-
         if let (Some(notifier_fd), Some(notifier)) = (notifier_fd, notifier.as_deref_mut())
             && events
                 .iter()
@@ -1095,15 +1094,71 @@ fn wait_session_inner(
                 lifecycle.state(),
                 lifecycle.is_cancelled(),
                 grants,
+                ApiPublicationContext::new(
+                    observation.namespace.as_ref(),
+                    grant_send.acknowledged(),
+                ),
             )? == SocketBrokerDrainStatus::Complete
         {
             // Shutdown is the broker's authenticated terminal message. Stop
             // observing the descriptor before the worker closes its peer.
             register_events(
                 kqueue.as_raw_fd(),
-                &[event(broker_fd, libc::EVFILT_READ, libc::EV_DELETE, 0)],
+                &[
+                    event(broker_fd, libc::EVFILT_READ, libc::EV_DELETE, 0),
+                    event(broker_fd, libc::EVFILT_WRITE, libc::EV_DELETE, 0),
+                ],
             )?;
             broker_complete = true;
+            broker_write_enabled = false;
+        }
+
+        if !broker_complete {
+            sync_broker_write_event(
+                kqueue.as_raw_fd(),
+                broker_fd,
+                &mut broker_write_enabled,
+                broker.requires_write_event(),
+            )?;
+            if events.iter().any(|queued| {
+                queued.filter == libc::EVFILT_WRITE
+                    && queued.ident == broker_fd
+                    && queued.flags & libc::EV_ERROR != 0
+            }) {
+                return Err(LauncherError::SocketBroker);
+            }
+            if !child_exited
+                && events.iter().any(|queued| {
+                    queued.filter == libc::EVFILT_WRITE
+                        && queued.ident == broker_fd
+                        && queued.flags & libc::EV_ERROR == 0
+                })
+            {
+                broker.pump(socket_broker)?;
+                sync_broker_write_event(
+                    kqueue.as_raw_fd(),
+                    broker_fd,
+                    &mut broker_write_enabled,
+                    broker.requires_write_event(),
+                )?;
+            }
+        }
+
+        if matches!(
+            observation.readiness,
+            Some(bangbang_session::Readiness::Api)
+        ) && !broker.api_readiness_is_valid()
+        {
+            return Err(LauncherError::SocketBroker);
+        }
+
+        if observation.readiness.is_some()
+            && let Some(notifier) = notifier.as_deref_mut()
+            && notifier.is_awaiting_ready()
+        {
+            // SAFETY: `getpid` has no pointer or ownership contract.
+            let supervisor_pid = unsafe { libc::getpid() };
+            notifier.notify_ready(supervisor_pid)?;
         }
 
         if !child_exited
@@ -1281,6 +1336,9 @@ fn wait_session_inner(
         }
         if grant_send.has_timed_out(Instant::now()) {
             return Err(LauncherError::GrantProtocol);
+        }
+        if broker.has_timed_out(Instant::now()) {
+            return Err(LauncherError::SocketBroker);
         }
         #[cfg(feature = "elevated-bootstrap-probe")]
         if !lifecycle.is_cancelled()
@@ -1706,6 +1764,10 @@ impl GrantSendState {
         self.final_sequence
     }
 
+    const fn acknowledged(&self) -> bool {
+        self.acknowledged
+    }
+
     fn begin(&mut self) -> Result<(), LauncherError> {
         if self.started || self.acknowledged || self.cancelled || self.outbound.is_empty() {
             return Err(LauncherError::GrantProtocol);
@@ -1796,6 +1858,32 @@ fn sync_grant_write_event(
     };
     register_events(kqueue, &[event(grant_fd, libc::EVFILT_WRITE, flag, 0)])?;
     state.event_enabled = should_enable;
+    Ok(())
+}
+
+fn sync_broker_write_event(
+    kqueue: RawFd,
+    broker_fd: usize,
+    enabled: &mut bool,
+    should_enable: bool,
+) -> Result<(), LauncherError> {
+    if should_enable == *enabled {
+        return Ok(());
+    }
+    register_events(
+        kqueue,
+        &[event(
+            broker_fd,
+            libc::EVFILT_WRITE,
+            if should_enable {
+                libc::EV_ENABLE
+            } else {
+                libc::EV_DISABLE
+            },
+            0,
+        )],
+    )?;
+    *enabled = should_enable;
     Ok(())
 }
 

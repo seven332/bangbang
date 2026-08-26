@@ -1,11 +1,13 @@
-//! Narrow launcher-side transport facet for granted-vsock guest connections.
+//! Narrow launcher-side transport for granted API publication and vsock connections.
 
 use std::ffi::{CStr, CString};
 use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
+use std::time::{Duration, Instant};
 
+use bangbang_session::macos::runtime::LauncherNamespace;
 use bangbang_session::macos::socket_broker::{
     SocketBrokerError, SocketBrokerMessage, receive_socket_broker_message,
     send_socket_broker_message,
@@ -16,13 +18,17 @@ use bangbang_session::{LauncherState, ObjectIdentity, ResourceRole, SessionId, S
 use crate::LauncherError;
 use crate::grant_manifest::PreparedGrantBatch;
 
+use super::api_listener::{ApiListenerPublication, publish_api_listener};
+
 const CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 8;
+const API_PUBLICATION_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Session-bound state for the one dormant or active broker endpoint.
 pub(crate) struct LauncherSocketBroker {
     session: SessionId,
     next_sequence: u64,
     state: BrokerState,
+    api: ApiPublicationState,
 }
 
 impl std::fmt::Debug for LauncherSocketBroker {
@@ -32,6 +38,7 @@ impl std::fmt::Debug for LauncherSocketBroker {
             .field("session", &"<redacted>")
             .field("next_sequence", &"<redacted>")
             .field("state", &self.state)
+            .field("api", &self.api)
             .finish()
     }
 }
@@ -43,6 +50,35 @@ enum BrokerState {
     Complete,
 }
 
+enum ApiPublicationState {
+    Available,
+    Pending(PendingApiPublicationReply),
+    Published,
+    Failed,
+}
+
+impl std::fmt::Debug for ApiPublicationState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Available => "Available",
+            Self::Pending(_) => "Pending(<redacted>)",
+            Self::Published => "Published",
+            Self::Failed => "Failed",
+        })
+    }
+}
+
+struct PendingApiPublicationReply {
+    sequence: u64,
+    deadline: Instant,
+    outcome: ApiPublicationOutcome,
+}
+
+enum ApiPublicationOutcome {
+    Published(ApiListenerPublication),
+    Failed(io::ErrorKind),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SocketBrokerDrainStatus {
     /// The authenticated broker remains open for another request.
@@ -51,12 +87,108 @@ pub(crate) enum SocketBrokerDrainStatus {
     Complete,
 }
 
+/// Narrow launcher authority required only by ordinary API publication.
+#[derive(Clone, Copy)]
+pub(crate) struct ApiPublicationContext<'a> {
+    namespace: Option<&'a LauncherNamespace>,
+    grants_acknowledged: bool,
+}
+
+impl<'a> ApiPublicationContext<'a> {
+    pub(crate) const fn new(
+        namespace: Option<&'a LauncherNamespace>,
+        grants_acknowledged: bool,
+    ) -> Self {
+        Self {
+            namespace,
+            grants_acknowledged,
+        }
+    }
+}
+
 impl LauncherSocketBroker {
     pub(crate) const fn new(session: SessionId) -> Self {
         Self {
             session,
             next_sequence: 1,
             state: BrokerState::Dormant,
+            api: ApiPublicationState::Available,
+        }
+    }
+
+    pub(crate) const fn api_readiness_is_valid(&self) -> bool {
+        matches!(
+            self.api,
+            ApiPublicationState::Available | ApiPublicationState::Published
+        )
+    }
+
+    pub(crate) const fn requires_write_event(&self) -> bool {
+        matches!(self.api, ApiPublicationState::Pending(_))
+    }
+
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
+        match &self.api {
+            ApiPublicationState::Pending(pending) => Some(pending.deadline),
+            ApiPublicationState::Available
+            | ApiPublicationState::Published
+            | ApiPublicationState::Failed => None,
+        }
+    }
+
+    pub(crate) fn has_timed_out(&self, now: Instant) -> bool {
+        self.deadline().is_some_and(|deadline| now >= deadline)
+    }
+
+    pub(crate) fn pump(&mut self, socket: &UnixDatagram) -> Result<(), LauncherError> {
+        let ApiPublicationState::Pending(pending) = &self.api else {
+            return Ok(());
+        };
+        let message = match &pending.outcome {
+            ApiPublicationOutcome::Published(publication) => SocketBrokerMessage::ApiPublished {
+                session: self.session,
+                sequence: pending.sequence,
+                identity: publication.identity(),
+            },
+            ApiPublicationOutcome::Failed(kind) => SocketBrokerMessage::ApiPublishFailed {
+                session: self.session,
+                sequence: pending.sequence,
+                kind: *kind,
+            },
+        };
+        let descriptor = match &pending.outcome {
+            ApiPublicationOutcome::Published(publication) => publication.listener_fd(),
+            ApiPublicationOutcome::Failed(_) => None,
+        };
+        match send_socket_broker_message(socket, &message, descriptor) {
+            Ok(()) => {
+                let sent = std::mem::replace(&mut self.api, ApiPublicationState::Failed);
+                match sent {
+                    ApiPublicationState::Pending(PendingApiPublicationReply {
+                        outcome: ApiPublicationOutcome::Published(mut publication),
+                        ..
+                    }) => {
+                        publication
+                            .release_listener_alias()
+                            .map_err(|_| LauncherError::SocketBroker)?;
+                        self.api = ApiPublicationState::Published;
+                    }
+                    ApiPublicationState::Pending(PendingApiPublicationReply {
+                        outcome: ApiPublicationOutcome::Failed(_),
+                        ..
+                    }) => {}
+                    ApiPublicationState::Available
+                    | ApiPublicationState::Published
+                    | ApiPublicationState::Failed => return Err(LauncherError::SocketBroker),
+                }
+                Ok(())
+            }
+            Err(SocketBrokerError::Io(io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock)) => {
+                Ok(())
+            }
+            Err(SocketBrokerError::Io(_) | SocketBrokerError::Invalid) => {
+                Err(LauncherError::SocketBroker)
+            }
         }
     }
 
@@ -67,7 +199,16 @@ impl LauncherSocketBroker {
         lifecycle_state: LauncherState,
         lifecycle_cancelled: bool,
         grants: &PreparedGrantBatch,
+        api_context: ApiPublicationContext<'_>,
     ) -> Result<SocketBrokerDrainStatus, LauncherError> {
+        let ApiPublicationContext {
+            namespace,
+            grants_acknowledged,
+        } = api_context;
+        self.pump(socket)?;
+        if self.requires_write_event() {
+            return Ok(SocketBrokerDrainStatus::Pending);
+        }
         loop {
             let received = match receive_socket_broker_message(socket) {
                 Ok(received) => received,
@@ -90,22 +231,50 @@ impl LauncherSocketBroker {
                 .checked_add(1)
                 .ok_or(LauncherError::SocketBroker)?;
 
-            match (&mut self.state, received.message) {
-                (
-                    BrokerState::Dormant,
-                    SocketBrokerMessage::Activate {
-                        child,
-                        sequence: request_sequence,
-                        ..
-                    },
-                ) if request_sequence == 1
-                    && !lifecycle_cancelled
-                    && matches!(
-                        lifecycle_state,
-                        LauncherState::AwaitStarting
-                            | LauncherState::Starting
-                            | LauncherState::Ready(_)
-                    ) =>
+            match received.message {
+                SocketBrokerMessage::PublishApi { child, .. }
+                    if matches!(self.api, ApiPublicationState::Available)
+                        && matches!(self.state, BrokerState::Dormant)
+                        && grants_acknowledged
+                        && !lifecycle_cancelled
+                        && matches!(
+                            lifecycle_state,
+                            LauncherState::AwaitStarting | LauncherState::Starting
+                        ) =>
+                {
+                    let namespace = namespace
+                        .ok_or(LauncherError::SocketBroker)?
+                        .socket_namespace()
+                        .map_err(|_| LauncherError::SocketBroker)?;
+                    let anchor = grants
+                        .socket_directory_anchor(ResourceRole::ApiSocketDirectory)
+                        .ok_or(LauncherError::SocketBroker)?;
+                    let outcome = match publish_api_listener(namespace, anchor, child) {
+                        Ok(publication) => ApiPublicationOutcome::Published(publication),
+                        Err(error) => ApiPublicationOutcome::Failed(error.category()),
+                    };
+                    self.api = ApiPublicationState::Pending(PendingApiPublicationReply {
+                        sequence,
+                        deadline: Instant::now()
+                            .checked_add(API_PUBLICATION_REPLY_TIMEOUT)
+                            .ok_or(LauncherError::SocketBroker)?,
+                        outcome,
+                    });
+                    self.pump(socket)?;
+                    if self.requires_write_event() {
+                        return Ok(SocketBrokerDrainStatus::Pending);
+                    }
+                }
+                SocketBrokerMessage::Activate { child, .. }
+                    if matches!(self.state, BrokerState::Dormant)
+                        && !matches!(self.api, ApiPublicationState::Failed)
+                        && !lifecycle_cancelled
+                        && matches!(
+                            lifecycle_state,
+                            LauncherState::AwaitStarting
+                                | LauncherState::Starting
+                                | LauncherState::Ready(_)
+                        ) =>
                 {
                     activate_directory(grants)?;
                     self.state = BrokerState::Active(child);
@@ -118,9 +287,12 @@ impl LauncherSocketBroker {
                         None,
                     )?;
                 }
-                (BrokerState::Active(child), SocketBrokerMessage::Connect { port, .. })
-                    if !lifecycle_cancelled =>
+                SocketBrokerMessage::Connect { port, .. }
+                    if matches!(self.state, BrokerState::Active(_)) && !lifecycle_cancelled =>
                 {
+                    let BrokerState::Active(child) = &self.state else {
+                        return Err(LauncherError::SocketBroker);
+                    };
                     match connect_relative_vsock_port(child, port) {
                         Ok(stream) => send(
                             socket,
@@ -146,7 +318,9 @@ impl LauncherSocketBroker {
                         }
                     }
                 }
-                (BrokerState::Active(_), SocketBrokerMessage::Shutdown { .. }) => {
+                SocketBrokerMessage::Shutdown { .. }
+                    if matches!(self.state, BrokerState::Active(_)) =>
+                {
                     self.state = BrokerState::Complete;
                     send(
                         socket,
@@ -497,7 +671,46 @@ mod tests {
         let mut broker = LauncherSocketBroker::new(broker_session);
         // SAFETY: The test process is both authenticated socketpair peers.
         let pid = unsafe { libc::getpid() };
-        broker.drain(&launcher, pid, lifecycle_state, cancelled, &empty_grants())
+        broker.drain(
+            &launcher,
+            pid,
+            lifecycle_state,
+            cancelled,
+            &empty_grants(),
+            ApiPublicationContext::new(None, true),
+        )
+    }
+
+    fn rejected_api_request(
+        lifecycle_state: LauncherState,
+        cancelled: bool,
+        acknowledged: bool,
+    ) -> Result<SocketBrokerDrainStatus, LauncherError> {
+        let (launcher, worker) = UnixDatagram::pair().expect("broker pair should open");
+        launcher
+            .set_nonblocking(true)
+            .expect("launcher endpoint should become nonblocking");
+        send_socket_broker_message(
+            &worker,
+            &SocketBrokerMessage::PublishApi {
+                session: session(),
+                sequence: 1,
+                child: SocketChild::parse("api.sock").expect("child should parse"),
+            },
+            None,
+        )
+        .expect("API request should send");
+        let mut broker = LauncherSocketBroker::new(session());
+        // SAFETY: The test process owns both authenticated peers.
+        let pid = unsafe { libc::getpid() };
+        broker.drain(
+            &launcher,
+            pid,
+            lifecycle_state,
+            cancelled,
+            &empty_grants(),
+            ApiPublicationContext::new(None, acknowledged),
+        )
     }
 
     #[test]
@@ -587,6 +800,156 @@ mod tests {
     }
 
     #[test]
+    fn api_publication_requires_start_authority_ack_namespace_and_anchor() {
+        for result in [
+            rejected_api_request(LauncherState::ReadyToProceed, false, true),
+            rejected_api_request(LauncherState::AwaitStarting, false, false),
+            rejected_api_request(LauncherState::AwaitStarting, true, true),
+            rejected_api_request(LauncherState::AwaitStarting, false, true),
+        ] {
+            assert_eq!(result, Err(LauncherError::SocketBroker));
+        }
+    }
+
+    #[test]
+    fn pending_api_reply_survives_backpressure_and_keeps_one_deadline() {
+        let (launcher, worker) = UnixDatagram::pair().expect("broker pair should open");
+        launcher
+            .set_nonblocking(true)
+            .expect("launcher endpoint should become nonblocking");
+        worker
+            .set_nonblocking(true)
+            .expect("worker endpoint should become nonblocking");
+        let filler = SocketBrokerMessage::Ready {
+            session: session(),
+            sequence: 1,
+        };
+        loop {
+            match send_socket_broker_message(&launcher, &filler, None) {
+                Ok(()) | Err(SocketBrokerError::Io(io::ErrorKind::Interrupted)) => {}
+                Err(SocketBrokerError::Io(io::ErrorKind::WouldBlock)) => break,
+                Err(error) => panic!("filler send should only backpressure: {error:?}"),
+            }
+        }
+
+        let deadline = Instant::now()
+            .checked_add(API_PUBLICATION_REPLY_TIMEOUT)
+            .expect("deadline should fit");
+        let mut broker = LauncherSocketBroker::new(session());
+        assert!(broker.api_readiness_is_valid());
+        broker.api = ApiPublicationState::Pending(PendingApiPublicationReply {
+            sequence: 1,
+            deadline,
+            outcome: ApiPublicationOutcome::Failed(io::ErrorKind::NotFound),
+        });
+        broker
+            .pump(&launcher)
+            .expect("backpressure should retain the reply");
+        assert!(broker.requires_write_event());
+        assert!(!broker.api_readiness_is_valid());
+        assert_eq!(broker.deadline(), Some(deadline));
+        assert!(!broker.has_timed_out(Instant::now()));
+
+        loop {
+            match receive_socket_broker_message(&worker) {
+                Ok(received) => assert_eq!(received.message, filler),
+                Err(SocketBrokerError::Io(io::ErrorKind::Interrupted)) => {}
+                Err(SocketBrokerError::Io(io::ErrorKind::WouldBlock)) => break,
+                Err(error) => panic!("filler drain should remain valid: {error:?}"),
+            }
+        }
+        broker
+            .pump(&launcher)
+            .expect("retained reply should send once writable");
+        assert!(!broker.requires_write_event());
+        assert_eq!(broker.deadline(), None);
+        assert!(matches!(broker.api, ApiPublicationState::Failed));
+        assert!(!broker.api_readiness_is_valid());
+        assert!(matches!(
+            receive_socket_broker_message(&worker),
+            Ok(bangbang_session::macos::socket_broker::ReceivedSocketBrokerMessage {
+                message: SocketBrokerMessage::ApiPublishFailed {
+                    session: response_session,
+                    sequence: 1,
+                    kind: io::ErrorKind::NotFound,
+                },
+                descriptor: None,
+            }) if response_session == session()
+        ));
+
+        loop {
+            match send_socket_broker_message(&launcher, &filler, None) {
+                Ok(()) | Err(SocketBrokerError::Io(io::ErrorKind::Interrupted)) => {}
+                Err(SocketBrokerError::Io(io::ErrorKind::WouldBlock)) => break,
+                Err(error) => panic!("second filler send should only backpressure: {error:?}"),
+            }
+        }
+        let (stream, stream_peer) =
+            std::os::unix::net::UnixStream::pair().expect("test descriptor pair should open");
+        let identity = ObjectIdentity {
+            device: 17,
+            inode: 23,
+        };
+        let publication = ApiListenerPublication::from_test_descriptor(stream.into(), identity);
+        let retained_descriptor = publication
+            .listener_fd()
+            .expect("test publication should retain its alias");
+        broker.api = ApiPublicationState::Pending(PendingApiPublicationReply {
+            sequence: 2,
+            deadline,
+            outcome: ApiPublicationOutcome::Published(publication),
+        });
+        broker
+            .pump(&launcher)
+            .expect("published reply backpressure should retain the alias");
+        assert!(matches!(
+            &broker.api,
+            ApiPublicationState::Pending(PendingApiPublicationReply {
+                outcome: ApiPublicationOutcome::Published(publication),
+                ..
+            }) if publication.listener_fd() == Some(retained_descriptor)
+        ));
+        loop {
+            match receive_socket_broker_message(&worker) {
+                Ok(received) => assert_eq!(received.message, filler),
+                Err(SocketBrokerError::Io(io::ErrorKind::Interrupted)) => {}
+                Err(SocketBrokerError::Io(io::ErrorKind::WouldBlock)) => break,
+                Err(error) => panic!("second filler drain should remain valid: {error:?}"),
+            }
+        }
+        broker
+            .pump(&launcher)
+            .expect("retained published reply should send once writable");
+        assert!(broker.api_readiness_is_valid());
+        assert!(matches!(broker.api, ApiPublicationState::Published));
+        assert!(matches!(
+            receive_socket_broker_message(&worker),
+            Ok(bangbang_session::macos::socket_broker::ReceivedSocketBrokerMessage {
+                message: SocketBrokerMessage::ApiPublished {
+                    session: response_session,
+                    sequence: 2,
+                    identity: response_identity,
+                },
+                descriptor: Some(_),
+            }) if response_session == session() && response_identity == identity
+        ));
+        drop(stream_peer);
+
+        broker.api = ApiPublicationState::Pending(PendingApiPublicationReply {
+            sequence: 3,
+            deadline: Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("past deadline should fit"),
+            outcome: ApiPublicationOutcome::Failed(io::ErrorKind::Other),
+        });
+        assert!(broker.has_timed_out(Instant::now()));
+        assert!(!format!("{broker:?}").contains("NotFound"));
+
+        broker.api = ApiPublicationState::Published;
+        assert!(broker.api_readiness_is_valid());
+    }
+
+    #[test]
     fn broker_rejects_another_activation_after_completion() {
         let (launcher, worker) = UnixDatagram::pair().expect("broker pair should open");
         launcher
@@ -615,6 +978,7 @@ mod tests {
                 LauncherState::ReadyToProceed,
                 false,
                 &empty_grants(),
+                ApiPublicationContext::new(None, true),
             ),
             Err(LauncherError::SocketBroker)
         );
@@ -649,6 +1013,7 @@ mod tests {
                 LauncherState::ReadyToProceed,
                 true,
                 &empty_grants(),
+                ApiPublicationContext::new(None, true),
             ),
             Ok(SocketBrokerDrainStatus::Complete)
         );

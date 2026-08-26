@@ -313,6 +313,32 @@ impl WorkerSocketNamespace {
         write_socket_record(self.anchor_fd(), record)
     }
 
+    /// Reads one strict socket record for an exact role.
+    pub fn socket_record(
+        &self,
+        role: ResourceRole,
+    ) -> Result<Option<SocketOwnershipRecord>, RuntimeError> {
+        self.require_record_support()?;
+        read_socket_record(self.anchor_fd(), role)
+    }
+
+    /// Requires the current role record to equal the expected value exactly.
+    pub fn require_socket_record(
+        &self,
+        expected: &SocketOwnershipRecord,
+    ) -> Result<(), RuntimeError> {
+        match self.socket_record(expected.role())? {
+            Some(actual) if actual == *expected => Ok(()),
+            Some(_) | None => Err(RuntimeError::InvalidEntry),
+        }
+    }
+
+    /// Removes only the exact fixed staging socket described by a record.
+    pub fn unlink_staged_socket(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
+        self.require_record_support()?;
+        unlink_staged_socket(self.anchor_fd(), record)
+    }
+
     /// Removes only the exact current ownership record.
     pub fn clear_socket_record(&self, record: &SocketOwnershipRecord) -> Result<(), RuntimeError> {
         self.require_record_support()?;
@@ -1171,9 +1197,28 @@ impl fmt::Debug for LauncherNamespace {
 }
 
 impl LauncherNamespace {
-    /// Revalidates the exact linked namespace and proves the worker lock remains held.
+    /// Duplicates the live namespace for one bounded socket publication transaction.
+    pub fn socket_namespace(&self) -> Result<WorkerSocketNamespace, RuntimeError> {
+        self.verify_worker_lock_inner()?;
+        Ok(WorkerSocketNamespace {
+            directory: duplicate_fd(self.directory.as_raw_fd())?,
+            identity: self.identity,
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            record_policy: match self.publication {
+                NamespacePublication::Linked => NamespaceRecordPolicy::Linked,
+                NamespacePublication::Retired => NamespaceRecordPolicy::RetiredRecordFree,
+            },
+        })
+    }
+
+    /// Revalidates the exact retained namespace and proves the worker lock remains held.
     #[cfg(feature = "elevated-bootstrap-probe")]
     pub fn verify_worker_lock(&self) -> Result<(), RuntimeError> {
+        self.verify_worker_lock_inner()
+    }
+
+    fn verify_worker_lock_inner(&self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "elevated-bootstrap-probe")]
         match self.publication {
             NamespacePublication::Linked => validate_preopened_namespace(
                 self.root.as_raw_fd(),
@@ -1192,6 +1237,15 @@ impl LauncherNamespace {
                 false,
             )?,
         }
+        #[cfg(not(feature = "elevated-bootstrap-probe"))]
+        validate_preopened_namespace(
+            self.root.as_raw_fd(),
+            self.directory.as_raw_fd(),
+            &self.name,
+            self.identity,
+            self.owner,
+            false,
+        )?;
         if try_lock_exclusive(self.directory.as_raw_fd())? {
             unlock(self.directory.as_raw_fd());
             return Err(RuntimeError::InvalidEntry);
@@ -1958,7 +2012,6 @@ fn validate_directory_owned(
     validate_directory_stat(directory_stat(fd)?, owner)
 }
 
-#[cfg(feature = "elevated-bootstrap-probe")]
 fn validate_linked_directory_owned(
     fd: RawFd,
     owner: DirectoryOwner,
@@ -1970,7 +2023,6 @@ fn validate_linked_directory_owned(
     validate_directory_stat(stat, owner)
 }
 
-#[cfg(feature = "elevated-bootstrap-probe")]
 fn validate_preopened_namespace(
     root: RawFd,
     directory: RawFd,
@@ -2766,6 +2818,18 @@ mod tests {
             Err(RuntimeError::InvalidEntry)
         );
         assert_eq!(
+            namespace.socket_record(ResourceRole::ApiSocketDirectory),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
+            namespace.require_socket_record(&socket),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
+            namespace.unlink_staged_socket(&socket),
+            Err(RuntimeError::InvalidEntry)
+        );
+        assert_eq!(
             namespace.clear_socket_record(&socket),
             Err(RuntimeError::InvalidEntry)
         );
@@ -3030,6 +3094,48 @@ mod tests {
     }
 
     #[test]
+    fn worker_socket_namespace_requires_one_exact_record() {
+        let root = TestRoot::new();
+        let namespace = WorkerSocketNamespace::from_directory_for_test(root.path())
+            .expect("test namespace should validate");
+        let record = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("api.sock").expect("child should parse"),
+            ObjectIdentity {
+                device: 101,
+                inode: 103,
+            },
+        )
+        .expect("record should construct");
+        let wrong = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            SocketChild::parse("other.sock").expect("child should parse"),
+            record.identity(),
+        )
+        .expect("wrong record should construct");
+        assert!(
+            namespace
+                .socket_record(ResourceRole::ApiSocketDirectory)
+                .expect("record absence should read")
+                .is_none()
+        );
+        namespace
+            .write_socket_record(&record)
+            .expect("record should write");
+        namespace
+            .require_socket_record(&record)
+            .expect("exact record should match");
+        assert_eq!(
+            namespace.require_socket_record(&wrong),
+            Err(RuntimeError::InvalidEntry)
+        );
+        namespace
+            .clear_socket_record(&record)
+            .expect("exact record should clear");
+        assert!(directory_is_empty(namespace.anchor_fd()).expect("namespace should inspect"));
+    }
+
+    #[test]
     fn snapshot_staging_records_round_trip_redacted_and_clear_exactly() {
         let root = TestRoot::new();
         let directory = open_directory(root.path()).expect("test root should open");
@@ -3286,6 +3392,62 @@ mod tests {
 
         assert_eq!(namespace.cleanup(), Err(RuntimeError::InvalidEntry));
         drop(namespace);
+        assert!(named_path.is_dir(), "replacement must be preserved");
+        assert!(moved_path.is_dir(), "original fd target must be preserved");
+    }
+
+    #[test]
+    fn launcher_socket_namespace_requires_linked_name_and_live_worker_lock() {
+        let root = TestRoot::new();
+        let name = session_name(SessionId::from_bytes([4; 32])).expect("name should derive");
+        let named_path = root.path().join(OsStr::from_bytes(name.as_bytes()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&named_path)
+            .expect("namespace should be created");
+        let root_fd = open_directory(root.path()).expect("test root should open");
+        let launcher_directory =
+            openat_directory(root_fd.as_raw_fd(), &name).expect("launcher anchor should open");
+        let identity =
+            validate_directory(launcher_directory.as_raw_fd()).expect("identity should validate");
+        let mut worker_directory = open_directory(&named_path).expect("worker anchor should open");
+        lock_exclusive(worker_directory.as_raw_fd()).expect("worker lock should acquire");
+        let mut namespace = LauncherNamespace {
+            root: root_fd,
+            directory: launcher_directory,
+            name,
+            identity,
+            owner: DirectoryOwner::current_user(),
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            publication: NamespacePublication::Linked,
+            cleaned: false,
+        };
+
+        namespace
+            .socket_namespace()
+            .expect("linked namespace with a worker lock should duplicate");
+        drop(worker_directory);
+        assert!(matches!(
+            namespace.socket_namespace(),
+            Err(RuntimeError::InvalidEntry)
+        ));
+
+        worker_directory = open_directory(&named_path).expect("worker anchor should reopen");
+        lock_exclusive(worker_directory.as_raw_fd()).expect("worker lock should reacquire");
+        let moved_path = root.path().join("moved-live-namespace");
+        fs::rename(&named_path, &moved_path).expect("original namespace should move");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&named_path)
+            .expect("replacement should be created");
+        assert!(matches!(
+            namespace.socket_namespace(),
+            Err(RuntimeError::InvalidEntry)
+        ));
+
+        drop(worker_directory);
+        assert_eq!(namespace.cleanup(), Err(RuntimeError::InvalidEntry));
+        namespace.cleaned = true;
         assert!(named_path.is_dir(), "replacement must be preserved");
         assert!(moved_path.is_dir(), "original fd target must be preserved");
     }
