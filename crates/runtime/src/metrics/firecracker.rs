@@ -1509,7 +1509,6 @@ fn metric_descriptor(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::io::Write as _;
     use std::time::Duration;
 
     use super::*;

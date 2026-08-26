@@ -3787,7 +3787,9 @@ fn prop_u32_cells(node: &device_tree::Node, name: &str) -> Vec<u32> {
     let raw = node.prop_raw(name).expect("property should exist");
     assert_eq!(raw.len() % 4, 0, "{name} property should contain u32 cells");
 
-    raw.chunks_exact(4)
+    raw.as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
 }
@@ -3797,7 +3799,9 @@ fn prop_u64_cells(node: &device_tree::Node, name: &str) -> Vec<u64> {
     let raw = node.prop_raw(name).expect("property should exist");
     assert_eq!(raw.len() % 8, 0, "{name} property should contain u64 cells");
 
-    raw.chunks_exact(8)
+    raw.as_chunks::<8>()
+        .0
+        .iter()
         .map(|chunk| {
             u64::from_be_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],

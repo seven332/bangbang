@@ -4070,9 +4070,12 @@ fn property_u32_cells_equal(node: &Node, name: &str, expected: &[u32]) -> bool {
         return false;
     };
     raw.len() == expected.len().saturating_mul(4)
-        && raw.chunks_exact(4).zip(expected).all(|(chunk, expected)| {
-            <[u8; 4]>::try_from(chunk).map(u32::from_be_bytes).ok() == Some(*expected)
-        })
+        && raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected)
+            .all(|(chunk, expected)| u32::from_be_bytes(*chunk) == *expected)
 }
 
 fn property_u64_cells_equal(node: &Node, name: &str, expected: &[u64]) -> bool {
@@ -4080,9 +4083,12 @@ fn property_u64_cells_equal(node: &Node, name: &str, expected: &[u64]) -> bool {
         return false;
     };
     raw.len() == expected.len().saturating_mul(8)
-        && raw.chunks_exact(8).zip(expected).all(|(chunk, expected)| {
-            <[u8; 8]>::try_from(chunk).map(u64::from_be_bytes).ok() == Some(*expected)
-        })
+        && raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(expected)
+            .all(|(chunk, expected)| u64::from_be_bytes(*chunk) == *expected)
 }
 
 fn memory_property_matches_binding(node: &Node, binding: &SnapshotV2MemoryBinding) -> bool {
@@ -4092,7 +4098,9 @@ fn memory_property_matches_binding(node: &Node, binding: &SnapshotV2MemoryBindin
     if raw.len() != binding.extents().len().saturating_mul(16) {
         return false;
     }
-    raw.chunks_exact(16)
+    raw.as_chunks::<16>()
+        .0
+        .iter()
         .zip(binding.extents())
         .enumerate()
         .all(|(index, (chunk, extent))| {

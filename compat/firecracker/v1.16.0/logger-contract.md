@@ -117,6 +117,14 @@ interrupt delivery; product-PCI endpoint owners cover MSI delivery. MMDS
 detours and transactional token-key rotation are fixed outcomes, and neither
 token nor key material can enter a record.
 
+Issue #1922 adds fixed direction-specific vsock lifecycle outcomes for guest
+RST/SHUTDOWN, local stream EOF/read failure, connection deadlines, reset
+queue/delivery, and guest RW disposition. These remain in the same semantic
+producer class and fixed-capacity batch. Local EOF/read and deadline outcomes
+use the bounded `logger-rate.vsock.endpoint-outcome` sub-budget, independent of
+the primary `logger-rate.vsock.outcome` state, so ordinary data-plane success
+records cannot hide the first endpoint-lifecycle observation.
+
 Issue #1816 closes balloon, virtio-mem, entropy, serial, and time/identity
 outcomes. Balloon, virtio-mem, and entropy observers consume complete typed
 queue summaries shared by MMIO and product PCI. Virtio-mem configuration

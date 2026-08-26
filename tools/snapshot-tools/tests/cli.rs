@@ -504,7 +504,9 @@ mod state {
             .collect::<Vec<_>>();
         assert_eq!(digits.len() % 2, 0, "fixture hex should be paired");
         digits
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let text = std::str::from_utf8(pair).expect("fixture digits should be UTF-8");
                 u8::from_str_radix(text, 16).expect("fixture should contain only hex")

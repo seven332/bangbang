@@ -1468,13 +1468,11 @@ fn ethernet_source_mac(packet: &[u8]) -> Option<[u8; ETHERNET_ADDRESS_LEN]> {
 }
 
 fn checksum_add(mut sum: u64, bytes: &[u8]) -> u64 {
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        if let Ok(word) = <[u8; 2]>::try_from(chunk) {
-            sum += u64::from(u16::from_be_bytes(word));
-        }
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    for word in chunks {
+        sum += u64::from(u16::from_be_bytes(*word));
     }
-    if let Some(byte) = chunks.remainder().first() {
+    if let Some(byte) = remainder.first() {
         sum += u64::from(*byte) << 8;
     }
     sum

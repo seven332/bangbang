@@ -938,14 +938,11 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
 }
 
 fn checksum_add(mut sum: u32, bytes: &[u8]) -> u32 {
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        let [first, second] = chunk else {
-            continue;
-        };
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    for [first, second] in chunks {
         sum = sum.saturating_add(u32::from(u16::from_be_bytes([*first, *second])));
     }
-    if let Some(byte) = chunks.remainder().first() {
+    if let Some(byte) = remainder.first() {
         sum = sum.saturating_add(u32::from(*byte) << 8);
     }
     sum

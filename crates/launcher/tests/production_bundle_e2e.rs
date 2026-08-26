@@ -1930,9 +1930,6 @@ fn run_production_vsock_snapshot_continuation(
         .unwrap_or_else(|error| {
             panic!("production {transport} old snapshot-vsock connection should arrive: {error}")
         });
-    drop(old_listener);
-    fs::remove_file(&old_port_path)
-        .expect("production snapshot-vsock old listener path should clean up");
     old_stream
         .set_nonblocking(true)
         .expect("production old snapshot-vsock stream should be nonblocking");
@@ -1943,6 +1940,11 @@ fn run_production_vsock_snapshot_continuation(
         old_ready, SNAPSHOT_VSOCK_OLD_READY,
         "production {transport} old readiness should match"
     );
+    // Accept can win before the launcher completes its post-connect identity
+    // check and SCM_RIGHTS handoff. Exact guest readiness proves that boundary.
+    drop(old_listener);
+    fs::remove_file(&old_port_path)
+        .expect("production snapshot-vsock old listener path should clean up");
 
     assert_http_status(
         &http_request(&source.socket, "PATCH", "/vm", r#"{"state":"Paused"}"#),
@@ -2193,9 +2195,6 @@ fn run_production_vsock_snapshot_destination(
         .unwrap_or_else(|error| {
             panic!("production {case} restored fresh vsock connection should arrive: {error}")
         });
-    drop(fresh_listener);
-    fs::remove_file(&fresh_port_path)
-        .expect("production restored snapshot-vsock listener path should clean up");
     fresh_stream
         .set_nonblocking(true)
         .expect("production restored fresh vsock stream should be nonblocking");
@@ -2206,6 +2205,11 @@ fn run_production_vsock_snapshot_destination(
         fresh_ready, SNAPSHOT_VSOCK_FRESH_READY,
         "production {case} fresh readiness should match"
     );
+    // Keep pathname authority through the launcher's identity check and FD
+    // handoff; exact restored-guest readiness proves both have completed.
+    drop(fresh_listener);
+    fs::remove_file(&fresh_port_path)
+        .expect("production restored snapshot-vsock listener path should clean up");
     write_all_nonblocking(&mut fresh_stream, SNAPSHOT_VSOCK_FRESH_ACK, PROCESS_TIMEOUT)
         .expect("production restored fresh vsock acknowledgement should write");
     wait_for_stream_eof_nonblocking(&mut fresh_stream, PROCESS_TIMEOUT)
@@ -2383,6 +2387,8 @@ fn run_certified_production_vsock_snapshot_restore(
             &source_fixture.socket(),
             &format!("production {transport} source"),
             &source,
+            &source_logger.opened,
+            &source_fixture.snapshot.opened_metrics,
         );
     assert_eq!(
         source_host_ports,
@@ -3143,13 +3149,14 @@ fn run_certified_production_vsock_destination(
         204,
         &format!("load production {case} certified vsock snapshot"),
     );
+    let state = http_get(&running.socket, "/");
     assert!(
-        http_get(&running.socket, "/").contains(if resume_vm {
+        state.contains(if resume_vm {
             r#""state":"Running""#
         } else {
             r#""state":"Paused""#
         }),
-        "production {case} certified destination must publish the requested resume state"
+        "production {case} certified destination must publish the requested resume state: {state}"
     );
     let config = http_get(&running.socket, "/vm/config");
     assert_http_status(
@@ -3208,20 +3215,22 @@ fn run_certified_production_vsock_destination(
         &fixture.snapshot.opened_metrics,
     );
     drop(fresh_guest_streams);
-    for (index, stream) in host_streams.iter_mut().enumerate() {
-        let local_port =
-            read_certified_production_vsock_connect_ok(stream, PROCESS_TIMEOUT).unwrap_or_else(
-                |error| {
-                    panic!(
-                        "production {case} preserved-listener stream {index} should connect: {error}; {}",
-                        certified_production_vsock_failure_diagnostics(
-                            &running,
-                            &logger.opened,
-                            &fixture.snapshot.opened_metrics,
-                        )
-                    )
-                },
-            );
+    for index in 0..host_streams.len() {
+        let local_port = match read_certified_production_vsock_connect_ok(
+            &mut host_streams[index],
+            PROCESS_TIMEOUT,
+        ) {
+            Ok(local_port) => local_port,
+            Err(error) => panic!(
+                "production {case} preserved-listener stream {index} should connect: {error}; host stream states: {}; {}",
+                certified_production_vsock_host_stream_states(&host_streams),
+                certified_production_vsock_failure_diagnostics(
+                    &running,
+                    &logger.opened,
+                    &fixture.snapshot.opened_metrics,
+                )
+            ),
+        };
         assert_eq!(
             local_port,
             saved_cursor
@@ -3230,23 +3239,26 @@ fn run_certified_production_vsock_destination(
             "production {case} clone host-local cursor must continue independently at stream {index}"
         );
         let mut guest_reply = vec![0_u8; 4096];
-        read_exact_nonblocking(stream, &mut guest_reply, PROCESS_TIMEOUT).unwrap_or_else(|error| {
+        if let Err(error) =
+            read_exact_nonblocking(&mut host_streams[index], &mut guest_reply, PROCESS_TIMEOUT)
+        {
             panic!(
-                "production {case} host stream {index} guest reply should arrive: {error}; {}",
+                "production {case} host stream {index} guest reply should arrive: {error}; host stream states: {}; {}",
+                certified_production_vsock_host_stream_states(&host_streams),
                 certified_production_vsock_failure_diagnostics(
                     &running,
                     &logger.opened,
                     &fixture.snapshot.opened_metrics,
                 )
-            )
-        });
+            );
+        }
         assert_eq!(
             guest_reply,
             certified_snapshot_vsock_payload("FRESH_H2G_REPLY", index, 4096),
             "production {case} host stream {index} guest reply must remain isolated"
         );
         write_all_nonblocking(
-            stream,
+            &mut host_streams[index],
             &certified_snapshot_vsock_payload("FRESH_H2G", index, 4096),
             PROCESS_TIMEOUT,
         )
@@ -3260,23 +3272,24 @@ fn run_certified_production_vsock_destination(
                 )
             )
         });
-        stream
+        host_streams[index]
             .shutdown(std::net::Shutdown::Write)
             .unwrap_or_else(|error| {
                 panic!("production {case} host stream {index} should half-close: {error}")
             });
-        wait_for_stream_eof_nonblocking(stream, PROCESS_TIMEOUT).unwrap_or_else(|error| {
-            panic!(
-                "production {case} host stream {index} EOF should arrive: {error}; {}",
-                certified_production_vsock_failure_diagnostics(
-                    &running,
-                    &logger.opened,
-                    &fixture.snapshot.opened_metrics,
+        wait_for_stream_eof_nonblocking(&mut host_streams[index], PROCESS_TIMEOUT).unwrap_or_else(
+            |error| {
+                panic!(
+                    "production {case} host stream {index} EOF should arrive: {error}; {}",
+                    certified_production_vsock_failure_diagnostics(
+                        &running,
+                        &logger.opened,
+                        &fixture.snapshot.opened_metrics,
+                    )
                 )
-            )
-        });
+            },
+        );
     }
-
     for marker in [
         SNAPSHOT_VSOCK_CERTIFY_RESET_OBSERVED,
         SNAPSHOT_VSOCK_CERTIFY_FRESH_G2H_OK,
@@ -3549,6 +3562,8 @@ fn connect_certified_production_vsock_source_host_streams(
     socket: &Path,
     context: &str,
     running: &RunningSerialApiLauncher,
+    logger: &Path,
+    metrics: &Path,
 ) -> (Vec<UnixStream>, Vec<u32>) {
     let mut streams = Vec::with_capacity(1);
     let mut local_ports = Vec::with_capacity(1);
@@ -3586,8 +3601,15 @@ fn connect_certified_production_vsock_source_host_streams(
         .expect("production source host payload should write");
         let expected = certified_snapshot_vsock_payload("SOURCE_H2G_ACK", index, 128);
         let mut received = vec![0_u8; expected.len()];
-        read_exact_nonblocking(&mut stream, &mut received, PROCESS_TIMEOUT)
-            .expect("production source host acknowledgement should arrive");
+        read_exact_nonblocking(&mut stream, &mut received, PROCESS_TIMEOUT).unwrap_or_else(
+            |error| {
+                panic!(
+                    "{context} source host acknowledgement {index} should arrive: {error}; host stream state: {}; {}",
+                    certified_production_vsock_host_stream_states(std::slice::from_ref(&stream)),
+                    certified_production_vsock_failure_diagnostics(running, logger, metrics)
+                )
+            },
+        );
         assert_eq!(
             received, expected,
             "{context} source host acknowledgement should remain isolated"
@@ -3658,6 +3680,40 @@ fn read_certified_production_vsock_connect_ok(
     local_port
         .parse::<u32>()
         .map_err(|_| "CONNECT response had an invalid local port".to_owned())
+}
+
+fn certified_production_vsock_host_stream_states(streams: &[UnixStream]) -> String {
+    streams
+        .iter()
+        .enumerate()
+        .map(|(index, stream)| {
+            let mut byte = 0_u8;
+            // SAFETY: `byte` is writable for this non-consuming one-byte peek,
+            // and the borrowed stream descriptor remains live for the call.
+            let result = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            let state = if result > 0 {
+                "readable".to_owned()
+            } else if result == 0 {
+                "eof".to_owned()
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    "open".to_owned()
+                } else {
+                    format!("error:{:?}", error.kind())
+                }
+            };
+            format!("{index}:{state}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn certified_snapshot_vsock_payload(kind: &str, index: usize, size: usize) -> Vec<u8> {
@@ -8773,21 +8829,25 @@ fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
         assert_eq!(port, expected_port);
         let stream = wait_for_unix_listener_accept(&listener, PROCESS_TIMEOUT)
             .unwrap_or_else(|error| panic!("guest vsock port {port} should connect: {error}"));
-        drop(listener);
-        fs::remove_file(&path).expect("host-owned vsock port path should clean up");
         stream
             .set_nonblocking(true)
             .expect("accepted vsock stream should remain nonblocking");
-        streams.push(stream);
+        streams.push((path, Some(listener), stream));
     }
 
-    for (stream, &(_, guest_payload, _)) in streams.iter_mut().zip(GRANTED_VSOCK_EXCHANGES) {
+    for ((path, listener, stream), &(_, guest_payload, _)) in
+        streams.iter_mut().zip(GRANTED_VSOCK_EXCHANGES)
+    {
         let mut received = vec![0_u8; guest_payload.len()];
         read_exact_nonblocking(stream, &mut received, PROCESS_TIMEOUT)
             .expect("guest vsock payload should arrive");
         assert_eq!(received, guest_payload);
+        // The exact payload proves the launcher's pathname identity check and
+        // SCM_RIGHTS handoff completed before pathname authority is withdrawn.
+        drop(listener.take());
+        fs::remove_file(path).expect("host-owned vsock port path should clean up");
     }
-    for (stream, &(_, _, host_payload)) in streams.iter_mut().zip(GRANTED_VSOCK_EXCHANGES) {
+    for ((_, _, stream), &(_, _, host_payload)) in streams.iter_mut().zip(GRANTED_VSOCK_EXCHANGES) {
         write_all_nonblocking(stream, host_payload, PROCESS_TIMEOUT)
             .expect("host vsock reply should write");
     }

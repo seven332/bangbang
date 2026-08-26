@@ -1414,7 +1414,9 @@ mod tests {
             .filter(|byte| !byte.is_ascii_whitespace())
             .collect();
         compact
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 u8::from_str_radix(
                     std::str::from_utf8(pair).expect("fixture hex should be UTF-8"),

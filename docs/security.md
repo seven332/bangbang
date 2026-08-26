@@ -883,14 +883,20 @@ The owner thread retains the resolved scope and exact directory anchor. A
 short-lived default-close instance of the already signed worker authenticates
 its parent, receives only its control endpoint at fd5 and the exact private
 namespace anchor at fd6, enters that anchor, binds one fixed role-specific
-staging name, validates the listener, transfers its descriptor, and is killed
-and reaped on every failure. The main worker verifies the namespace inode and
-listener identity, writes one fixed bounded record containing only role, safe
-child, and socket device/inode, and publishes the live vnode exclusively with
-fd-relative `renameatx_np(RENAME_EXCL)` to the grant anchor. Cross-filesystem
-publication, an existing target, symlink or pathname replacement, role/identity
-mismatch, and extra rights fail closed and value-redacted. The binder is always
-reaped before API readiness or VM-start success.
+staging name, validates the listener, and transfers its descriptor. It retains
+the listener until the authenticated parent returns one fixed adoption
+acknowledgment bound to the role and socket device/inode; the parent sends that
+acknowledgment only after validating the received descriptor. This keeps the
+listener externally reachable until `SCM_RIGHTS` externalization completes,
+rather than leaving its last reference only in an in-flight Unix-domain
+message. The main worker then verifies the namespace inode and listener
+identity, writes one fixed bounded record containing only role, safe child, and
+socket device/inode, and publishes the live vnode exclusively with fd-relative
+`renameatx_np(RENAME_EXCL)` to the grant anchor. Cross-filesystem publication,
+an existing target, symlink or pathname replacement, role/identity mismatch,
+malformed acknowledgment, and extra rights fail closed and value-redacted. The
+binder is killed and reaped on every failure and is always reaped before API
+readiness or VM-start success.
 
 The supplied API listener preserves owner-only mode, no-clobber publication,
 readiness timing, and identity-aware cleanup. The supplied vsock main listener
@@ -3222,7 +3228,10 @@ producer snapshot shares the controller's sole worker and the independent
 `logger-rate.entropy.outcome`, `logger-rate.memory-hotplug.outcome`,
 `logger-rate.network.outcome`, `logger-rate.pmem.outcome`,
 `logger-rate.serial.outcome`, `logger-rate.time-identity.outcome`, and
-`logger-rate.vsock.outcome` states.
+`logger-rate.vsock.outcome` states. Vsock local-stream EOF/read failures and
+connection deadlines use the additional bounded
+`logger-rate.vsock.endpoint-outcome` state, so ordinary RX/TX success traffic
+cannot consume the first endpoint-lifecycle evidence budget.
 Normal and native-v2 assembly install the capability before HVF and MMIO/PCI
 publication, and run-loop adapter traits require explicit logger forwarding so
 a wrapper cannot silently substitute an inert capability. Repeating successful

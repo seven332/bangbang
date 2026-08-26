@@ -157,7 +157,7 @@ pub(super) fn encode_with_policy<R: ReservePolicy>(
     for (record, sections) in graph
         .records
         .iter()
-        .zip(sections.chunks_exact(SECTION_COUNT_PER_RECORD))
+        .zip(sections.as_chunks::<SECTION_COUNT_PER_RECORD>().0)
     {
         let config = sections
             .first()

@@ -239,7 +239,7 @@ use bangbang_runtime::vsock::{
     VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_QUEUE_SIZES, VirtioVsockCaptureValidation,
     VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockMmioCaptureState,
     VirtioVsockPciCaptureState, VirtioVsockReconstructionResource, VsockConfig, VsockHostReadiness,
-    VsockHostWakeup, VsockMmioDeviceRegistration, VsockMmioLayout,
+    VsockHostReadinessRegistration, VsockHostWakeup, VsockMmioDeviceRegistration, VsockMmioLayout,
     attach_vsock_metrics_to_mmio_handler, observe_vsock_host_readiness_for_mmio_handler,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -31353,6 +31353,13 @@ where
         self.session.start_run_loop_wakeup_monitor()
     }
 
+    fn observe_run_loop_vsock_readiness(
+        &mut self,
+        observation: &HvfArm64BootVsockReadinessObservation,
+    ) {
+        self.session.observe_run_loop_vsock_readiness(observation);
+    }
+
     fn take_run_loop_wakeup_request(&mut self) -> bool {
         self.session.take_run_loop_wakeup_request()
     }
@@ -32638,6 +32645,8 @@ fn start_run_loop_wakeup_monitor(
     let mut write_fds = Vec::new();
     let mut vsock_read_fds = Vec::new();
     let mut vsock_write_fds = Vec::new();
+    let mut vsock_read_registrations = Vec::new();
+    let mut vsock_readiness_generation = 0;
     let mut deadline = None;
     let mut has_block_wakeup_fds = async_block_fd.is_some();
     let has_serial_input_fd = serial_input_fd.is_some();
@@ -32657,13 +32666,21 @@ fn start_run_loop_wakeup_monitor(
         let mut mmio_dispatcher = lock_boot_mmio_dispatcher_runtime(dispatcher)
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
         if runtime_resources.vsock_device.is_some() {
-            let (device_read_fds, device_write_fds, vsock_deadline) =
+            let (
+                device_read_fds,
+                device_write_fds,
+                vsock_deadline,
+                device_readiness_generation,
+                device_read_registrations,
+            ) =
                 runtime_resources
                     .vsock_wakeup(&mut mmio_dispatcher)
                     .map_err(|source| {
                         HvfArm64BootRunLoopWakeupMonitorError::CollectVsockWakeupFds { source }
                     })?
                     .into_parts();
+            vsock_readiness_generation = device_readiness_generation;
+            vsock_read_registrations = device_read_registrations;
             read_fds
                 .try_reserve_exact(device_read_fds.len())
                 .map_err(
@@ -32707,7 +32724,13 @@ fn start_run_loop_wakeup_monitor(
         }
     }
     if let Some(devices) = pci_vsock {
-        let (pci_read_fds, pci_write_fds, pci_deadline) = devices
+        let (
+            pci_read_fds,
+            pci_write_fds,
+            pci_deadline,
+            pci_readiness_generation,
+            pci_read_registrations,
+        ) = devices
             .vsock_wakeup()
             .map_err(
                 |source| HvfArm64BootRunLoopWakeupMonitorError::PciVsockWakeup {
@@ -32717,6 +32740,8 @@ fn start_run_loop_wakeup_monitor(
             .ok_or_else(|| HvfArm64BootRunLoopWakeupMonitorError::PciVsockWakeup {
                 message: "PCI vsock endpoint disappeared".to_string(),
             })?;
+        vsock_readiness_generation = pci_readiness_generation;
+        vsock_read_registrations = pci_read_registrations;
         read_fds
             .try_reserve_exact(pci_read_fds.len())
             .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
@@ -32754,6 +32779,8 @@ fn start_run_loop_wakeup_monitor(
             host_write_fds: write_fds,
             vsock_read_fds,
             vsock_write_fds,
+            vsock_read_registrations,
+            vsock_readiness_generation,
             deadline,
             has_block_wakeup_fds,
             has_serial_input_fd,
@@ -33018,9 +33045,8 @@ trait BootSessionRunLoopSession {
 
     fn observe_run_loop_vsock_readiness(
         &mut self,
-        _observation: &HvfArm64BootVsockReadinessObservation,
-    ) {
-    }
+        observation: &HvfArm64BootVsockReadinessObservation,
+    );
 
     fn take_run_loop_wakeup_request(&mut self) -> bool {
         false
@@ -34040,6 +34066,8 @@ struct HvfArm64BootRunLoopWakeupInputs {
     host_write_fds: Vec<RawFd>,
     vsock_read_fds: Vec<RawFd>,
     vsock_write_fds: Vec<RawFd>,
+    vsock_read_registrations: Vec<VsockHostReadinessRegistration>,
+    vsock_readiness_generation: u64,
     deadline: Option<Instant>,
     has_block_wakeup_fds: bool,
     has_serial_input_fd: bool,
@@ -34099,6 +34127,8 @@ impl HvfArm64BootRunLoopWakeupMonitor {
             host_write_fds,
             mut vsock_read_fds,
             mut vsock_write_fds,
+            vsock_read_registrations,
+            vsock_readiness_generation,
             deadline,
             has_block_wakeup_fds,
             has_serial_input_fd,
@@ -34135,7 +34165,11 @@ impl HvfArm64BootRunLoopWakeupMonitor {
                     pollfd_count,
                     stop_reader,
                     deadline,
-                    &vsock_fds,
+                    HvfArm64BootVsockPollSnapshot::new(
+                        &vsock_fds,
+                        &vsock_read_registrations,
+                        vsock_readiness_generation,
+                    ),
                     vcpu_control,
                     wakeup_token,
                 )
@@ -34264,12 +34298,33 @@ fn run_loop_wakeup_pollfds(
     Ok(pollfds)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HvfArm64BootVsockPollSnapshot<'a> {
+    descriptors: &'a [RawFd],
+    read_registrations: &'a [VsockHostReadinessRegistration],
+    readiness_generation: u64,
+}
+
+impl<'a> HvfArm64BootVsockPollSnapshot<'a> {
+    const fn new(
+        descriptors: &'a [RawFd],
+        read_registrations: &'a [VsockHostReadinessRegistration],
+        readiness_generation: u64,
+    ) -> Self {
+        Self {
+            descriptors,
+            read_registrations,
+            readiness_generation,
+        }
+    }
+}
+
 fn run_loop_wakeup_monitor(
     pollfds: &mut [libc::pollfd],
     pollfd_count: libc::nfds_t,
     _stop_reader: UnixStream,
     deadline: Option<Instant>,
-    vsock_fds: &[RawFd],
+    vsock_poll_snapshot: HvfArm64BootVsockPollSnapshot<'_>,
     vcpu_control: HvfVcpuRunControl,
     wakeup_token: HvfArm64BootRunLoopWakeupToken,
 ) -> HvfArm64BootRunLoopWakeupObservation {
@@ -34277,7 +34332,7 @@ fn run_loop_wakeup_monitor(
         pollfds,
         pollfd_count,
         deadline,
-        vsock_fds,
+        vsock_poll_snapshot,
         Instant::now,
         |pollfds, pollfd_count, timeout| {
             // SAFETY: `pollfds` is a valid mutable slice for `pollfd_count`
@@ -34301,7 +34356,7 @@ fn run_loop_wakeup_monitor_with(
     pollfds: &mut [libc::pollfd],
     pollfd_count: libc::nfds_t,
     deadline: Option<Instant>,
-    vsock_fds: &[RawFd],
+    vsock_poll_snapshot: HvfArm64BootVsockPollSnapshot<'_>,
     mut now: impl FnMut() -> Instant,
     mut poll: impl FnMut(
         &mut [libc::pollfd],
@@ -34325,7 +34380,7 @@ fn run_loop_wakeup_monitor_with(
                     wakeup_requested: true,
                     vsock: HvfArm64BootVsockReadinessObservation {
                         events: Vec::new(),
-                        poll_failed: !vsock_fds.is_empty(),
+                        poll_failed: !vsock_poll_snapshot.descriptors.is_empty(),
                     },
                 };
             }
@@ -34335,6 +34390,9 @@ fn run_loop_wakeup_monitor_with(
             return HvfArm64BootRunLoopWakeupObservation::default();
         };
         if pollfd_has_wakeup_event(stop_pollfd.revents) {
+            // The owning run-loop step has completed, so every descriptor observation in this
+            // poll snapshot is stale by construction. Read readiness is level-triggered and will
+            // be observed again by the next monitor against the next exact registration set.
             return HvfArm64BootRunLoopWakeupObservation::default();
         }
         let fd_wakeup = pollfds
@@ -34348,9 +34406,34 @@ fn run_loop_wakeup_monitor_with(
                 .skip(1)
                 .filter(|pollfd| {
                     pollfd_has_wakeup_event(pollfd.revents)
-                        && vsock_fds.binary_search(&pollfd.fd).is_ok()
+                        && vsock_poll_snapshot
+                            .descriptors
+                            .binary_search(&pollfd.fd)
+                            .is_ok()
                 })
-                .map(|pollfd| VsockHostReadiness::from_poll_revents(pollfd.fd, pollfd.revents))
+                .map(|pollfd| {
+                    vsock_poll_snapshot
+                        .read_registrations
+                        .iter()
+                        .copied()
+                        .find(|registration| registration.descriptor() == pollfd.fd)
+                        .map_or_else(
+                            || {
+                                VsockHostReadiness::from_poll_revents(
+                                    pollfd.fd,
+                                    pollfd.revents,
+                                    vsock_poll_snapshot.readiness_generation,
+                                )
+                            },
+                            |registration| {
+                                VsockHostReadiness::for_registration(
+                                    registration,
+                                    pollfd.revents,
+                                    vsock_poll_snapshot.readiness_generation,
+                                )
+                            },
+                        )
+                })
                 .collect();
             return HvfArm64BootRunLoopWakeupObservation {
                 wakeup_requested: true,
@@ -38761,7 +38844,8 @@ mod tests {
     use bangbang_runtime::vsock::{
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_PACKET_HEADER_SIZE,
         VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VirtioVsockPacketHeader,
-        VsockConfigInput, VsockMmioLayout, attach_vsock_metrics_to_mmio_handler,
+        VsockConfigInput, VsockHostReadinessRegistration, VsockMmioLayout,
+        attach_vsock_metrics_to_mmio_handler,
     };
 
     use super::{
@@ -39101,7 +39185,7 @@ mod tests {
             &mut pollfds,
             1,
             Some(deadline),
-            &[],
+            super::HvfArm64BootVsockPollSnapshot::new(&[], &[], 0),
             || times.pop_front().expect("each poll should sample time"),
             |pollfds, count, timeout| {
                 assert_eq!(pollfds.len(), 1);
@@ -39141,7 +39225,11 @@ mod tests {
             &mut pollfds,
             2,
             Some(now),
-            &[11],
+            super::HvfArm64BootVsockPollSnapshot::new(
+                &[11],
+                &[VsockHostReadinessRegistration::unclassified(11)],
+                7,
+            ),
             || now,
             |pollfds, _, timeout| {
                 assert_eq!(timeout, 0);
@@ -39178,7 +39266,11 @@ mod tests {
             &mut pollfds,
             2,
             Some(now),
-            &[11],
+            super::HvfArm64BootVsockPollSnapshot::new(
+                &[11],
+                &[VsockHostReadinessRegistration::unclassified(11)],
+                8,
+            ),
             || now,
             |pollfds, _, timeout| {
                 assert_eq!(timeout, 0);
@@ -39193,6 +39285,7 @@ mod tests {
         assert!(!observation.vsock.poll_failed);
         assert_eq!(observation.vsock.events.len(), 1);
         assert_eq!(observation.vsock.events[0].descriptor(), 11);
+        assert_eq!(observation.vsock.events[0].generation(), 8);
         assert!(observation.vsock.events[0].readable());
         assert!(observation.vsock.events[0].writable());
         assert!(observation.vsock.events[0].error());
@@ -39215,7 +39308,11 @@ mod tests {
             &mut pollfds,
             1,
             None,
-            &[10],
+            super::HvfArm64BootVsockPollSnapshot::new(
+                &[10],
+                &[VsockHostReadinessRegistration::unclassified(10)],
+                9,
+            ),
             || now,
             |_, _, timeout| {
                 assert_eq!(timeout, -1);
@@ -39244,6 +39341,8 @@ mod tests {
                 host_write_fds: Vec::new(),
                 vsock_read_fds: Vec::new(),
                 vsock_write_fds: Vec::new(),
+                vsock_read_registrations: Vec::new(),
+                vsock_readiness_generation: 0,
                 deadline: Some(Instant::now() + Duration::from_secs(60 * 60)),
                 has_block_wakeup_fds: false,
                 has_serial_input_fd: false,
@@ -42223,6 +42322,12 @@ mod tests {
             } else {
                 super::HvfArm64BootRunLoopWakeupMonitor::completed_for_test(completed_wakeup)
             })
+        }
+
+        fn observe_run_loop_vsock_readiness(
+            &mut self,
+            _observation: &super::HvfArm64BootVsockReadinessObservation,
+        ) {
         }
 
         fn take_run_loop_wakeup_request(&mut self) -> bool {

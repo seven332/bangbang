@@ -19066,8 +19066,10 @@ fn psci_1_0_and_smccc_1_1_discovery_match_the_advertised_guest_contract() {
         .read_slice(&mut result_bytes, results)
         .expect("discovery results should read after terminal exit");
     let actual = result_bytes
-        .chunks_exact(size_of::<u64>())
-        .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("result chunk should be u64")))
+        .as_chunks::<{ size_of::<u64>() }>()
+        .0
+        .iter()
+        .map(|bytes| u64::from_le_bytes(*bytes))
         .collect::<Vec<_>>();
     let mut expected = FEATURE_QUERIES
         .iter()

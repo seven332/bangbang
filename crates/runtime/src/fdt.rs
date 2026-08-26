@@ -7299,7 +7299,9 @@ mod tests {
     fn prop_u32_cells(node: &Node, name: &str) -> Vec<u32> {
         node.prop_raw(name)
             .expect("property should exist")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
     }
@@ -7307,7 +7309,9 @@ mod tests {
     fn prop_u64_cells(node: &Node, name: &str) -> Vec<u64> {
         node.prop_raw(name)
             .expect("property should exist")
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| {
                 u64::from_be_bytes([
                     chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],

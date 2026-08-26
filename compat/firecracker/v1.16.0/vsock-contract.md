@@ -32,7 +32,9 @@ The immutable upstream baseline is Firecracker commit
   metrics, and teardown in `crates/runtime/src/{vsock,metrics}.rs`,
   `crates/hvf/src/startup.rs`, and `crates/bangbang/src/vmm.rs`.
 - **AUTHORITY** — exact direct listener/connector ownership and exact
-  App Sandbox grant/listener/broker adoption with no ambient fallback in
+  App Sandbox grant/listener/broker adoption, including authenticated
+  role-and-inode-bound listener-transfer acknowledgment before binder exit,
+  with no ambient fallback in
   `crates/bangbang/src/{anchored_socket,contained_session,vsock_restore,vmm}.rs`
   and `crates/launcher/src/macos/socket_broker.rs`.
 - **SNAPSHOT** — exact native-v2 2.12 kind 13, MMIO/PCI placement, public

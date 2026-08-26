@@ -112,8 +112,8 @@ use crate::vsock::{
     VirtioVsockCaptureValidation, VirtioVsockDeviceCaptureError,
     VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
     VirtioVsockMmioCaptureState, VirtioVsockMmioHandler, VirtioVsockTransportResetAttempt,
-    VirtioVsockTransportResetError, VsockConfig, VsockMmioDeviceRegistration, VsockMmioLayout,
-    VsockMmioRegistrationError,
+    VirtioVsockTransportResetError, VsockConfig, VsockHostReadinessRegistration,
+    VsockMmioDeviceRegistration, VsockMmioLayout, VsockMmioRegistrationError,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -705,6 +705,8 @@ pub struct Arm64BootVsockWakeup {
     host_read_fds: Vec<RawFd>,
     host_write_fds: Vec<RawFd>,
     deadline: Option<Instant>,
+    readiness_generation: u64,
+    read_registrations: Vec<VsockHostReadinessRegistration>,
 }
 
 impl Arm64BootVsockWakeup {
@@ -713,6 +715,8 @@ impl Arm64BootVsockWakeup {
             host_read_fds: Vec::new(),
             host_write_fds: Vec::new(),
             deadline: None,
+            readiness_generation: 0,
+            read_registrations: Vec::new(),
         }
     }
 
@@ -720,11 +724,15 @@ impl Arm64BootVsockWakeup {
         host_read_fds: Vec<RawFd>,
         host_write_fds: Vec<RawFd>,
         deadline: Option<Instant>,
+        readiness_generation: u64,
+        read_registrations: Vec<VsockHostReadinessRegistration>,
     ) -> Self {
         Self {
             host_read_fds,
             host_write_fds,
             deadline,
+            readiness_generation,
+            read_registrations,
         }
     }
 
@@ -740,8 +748,26 @@ impl Arm64BootVsockWakeup {
         self.deadline
     }
 
-    pub fn into_parts(self) -> (Vec<RawFd>, Vec<RawFd>, Option<Instant>) {
-        (self.host_read_fds, self.host_write_fds, self.deadline)
+    pub const fn readiness_generation(&self) -> u64 {
+        self.readiness_generation
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<RawFd>,
+        Vec<RawFd>,
+        Option<Instant>,
+        u64,
+        Vec<VsockHostReadinessRegistration>,
+    ) {
+        (
+            self.host_read_fds,
+            self.host_write_fds,
+            self.deadline,
+            self.readiness_generation,
+            self.read_registrations,
+        )
     }
 }
 
@@ -3649,9 +3675,17 @@ impl Arm64BootRuntimeResources {
         handler
             .activation_handler()
             .host_wakeup()
-            .map(|(read_fds, write_fds, deadline)| {
-                Arm64BootVsockWakeup::new(read_fds, write_fds, deadline)
-            })
+            .map(
+                |(read_fds, write_fds, deadline, readiness_generation, read_registrations)| {
+                    Arm64BootVsockWakeup::new(
+                        read_fds,
+                        write_fds,
+                        deadline,
+                        readiness_generation,
+                        read_registrations,
+                    )
+                },
+            )
             .map_err(|source| Arm64BootVsockWakeupFdsError::ResultAllocation { source })
     }
 
@@ -5971,8 +6005,15 @@ fn ensure_distinct_vmgenid_generation_id(
     retained: &[u8; ARM64_BOOT_VMGENID_SIZE],
 ) {
     for (candidate_half, retained_half) in candidate
-        .chunks_exact_mut(std::mem::size_of::<u64>())
-        .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+        .as_chunks_mut::<{ std::mem::size_of::<u64>() }>()
+        .0
+        .iter_mut()
+        .zip(
+            retained
+                .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                .0
+                .iter(),
+        )
     {
         if candidate_half == retained_half
             && let Some(first_byte) = candidate_half.first_mut()
@@ -9423,7 +9464,9 @@ mod tests {
     fn prop_u32_cells(node: &Node, name: &str) -> Vec<u32> {
         node.prop_raw(name)
             .expect("property should exist")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
     }
@@ -9431,7 +9474,9 @@ mod tests {
     fn prop_u64_cells(node: &Node, name: &str) -> Vec<u64> {
         node.prop_raw(name)
             .expect("property should exist")
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| {
                 u64::from_be_bytes([
                     chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
@@ -10220,8 +10265,15 @@ mod tests {
         assert!(
             device
                 .generation_id
-                .chunks_exact(std::mem::size_of::<u64>())
-                .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+                .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                .0
+                .iter()
+                .zip(
+                    retained
+                        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                        .0
+                        .iter(),
+                )
                 .all(|(candidate_half, retained_half)| candidate_half != retained_half)
         );
         assert!(device.generation_id.iter().any(|byte| *byte != 0));
@@ -10242,8 +10294,15 @@ mod tests {
         assert!(
             device
                 .generation_id
-                .chunks_exact(std::mem::size_of::<u64>())
-                .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+                .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                .0
+                .iter()
+                .zip(
+                    retained
+                        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                        .0
+                        .iter(),
+                )
                 .all(|(candidate_half, retained_half)| candidate_half != retained_half)
         );
         assert!(device.generation_id.iter().any(|byte| *byte != 0));

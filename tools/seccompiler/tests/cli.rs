@@ -122,8 +122,10 @@ fn decode_split(path: &Path) -> Vec<u64> {
     let bytes = fs::read(path).expect("split output should be readable");
     assert!(bytes.len().is_multiple_of(size_of::<u64>()));
     bytes
-        .chunks_exact(size_of::<u64>())
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("chunk should be eight bytes")))
+        .as_chunks::<{ size_of::<u64>() }>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect()
 }
 

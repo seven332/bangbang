@@ -4080,7 +4080,9 @@ mod tests {
         let fixture = fixture.trim();
         let graph_bytes = fixture
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")
@@ -4269,7 +4271,9 @@ mod tests {
     fn decode_fixture_hex(hex: &str) -> Vec<u8> {
         let hex = hex.split_whitespace().collect::<String>();
         hex.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")
@@ -4292,7 +4296,9 @@ mod tests {
             .split_whitespace()
             .collect::<String>()
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")

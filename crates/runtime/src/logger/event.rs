@@ -906,14 +906,51 @@ pub enum LoggerVsockOutcome {
     GuestConnectionClosed,
     GuestConnectionIgnored,
     GuestConnectionDropped,
+    GuestRwHostConnectionForwarded,
+    GuestRwHostConnectionSuppressed,
+    GuestRwHostConnectionMissing,
+    GuestRwGuestConnectionForwarded,
+    GuestRwGuestConnectionSuppressed,
+    GuestRwGuestConnectionMissing,
+    GuestRstHostConnectionClosed,
+    GuestRstGuestConnectionClosed,
+    GuestRstIgnored,
+    GuestShutdownHostConnectionUpdated,
+    GuestShutdownHostConnectionClosed,
+    GuestShutdownGuestConnectionUpdated,
+    GuestShutdownGuestConnectionClosed,
+    GuestShutdownIgnored,
+    HostStreamHostConnectionClosed,
+    HostStreamHostConnectionReadFailed,
+    HostStreamGuestConnectionClosed,
+    HostStreamGuestConnectionReadFailed,
+    HostConnectionRequestDeadlineExpired,
+    HostConnectionShutdownDeadlineExpired,
+    GuestConnectionRequestDeadlineExpired,
+    GuestConnectionShutdownDeadlineExpired,
     ConnectionResetQueued,
     ConnectionResetDropped,
+    ConnectionResetDelivered,
     TransportResetSucceeded,
     TransportResetFailed,
     InterruptDeliveryFailed,
 }
 
 impl LoggerVsockOutcome {
+    pub(super) const fn uses_endpoint_rate_limiter(self) -> bool {
+        matches!(
+            self,
+            Self::HostStreamHostConnectionClosed
+                | Self::HostStreamHostConnectionReadFailed
+                | Self::HostStreamGuestConnectionClosed
+                | Self::HostStreamGuestConnectionReadFailed
+                | Self::HostConnectionRequestDeadlineExpired
+                | Self::HostConnectionShutdownDeadlineExpired
+                | Self::GuestConnectionRequestDeadlineExpired
+                | Self::GuestConnectionShutdownDeadlineExpired
+        )
+    }
+
     pub const fn operation(self) -> &'static str {
         match self {
             Self::RxSucceeded => "rx",
@@ -934,7 +971,34 @@ impl LoggerVsockOutcome {
             | Self::GuestConnectionClosed
             | Self::GuestConnectionIgnored
             | Self::GuestConnectionDropped => "guest-connection",
-            Self::ConnectionResetQueued | Self::ConnectionResetDropped => "connection-reset",
+            Self::GuestRwHostConnectionForwarded
+            | Self::GuestRwHostConnectionSuppressed
+            | Self::GuestRwHostConnectionMissing => "guest-rw-host-connection",
+            Self::GuestRwGuestConnectionForwarded
+            | Self::GuestRwGuestConnectionSuppressed
+            | Self::GuestRwGuestConnectionMissing => "guest-rw-guest-connection",
+            Self::GuestRstHostConnectionClosed => "guest-rst-host-connection",
+            Self::GuestRstGuestConnectionClosed => "guest-rst-guest-connection",
+            Self::GuestRstIgnored => "guest-rst",
+            Self::GuestShutdownHostConnectionUpdated | Self::GuestShutdownHostConnectionClosed => {
+                "guest-shutdown-host-connection"
+            }
+            Self::GuestShutdownGuestConnectionUpdated
+            | Self::GuestShutdownGuestConnectionClosed => "guest-shutdown-guest-connection",
+            Self::GuestShutdownIgnored => "guest-shutdown",
+            Self::HostStreamHostConnectionClosed | Self::HostStreamHostConnectionReadFailed => {
+                "host-stream-host-connection"
+            }
+            Self::HostStreamGuestConnectionClosed | Self::HostStreamGuestConnectionReadFailed => {
+                "host-stream-guest-connection"
+            }
+            Self::HostConnectionRequestDeadlineExpired => "host-connection-request-deadline",
+            Self::HostConnectionShutdownDeadlineExpired => "host-connection-shutdown-deadline",
+            Self::GuestConnectionRequestDeadlineExpired => "guest-connection-request-deadline",
+            Self::GuestConnectionShutdownDeadlineExpired => "guest-connection-shutdown-deadline",
+            Self::ConnectionResetQueued
+            | Self::ConnectionResetDropped
+            | Self::ConnectionResetDelivered => "connection-reset",
             Self::TransportResetSucceeded | Self::TransportResetFailed => "transport-reset",
             Self::InterruptDeliveryFailed => "interrupt-delivery",
         }
@@ -955,18 +1019,44 @@ impl LoggerVsockOutcome {
             Self::HostConnectionPending => "pending",
             Self::HostConnectionDropped | Self::GuestConnectionDropped => "dropped",
             Self::GuestConnectionRetained => "retained",
-            Self::GuestConnectionForwarded => "forwarded",
-            Self::GuestConnectionUpdated => "updated",
-            Self::GuestConnectionClosed => "closed",
-            Self::GuestConnectionIgnored => "ignored",
+            Self::GuestConnectionForwarded
+            | Self::GuestRwHostConnectionForwarded
+            | Self::GuestRwGuestConnectionForwarded => "forwarded",
+            Self::GuestConnectionUpdated
+            | Self::GuestShutdownHostConnectionUpdated
+            | Self::GuestShutdownGuestConnectionUpdated => "updated",
+            Self::GuestConnectionClosed
+            | Self::GuestRstHostConnectionClosed
+            | Self::GuestRstGuestConnectionClosed
+            | Self::GuestShutdownHostConnectionClosed
+            | Self::GuestShutdownGuestConnectionClosed
+            | Self::HostStreamHostConnectionClosed
+            | Self::HostStreamGuestConnectionClosed => "closed",
+            Self::GuestConnectionIgnored | Self::GuestRstIgnored | Self::GuestShutdownIgnored => {
+                "ignored"
+            }
+            Self::GuestRwHostConnectionSuppressed | Self::GuestRwGuestConnectionSuppressed => {
+                "suppressed"
+            }
+            Self::GuestRwHostConnectionMissing | Self::GuestRwGuestConnectionMissing => "missing",
+            Self::HostStreamHostConnectionReadFailed
+            | Self::HostStreamGuestConnectionReadFailed => "read-failed",
+            Self::HostConnectionRequestDeadlineExpired
+            | Self::HostConnectionShutdownDeadlineExpired
+            | Self::GuestConnectionRequestDeadlineExpired
+            | Self::GuestConnectionShutdownDeadlineExpired => "expired",
             Self::ConnectionResetQueued => "queued",
             Self::ConnectionResetDropped => "dropped",
+            Self::ConnectionResetDelivered => "delivered",
         }
     }
 
     pub(super) const fn level(self) -> LoggerLevel {
         match self {
-            Self::HostConnectionPending | Self::GuestConnectionIgnored => LoggerLevel::Debug,
+            Self::HostConnectionPending
+            | Self::GuestConnectionIgnored
+            | Self::GuestRstIgnored
+            | Self::GuestShutdownIgnored => LoggerLevel::Debug,
             Self::RxSucceeded
             | Self::TxSucceeded
             | Self::HostConnectionAccepted
@@ -975,17 +1065,38 @@ impl LoggerVsockOutcome {
             | Self::GuestConnectionForwarded
             | Self::GuestConnectionUpdated
             | Self::GuestConnectionClosed
+            | Self::GuestRwHostConnectionForwarded
+            | Self::GuestRwHostConnectionSuppressed
+            | Self::GuestRwGuestConnectionForwarded
+            | Self::GuestRwGuestConnectionSuppressed
+            | Self::GuestRstHostConnectionClosed
+            | Self::GuestRstGuestConnectionClosed
+            | Self::GuestShutdownHostConnectionUpdated
+            | Self::GuestShutdownHostConnectionClosed
+            | Self::GuestShutdownGuestConnectionUpdated
+            | Self::GuestShutdownGuestConnectionClosed
+            | Self::HostStreamHostConnectionClosed
+            | Self::HostStreamGuestConnectionClosed
             | Self::ConnectionResetQueued
+            | Self::ConnectionResetDelivered
             | Self::TransportResetSucceeded => LoggerLevel::Info,
             Self::RxBufferTooSmall
             | Self::QueueNotificationUnsupported
             | Self::HostConnectionDropped
             | Self::GuestConnectionDropped
+            | Self::GuestRwHostConnectionMissing
+            | Self::GuestRwGuestConnectionMissing
+            | Self::HostConnectionRequestDeadlineExpired
+            | Self::HostConnectionShutdownDeadlineExpired
+            | Self::GuestConnectionRequestDeadlineExpired
+            | Self::GuestConnectionShutdownDeadlineExpired
             | Self::ConnectionResetDropped => LoggerLevel::Warn,
             Self::RxBufferMalformed
             | Self::TxPacketMalformed
             | Self::QueueDispatchFailed
             | Self::QueueNotificationInactive
+            | Self::HostStreamHostConnectionReadFailed
+            | Self::HostStreamGuestConnectionReadFailed
             | Self::TransportResetFailed
             | Self::InterruptDeliveryFailed => LoggerLevel::Error,
         }
@@ -3708,6 +3819,138 @@ mod tests {
                 "dropped",
             ),
             (
+                LoggerVsockOutcome::GuestRwHostConnectionForwarded,
+                LoggerLevel::Info,
+                "guest-rw-host-connection",
+                "forwarded",
+            ),
+            (
+                LoggerVsockOutcome::GuestRwHostConnectionSuppressed,
+                LoggerLevel::Info,
+                "guest-rw-host-connection",
+                "suppressed",
+            ),
+            (
+                LoggerVsockOutcome::GuestRwHostConnectionMissing,
+                LoggerLevel::Warn,
+                "guest-rw-host-connection",
+                "missing",
+            ),
+            (
+                LoggerVsockOutcome::GuestRwGuestConnectionForwarded,
+                LoggerLevel::Info,
+                "guest-rw-guest-connection",
+                "forwarded",
+            ),
+            (
+                LoggerVsockOutcome::GuestRwGuestConnectionSuppressed,
+                LoggerLevel::Info,
+                "guest-rw-guest-connection",
+                "suppressed",
+            ),
+            (
+                LoggerVsockOutcome::GuestRwGuestConnectionMissing,
+                LoggerLevel::Warn,
+                "guest-rw-guest-connection",
+                "missing",
+            ),
+            (
+                LoggerVsockOutcome::GuestRstHostConnectionClosed,
+                LoggerLevel::Info,
+                "guest-rst-host-connection",
+                "closed",
+            ),
+            (
+                LoggerVsockOutcome::GuestRstGuestConnectionClosed,
+                LoggerLevel::Info,
+                "guest-rst-guest-connection",
+                "closed",
+            ),
+            (
+                LoggerVsockOutcome::GuestRstIgnored,
+                LoggerLevel::Debug,
+                "guest-rst",
+                "ignored",
+            ),
+            (
+                LoggerVsockOutcome::GuestShutdownHostConnectionUpdated,
+                LoggerLevel::Info,
+                "guest-shutdown-host-connection",
+                "updated",
+            ),
+            (
+                LoggerVsockOutcome::GuestShutdownHostConnectionClosed,
+                LoggerLevel::Info,
+                "guest-shutdown-host-connection",
+                "closed",
+            ),
+            (
+                LoggerVsockOutcome::GuestShutdownGuestConnectionUpdated,
+                LoggerLevel::Info,
+                "guest-shutdown-guest-connection",
+                "updated",
+            ),
+            (
+                LoggerVsockOutcome::GuestShutdownGuestConnectionClosed,
+                LoggerLevel::Info,
+                "guest-shutdown-guest-connection",
+                "closed",
+            ),
+            (
+                LoggerVsockOutcome::GuestShutdownIgnored,
+                LoggerLevel::Debug,
+                "guest-shutdown",
+                "ignored",
+            ),
+            (
+                LoggerVsockOutcome::HostStreamHostConnectionClosed,
+                LoggerLevel::Info,
+                "host-stream-host-connection",
+                "closed",
+            ),
+            (
+                LoggerVsockOutcome::HostStreamHostConnectionReadFailed,
+                LoggerLevel::Error,
+                "host-stream-host-connection",
+                "read-failed",
+            ),
+            (
+                LoggerVsockOutcome::HostStreamGuestConnectionClosed,
+                LoggerLevel::Info,
+                "host-stream-guest-connection",
+                "closed",
+            ),
+            (
+                LoggerVsockOutcome::HostStreamGuestConnectionReadFailed,
+                LoggerLevel::Error,
+                "host-stream-guest-connection",
+                "read-failed",
+            ),
+            (
+                LoggerVsockOutcome::HostConnectionRequestDeadlineExpired,
+                LoggerLevel::Warn,
+                "host-connection-request-deadline",
+                "expired",
+            ),
+            (
+                LoggerVsockOutcome::HostConnectionShutdownDeadlineExpired,
+                LoggerLevel::Warn,
+                "host-connection-shutdown-deadline",
+                "expired",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionRequestDeadlineExpired,
+                LoggerLevel::Warn,
+                "guest-connection-request-deadline",
+                "expired",
+            ),
+            (
+                LoggerVsockOutcome::GuestConnectionShutdownDeadlineExpired,
+                LoggerLevel::Warn,
+                "guest-connection-shutdown-deadline",
+                "expired",
+            ),
+            (
                 LoggerVsockOutcome::ConnectionResetQueued,
                 LoggerLevel::Info,
                 "connection-reset",
@@ -3718,6 +3961,12 @@ mod tests {
                 LoggerLevel::Warn,
                 "connection-reset",
                 "dropped",
+            ),
+            (
+                LoggerVsockOutcome::ConnectionResetDelivered,
+                LoggerLevel::Info,
+                "connection-reset",
+                "delivered",
             ),
             (
                 LoggerVsockOutcome::TransportResetSucceeded,

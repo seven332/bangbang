@@ -1287,7 +1287,7 @@ fn restore_device_key() -> Result<SnapshotV2DeviceKey, ContainedSessionError> {
     bytes
         .try_reserve_exact(hex.len() / 2)
         .map_err(|_| ContainedSessionError)?;
-    for pair in hex.chunks_exact(2) {
+    for pair in hex.as_chunks::<2>().0 {
         let pair = std::str::from_utf8(pair).map_err(|_| ContainedSessionError)?;
         bytes.push(u8::from_str_radix(pair, 16).map_err(|_| ContainedSessionError)?);
     }
