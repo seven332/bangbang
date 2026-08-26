@@ -2792,17 +2792,22 @@ packet connectivity; that positive signed matrix remains #1378.
 
 ### Production vmnet certification foundation
 
-The credential-free first #1378 slice defines the inputs and oracles for a
-later production runner without building a bundle or opening vmnet. The host
-module intentionally exposes only validation commands:
+The #1378 protocol foundation and production runner are one fail-closed CLI.
+Validation remains credential-free; `run` requires a clean checkout with no
+non-ignored untracked inputs on a supported Apple Silicon macOS host plus the
+caller's approved identity, profile, and isolated fixture:
 
 ```sh
 python3 scripts/production_vmnet_certification.py validate-config \
   --config /absolute/private/config.json
 python3 scripts/production_vmnet_certification.py validate-result \
   --result /absolute/private/result.json
+python3 scripts/production_vmnet_certification.py run \
+  --config /absolute/private/config.json \
+  --result /absolute/private/result.json
 python3 -m unittest \
   scripts.tests.test_production_vmnet_certification \
+  scripts.tests.test_production_vmnet_orchestration \
   scripts.tests.test_production_vmnet_guest
 ```
 
@@ -2816,6 +2821,20 @@ case selectors, and seven bounded timeouts. The command discovers no keychain,
 profile, bridge, endpoint, or alternate fixture. Paths, identity, interface,
 digest, endpoint, nonce, traffic, process/session values, and raw tool output
 never enter its fixed errors or the result.
+
+The real driver records the clean commit/tree and exact macOS/SDK/HVF platform,
+prepares the pinned kernel plus exact 512 MiB `direct-boot-v110` rootfs, and
+builds separate networkless and approved-vmnet `Bangbang.app` bundles through
+the public production builder. It verifies layout and nested signatures, then
+requires entitlement-free outer launchers, an App Sandbox plus Hypervisor
+networkless worker, and the exact five-key vmnet worker profile. Only the outer
+launcher is executed. Each case receives private descriptor-rooted grants for
+the kernel, read-only rootfs, serial sink, API-socket directory, and, when
+needed, one read-only control sector. The runner uses the authenticated vmnet
+allowlist/count policy and the strict one-request Unix HTTP API; it never
+executes the nested worker directly or enumerates process arguments.
+Each connection rechecks the socket identity and requires Darwin's peer PID to
+match the exact contained worker discovered beneath the outer launcher.
 
 One fixture session rechecks the configured executable's device, inode, size,
 timestamps, and digest, then launches that exact path directly with no
@@ -2832,7 +2851,7 @@ The guest helper is installed as the exact mode-`0555`
 `/bangbang-production-vmnet-certification` input of the current
 `direct-boot-v110` recipe. The non-sensitive
 `bangbang.production-vmnet-certification=1` boot selector invokes it without
-private arguments. A later runner will attach one read-only 512-byte `/dev/vdb`
+private arguments. The runner attaches one read-only 512-byte `/dev/vdb`
 control sector carrying the mode, private endpoint, port, and nonce under a
 SHA-256 binding. The helper discovers exactly one virtio-net interface, performs
 strict interface-bound DHCPv4 under one 30-second deadline, applies only the
@@ -2846,18 +2865,44 @@ BANGBANG_PRODUCTION_VMNET_CERTIFICATION_OK
 BANGBANG_PRODUCTION_VMNET_CERTIFICATION_FAIL_<FIXED_PHASE>
 ```
 
-The canonical result contains the source/platform categories, three
-entitlement assertions, all 21 fixed case rows, cleanup state, and a coherent
-categorical verdict. Publication uses a private same-directory stage and an
-atomic no-replace commit; neither validation command produces a result. The
+The exact ordered matrix is:
+
+```text
+entitlement-split, networkless-denial, missing-policy-denial,
+mismatched-policy-denial, bridge-allowlist-denial,
+active-interface-count-exhaustion, mmds-only-no-consumption,
+shared-connectivity, host-connectivity, bridged-connectivity, not-authorized,
+sharing-service-busy, normal-teardown, partial-start-cleanup,
+pre-ready-cancellation, post-ready-cancellation, worker-first-death,
+launcher-first-death, worker-sigkill-reclamation, clean-repeat,
+concurrent-noninterchangeability
+```
+
+Host and bridged connectivity plus the two real vmnet service conditions remain
+`environment-gated` unless explicitly authorized by the private config. The
+service rows pass only from Bangbang's typed API fault after fixture preparation;
+fixture output cannot declare them. Mandatory rows cannot skip. Process
+inspection is restricted to pid/ppid/state/comm; cancellation, both death
+orders, SIGKILL, repeat, and concurrency must restore every owned process group,
+socket, case tree, bundle, fixture session, and private runner session.
+
+The canonical result contains the source/platform categories, three entitlement
+assertions, all 21 rows, cleanup state, and one coherent categorical verdict.
+Publication uses a private same-directory stage and an atomic no-replace commit.
+Setup failure produces no result; after setup, the first case failure is
+recorded, later rows are blocked, cleanup takes precedence, and no failed result
+is positive evidence. Neither validation command produces a result. The
 historical `direct-boot-v109` identity is not reused for the new helper bytes:
 current preparation accepts only `direct-boot-v110`, so v109 invocation and
 sidecar identities are stale and rejected.
 
-These portable tests use fake DHCP/TCP/kernel-command boundaries and a local
-fixture process. They launch no Bangbang production bundle, create no vmnet
-interface, use no Apple credentials, and promote no capability. Until the
-subsequent orchestration and caller-approved external execution slices finish,
+The committed placeholder invocation exits 3 with exactly
+`bangbang production vmnet run: blocked category=config` and publishes no
+result. Portable tests inject the orchestration boundary and use fake
+DHCP/TCP/kernel commands plus a local retained fixture. They launch no Bangbang
+production bundle, create no vmnet interface, use no Apple credentials, and
+promote no capability. Until the subsequent caller-approved external execution
+and exact evidence-promotion slice finishes,
 `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` remain
 `audit-required` and the global final gate remains expected to fail on them.

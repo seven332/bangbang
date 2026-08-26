@@ -611,6 +611,11 @@
           "kind": "local",
           "path": "scripts/preflight-production-vmnet.sh",
           "anchor": "bangbang vmnet preflight: blocked"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/production_vmnet_certification.py",
+          "anchor": "def run_certification("
         }
       ],
       "validation": [
@@ -618,6 +623,11 @@
           "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
           "anchor": "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_production_vmnet_orchestration.py",
+          "anchor": "class ProductionVmnetOrchestrationTests"
         }
       ]
     }

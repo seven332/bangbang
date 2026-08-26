@@ -69,13 +69,14 @@ the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
   fresh sessions, immutable artifacts, redacted failures, cancellation and
   death cleanup, retry, and all-MMDS containment without vmnet authority.
 - **EXTERNAL-GATE** — the missing-credential production preflight exits 3 and
-  prints exactly `bangbang vmnet preflight: blocked`. The credential-free
-  foundation additionally fixes and portable-tests the private config,
-  digest-pinned retained fixture, direct-rootfs-v110 DHCP/TCP guest oracle, and
-  complete redacted result contracts without exposing a `run` operation.
-  #1378 still owns the first real Apple-approved start, packet-connectivity,
-  service-error, teardown, crash, retry, and concurrent-session results; a
-  non-success local gate or fixture declaration is never a passing skip.
+  prints exactly `bangbang vmnet preflight: blocked`. The certification path
+  additionally fixes and portable-tests the private protocols,
+  direct-rootfs-v110 DHCP/TCP oracle, two-package inspection, descriptor grants,
+  complete 21-case production runner, and redacted result. The placeholder
+  `run` exits 3 and publishes nothing. #1378 still owns the first real
+  Apple-approved start, packet-connectivity, service-error, teardown, crash,
+  retry, and concurrent-session results; an injected driver, non-success local
+  gate, or fixture declaration is never a passing skip.
 - **W7** — #1798 closes the separate `corpus:network-performance` reference
   interpretation and strict optional-fixture boundary without claiming a
   positive network sample; #1378 retains production connectivity.
@@ -216,9 +217,9 @@ before session creation.
 
 - #1378 remains open. This contract does not claim an Apple-approved production
   vmnet start, external packet connectivity, service failure, crash reclamation,
-  or credentialed concurrent connectivity. Its first checked foundation slice
-  changes no row: production orchestration and caller-approved execution remain
-  required.
+  or credentialed concurrent connectivity. Its checked foundation and
+  production orchestration change no row: caller-approved execution and exact
+  evidence promotion remain required.
 - The checked [Wave 6 snapshot contract](snapshot-wave6-contract.md) makes
   Diff, version/tool composition, exact 2.11 network/MMDS bytes,
   reconstruction, overrides, and clone-session freshness terminal. Current

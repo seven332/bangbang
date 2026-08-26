@@ -5390,9 +5390,9 @@ credential/chroot authority, remaining Linux
 jailer controls, seccomp outcome classification, and deployment signing policy
 remain later #1351 work.
 
-The credential-free production-vmnet certification foundation now fixes the
-next external gate's private config, complete 21-row redacted result, retained
-digest-pinned fixture session, and independent guest oracle. The current
+The production-vmnet certification path now fixes the external gate's private
+config, complete 21-row redacted result, retained digest-pinned fixture session,
+independent guest oracle, and fail-closed production runner. The current
 direct-rootfs recipe is `direct-boot-v110`; it installs an exact mode-`0555`
 Python helper selected by the non-sensitive
 `bangbang.production-vmnet-certification=1` argument. A read-only 512-byte
@@ -5402,10 +5402,15 @@ applies and later removes the accepted address/default route, and requires an
 exact nonce-bound TCP request, response, and EOF. Its output contains only
 fixed phase markers. Historical v109 sidecars cannot identify these bytes.
 
-This slice has no `run` operation: it validates contracts and exercises only
-portable injected boundaries. It does not build the package, construct grants,
-drive the API/process/death matrix, open real vmnet, accept fixture-declared
-service outcomes, record external evidence, or promote either #1378 row.
+The documented `run` operation verifies clean source and platform identity,
+builds and inspects networkless and approved-vmnet production packages, creates
+only descriptor-rooted grants, launches only the outer executable, and drives
+the fixed policy/API/guest/cancellation/death/reclamation/concurrency matrix.
+Host/bridged connectivity and the two typed service-failure rows stay explicit
+environment gates. Portable dependency-injected tests verify the state machine,
+redaction, and cleanup but are not production evidence. This slice does not
+discover or use restricted credentials, record a successful external run, or
+promote either #1378 row.
 `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` therefore remain
 `audit-required`.
