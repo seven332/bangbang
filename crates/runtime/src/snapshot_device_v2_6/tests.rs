@@ -92,7 +92,9 @@ fn decode_hex(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
     assert!(hex.len().is_multiple_of(2));
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             u8::from_str_radix(
                 std::str::from_utf8(pair).expect("fixture pair should be UTF-8"),

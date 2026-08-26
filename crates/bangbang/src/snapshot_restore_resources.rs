@@ -6393,7 +6393,9 @@ mod tests {
         let bytes = fixture
             .trim()
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")
@@ -6411,7 +6413,9 @@ mod tests {
         let mut bytes = fixture
             .trim()
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")
@@ -6449,7 +6453,9 @@ mod tests {
         let mut bytes = fixture
             .trim()
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")
@@ -6495,7 +6501,9 @@ mod tests {
         let bytes = fixture
             .trim()
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")

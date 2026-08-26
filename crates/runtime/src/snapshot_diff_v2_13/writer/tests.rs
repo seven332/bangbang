@@ -966,13 +966,13 @@ fn allocation_error() -> TryReserveError {
 
 fn decode_hex(text: &str) -> Vec<u8> {
     let text = text.trim();
-    let mut chunks = text.as_bytes().chunks_exact(2);
+    let (chunks, remainder) = text.as_bytes().as_chunks::<2>();
     let mut bytes = Vec::new();
     bytes.reserve_exact(chunks.len());
-    for chunk in &mut chunks {
+    for chunk in chunks {
         let pair = std::str::from_utf8(chunk).expect("fixture hex should be UTF-8");
         bytes.push(u8::from_str_radix(pair, 16).expect("fixture hex should decode"));
     }
-    assert!(chunks.remainder().is_empty());
+    assert!(remainder.is_empty());
     bytes
 }

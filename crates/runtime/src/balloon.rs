@@ -934,7 +934,7 @@ impl VirtioBalloonPfnPayload {
         let mut pfns = Vec::new();
         pfns.try_reserve_exact(count)
             .map_err(|source| VirtioBalloonPfnPayloadParseError::PfnAllocation { count, source })?;
-        for chunk in bytes.chunks_exact(VIRTIO_BALLOON_PFN_SIZE) {
+        for chunk in bytes.as_chunks::<VIRTIO_BALLOON_PFN_SIZE>().0 {
             let mut pfn = [0; VIRTIO_BALLOON_PFN_SIZE];
             pfn.copy_from_slice(chunk);
             pfns.push(u32::from_le_bytes(pfn));
@@ -1956,7 +1956,7 @@ impl VirtioBalloonStatisticsDescriptor {
         let mut stats = BalloonOptionalStats::default();
         let mut stat_count = 0;
         let mut recognized_stat_count = 0;
-        for chunk in bytes.chunks_exact(VIRTIO_BALLOON_STAT_SIZE) {
+        for chunk in bytes.as_chunks::<VIRTIO_BALLOON_STAT_SIZE>().0 {
             let mut stat_bytes = [0; VIRTIO_BALLOON_STAT_SIZE];
             stat_bytes.copy_from_slice(chunk);
             stat_count += 1;

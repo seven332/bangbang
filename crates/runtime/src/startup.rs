@@ -6005,8 +6005,15 @@ fn ensure_distinct_vmgenid_generation_id(
     retained: &[u8; ARM64_BOOT_VMGENID_SIZE],
 ) {
     for (candidate_half, retained_half) in candidate
-        .chunks_exact_mut(std::mem::size_of::<u64>())
-        .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+        .as_chunks_mut::<{ std::mem::size_of::<u64>() }>()
+        .0
+        .iter_mut()
+        .zip(
+            retained
+                .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                .0
+                .iter(),
+        )
     {
         if candidate_half == retained_half
             && let Some(first_byte) = candidate_half.first_mut()
@@ -9457,7 +9464,9 @@ mod tests {
     fn prop_u32_cells(node: &Node, name: &str) -> Vec<u32> {
         node.prop_raw(name)
             .expect("property should exist")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
     }
@@ -9465,7 +9474,9 @@ mod tests {
     fn prop_u64_cells(node: &Node, name: &str) -> Vec<u64> {
         node.prop_raw(name)
             .expect("property should exist")
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|chunk| {
                 u64::from_be_bytes([
                     chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
@@ -10254,8 +10265,15 @@ mod tests {
         assert!(
             device
                 .generation_id
-                .chunks_exact(std::mem::size_of::<u64>())
-                .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+                .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                .0
+                .iter()
+                .zip(
+                    retained
+                        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                        .0
+                        .iter(),
+                )
                 .all(|(candidate_half, retained_half)| candidate_half != retained_half)
         );
         assert!(device.generation_id.iter().any(|byte| *byte != 0));
@@ -10276,8 +10294,15 @@ mod tests {
         assert!(
             device
                 .generation_id
-                .chunks_exact(std::mem::size_of::<u64>())
-                .zip(retained.chunks_exact(std::mem::size_of::<u64>()))
+                .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                .0
+                .iter()
+                .zip(
+                    retained
+                        .as_chunks::<{ std::mem::size_of::<u64>() }>()
+                        .0
+                        .iter(),
+                )
                 .all(|(candidate_half, retained_half)| candidate_half != retained_half)
         );
         assert!(device.generation_id.iter().any(|byte| *byte != 0));

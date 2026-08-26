@@ -46445,7 +46445,9 @@ mod tests {
         let hex = hex.split_ascii_whitespace().collect::<String>();
         assert!(hex.len().is_multiple_of(2));
         hex.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture hex should be UTF-8");
                 u8::from_str_radix(pair, 16).expect("fixture hex should decode")
