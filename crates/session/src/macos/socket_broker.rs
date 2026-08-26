@@ -1,11 +1,12 @@
-//! Closed launcher-worker transport for granted-vsock guest connections.
+//! Closed launcher-worker transport for granted API publication and vsock connections.
 
 use std::fmt;
 use std::io;
+use std::mem::size_of;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixDatagram;
 
-use crate::{MAX_SOCKET_CHILD_BYTES, SessionId, SocketChild};
+use crate::{MAX_SOCKET_CHILD_BYTES, ObjectIdentity, SessionId, SocketChild};
 
 use super::grant_transport::{GrantTransportError, receive_raw, send_raw};
 
@@ -19,6 +20,9 @@ const KIND_READY: u8 = 4;
 const KIND_CONNECTED: u8 = 5;
 const KIND_FAILED: u8 = 6;
 const KIND_COMPLETE: u8 = 7;
+const KIND_PUBLISH_API: u8 = 8;
+const KIND_API_PUBLISHED: u8 = 9;
+const KIND_API_PUBLISH_FAILED: u8 = 10;
 const STATUS_OK: u8 = 0;
 const STATUS_NOT_FOUND: u8 = 1;
 const STATUS_PERMISSION_DENIED: u8 = 2;
@@ -31,10 +35,22 @@ const PORT_OFFSET: usize = 48;
 const CHILD_LENGTH_OFFSET: usize = 52;
 const CHILD_OFFSET: usize = 56;
 const CHILD_END: usize = CHILD_OFFSET + MAX_SOCKET_CHILD_BYTES;
+const IDENTITY_DEVICE_OFFSET: usize = CHILD_OFFSET;
+const IDENTITY_INODE_OFFSET: usize = IDENTITY_DEVICE_OFFSET + size_of::<u64>();
+const IDENTITY_END: usize = IDENTITY_INODE_OFFSET + size_of::<u64>();
 
 /// One closed session-bound broker message.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SocketBrokerMessage {
+    /// Requests publication of one already-claimed API socket child.
+    PublishApi {
+        /// Exact lifecycle session.
+        session: SessionId,
+        /// Monotonic request sequence.
+        sequence: u64,
+        /// Exact child selected by the worker grant claim.
+        child: SocketChild,
+    },
     /// Fixes the dormant broker to one already-claimed safe child.
     Activate {
         /// Exact lifecycle session.
@@ -94,11 +110,30 @@ pub enum SocketBrokerMessage {
         /// Matching request sequence.
         sequence: u64,
     },
+    /// Returns one published API listener and its exact path identity.
+    ApiPublished {
+        /// Exact lifecycle session.
+        session: SessionId,
+        /// Matching request sequence.
+        sequence: u64,
+        /// Exact final socket device/inode.
+        identity: ObjectIdentity,
+    },
+    /// Reports one bounded API publication failure without path data.
+    ApiPublishFailed {
+        /// Exact lifecycle session.
+        session: SessionId,
+        /// Matching request sequence.
+        sequence: u64,
+        /// Stable redacted failure category.
+        kind: io::ErrorKind,
+    },
 }
 
 impl fmt::Debug for SocketBrokerMessage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::PublishApi { .. } => "PublishApi(<redacted>)",
             Self::Activate { .. } => "Activate(<redacted>)",
             Self::Connect { .. } => "Connect(<redacted>)",
             Self::Shutdown { .. } => "Shutdown(<redacted>)",
@@ -106,6 +141,8 @@ impl fmt::Debug for SocketBrokerMessage {
             Self::Connected { .. } => "Connected(<redacted>)",
             Self::Failed { .. } => "Failed(<redacted>)",
             Self::Complete { .. } => "Complete(<redacted>)",
+            Self::ApiPublished { .. } => "ApiPublished(<redacted>)",
+            Self::ApiPublishFailed { .. } => "ApiPublishFailed(<redacted>)",
         })
     }
 }
@@ -115,13 +152,16 @@ impl SocketBrokerMessage {
     #[must_use]
     pub const fn session(&self) -> SessionId {
         match self {
-            Self::Activate { session, .. }
+            Self::PublishApi { session, .. }
+            | Self::Activate { session, .. }
             | Self::Connect { session, .. }
             | Self::Shutdown { session, .. }
             | Self::Ready { session, .. }
             | Self::Connected { session, .. }
             | Self::Failed { session, .. }
-            | Self::Complete { session, .. } => *session,
+            | Self::Complete { session, .. }
+            | Self::ApiPublished { session, .. }
+            | Self::ApiPublishFailed { session, .. } => *session,
         }
     }
 
@@ -129,18 +169,21 @@ impl SocketBrokerMessage {
     #[must_use]
     pub const fn sequence(&self) -> u64 {
         match self {
-            Self::Activate { sequence, .. }
+            Self::PublishApi { sequence, .. }
+            | Self::Activate { sequence, .. }
             | Self::Connect { sequence, .. }
             | Self::Shutdown { sequence, .. }
             | Self::Ready { sequence, .. }
             | Self::Connected { sequence, .. }
             | Self::Failed { sequence, .. }
-            | Self::Complete { sequence, .. } => *sequence,
+            | Self::Complete { sequence, .. }
+            | Self::ApiPublished { sequence, .. }
+            | Self::ApiPublishFailed { sequence, .. } => *sequence,
         }
     }
 
     const fn descriptor_count(&self) -> u8 {
-        if matches!(self, Self::Connected { .. }) {
+        if matches!(self, Self::Connected { .. } | Self::ApiPublished { .. }) {
             1
         } else {
             0
@@ -178,7 +221,7 @@ impl From<GrantTransportError> for SocketBrokerError {
 pub struct ReceivedSocketBrokerMessage {
     /// Decoded session-bound message.
     pub message: SocketBrokerMessage,
-    /// Descriptor required by `Connected`, if any.
+    /// Descriptor required by `Connected` or `ApiPublished`, if any.
     pub descriptor: Option<OwnedFd>,
 }
 
@@ -242,8 +285,13 @@ fn encode(message: &SocketBrokerMessage) -> Result<[u8; FRAME_BYTES], SocketBrok
     frame[SEQUENCE_OFFSET..PORT_OFFSET].copy_from_slice(&sequence.to_be_bytes());
 
     match message {
-        SocketBrokerMessage::Activate { child, .. } => {
-            frame[5] = KIND_ACTIVATE;
+        SocketBrokerMessage::PublishApi { child, .. }
+        | SocketBrokerMessage::Activate { child, .. } => {
+            frame[5] = if matches!(message, SocketBrokerMessage::PublishApi { .. }) {
+                KIND_PUBLISH_API
+            } else {
+                KIND_ACTIVATE
+            };
             let length =
                 u8::try_from(child.as_bytes().len()).map_err(|_| SocketBrokerError::Invalid)?;
             frame[CHILD_LENGTH_OFFSET] = length;
@@ -271,6 +319,20 @@ fn encode(message: &SocketBrokerMessage) -> Result<[u8; FRAME_BYTES], SocketBrok
             frame[PORT_OFFSET..PORT_OFFSET + 4].copy_from_slice(&port.to_be_bytes());
         }
         SocketBrokerMessage::Complete { .. } => frame[5] = KIND_COMPLETE,
+        SocketBrokerMessage::ApiPublished { identity, .. } => {
+            if identity.device == 0 || identity.inode == 0 {
+                return Err(SocketBrokerError::Invalid);
+            }
+            frame[5] = KIND_API_PUBLISHED;
+            frame[IDENTITY_DEVICE_OFFSET..IDENTITY_INODE_OFFSET]
+                .copy_from_slice(&identity.device.to_be_bytes());
+            frame[IDENTITY_INODE_OFFSET..IDENTITY_END]
+                .copy_from_slice(&identity.inode.to_be_bytes());
+        }
+        SocketBrokerMessage::ApiPublishFailed { kind, .. } => {
+            frame[5] = KIND_API_PUBLISH_FAILED;
+            frame[6] = failure_status(*kind);
+        }
     }
     Ok(frame)
 }
@@ -302,21 +364,19 @@ fn decode(frame: &[u8; FRAME_BYTES]) -> Result<SocketBrokerMessage, SocketBroker
     let child_end = CHILD_OFFSET
         .checked_add(child_length)
         .ok_or(SocketBrokerError::Invalid)?;
-    if session.is_pre_session()
-        || sequence == 0
-        || child_length > MAX_SOCKET_CHILD_BYTES
-        || frame
-            .get(child_end..CHILD_END)
-            .ok_or(SocketBrokerError::Invalid)?
-            .iter()
-            .any(|byte| *byte != 0)
-    {
+    if session.is_pre_session() || sequence == 0 || child_length > MAX_SOCKET_CHILD_BYTES {
         return Err(SocketBrokerError::Invalid);
     }
     let kind = frame[5];
     let status = frame[6];
     let descriptor_count = frame[7];
     let no_child = child_length == 0;
+    let child_padding_zero = frame
+        .get(child_end..CHILD_END)
+        .ok_or(SocketBrokerError::Invalid)?
+        .iter()
+        .all(|byte| *byte == 0);
+    let no_child_bytes = frame[CHILD_OFFSET..CHILD_END].iter().all(|byte| *byte == 0);
     let child = || {
         std::str::from_utf8(
             frame
@@ -328,33 +388,79 @@ fn decode(frame: &[u8; FRAME_BYTES]) -> Result<SocketBrokerMessage, SocketBroker
     };
 
     match (kind, status, descriptor_count, port, no_child) {
-        (KIND_ACTIVATE, STATUS_OK, 0, 0, false) => Ok(SocketBrokerMessage::Activate {
-            session,
-            sequence,
-            child: child()?,
-        }),
-        (KIND_CONNECT, STATUS_OK, 0, _, true) => Ok(SocketBrokerMessage::Connect {
-            session,
-            sequence,
-            port,
-        }),
-        (KIND_SHUTDOWN, STATUS_OK, 0, 0, true) => {
+        (KIND_PUBLISH_API, STATUS_OK, 0, 0, false) if child_padding_zero => {
+            Ok(SocketBrokerMessage::PublishApi {
+                session,
+                sequence,
+                child: child()?,
+            })
+        }
+        (KIND_ACTIVATE, STATUS_OK, 0, 0, false) if child_padding_zero => {
+            Ok(SocketBrokerMessage::Activate {
+                session,
+                sequence,
+                child: child()?,
+            })
+        }
+        (KIND_CONNECT, STATUS_OK, 0, _, true) if no_child_bytes => {
+            Ok(SocketBrokerMessage::Connect {
+                session,
+                sequence,
+                port,
+            })
+        }
+        (KIND_SHUTDOWN, STATUS_OK, 0, 0, true) if no_child_bytes => {
             Ok(SocketBrokerMessage::Shutdown { session, sequence })
         }
-        (KIND_READY, STATUS_OK, 0, 0, true) => Ok(SocketBrokerMessage::Ready { session, sequence }),
-        (KIND_CONNECTED, STATUS_OK, 1, _, true) => Ok(SocketBrokerMessage::Connected {
-            session,
-            sequence,
-            port,
-        }),
-        (KIND_FAILED, status, 0, _, true) => Ok(SocketBrokerMessage::Failed {
+        (KIND_READY, STATUS_OK, 0, 0, true) if no_child_bytes => {
+            Ok(SocketBrokerMessage::Ready { session, sequence })
+        }
+        (KIND_CONNECTED, STATUS_OK, 1, _, true) if no_child_bytes => {
+            Ok(SocketBrokerMessage::Connected {
+                session,
+                sequence,
+                port,
+            })
+        }
+        (KIND_FAILED, status, 0, _, true) if no_child_bytes => Ok(SocketBrokerMessage::Failed {
             session,
             sequence,
             port,
             kind: failure_kind(status)?,
         }),
-        (KIND_COMPLETE, STATUS_OK, 0, 0, true) => {
+        (KIND_COMPLETE, STATUS_OK, 0, 0, true) if no_child_bytes => {
             Ok(SocketBrokerMessage::Complete { session, sequence })
+        }
+        (KIND_API_PUBLISHED, STATUS_OK, 1, 0, true)
+            if frame[IDENTITY_END..CHILD_END].iter().all(|byte| *byte == 0) =>
+        {
+            let identity = ObjectIdentity {
+                device: u64::from_be_bytes(
+                    frame[IDENTITY_DEVICE_OFFSET..IDENTITY_INODE_OFFSET]
+                        .try_into()
+                        .map_err(|_| SocketBrokerError::Invalid)?,
+                ),
+                inode: u64::from_be_bytes(
+                    frame[IDENTITY_INODE_OFFSET..IDENTITY_END]
+                        .try_into()
+                        .map_err(|_| SocketBrokerError::Invalid)?,
+                ),
+            };
+            if identity.device == 0 || identity.inode == 0 {
+                return Err(SocketBrokerError::Invalid);
+            }
+            Ok(SocketBrokerMessage::ApiPublished {
+                session,
+                sequence,
+                identity,
+            })
+        }
+        (KIND_API_PUBLISH_FAILED, status, 0, 0, true) if no_child_bytes => {
+            Ok(SocketBrokerMessage::ApiPublishFailed {
+                session,
+                sequence,
+                kind: failure_kind(status)?,
+            })
         }
         _ => Err(SocketBrokerError::Invalid),
     }
@@ -395,6 +501,11 @@ mod tests {
     fn round_trips_closed_messages_and_one_descriptor() {
         let child = SocketChild::parse("vm.vsock").expect("child should parse");
         let messages = [
+            SocketBrokerMessage::PublishApi {
+                session: session(),
+                sequence: 1,
+                child: child.clone(),
+            },
             SocketBrokerMessage::Activate {
                 session: session(),
                 sequence: 1,
@@ -423,6 +534,11 @@ mod tests {
                 session: session(),
                 sequence: 3,
             },
+            SocketBrokerMessage::ApiPublishFailed {
+                session: session(),
+                sequence: 1,
+                kind: io::ErrorKind::PermissionDenied,
+            },
         ];
         for message in messages {
             let encoded = encode(&message).expect("message should encode");
@@ -441,6 +557,22 @@ mod tests {
         let received =
             receive_socket_broker_message(&receiver).expect("descriptor response should receive");
         assert_eq!(received.message, message);
+        assert!(received.descriptor.is_some());
+
+        let identity = ObjectIdentity {
+            device: 17,
+            inode: 23,
+        };
+        let published = SocketBrokerMessage::ApiPublished {
+            session: session(),
+            sequence: 5,
+            identity,
+        };
+        send_socket_broker_message(&sender, &published, Some(file.as_raw_fd()))
+            .expect("API listener response should send");
+        let received =
+            receive_socket_broker_message(&receiver).expect("API listener response should receive");
+        assert_eq!(received.message, published);
         assert!(received.descriptor.is_some());
     }
 
@@ -473,5 +605,48 @@ mod tests {
             format!("{message:?} {}", SocketBrokerError::Invalid),
             "Connect(<redacted>) private socket broker failure"
         );
+    }
+
+    #[test]
+    fn rejects_api_identity_reserved_bytes_and_wrong_rights() {
+        let identity = ObjectIdentity {
+            device: 17,
+            inode: 23,
+        };
+        let message = SocketBrokerMessage::ApiPublished {
+            session: session(),
+            sequence: 1,
+            identity,
+        };
+        let mut encoded = encode(&message).expect("API response should encode");
+        encoded[IDENTITY_END] = 1;
+        assert_eq!(decode(&encoded), Err(SocketBrokerError::Invalid));
+
+        assert_eq!(
+            encode(&SocketBrokerMessage::ApiPublished {
+                session: session(),
+                sequence: 1,
+                identity: ObjectIdentity {
+                    device: 0,
+                    inode: 23,
+                },
+            }),
+            Err(SocketBrokerError::Invalid)
+        );
+
+        let child = SocketChild::parse("api.sock").expect("API child should parse");
+        let request = SocketBrokerMessage::PublishApi {
+            session: session(),
+            sequence: 1,
+            child,
+        };
+        assert!(matches!(
+            send_socket_broker_message(
+                &UnixDatagram::pair().expect("pair should open").0,
+                &request,
+                Some(libc::STDIN_FILENO)
+            ),
+            Err(SocketBrokerError::Invalid)
+        ));
     }
 }

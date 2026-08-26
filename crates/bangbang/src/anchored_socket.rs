@@ -25,7 +25,7 @@ use bangbang_session::{ObjectIdentity, ResourceRole, SocketChild};
 
 use crate::contained_session::{
     ClaimedSocketDirectory, PreparedSocketBrokerEndpoint, PreparedSocketDirectoryClaim,
-    SocketBrokerEndpoint,
+    SocketBrokerAuthority, SocketBrokerEndpoint,
 };
 
 const BINDER_ARGUMENT: &str = "--bangbang-internal-socket-binder-v1";
@@ -416,6 +416,185 @@ pub(crate) fn bind(
         broker.map(SocketBrokerClaim::Committed),
         || false,
     )
+}
+
+/// Requests launcher-side staged publication and adopts one ordinary API listener.
+pub(crate) fn request_api_listener(
+    namespace: WorkerSocketNamespace,
+    claim: ClaimedSocketDirectory,
+    authority: &SocketBrokerAuthority,
+) -> Result<BoundAnchoredSocket, AnchoredSocketError> {
+    if namespace.identity().device != claim.directory.identity().device {
+        return Err(AnchoredSocketError::CrossFilesystem);
+    }
+    let mut broker = authority
+        .prepare_endpoint()
+        .map_err(|_| AnchoredSocketError::Broker)?;
+    let exchanged = exchange_api_publication(&mut broker, &claim.child);
+    let (descriptor, identity) = match exchanged {
+        Ok(published) => published,
+        Err(error) => {
+            broker.invalidate();
+            cleanup_failed_api_publication(&namespace, &claim)?;
+            return Err(error);
+        }
+    };
+    let record = match SocketOwnershipRecord::new(
+        ResourceRole::ApiSocketDirectory,
+        claim.child.clone(),
+        identity,
+    ) {
+        Ok(record) => record,
+        Err(_) => {
+            broker.invalidate();
+            cleanup_failed_api_publication(&namespace, &claim)?;
+            return Err(AnchoredSocketError::Invalid);
+        }
+    };
+    let listener = UnixListener::from(descriptor);
+    // SAFETY: Effective identity calls have no pointer or ownership contract.
+    let expected_owner = unsafe { (libc::geteuid(), libc::getegid()) };
+    let adopted = (|| {
+        if identity.device != claim.directory.identity().device {
+            return Err(AnchoredSocketError::CrossFilesystem);
+        }
+        namespace
+            .require_socket_record(&record)
+            .map_err(|_| AnchoredSocketError::Invalid)?;
+        let child = child_cstring(&claim.child)?;
+        if relative_socket_identity_with_owner(
+            claim.directory.anchor_fd(),
+            &child,
+            Some(expected_owner),
+        )? != identity
+        {
+            return Err(AnchoredSocketError::PathChanged);
+        }
+        validate_brokered_api_listener_descriptor(listener.as_raw_fd())?;
+        if relative_socket_identity_with_owner(
+            claim.directory.anchor_fd(),
+            &child,
+            Some(expected_owner),
+        )? != identity
+        {
+            return Err(AnchoredSocketError::PathChanged);
+        }
+        namespace
+            .require_socket_record(&record)
+            .map_err(|_| AnchoredSocketError::Invalid)
+    })();
+    if let Err(error) = adopted {
+        broker.invalidate();
+        drop(listener);
+        cleanup_failed_api_publication(&namespace, &claim)?;
+        return Err(error);
+    }
+    if broker.restore_after_exchange().is_err() {
+        drop(listener);
+        cleanup_failed_api_publication(&namespace, &claim)?;
+        return Err(AnchoredSocketError::Broker);
+    }
+    Ok(BoundAnchoredSocket {
+        listener,
+        guard: AnchoredSocketGuard {
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            ownership: AnchoredSocketOwnership::Recorded(namespace),
+            #[cfg(not(feature = "elevated-bootstrap-probe"))]
+            namespace,
+            claim,
+            record,
+            expected_owner: Some(expected_owner),
+        },
+        connector: None,
+    })
+}
+
+fn exchange_api_publication(
+    broker: &mut PreparedSocketBrokerEndpoint,
+    child: &SocketChild,
+) -> Result<(OwnedFd, ObjectIdentity), AnchoredSocketError> {
+    let endpoint = broker
+        .endpoint_mut()
+        .map_err(|_| AnchoredSocketError::Broker)?;
+    prepare_connector_endpoint(endpoint)?;
+    wait_for_broker(endpoint, libc::POLLOUT, AnchoredSocketError::Cancelled)?;
+    let sequence = endpoint.next_sequence;
+    let next_sequence = sequence.checked_add(1).ok_or(AnchoredSocketError::Broker)?;
+    send_socket_broker_message(
+        &endpoint.socket,
+        &SocketBrokerMessage::PublishApi {
+            session: endpoint.session,
+            sequence,
+            child: child.clone(),
+        },
+        None,
+    )
+    .map_err(|_| AnchoredSocketError::Broker)?;
+    verify_peer_pid(endpoint.socket.as_raw_fd(), endpoint.launcher_pid)
+        .map_err(|_| AnchoredSocketError::Broker)?;
+    wait_for_broker(endpoint, libc::POLLIN, AnchoredSocketError::Cancelled)?;
+    let response =
+        receive_socket_broker_message(&endpoint.socket).map_err(|_| AnchoredSocketError::Broker)?;
+    verify_peer_pid(endpoint.socket.as_raw_fd(), endpoint.launcher_pid)
+        .map_err(|_| AnchoredSocketError::Broker)?;
+    endpoint.next_sequence = next_sequence;
+    match (response.message, response.descriptor) {
+        (
+            SocketBrokerMessage::ApiPublished {
+                session,
+                sequence: response_sequence,
+                identity,
+            },
+            Some(descriptor),
+        ) if session == endpoint.session && response_sequence == sequence => {
+            Ok((descriptor, identity))
+        }
+        (
+            SocketBrokerMessage::ApiPublishFailed {
+                session,
+                sequence: response_sequence,
+                kind,
+            },
+            None,
+        ) if session == endpoint.session && response_sequence == sequence => {
+            Err(AnchoredSocketError::Io(kind))
+        }
+        _ => Err(AnchoredSocketError::Invalid),
+    }
+}
+
+fn cleanup_failed_api_publication(
+    namespace: &WorkerSocketNamespace,
+    claim: &ClaimedSocketDirectory,
+) -> Result<(), AnchoredSocketError> {
+    let record = namespace
+        .socket_record(ResourceRole::ApiSocketDirectory)
+        .map_err(|_| AnchoredSocketError::Cleanup)?;
+    let Some(record) = record else {
+        let staging = socket_staging_name(ResourceRole::ApiSocketDirectory)
+            .map_err(|_| AnchoredSocketError::Cleanup)?;
+        return cleanup_staged_socket_checked(namespace, staging, None);
+    };
+    if record.child() != &claim.child {
+        return Err(AnchoredSocketError::Cleanup);
+    }
+    // SAFETY: Effective identity calls have no pointer or ownership contract.
+    let expected_owner = unsafe { (libc::geteuid(), libc::getegid()) };
+    match unlink_socket_if_owned_with_owner(
+        claim.directory.anchor_fd(),
+        &claim.child,
+        record.identity(),
+        Some(expected_owner),
+    ) {
+        Ok(()) | Err(AnchoredSocketError::Io(io::ErrorKind::NotFound)) => {}
+        Err(_) => return Err(AnchoredSocketError::Cleanup),
+    }
+    namespace
+        .unlink_staged_socket(&record)
+        .map_err(|_| AnchoredSocketError::Cleanup)?;
+    namespace
+        .clear_socket_record(&record)
+        .map_err(|_| AnchoredSocketError::Cleanup)
 }
 
 /// Adopts the fixed final API listener created by the elevated launcher.
@@ -834,9 +1013,11 @@ fn spawn_connector(
 ) -> Result<AnchoredVsockConnector, AnchoredSocketError> {
     prepare_connector_endpoint(&endpoint)?;
     wait_for_broker(&endpoint, libc::POLLOUT, AnchoredSocketError::Broker)?;
+    let sequence = endpoint.next_sequence;
+    let next_sequence = sequence.checked_add(1).ok_or(AnchoredSocketError::Broker)?;
     let activate = SocketBrokerMessage::Activate {
         session: endpoint.session,
-        sequence: 1,
+        sequence,
         child: claim.child.clone(),
     };
     send_socket_broker_message(&endpoint.socket, &activate, None)
@@ -849,9 +1030,9 @@ fn spawn_connector(
     if !matches!(
         response,
         bangbang_session::macos::socket_broker::ReceivedSocketBrokerMessage {
-            message: SocketBrokerMessage::Ready { session, sequence: 1 },
+            message: SocketBrokerMessage::Ready { session, sequence: response_sequence },
             descriptor: None,
-        } if session == endpoint.session
+        } if session == endpoint.session && response_sequence == sequence
     ) {
         return Err(AnchoredSocketError::Invalid);
     }
@@ -859,13 +1040,14 @@ fn spawn_connector(
         socket,
         session,
         launcher_pid,
+        next_sequence: _,
         wakeup: _,
     } = endpoint;
     Ok(AnchoredVsockConnector {
         socket,
         session,
         launcher_pid,
-        next_sequence: 2,
+        next_sequence,
         healthy: true,
     })
 }
@@ -1234,6 +1416,22 @@ fn validate_listener_descriptor(
 ) -> Result<(), AnchoredSocketError> {
     let staging = socket_staging_name(role).map_err(|_| AnchoredSocketError::Invalid)?;
     validate_listener_descriptor_for_name(descriptor, staging)
+}
+
+fn validate_brokered_api_listener_descriptor(descriptor: RawFd) -> Result<(), AnchoredSocketError> {
+    // SAFETY: F_GETFD and F_GETFL inspect the live received descriptor.
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    // SAFETY: F_GETFL inspects the same live received descriptor.
+    let status_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if descriptor_flags < 0
+        || status_flags < 0
+        || descriptor_flags & libc::FD_CLOEXEC == 0
+        || status_flags & libc::O_NONBLOCK == 0
+        || socket_int_option(descriptor, libc::SO_ERROR)? != 0
+    {
+        return Err(AnchoredSocketError::Invalid);
+    }
+    validate_listener_descriptor(descriptor, ResourceRole::ApiSocketDirectory)
 }
 
 fn validate_listener_descriptor_for_name(
@@ -2093,10 +2291,199 @@ mod tests {
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
     use std::rc::Rc;
+    use std::thread;
 
     use bangbang_session::SessionId;
+    use bangbang_session::macos::socket_broker::{
+        receive_socket_broker_message, send_socket_broker_message,
+    };
 
     use super::*;
+
+    fn ordinary_api_fixture() -> (
+        WorkerSocketNamespace,
+        ClaimedSocketDirectory,
+        crate::contained_session::TestVhostDirectory,
+        crate::contained_session::TestVhostDirectory,
+    ) {
+        use crate::contained_session::{
+            TestVhostDirectory, ordinary_api_directory_authority_for_test,
+        };
+
+        let (directories, api_directory) = ordinary_api_directory_authority_for_test();
+        let claim = directories
+            .claim_socket_directory(
+                Path::new("bangbang-grant:api-directory/api.sock"),
+                ResourceRole::ApiSocketDirectory,
+            )
+            .expect("API grant should claim")
+            .expect("API reference should be contained");
+        let namespace_directory = TestVhostDirectory::new();
+        for directory in [namespace_directory.path(), api_directory.path()] {
+            let descriptor = fs::File::open(directory).expect("test directory should open");
+            assert_eq!(
+                // SAFETY: The directory descriptor is live and effective IDs need no pointers.
+                unsafe { libc::fchown(descriptor.as_raw_fd(), libc::geteuid(), libc::getegid(),) },
+                0,
+                "test directory owner and group should install"
+            );
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("test directory mode should restrict");
+        }
+        let namespace = WorkerSocketNamespace::from_directory_for_test(namespace_directory.path())
+            .expect("test namespace should validate");
+        (namespace, claim, namespace_directory, api_directory)
+    }
+
+    fn prepublish_api_listener(
+        namespace: &WorkerSocketNamespace,
+        claim: &ClaimedSocketDirectory,
+    ) -> (UnixListener, ObjectIdentity) {
+        let (listener, identity) = spawn_binder(namespace, ResourceRole::ApiSocketDirectory)
+            .expect("test binder should return an API listener");
+        listener
+            .set_nonblocking(true)
+            .expect("brokered API listener should be nonblocking");
+        let record = SocketOwnershipRecord::new(
+            ResourceRole::ApiSocketDirectory,
+            claim.child.clone(),
+            identity,
+        )
+        .expect("API ownership record should validate");
+        namespace
+            .write_socket_record(&record)
+            .expect("API ownership record should write");
+        let staging = socket_staging_name(ResourceRole::ApiSocketDirectory)
+            .expect("API staging name should resolve");
+        let child = child_cstring(&claim.child).expect("API child should encode");
+        assert_eq!(
+            // SAFETY: Both test-owned anchors and bounded names remain live.
+            unsafe {
+                renameatx_np(
+                    namespace.anchor_fd(),
+                    staging.as_ptr(),
+                    claim.directory.anchor_fd(),
+                    child.as_ptr(),
+                    RENAME_EXCL,
+                )
+            },
+            0,
+            "test listener should publish"
+        );
+        (listener, identity)
+    }
+
+    #[test]
+    fn brokered_api_adoption_restores_the_advanced_endpoint_and_cleans() {
+        use crate::contained_session::socket_broker_authority_for_test;
+
+        let (namespace, claim, namespace_directory, api_directory) = ordinary_api_fixture();
+        let (listener, identity) = prepublish_api_listener(&namespace, &claim);
+        let (authority, launcher, session) = socket_broker_authority_for_test();
+        let retained = authority.clone();
+        let (release, hold) = std::sync::mpsc::channel();
+        let peer = thread::spawn(move || {
+            let received = receive_socket_broker_message(&launcher)
+                .expect("API publication request should receive");
+            assert!(matches!(
+                received,
+                bangbang_session::macos::socket_broker::ReceivedSocketBrokerMessage {
+                    message: SocketBrokerMessage::PublishApi {
+                        session: request_session,
+                        sequence: 1,
+                        ref child,
+                    },
+                    descriptor: None,
+                } if request_session == session && child.as_bytes() == b"api.sock"
+            ));
+            send_socket_broker_message(
+                &launcher,
+                &SocketBrokerMessage::ApiPublished {
+                    session,
+                    sequence: 1,
+                    identity,
+                },
+                Some(listener.as_raw_fd()),
+            )
+            .expect("API publication response should send");
+            hold.recv().expect("broker peer should remain live");
+        });
+
+        let adopted = request_api_listener(namespace, claim, &authority);
+        release.send(()).expect("broker peer should release");
+        peer.join().expect("broker peer should join");
+        let bound = adopted.expect("brokered API listener should adopt");
+        let carried = retained
+            .prepare_endpoint()
+            .expect("successful adoption should restore broker authority");
+        assert_eq!(
+            carried
+                .endpoint()
+                .expect("restored endpoint should remain active")
+                .next_sequence,
+            2
+        );
+        carried
+            .abort()
+            .expect("inspection should restore broker authority");
+        assert!(api_directory.path().join("api.sock").exists());
+        drop(bound);
+        assert!(!api_directory.path().join("api.sock").exists());
+        assert_eq!(
+            fs::read_dir(namespace_directory.path())
+                .expect("namespace should read")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn brokered_api_failure_and_wrong_sequence_poison_authority_without_residue() {
+        use crate::contained_session::socket_broker_authority_for_test;
+
+        for wrong_sequence in [false, true] {
+            let (namespace, claim, namespace_directory, api_directory) = ordinary_api_fixture();
+            let (authority, launcher, session) = socket_broker_authority_for_test();
+            let retained = authority.clone();
+            let (release, hold) = std::sync::mpsc::channel();
+            let peer = thread::spawn(move || {
+                let received = receive_socket_broker_message(&launcher)
+                    .expect("API publication request should receive");
+                assert_eq!(received.message.sequence(), 1);
+                send_socket_broker_message(
+                    &launcher,
+                    &SocketBrokerMessage::ApiPublishFailed {
+                        session,
+                        sequence: if wrong_sequence { 2 } else { 1 },
+                        kind: io::ErrorKind::NotFound,
+                    },
+                    None,
+                )
+                .expect("API failure response should send");
+                hold.recv().expect("broker peer should remain live");
+            });
+            let failure = request_api_listener(namespace, claim, &authority)
+                .expect_err("API publication failure should reject");
+            release.send(()).expect("broker peer should release");
+            peer.join().expect("broker peer should join");
+            assert_eq!(
+                failure,
+                if wrong_sequence {
+                    AnchoredSocketError::Invalid
+                } else {
+                    AnchoredSocketError::Io(io::ErrorKind::NotFound)
+                }
+            );
+            assert!(retained.prepare_endpoint().is_err());
+            assert!(!api_directory.path().join("api.sock").exists());
+            assert_eq!(
+                fs::read_dir(namespace_directory.path())
+                    .expect("namespace should read")
+                    .count(),
+                0
+            );
+        }
+    }
 
     #[test]
     #[ignore = "private binder subprocess entry point"]
@@ -2490,6 +2877,7 @@ mod tests {
             socket: worker,
             session: SessionId::from_bytes([71; 32]),
             launcher_pid: pid,
+            next_sequence: 1,
             wakeup: Some(Rc::new(wakeup_reader)),
         };
 
@@ -2538,6 +2926,7 @@ mod tests {
             socket: worker,
             session: SessionId::from_bytes([72; 32]),
             launcher_pid: pid,
+            next_sequence: 1,
             wakeup: None,
         };
         launcher

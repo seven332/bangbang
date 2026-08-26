@@ -214,17 +214,27 @@ For API/vsock directory grants, require the distinct exact
 ASCII component and direct mode preserves identical bytes as a path. Review
 validation-before-claim, exact singleton role/access, owner-thread scope and
 anchor lifetime, no-API non-consumption, API readiness after publication, and
-deferred vsock claim/startup failure atomicity. The transient signed binder must
-use a default-close fd5/fd6 allowlist, authenticate its parent, bind only the
-fixed private staging name, validate and transfer exactly one listener, and be
-killed/reaped before exposure. Publication must require matching filesystems,
-use fd-relative exclusive rename, reject replacement and traversal races, and
-install a strict value-redacted ownership record before the public name exists.
+deferred vsock claim/startup failure atomicity. Ordinary API publication must
+reserve the authenticated broker endpoint, let the launcher bind the fixed
+private staging name outside App Sandbox, install the strict value-redacted
+ownership record before the public name exists, and return exactly one listener
+descriptor only after fd-relative exclusive rename and final revalidation.
+Review `Interrupted`/`WouldBlock` as one retained reply transaction: no second
+bind, record, or rename is allowed, and readiness must require a sent reply.
+The worker must validate record, final path, descriptor, peer, session, and
+sequence before restoring the same broker endpoint at its advanced sequence.
+The transient signed fd5/fd6 binder is retained for vsock only; it must
+authenticate its parent, bind only that role's fixed private staging name,
+validate and transfer exactly one listener, and be killed/reaped before
+VM-start exposure. Both publication paths require matching filesystems and
+must reject replacement and traversal races.
 
 Review the fixed vsock broker separately from general resource brokerage. Its
 initial endpoint is always inherited but dormant; activation must bind exact
-peer PID, lifecycle SessionId, first sequence, retained singleton anchor, cwd
-identity, and the already validated child. Later requests may contain only a
+peer PID, lifecycle SessionId, the carried next sequence, retained singleton
+anchor, cwd identity, and the already validated child. Vsock-only activation is
+sequence one; API-then-vsock activation follows the successful API exchange.
+Later requests may contain only a
 monotonic sequence and `u32` port, producing only relative
 `<SocketChild>_<port>` targets and at most one validated connected AF_UNIX
 stream descriptor. Require closed frame/reserved/status variants, exact rights
@@ -260,9 +270,9 @@ escalation, and concurrent launchers must never share session state or signal,
 reap, or clean each other's workers and namespaces. Absolute handshake
 deadlines must survive fragmented reads and `EINTR`; `Terminal` or EOF must also
 start a bounded owned-process exit grace rather than permitting an indefinite
-wait. Grant sending must remain nonblocking in the same event loop, continue to
-observe signals, lifecycle input, and child exit, and use one absolute
-send-plus-acknowledgment deadline.
+wait. Grant and broker-reply sending must remain nonblocking in the same event
+loop, continue to observe signals, lifecycle input, and child exit, and use
+their absolute send/acknowledgment or publication-reply deadlines.
 
 Authorized socket construction may transiently add only one fixed role-specific
 staging socket. Snapshot construction may transiently add one strict record per

@@ -8729,7 +8729,7 @@ fn normal_bundle_routes_guest_vsock_through_launcher_broker_without_helpers() {
     let worker = only_worker_pid(&running.child);
     assert!(
         child_pids(worker).is_empty(),
-        "short-lived API binder must be reaped before readiness"
+        "launcher-owned API publication must not leave a worker helper"
     );
 
     assert_http_status(
@@ -14195,6 +14195,92 @@ fn concurrent_sessions_remain_independent_when_one_worker_crashes() {
     assert!(session_entries().is_empty());
     let _ = fs::remove_file(&first.socket);
     assert!(!second.socket.exists());
+}
+
+#[test]
+fn normal_granted_api_listener_preserves_5000_fresh_connections() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new("api-transport-stress");
+    let mut running =
+        spawn_ready_socket_grant_api_launcher(&bundle, &fixture, "api-transport-stress");
+
+    for request in 0..5_000 {
+        let response = http_get(&running.socket, "/");
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "fresh production API request {request} failed:\n{response}"
+        );
+    }
+
+    let launcher_pid = i32::try_from(running.child.id()).expect("launcher PID should fit");
+    // SAFETY: `launcher_pid` is the live unreaped launcher owned by this fixture.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGTERM) }, 0);
+    assert!(running.wait("API transport stress graceful stop").success());
+    assert!(!running.socket.exists());
+    assert!(session_entries().is_empty());
+}
+
+#[test]
+fn direct_api_remains_independent_of_unused_socket_directory_grants() {
+    let bundle = production_bundle();
+    let fixture = SocketDirectoryGrantFixture::new("direct-api-unused-socket-grants");
+    initialize_worker_container(&bundle);
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let socket = container_tmp_dir().join(format!(
+        "bb-direct-extra-{:x}-{test_id:x}.sock",
+        std::process::id()
+    ));
+    let mut child = Command::new(launcher(&bundle))
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.devices.manifest)
+        .arg("--")
+        .args(["--api-sock", path_text(&socket)])
+        .args(["--id", &format!("direct-extra-{test_id}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("direct API launcher with extra grants should start");
+    let (ready, stdout_reader) = read_stdout_until_ready(&mut child);
+    let stderr_reader = read_stream(child.stderr.take().expect("stderr should be piped"));
+    if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+        kill_child_group(&mut child);
+        let _ = child.wait();
+        let stdout = stdout_reader.join().expect("stdout reader should join");
+        let stderr = stderr_reader.join().expect("stderr reader should join");
+        panic!(
+            "direct API with unused socket grants should become ready: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    let mut running = RunningApiLauncher {
+        child,
+        socket,
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
+        sensitive: fixture.sensitive_strings(),
+        completed: false,
+    };
+
+    assert_http_status(
+        &http_get(&running.socket, "/"),
+        200,
+        "direct API with unused socket grants",
+    );
+    assert!(
+        !fixture.api_socket().exists(),
+        "unused API grant must not publish a listener"
+    );
+    let worker = only_worker_pid(&running.child);
+    assert!(
+        child_pids(worker).is_empty(),
+        "direct API path must not start a socket binder"
+    );
+    let launcher_pid = i32::try_from(running.child.id()).expect("launcher PID should fit");
+    // SAFETY: `launcher_pid` is the live unreaped launcher owned by this fixture.
+    assert_eq!(unsafe { libc::kill(launcher_pid, libc::SIGTERM) }, 0);
+    assert!(running.wait("direct API with unused grants stop").success());
+    assert!(!running.socket.exists());
+    assert!(session_entries().is_empty());
 }
 
 fn run_graceful_signal_case(signal: i32, name: &str) {

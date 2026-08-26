@@ -43,7 +43,7 @@ mod vsock_restore;
 #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
 use anchored_socket::adopt_elevated_api_listener;
 #[cfg(target_os = "macos")]
-use anchored_socket::bind as bind_anchored_socket;
+use anchored_socket::request_api_listener;
 use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::config::{
@@ -530,13 +530,11 @@ fn run(
                                             .socket_namespace()
                                             .map_err(|_| ProcessError::ContainedSession)?
                                             .ok_or(ProcessError::ContainedSession)?;
-                                        bind_anchored_socket(
-                                            namespace,
-                                            claim,
-                                            ResourceRole::ApiSocketDirectory,
-                                            None,
-                                        )
-                                        .map_err(
+                                        let broker = contained
+                                            .as_ref()
+                                            .and_then(ContainedSession::socket_broker_authority)
+                                            .ok_or(ProcessError::ContainedSession)?;
+                                        request_api_listener(namespace, claim, &broker).map_err(
                                             |error| {
                                                 ProcessError::ApiServer(ApiServerError::Anchored(
                                                     error,
@@ -545,15 +543,19 @@ fn run(
                                         )?
                                     };
                                     #[cfg(not(feature = "elevated-bootstrap-probe"))]
-                                    let socket = bind_anchored_socket(
-                                        namespace,
-                                        claim,
-                                        ResourceRole::ApiSocketDirectory,
-                                        None,
-                                    )
-                                    .map_err(|error| {
-                                        ProcessError::ApiServer(ApiServerError::Anchored(error))
-                                    })?;
+                                    let socket = {
+                                        let broker = contained
+                                            .as_ref()
+                                            .and_then(ContainedSession::socket_broker_authority)
+                                            .ok_or(ProcessError::ContainedSession)?;
+                                        request_api_listener(namespace, claim, &broker).map_err(
+                                            |error| {
+                                                ProcessError::ApiServer(ApiServerError::Anchored(
+                                                    error,
+                                                ))
+                                            },
+                                        )?
+                                    };
                                     let (server, guard) =
                                         ApiServer::from_anchored(socket, http_api_max_payload_size);
                                     (Some(guard), server)

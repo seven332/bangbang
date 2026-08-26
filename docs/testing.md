@@ -2678,9 +2678,13 @@ may skip execution. On supported Apple Silicon it proves:
   recorded, followed by worker `SIGKILL`; launcher recovery removes an exact
   current-user regular `0600` single-link inode but preserves a same-name
   replacement while clearing the private record and namespace;
-- exact socket-directory references publishing an owner-only API listener into
-  an outside-container granted directory, serving a real client only after
-  readiness, and reaping the short-lived signed binder before exposure;
+- exact socket-directory references having the unsandboxed launcher bind one
+  fixed private staging listener, durably record it, exclusively publish it
+  into an outside-container granted directory, transfer exactly one descriptor
+  through the authenticated broker, and serve clients only after worker
+  adoption and readiness; the strict transport regression opens 5,000 fresh
+  connections, requires HTTP 200 every time, then proves normal signal exit and
+  zero socket/record/staging/session residue;
 - delayed API `PUT /vsock` retaining the directory claim until startup,
   publishing the supplied main listener, and leaving only launcher plus worker
   in steady state with the worker's exact entitlements unchanged;
@@ -2722,8 +2726,13 @@ tests cover every closed record, limit and descriptor declaration, including
 connected-stream source/peer identity and the 255-byte redacted snapshot child
 grammar. Socket
 broker codec tests cover every closed kind, exact fixed frame/reserved fields,
-session/sequence/child/port/status encoding, descriptor declarations,
-truncation, malformed ancillary data, and value-redacted formatting. The
+session/sequence/child/port/status/identity encoding, API publication variants,
+descriptor declarations, truncation, malformed ancillary data, and
+value-redacted formatting. Launcher tests retain one exact API reply and
+deadline across datagram backpressure, enforce grants/lifecycle/namespace
+gates, and reject replay. Worker tests prove exact record/path/fd adoption,
+advanced broker-sequence restoration, failed-exchange poisoning, and
+residue-free bounded failures. The
 separate fixed 256-byte `BBU1` vhost-user broker codec covers exact
 session/sequence/grant/child/status correlation, one-stream rights, retryable
 failures, stale or malformed response rejection, and facet poisoning. Darwin
@@ -2737,8 +2746,8 @@ poisoning and rollback, fragmented bookmark scope, kernel peer acceptance and
 PID rejection, exact namespace naming/root derivation, bounded independent
 directory iteration across repeated checks, stale empty-directory recovery,
 populated-entry preservation, strict socket ownership records, identity-safe
-fixed-staging cleanup, anchored exclusive publication/rollback, binder
-framing/descriptor validation, broker state and relative-target validation, and
+fixed-staging cleanup, launcher-owned API staged publication/alias lifetime,
+vsock binder framing/descriptor validation, broker state and relative-target validation, and
 replacement-safe cleanup. Snapshot registry/runtime tests additionally cover
 non-consuming exact file duplication, validate-all-before-remove state/memory/
 root and output-directory batches, shared/distinct output anchors, strict
