@@ -174,7 +174,12 @@ The [`provider-v1` contract](../../../docs/vmnet-provider-protocol.md) freezes
 the closed session/control/data wire and descriptor ownership. #1934 now adds
 the minimal root broker, exact per-interface owner process, irreversible
 credential drop, and entitlement-free real-host lifecycle/cancellation/repeat
-proof. Production launcher/sandbox assembly and guest-through-provider
+proof. #1936 adds the distinct contained provider grant, authenticated
+remote-only route, sole-owner client pumps, and startup/hotplug/restore adapter
+with credential-free portable fake-broker evidence and an ad-hoc-signed
+networkless App Sandbox process case. The remote path creates no local
+vmnet/XPC descriptor and needs no Apple developer identity or vmnet profile.
+Elevated launcher/provider assembly and real guest-through-provider
 certification remain later slices; the inventory and both
 `missing-platform-feasible` dispositions stay unchanged.
 

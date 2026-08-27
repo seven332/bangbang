@@ -205,7 +205,7 @@ mapping. The four remaining nonterminal outcomes are one #1373
 audit-required outcome, the same two #1378 audit-required outcomes, and the
 final #1351 jailer/seccomp/macOS-containment semantic. The checked
 [host-resource authority contract](host-resource-authority-contract.md) pins
-30 clauses, the exact 17-role/five-access surface, current-tree evidence,
+30 clauses, the exact 18-role/five-access surface, current-tree evidence,
 terminal and external dependencies, residuals, and every nonclaim.
 
 ## Exact jailer/seccomp containment and production-host successors

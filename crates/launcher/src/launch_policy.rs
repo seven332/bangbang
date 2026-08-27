@@ -281,10 +281,10 @@ impl LaunchRequest {
             .jailer
             .as_ref()
             .map_or_else(VmnetAuthority::denied, |jailer| jailer.vmnet_authority);
-        if !worker_profile.admits(vmnet_authority) {
-            return Err(LauncherError::InvalidLaunchPolicy);
-        }
         let (mut worker_args, grants) = self.grants.prepare()?;
+        let vmnet_backend_route = worker_profile
+            .vmnet_backend_route(vmnet_authority, grants.has_vmnet_provider_stream())
+            .ok_or(LauncherError::InvalidLaunchPolicy)?;
         let (uid, gid) = (identity.uid(), identity.gid());
         let (no_file, file_size) = if let Some(jailer) = self.jailer {
             let mut injected = vec![
@@ -307,7 +307,9 @@ impl LaunchRequest {
             worker_args,
             grants,
             worker_policy: WorkerPolicy::new(uid, gid, no_file, file_size, daemonized)
-                .with_vmnet_authority(vmnet_authority),
+                .with_vmnet_authority(vmnet_authority)
+                .try_with_vmnet_backend_route(vmnet_backend_route)
+                .ok_or(LauncherError::InvalidLaunchPolicy)?,
             worker_profile,
             identity,
         })
@@ -610,7 +612,10 @@ fn clock_microseconds(clock: libc::clockid_t) -> Result<u64, LauncherError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -624,6 +629,8 @@ mod tests {
             team_identifier: "TEAM123456".to_owned(),
         }
     }
+
+    static NEXT_PROVIDER_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     fn base(worker: &Path) -> Vec<OsString> {
         let (uid, gid) = current_credentials()
@@ -887,6 +894,76 @@ mod tests {
             ),
             Err(LauncherError::InvalidLaunchPolicy)
         ));
+    }
+
+    #[test]
+    fn networkless_profile_routes_positive_authority_only_through_provider_grant() {
+        let worker = Path::new("/fixed/BangbangWorker");
+        let fixture = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary root should canonicalize")
+            .join(format!(
+                "bangbang-provider-policy-{}-{}",
+                std::process::id(),
+                NEXT_PROVIDER_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir(&fixture).expect("fixture directory should create");
+        let socket = fixture.join("provider.sock");
+        let manifest = fixture.join("grants.json");
+        let listener = UnixListener::bind(&socket).expect("provider listener should bind");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "grants": [{
+                    "id": "vmnet-provider",
+                    "role": "vmnet-provider-stream",
+                    "access": "read-write",
+                    "source": socket,
+                }]
+            }))
+            .expect("manifest should serialize"),
+        )
+        .expect("manifest should write");
+
+        let mut args = base(worker);
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            [
+                OsString::from(VMNET_ALLOW_OPTION),
+                OsString::from("shared"),
+                OsString::from(VMNET_MAX_INTERFACES_OPTION),
+                OsString::from("1"),
+            ],
+        );
+        args.extend([
+            OsString::from("--bangbang-grant-manifest"),
+            manifest.as_os_str().to_owned(),
+            OsString::from(DELIMITER),
+        ]);
+        let LaunchCommand::Run(request) =
+            LaunchCommand::parse(args).expect("remote policy should parse")
+        else {
+            panic!("run command expected");
+        };
+        let prepared = request
+            .prepare(
+                worker,
+                LaunchTiming::sample().expect("timing should sample"),
+                false,
+                networkless_profile(),
+            )
+            .expect("networkless provider policy should prepare");
+        let (_accepted, _) = listener.accept().expect("provider stream should connect");
+        assert_eq!(
+            prepared.worker_policy.vmnet_backend_route(),
+            bangbang_session::VmnetBackendRoute::RemoteProvider
+        );
+        assert!(prepared.worker_policy.vmnet_authority().allows_shared());
+        assert_eq!(prepared.grants.grant_count(), 1);
+        drop(prepared);
+        drop(listener);
+        fs::remove_dir_all(&fixture).expect("fixture directory should clean up");
     }
 
     #[test]

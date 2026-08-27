@@ -22,7 +22,7 @@ pub const VMNET_FEASIBILITY_AUDIT_PATH: &str =
 pub const VMNET_FEASIBILITY_CAPABILITY_IDS: [&str; 2] = NETWORK_VMNET_FEASIBLE_IDS;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "591e35dd9aa7ce0ac077fa835f3fb31e448cf4e70a21fd6f7e71020c74b77941";
+    "eb54c4cf9cadaaf7a2ddb7a86b5642a93af1cc913bdd3edaedff5cc53472dc00";
 
 const NONCLAIMS: [VmnetFeasibilityNonclaim; 6] = [
     VmnetFeasibilityNonclaim::RootDirectProductionTopology,

@@ -7,11 +7,12 @@ per interface. Exact-host evidence calls the real vmnet API under explicit root
 authority and requires no Apple-approved vmnet entitlement, provisioning
 profile, or signing identity.
 
-This is still not a production network path. No launcher-to-root bootstrap,
-operator authorization workflow, bundle assembly, sandbox grant/adapter, or
-guest-through-provider integration exists in this slice. The contained worker
-does not yet consume the transferred packet stream, and neither retained
-network capability is promoted.
+The networkless contained worker now accepts one authenticated
+`vmnet-provider-stream` startup grant and adapts it to the existing process
+network registry. This is still not a final production network path: no
+launcher-to-root bootstrap, operator authorization workflow, elevated product
+assembly, or real guest-through-provider certification exists in this slice.
+Neither retained network capability is promoted.
 
 ## Components
 
@@ -26,12 +27,58 @@ network capability is promoted.
   resolution, broker/owner supervision, exact child lifetime, credential
   type-state boundary, and the macOS adapter to the existing
   `SystemVmnetInterfaceBackend`.
+- `bangbang` owns the contained client adapter. A session-scoped control pump
+  and one data pump per interface are the only readers and writers of their
+  Provider-v1 streams; the existing process network registry continues to own
+  MMDS, queues, limiters, metrics, hotplug, snapshot reconstruction, and
+  cleanup.
 - The `bangbang` library exposes only its host-network backend view to this
   package. The privileged entry point does not link the VMM, HTTP API, guest,
   launcher, bundle, grant, or listener modules.
 
 The same shared Unix-stream primitive backs the existing portable vhost-user
 frontend without changing its public protocol.
+
+## Contained worker route and ownership
+
+Lifecycle policy authenticates exactly one backend route: `Denied`,
+`LocalSystem`, or `RemoteProvider`. The launcher admits only these combinations:
+
+- networkless profile, denied vmnet policy, and no provider grant;
+- networkless profile, positive canonical policy, and exactly one provider
+  grant;
+- optional Apple-authorized vmnet profile, positive policy, and no provider
+  grant.
+
+Every other profile/policy/grant combination fails before worker execution.
+The worker checks the same matrix after committing its startup batch, includes
+the route in process network ownership identity, and never changes route or
+falls back after a failure. Pager and provider connected-stream roles are
+noninterchangeable and one-time.
+
+The remote source claims and handshakes the provider stream lazily on the first
+actual vmnet-backed interface. An MMDS-only startup, runtime insertion, or
+restore validates policy but never claims or contacts the provider. Host and
+shared requests map directly to fixed slots; bridged requests map only by
+equality against bootstrap-owned bridge slots zero through three. The bridge
+name itself never crosses the protocol.
+
+The remote backend builds only an in-process policy descriptor. It does not
+construct an XPC dictionary, resolve local vmnet keys, or call any
+Hypervisor.framework/vmnet acquisition API in the contained worker. The signed
+networkless bundle test runs two complete fake-provider packet lifecycles plus
+one unclaimed-grant lifecycle using ad-hoc signing, no vmnet entitlement, and no
+Apple developer identity.
+
+One bounded command queue wakes the sole control pump for Start, Stop, Cancel,
+and Shutdown. Each successful Start handshakes its transferred stream before
+publication and creates one sole data pump for readiness, read, write,
+callback drain, Stop, and Shutdown. Requests use bounded waits; abandoned or
+expired work terminalizes its pump, and a late raced `Started` stream is
+retired inside the control state. Normal release drains callbacks, completes
+data Stop/Shutdown, and only then retires the exact control generation. Restore
+retains only the session source and always requests a fresh interface and
+generation; no provider stream or generation enters a snapshot.
 
 ## Broker and owner process boundary
 
@@ -178,6 +225,7 @@ cargo test -p bangbang-unix-stream --all-features --locked
 cargo test -p bangbang-session --all-features --locked
 cargo test -p bangbang-vhost-user --all-features --locked
 cargo test -p bangbang-vmnet-provider --all-features --locked
+cargo test -p bangbang --all-features --locked host_network::remote_vmnet::tests::
 ```
 
 Provider tests additionally cover canonical bootstrap/supervision records,
@@ -189,10 +237,10 @@ adds real provider-v1 data lifecycle, control cancellation, clean repeat, and
 empty-residue cases before the existing dropped-owner and repeated guest gates.
 Its fixed successful status explicitly records `apple-vmnet=absent`.
 
-This implementation deliberately changes no capability disposition. The checked
-inventory remains `383 implemented / 0 audit-required / 2
+This implementation deliberately changes no capability disposition. The
+checked inventory remains `383 implemented / 0 audit-required / 2
 missing-platform-feasible / 33 proven-platform-impossible`; the two retained
 rows are `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity`. Production
-launcher bootstrap, sandbox-worker consumption, a guest through this provider,
-and final lifecycle certification remain successor work.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity`. Elevated launcher
+bootstrap, a real guest through this provider, production death/reclamation and
+concurrency evidence, and final lifecycle certification remain successor work.

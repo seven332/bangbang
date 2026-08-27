@@ -136,7 +136,7 @@ fn validate_contract_contents(contract: &str, errors: &mut Vec<String>) {
     for token in [
         "## Pinned source identity",
         "30 ordered source clauses",
-        "17 resource roles",
+        "18 resource roles",
         "five access modes",
         "380/3/2/33",
         "381/3/1/33",
@@ -202,7 +202,7 @@ mod tests {
             "| `{HOST_RESOURCE_AUTHORITY_CAPABILITY_ID}` | #1916 | `implemented-and-verified` |"
         );
         let contract = format!(
-            "## Pinned source identity 30 ordered source clauses 17 resource roles five access modes 380/3/2/33 381/3/1/33 validate --host-resource-authority-final privileged third-party vhost-user backend general dynamic resource broker positive vmnet connectivity corpus:design corpus:production-host global `--final`\n{row}"
+            "## Pinned source identity 30 ordered source clauses 18 resource roles five access modes 380/3/2/33 381/3/1/33 validate --host-resource-authority-final privileged third-party vhost-user backend general dynamic resource broker positive vmnet connectivity corpus:design corpus:production-host global `--final`\n{row}"
         );
         let mut errors = Vec::new();
         validate_contract_contents(&contract, &mut errors);

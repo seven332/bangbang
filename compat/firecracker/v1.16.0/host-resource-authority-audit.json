@@ -50,7 +50,7 @@
     "missing_platform_feasible": 1,
     "proven_platform_impossible": 33
   },
-  "unrelated_inventory_sha256": "d3b14c81f9b2d9173e60a312411c6f30626f46e853c8916e7b176fc3327d9be7",
+  "unrelated_inventory_sha256": "fe268291c594ff41ff6bdc71e33a3aa71ee6d7b4997ec112d45dc9a21927e7a1",
   "source_clauses": [
     {
       "order": 1,
@@ -627,6 +627,21 @@
       "evidence_profiles": [
         "snapshot-and-pager-authority"
       ]
+    },
+    {
+      "order": 18,
+      "role": "vmnet-provider-stream",
+      "object_kinds": [
+        "connected-unix-stream"
+      ],
+      "access": [
+        "read-write"
+      ],
+      "lifetime": "one-time-claim",
+      "consumer": "contained-remote-vmnet-provider",
+      "evidence_profiles": [
+        "network-policy-boundary"
+      ]
     }
   ],
   "terminal_dependencies": [
@@ -992,8 +1007,13 @@
       "implementation": [
         {
           "kind": "local",
-          "path": "crates/bangbang/src/host_network/vmnet.rs",
-          "anchor": "pub struct VmnetInterfaceConfig"
+          "path": "crates/bangbang/src/contained_session.rs",
+          "anchor": "pub(crate) struct VmnetProviderGrantAuthority"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/remote_vmnet.rs",
+          "anchor": "pub(crate) struct RemoteVmnetProviderSource"
         },
         {
           "kind": "local",
@@ -1003,24 +1023,34 @@
         {
           "kind": "local",
           "path": "crates/session/src/codec.rs",
-          "anchor": "pub struct VmnetAuthority"
+          "anchor": "pub enum VmnetBackendRoute"
         }
       ],
       "validation": [
         {
           "kind": "local",
+          "path": "crates/bangbang/src/host_network/remote_vmnet.rs",
+          "anchor": "fn remote_pumps_route_readiness_packets_and_ordered_cleanup()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/grant_manifest.rs",
+          "anchor": "fn provider_stream_manifest_connects_once_and_is_classified_for_remote_routing()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/launch_policy.rs",
+          "anchor": "fn networkless_profile_routes_positive_authority_only_through_provider_grant()"
+        },
+        {
+          "kind": "local",
           "path": "crates/launcher/tests/production_bundle_e2e.rs",
-          "anchor": "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()"
+          "anchor": "fn signed_networkless_worker_uses_authenticated_remote_provider_without_apple_authorization()"
         },
         {
           "kind": "local",
           "path": "crates/session/src/codec.rs",
-          "anchor": "fn vmnet_authority_debug_and_errors_do_not_reveal_policy_values()"
-        },
-        {
-          "kind": "local",
-          "path": "crates/session/src/codec.rs",
-          "anchor": "fn vmnet_authority_validates_exact_bounded_modes_and_names()"
+          "anchor": "fn vmnet_backend_route_round_trips_and_fails_closed_against_authority()"
         }
       ]
     },

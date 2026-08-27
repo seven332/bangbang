@@ -42,7 +42,7 @@ Each detailed subject has one primary document:
   owns the 13-clause process/tenant mapping, failure-atomic and concurrent
   evidence, terminal identity composition, residuals, and nonclaims.
 - [Host-Resource Authority Contract](compat/firecracker/v1.16.0/host-resource-authority-contract.md)
-  owns the four-source obligation map, exact 17-role/five-access grant surface,
+  owns the four-source obligation map, exact 18-role/five-access grant surface,
   fixed broker facets, operator/external boundaries, residuals, and nonclaims.
 - [Jailer, Seccomp, and macOS Containment Contract](compat/firecracker/v1.16.0/jailer-seccomp-containment-contract.md)
   owns the final five-source, 46-clause containment composition, portable
@@ -57,8 +57,12 @@ Each detailed subject has one primary document:
 - [Private vmnet Provider Protocol](docs/vmnet-provider-protocol.md) freezes the
   bounded session/control/data wire, state, packet, deadline, and descriptor
   ownership contract and documents the minimal root broker plus irreversibly
-  dropped per-interface owner. Production launcher/sandbox integration remains
-  separate, and this foundation promotes no capability.
+  dropped per-interface owner. The networkless contained worker now adopts one
+  authenticated provider stream through a fixed remote-only route, with an
+  ad-hoc-signed App Sandbox fake-provider test that needs no Apple identity or
+  vmnet profile and constructs no local vmnet/XPC descriptor; elevated
+  launcher-to-broker assembly and real guest connectivity remain separate, and
+  this integration promotes no capability.
 - [Production vmnet certification runner](docs/testing.md#production-vmnet-certification-foundation)
   owns the private config, retained fixture, guest DHCP/TCP oracle, two-package
   inspection, descriptor-grant assembly, fixed 21-case production matrix, and

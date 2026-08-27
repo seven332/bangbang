@@ -316,7 +316,9 @@ use bangbang_runtime::{
 };
 #[cfg(target_os = "macos")]
 use bangbang_session::macos::runtime::WorkerSocketNamespace;
-use bangbang_session::{GrantAccess, GrantId, ResourceRole, SessionId, VmnetAuthority};
+use bangbang_session::{
+    GrantAccess, GrantId, ResourceRole, SessionId, VmnetAuthority, VmnetBackendRoute,
+};
 
 #[cfg(target_os = "macos")]
 use crate::anchored_socket::{AnchoredSocketGuard, bind as bind_anchored_socket};
@@ -336,6 +338,7 @@ use crate::contained_session::{
 };
 use crate::direct_snapshot_pager::{self, DirectSnapshotPagerConnectError};
 use crate::direct_vhost_user;
+use crate::host_network::remote_vmnet::{ProcessVmnetBackendSource, ProcessVmnetInterfaceBackend};
 use crate::host_network::virtio_vmnet::{
     MmdsNetworkStackBuildError, MmdsOnlyVirtioNetworkPacketIo,
     MmdsOnlyVirtioNetworkPacketIoBuildError, MmdsPacketDetour, PreparedVmnetVirtioNetworkRxBuffer,
@@ -345,10 +348,10 @@ use crate::host_network::virtio_vmnet::{
     VmnetVirtioNetworkPacketProfile,
 };
 use crate::host_network::vmnet::{
-    StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VMNET_MAX_BYTES_PER_OPERATION,
-    VMNET_MAX_PACKETS_PER_OPERATION, VmnetHostDeviceNameConfigError, VmnetInterfaceBackend,
-    VmnetInterfaceConfig, VmnetInterfaceParameters, VmnetInterfaceStartDisposition,
-    VmnetInterfaceStartError, VmnetMode, VmnetPacketIoBackend,
+    StartedVmnetPacketIoBackend, VMNET_MAX_BYTES_PER_OPERATION, VMNET_MAX_PACKETS_PER_OPERATION,
+    VmnetHostDeviceNameConfigError, VmnetInterfaceBackend, VmnetInterfaceConfig,
+    VmnetInterfaceParameters, VmnetInterfaceStartDisposition, VmnetInterfaceStartError, VmnetMode,
+    VmnetPacketIoBackend,
 };
 #[cfg(target_os = "macos")]
 use crate::snapshot_restore_resources::{
@@ -5636,14 +5639,28 @@ pub(crate) enum ProcessVmnetAuthority {
     Contained {
         session_id: SessionId,
         authority: VmnetAuthority,
+        route: VmnetBackendRoute,
     },
 }
 
 impl ProcessVmnetAuthority {
-    pub(crate) fn contained(session_id: SessionId, authority: VmnetAuthority) -> Option<Self> {
-        (!session_id.is_pre_session()).then_some(Self::Contained {
+    pub(crate) fn contained(
+        session_id: SessionId,
+        authority: VmnetAuthority,
+        route: VmnetBackendRoute,
+    ) -> Option<Self> {
+        let coherent = matches!(
+            (route, authority.is_denied()),
+            (VmnetBackendRoute::Denied, true)
+                | (
+                    VmnetBackendRoute::LocalSystem | VmnetBackendRoute::RemoteProvider,
+                    false
+                )
+        );
+        (!session_id.is_pre_session() && coherent).then_some(Self::Contained {
             session_id,
             authority,
+            route,
         })
     }
 
@@ -5651,6 +5668,13 @@ impl ProcessVmnetAuthority {
         match self {
             Self::Direct => None,
             Self::Contained { authority, .. } => Some(authority),
+        }
+    }
+
+    const fn backend_route(self) -> VmnetBackendRoute {
+        match self {
+            Self::Direct => VmnetBackendRoute::LocalSystem,
+            Self::Contained { route, .. } => route,
         }
     }
 }
@@ -5799,6 +5823,16 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
 
     pub(crate) fn with_process_serial_stdio(mut self) -> Self {
         self.starter.process_serial_stdio = true;
+        self
+    }
+
+    pub(crate) fn with_vmnet_backend_source(mut self, source: ProcessVmnetBackendSource) -> Self {
+        assert_eq!(
+            self.vmnet_authority.backend_route() == VmnetBackendRoute::RemoteProvider,
+            source.is_remote(),
+            "vmnet backend source must match authenticated route",
+        );
+        self.starter.vmnet_backend_source = source;
         self
     }
 
@@ -10937,6 +10971,7 @@ pub(crate) struct HvfInstanceStartExecutor {
     process_serial_stdio: bool,
     serial_output: SharedSerialOutputBuffer,
     active_serial_output: Option<SharedSerialOutput>,
+    vmnet_backend_source: ProcessVmnetBackendSource,
     #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
     guest_evidence: Option<GuestEvidenceAuthority>,
 }
@@ -14612,6 +14647,7 @@ struct PrepareHvfSnapshotV2NetworkDestinationInput<'a> {
     resume_requested: bool,
     cancellation: NativeV2SnapshotCaptureCancellation,
     guest_logger: GuestLogger,
+    vmnet_backend_source: ProcessVmnetBackendSource,
 }
 
 /// Reconstructs and atomically commits one retained exact-2.11 destination,
@@ -14644,6 +14680,7 @@ fn prepare_hvf_native_v2_network_destination(
         resume_requested,
         cancellation,
         guest_logger,
+        vmnet_backend_source,
     } = input;
     let expected_transport = if pci_enabled {
         SnapshotV2DeviceTransportKind::Pci
@@ -14754,12 +14791,14 @@ fn prepare_hvf_native_v2_network_destination(
             let serial_output = serial.output().clone();
             let process_shell = HvfSnapshotV2RestoredSerialShell::new(serial)
                 .with_guest_logger(guest_logger.clone());
+            let mut vmnet_factory =
+                SystemProcessVmnetPacketIoBackendFactory::new(vmnet_backend_source.clone());
             let restored = match platform_plan {
                 HvfSnapshotV2NetworkPlatformPlan::Mmio(plan) => {
                     let memory = static_memory
                         .map(HvfSnapshotV2NetworkMmioMemoryInput::Static)
                         .unwrap_or(HvfSnapshotV2NetworkMmioMemoryInput::ProductOwned);
-                    restore_process_snapshot_v2_network_mmio(
+                    restore_process_snapshot_v2_network_mmio_with_factory(
                         platform,
                         memory,
                         process_shell,
@@ -14768,6 +14807,7 @@ fn prepare_hvf_native_v2_network_destination(
                         resource_plan,
                         destination_instance_id,
                         mmds_data_store_limit_bytes,
+                        &mut vmnet_factory,
                         now,
                         |_| cancellation.is_cancelled(),
                     )
@@ -14780,7 +14820,7 @@ fn prepare_hvf_native_v2_network_destination(
                     let memory = static_memory
                         .map(HvfSnapshotV2NetworkPciMemoryInput::Static)
                         .unwrap_or(HvfSnapshotV2NetworkPciMemoryInput::ProductOwned);
-                    restore_process_snapshot_v2_network_pci(
+                    restore_process_snapshot_v2_network_pci_with_factory(
                         platform,
                         memory,
                         process_shell,
@@ -14789,6 +14829,7 @@ fn prepare_hvf_native_v2_network_destination(
                         resource_plan,
                         destination_instance_id,
                         mmds_data_store_limit_bytes,
+                        &mut vmnet_factory,
                         now,
                         |_| cancellation.is_cancelled(),
                     )
@@ -15369,25 +15410,26 @@ impl HvfInstanceStartExecutor {
             virtual_timer_intid: _virtual_timer_intid,
             cancellation,
         } = prepared.into_parts();
-        let (packet_io, mmds_metrics) =
-            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
-                Ok(prepared) => prepared,
-                Err(source) => {
-                    drop(root);
-                    drop(platform);
-                    drop(memory);
-                    drop(controller_commit);
-                    drop(serial_output);
-                    return Err(native_v2_error_after_root_resource_abort(
-                        NativeV2SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(
-                            format!(
-                                "failed to build native-v2 network packet I/O provider: {source}"
-                            ),
-                        )),
-                        root_completion,
-                    ));
-                }
-            };
+        let (packet_io, mmds_metrics) = match ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                drop(root);
+                drop(platform);
+                drop(memory);
+                drop(controller_commit);
+                drop(serial_output);
+                return Err(native_v2_error_after_root_resource_abort(
+                    NativeV2SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(
+                        format!("failed to build native-v2 network packet I/O provider: {source}"),
+                    )),
+                    root_completion,
+                ));
+            }
+        };
         let process_shell = HvfSnapshotV2DefaultProcessShell::new(serial_output.clone())
             .with_guest_logger(controller.guest_logger());
         let mut session = match OwnedHvfArm64BootSession::restore_snapshot_v2_root(
@@ -15630,19 +15672,21 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             controller,
             serial_output.clone(),
         );
-        let (mut packet_io, mmds_metrics) =
-            ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority).map_err(
-                |err| {
-                    let source = BackendError::Hypervisor(format!(
-                        "failed to build network packet I/O provider: {err}"
-                    ));
-                    if err.is_terminal() {
-                        InstanceStartError::terminal(source)
-                    } else {
-                        InstanceStartError::retryable(source)
-                    }
-                },
-            )?;
+        let (mut packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        )
+        .map_err(|err| {
+            let source = BackendError::Hypervisor(format!(
+                "failed to build network packet I/O provider: {err}"
+            ));
+            if err.is_terminal() {
+                InstanceStartError::terminal(source)
+            } else {
+                InstanceStartError::retryable(source)
+            }
+        })?;
         startup_resources =
             startup_resources.with_network_device_profiles(packet_io.device_profiles());
         #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
@@ -15939,14 +15983,16 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             input.resume_vm(),
         )
         .map_err(NativeV1SnapshotLoadError::ControllerCommitAllocation)?;
-        let (packet_io, mmds_metrics) =
-            ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority).map_err(
-                |source| {
-                    NativeV1SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(
-                        format!("failed to build network packet I/O provider: {source}"),
-                    ))
-                },
-            )?;
+        let (packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        )
+        .map_err(|source| {
+            NativeV1SnapshotLoadError::ProcessPreparation(BackendError::Hypervisor(format!(
+                "failed to build network packet I/O provider: {source}"
+            )))
+        })?;
 
         let restored =
             OwnedHvfArm64BootSession::restore_snapshot_v1(prepared, input.track_dirty_pages())
@@ -16125,23 +16171,26 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 });
             }
         };
-        let (packet_io, mmds_metrics) =
-            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
-                Ok(prepared) => prepared,
-                Err(source) => {
-                    let cleanup_failed = bundle.abort().is_err();
-                    if cleanup_failed {
-                        return Err(NativeV2SnapshotLoadError::MultiBlockDestination(
-                            NativeV2MultiBlockDestinationLoadError::new(expected_transport, true),
-                        ));
-                    }
-                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
-                        BackendError::Hypervisor(format!(
-                            "failed to build native-v2 network packet I/O provider: {source}"
-                        )),
+        let (packet_io, mmds_metrics) = match ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                let cleanup_failed = bundle.abort().is_err();
+                if cleanup_failed {
+                    return Err(NativeV2SnapshotLoadError::MultiBlockDestination(
+                        NativeV2MultiBlockDestinationLoadError::new(expected_transport, true),
                     ));
                 }
-            };
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::Hypervisor(format!(
+                        "failed to build native-v2 network packet I/O provider: {source}"
+                    )),
+                ));
+            }
+        };
 
         let restored = match expected_transport {
             SnapshotV2DeviceTransportKind::Mmio => {
@@ -16337,23 +16386,26 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             }
         };
 
-        let (packet_io, mmds_metrics) =
-            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
-                Ok(prepared) => prepared,
-                Err(source) => {
-                    let cleanup_failed = bundle.abort().is_err();
-                    if cleanup_failed {
-                        return Err(NativeV2SnapshotLoadError::StorageDestination(
-                            NativeV2StorageDestinationLoadError::new(expected_transport, true),
-                        ));
-                    }
-                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
-                        BackendError::Hypervisor(format!(
-                            "failed to build native-v2 network packet I/O provider: {source}"
-                        )),
+        let (packet_io, mmds_metrics) = match ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                let cleanup_failed = bundle.abort().is_err();
+                if cleanup_failed {
+                    return Err(NativeV2SnapshotLoadError::StorageDestination(
+                        NativeV2StorageDestinationLoadError::new(expected_transport, true),
                     ));
                 }
-            };
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::Hypervisor(format!(
+                        "failed to build native-v2 network packet I/O provider: {source}"
+                    )),
+                ));
+            }
+        };
 
         let restored = match plan {
             StoragePlatformPlan::Mmio(plan) => prepare_hvf_native_v2_storage_mmio_destination(
@@ -16486,22 +16538,25 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             || cancellation.is_cancelled(),
         )
         .map_err(NativeV2SnapshotLoadError::SerialBundle)?;
-        let (packet_io, mmds_metrics) =
-            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
-                Ok(prepared) => prepared,
-                Err(source) => {
-                    if bundle.abort().is_err() {
-                        return Err(NativeV2SnapshotLoadError::SerialDestination(
-                            NativeV2SerialDestinationLoadError::new(true),
-                        ));
-                    }
-                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
-                        BackendError::Hypervisor(format!(
-                            "failed to build native-v2 network packet I/O provider: {source}"
-                        )),
+        let (packet_io, mmds_metrics) = match ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                if bundle.abort().is_err() {
+                    return Err(NativeV2SnapshotLoadError::SerialDestination(
+                        NativeV2SerialDestinationLoadError::new(true),
                     ));
                 }
-            };
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::Hypervisor(format!(
+                        "failed to build native-v2 network packet I/O provider: {source}"
+                    )),
+                ));
+            }
+        };
 
         let (destination, controller_commit) =
             prepare_hvf_native_v2_serial_destination(PrepareHvfSnapshotV2SerialDestinationInput {
@@ -16643,6 +16698,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     match ProcessNetworkPacketIoProvider::from_controller(
                         controller,
                         vmnet_authority,
+                        &self.vmnet_backend_source,
                     ) {
                         Ok(prepared) => prepared,
                         Err(source) => {
@@ -16794,6 +16850,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                     match ProcessNetworkPacketIoProvider::from_controller(
                         controller,
                         vmnet_authority,
+                        &self.vmnet_backend_source,
                     ) {
                         Ok(prepared) => prepared,
                         Err(source) => {
@@ -17034,6 +17091,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 resume_requested: input.resume_vm(),
                 cancellation,
                 guest_logger: controller.guest_logger(),
+                vmnet_backend_source: self.vmnet_backend_source.clone(),
             },
         )
         .map_err(|source| {
@@ -17307,8 +17365,10 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 ))
             })?;
         let now = Instant::now();
+        let mut vmnet_factory =
+            SystemProcessVmnetPacketIoBackendFactory::new(self.vmnet_backend_source.clone());
         let parts = if pci_enabled {
-            restore_process_snapshot_v2_vsock_pci_with_logger(
+            restore_process_snapshot_v2_vsock_pci_with_factory_and_logger(
                 platform,
                 memory,
                 resource_plan,
@@ -17316,6 +17376,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 &controller.instance_info().id,
                 mmds_data_store_limit_bytes,
                 controller.guest_logger(),
+                &mut vmnet_factory,
                 now,
                 |_| cancellation.is_cancelled(),
             )
@@ -17331,7 +17392,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 )
             })?
         } else {
-            restore_process_snapshot_v2_vsock_mmio_with_logger(
+            restore_process_snapshot_v2_vsock_mmio_with_factory_and_logger(
                 platform,
                 memory,
                 resource_plan,
@@ -17339,6 +17400,7 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
                 &controller.instance_info().id,
                 mmds_data_store_limit_bytes,
                 controller.guest_logger(),
+                &mut vmnet_factory,
                 now,
                 |_| cancellation.is_cancelled(),
             )
@@ -17451,22 +17513,25 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             || cancellation.is_cancelled(),
         )
         .map_err(NativeV2SnapshotLoadError::EntropyBundle)?;
-        let (packet_io, mmds_metrics) =
-            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
-                Ok(prepared) => prepared,
-                Err(source) => {
-                    if bundle.abort().is_err() {
-                        return Err(NativeV2SnapshotLoadError::EntropyDestination(
-                            NativeV2EntropyDestinationLoadError::new(expected_transport, true),
-                        ));
-                    }
-                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
-                        BackendError::Hypervisor(format!(
-                            "failed to build native-v2 network packet I/O provider: {source}"
-                        )),
+        let (packet_io, mmds_metrics) = match ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                if bundle.abort().is_err() {
+                    return Err(NativeV2SnapshotLoadError::EntropyDestination(
+                        NativeV2EntropyDestinationLoadError::new(expected_transport, true),
                     ));
                 }
-            };
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::Hypervisor(format!(
+                        "failed to build native-v2 network packet I/O provider: {source}"
+                    )),
+                ));
+            }
+        };
 
         let (destination, controller_commit) = prepare_hvf_native_v2_entropy_destination(
             PrepareHvfSnapshotV2EntropyDestinationInput {
@@ -17602,22 +17667,25 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
             || cancellation.is_cancelled(),
         )
         .map_err(NativeV2SnapshotLoadError::BalloonBundle)?;
-        let (packet_io, mmds_metrics) =
-            match ProcessNetworkPacketIoProvider::from_controller(controller, vmnet_authority) {
-                Ok(prepared) => prepared,
-                Err(source) => {
-                    if bundle.abort().is_err() {
-                        return Err(NativeV2SnapshotLoadError::BalloonDestination(
-                            NativeV2BalloonDestinationLoadError::new(expected_transport, true),
-                        ));
-                    }
-                    return Err(NativeV2SnapshotLoadError::ProcessPreparation(
-                        BackendError::Hypervisor(format!(
-                            "failed to build native-v2 network packet I/O provider: {source}"
-                        )),
+        let (packet_io, mmds_metrics) = match ProcessNetworkPacketIoProvider::from_controller(
+            controller,
+            vmnet_authority,
+            &self.vmnet_backend_source,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                if bundle.abort().is_err() {
+                    return Err(NativeV2SnapshotLoadError::BalloonDestination(
+                        NativeV2BalloonDestinationLoadError::new(expected_transport, true),
                     ));
                 }
-            };
+                return Err(NativeV2SnapshotLoadError::ProcessPreparation(
+                    BackendError::Hypervisor(format!(
+                        "failed to build native-v2 network packet I/O provider: {source}"
+                    )),
+                ));
+            }
+        };
 
         let result = match balloon {
             Some(balloon) => prepare_hvf_native_v2_balloon_destination(
@@ -19869,7 +19937,7 @@ where
 }
 
 pub(crate) type ProcessNetworkPacketIoProvider =
-    ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend>;
+    ProcessNetworkPacketIoRegistry<ProcessVmnetInterfaceBackend>;
 
 pub(crate) trait ProcessVmnetBackend:
     VmnetInterfaceBackend + VmnetPacketIoBackend<Interface = <Self as VmnetInterfaceBackend>::Interface>
@@ -20451,6 +20519,7 @@ where
     readiness_receiver: Option<mpsc::Receiver<()>>,
     readiness_wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     readiness_bridge: Option<ProcessNetworkPacketReadinessBridge>,
+    backend_source: Option<ProcessVmnetBackendSource>,
 }
 
 impl<B> fmt::Debug for ProcessNetworkPacketIoRegistry<B>
@@ -20475,10 +20544,11 @@ where
     }
 }
 
-impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
+impl ProcessNetworkPacketIoRegistry<ProcessVmnetInterfaceBackend> {
     fn from_controller(
         controller: &VmmController,
         owner: ProcessVmnetAuthority,
+        backend_source: &ProcessVmnetBackendSource,
     ) -> Result<(Self, Option<SharedMmdsMetrics>), ProcessNetworkPacketIoProviderBuildError> {
         validate_process_vmnet_authority(controller, owner).map_err(|error| match error {
             ProcessVmnetAuthorityValidationError::Provider(source) => source,
@@ -20506,6 +20576,7 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
             controller.network_interface_configs(),
             mmds_detour.as_ref(),
             owner,
+            backend_source,
         )?;
         Ok((provider, mmds_metrics))
     }
@@ -20526,6 +20597,7 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
             configs,
             mmds_detour,
             ProcessVmnetAuthority::Direct,
+            &ProcessVmnetBackendSource::LocalSystem,
         )
     }
 
@@ -20533,14 +20605,17 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
         configs: &[NetworkInterfaceConfig],
         mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
         owner: ProcessVmnetAuthority,
+        backend_source: &ProcessVmnetBackendSource,
     ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
-        let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-        Self::from_network_configs_and_mmds_detour_with_factory_and_owner(
+        let mut factory = SystemProcessVmnetPacketIoBackendFactory::new(backend_source.clone());
+        let mut provider = Self::from_network_configs_and_mmds_detour_with_factory_and_owner(
             configs,
             mmds_detour,
             owner,
             &mut factory,
-        )
+        )?;
+        provider.backend_source = Some(backend_source.clone());
+        Ok(provider)
     }
 
     fn prepare_runtime_entry(
@@ -20548,10 +20623,11 @@ impl ProcessNetworkPacketIoRegistry<SystemVmnetInterfaceBackend> {
         config: &NetworkInterfaceConfig,
         authority: ProcessVmnetAuthority,
     ) -> Result<
-        PreparedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>,
+        PreparedProcessNetworkPacketIoEntry<ProcessVmnetInterfaceBackend>,
         NetworkRuntimeMutationError,
     > {
-        let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+        let source = self.backend_source.clone().unwrap_or_default();
+        let mut factory = SystemProcessVmnetPacketIoBackendFactory::new(source);
         self.prepare_runtime_entry_with_factory(config, authority, &mut factory)
     }
 }
@@ -20681,6 +20757,12 @@ where
     where
         F: ProcessVmnetPacketIoBackendFactory<Backend = B>,
     {
+        let backend_source = factory.backend_source();
+        if backend_source.as_ref().is_some_and(|source| {
+            (owner.backend_route() == VmnetBackendRoute::RemoteProvider) != source.is_remote()
+        }) {
+            return Err(ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch);
+        }
         validate_network_interface_count(configs.len()).map_err(|source| {
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source }
         })?;
@@ -20709,6 +20791,7 @@ where
             owner,
             configs.iter().filter_map(NetworkInterfaceConfig::guest_mac),
         )?;
+        provider.backend_source = backend_source;
         for config in configs {
             let class = provider.class_for_interface(config.iface_id());
             let prepared = match provider.prepare_entry_with_factory(
@@ -20769,6 +20852,7 @@ where
             readiness_receiver: Some(readiness_receiver),
             readiness_wake: None,
             readiness_bridge: None,
+            backend_source: None,
         })
     }
 
@@ -21824,9 +21908,9 @@ pub(crate) trait ProcessRuntimeNetworkPacketIoProvider:
 }
 
 impl ProcessRuntimeNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
-    type PreparedEntry = PreparedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>;
+    type PreparedEntry = PreparedProcessNetworkPacketIoEntry<ProcessVmnetInterfaceBackend>;
     type PublishedEntry = PublishedProcessNetworkPacketIoEntry;
-    type RemovedEntry = RemovedProcessNetworkPacketIoEntry<SystemVmnetInterfaceBackend>;
+    type RemovedEntry = RemovedProcessNetworkPacketIoEntry<ProcessVmnetInterfaceBackend>;
 
     fn bind_readiness_wake(
         &mut self,
@@ -23842,9 +23926,9 @@ where
 }
 
 type SystemPreparedProcessSnapshotV2NetworkRestoreBatch =
-    PreparedProcessSnapshotV2NetworkRestoreBatch<SystemVmnetInterfaceBackend>;
+    PreparedProcessSnapshotV2NetworkRestoreBatch<ProcessVmnetInterfaceBackend>;
 type SystemPreparedProcessSnapshotV2NetworkRestoreCompletion =
-    PreparedProcessSnapshotV2NetworkRestoreCompletion<SystemVmnetInterfaceBackend>;
+    PreparedProcessSnapshotV2NetworkRestoreCompletion<ProcessVmnetInterfaceBackend>;
 
 const _: fn(
     &ProcessSnapshotV2NetworkRestoreResourceError,
@@ -23908,7 +23992,7 @@ const _: fn(
 const _: fn(
     SystemPreparedProcessSnapshotV2NetworkRestoreCompletion,
 ) -> Result<
-    PreparedProcessSnapshotV2NetworkRestoreCompletionParts<SystemVmnetInterfaceBackend>,
+    PreparedProcessSnapshotV2NetworkRestoreCompletionParts<ProcessVmnetInterfaceBackend>,
     ProcessSnapshotV2NetworkRestoreResourceError,
 > = SystemPreparedProcessSnapshotV2NetworkRestoreCompletion::into_parts;
 
@@ -23945,13 +24029,13 @@ fn prepare_process_snapshot_v2_network_restore_resources<C>(
     mmds_data_store_limit_bytes: usize,
     cancelled: C,
 ) -> Result<
-    PreparedProcessSnapshotV2NetworkRestoreBatch<SystemVmnetInterfaceBackend>,
+    PreparedProcessSnapshotV2NetworkRestoreBatch<ProcessVmnetInterfaceBackend>,
     ProcessSnapshotV2NetworkRestoreResourceError,
 >
 where
     C: FnMut(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
 {
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory::default();
     prepare_process_snapshot_v2_network_restore_resources_with_factory(
         plan,
         destination_instance_id,
@@ -24022,6 +24106,15 @@ where
         all_mmds,
         authority,
     } = plan;
+    let backend_source = factory.backend_source();
+    if backend_source.as_ref().is_some_and(|source| {
+        (authority.backend_route() == VmnetBackendRoute::RemoteProvider) != source.is_remote()
+    }) {
+        return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
+            ProcessSnapshotV2NetworkRestoreResourceStage::Start,
+            ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch,
+        ));
+    }
     if interfaces.len() != vmnet_configs.len() {
         return Err(ProcessSnapshotV2NetworkRestoreResourceError::terminal(
             ProcessSnapshotV2NetworkRestoreResourceStage::Start,
@@ -24301,6 +24394,7 @@ where
             source,
         )
     })?;
+    provider.backend_source = backend_source;
 
     for ((interface, provider_vmnet), metrics_lease) in interfaces
         .iter()
@@ -25462,13 +25556,13 @@ fn prepare_process_snapshot_v2_vsock_restore_resources<C>(
     mmds_data_store_limit_bytes: usize,
     cancelled: C,
 ) -> Result<
-    PreparedProcessSnapshotV2VsockRestoreBatch<SystemVmnetInterfaceBackend>,
+    PreparedProcessSnapshotV2VsockRestoreBatch<ProcessVmnetInterfaceBackend>,
     ProcessSnapshotV2VsockRestoreResourceError,
 >
 where
     C: Fn(ProcessSnapshotV2VsockRestoreResourceStage) -> bool,
 {
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory::default();
     prepare_process_snapshot_v2_vsock_restore_resources_with_factory(
         plan,
         contained_authority,
@@ -25480,11 +25574,11 @@ where
 }
 
 type SystemPreparedProcessSnapshotV2VsockRestoreBatch =
-    PreparedProcessSnapshotV2VsockRestoreBatch<SystemVmnetInterfaceBackend>;
+    PreparedProcessSnapshotV2VsockRestoreBatch<ProcessVmnetInterfaceBackend>;
 type SystemPreparedProcessSnapshotV2VsockRestoreCompletion =
-    PreparedProcessSnapshotV2VsockRestoreCompletion<SystemVmnetInterfaceBackend>;
+    PreparedProcessSnapshotV2VsockRestoreCompletion<ProcessVmnetInterfaceBackend>;
 type SystemPreparedProcessSnapshotV2VsockRestoreCompletionParts =
-    PreparedProcessSnapshotV2VsockRestoreCompletionParts<SystemVmnetInterfaceBackend>;
+    PreparedProcessSnapshotV2VsockRestoreCompletionParts<ProcessVmnetInterfaceBackend>;
 type SystemPrepareProcessSnapshotV2VsockRestoreResourcesFn = fn(
     PreparedProcessSnapshotV2VsockResourcePlan,
     Option<&ContainedSnapshotRestoreAuthority>,
@@ -26614,7 +26708,7 @@ type ProcessSnapshotV2NetworkRestoreResourceBuilder = fn(
     usize,
     fn(ProcessSnapshotV2NetworkRestoreResourceStage) -> bool,
 ) -> Result<
-    PreparedProcessSnapshotV2NetworkRestoreBatch<SystemVmnetInterfaceBackend>,
+    PreparedProcessSnapshotV2NetworkRestoreBatch<ProcessVmnetInterfaceBackend>,
     ProcessSnapshotV2NetworkRestoreResourceError,
 >;
 
@@ -27898,7 +27992,7 @@ where
 }
 
 type SystemRestoredProcessSnapshotV2VsockMmioOwners =
-    RestoredProcessSnapshotV2VsockMmioOwners<SystemVmnetInterfaceBackend>;
+    RestoredProcessSnapshotV2VsockMmioOwners<ProcessVmnetInterfaceBackend>;
 
 #[cfg(target_os = "macos")]
 impl SystemRestoredProcessSnapshotV2VsockMmioOwners {
@@ -28130,7 +28224,7 @@ fn restore_process_snapshot_v2_vsock_mmio_with_logger<C>(
 where
     C: Fn(ProcessSnapshotV2VsockMmioRestoreStage) -> bool,
 {
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory::default();
     restore_process_snapshot_v2_vsock_mmio_with_factory_and_logger(
         platform,
         memory,
@@ -28800,7 +28894,7 @@ where
 }
 
 type SystemRestoredProcessSnapshotV2VsockPciOwners =
-    RestoredProcessSnapshotV2VsockPciOwners<SystemVmnetInterfaceBackend>;
+    RestoredProcessSnapshotV2VsockPciOwners<ProcessVmnetInterfaceBackend>;
 
 #[cfg(target_os = "macos")]
 impl SystemRestoredProcessSnapshotV2VsockPciOwners {
@@ -29030,7 +29124,7 @@ fn restore_process_snapshot_v2_vsock_pci_with_logger<C>(
 where
     C: Fn(ProcessSnapshotV2VsockPciRestoreStage) -> bool,
 {
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+    let mut factory = SystemProcessVmnetPacketIoBackendFactory::default();
     restore_process_snapshot_v2_vsock_pci_with_factory_and_logger(
         platform,
         memory,
@@ -29664,7 +29758,7 @@ where
 }
 
 type SystemRestoredProcessSnapshotV2NetworkMmioOwners =
-    RestoredProcessSnapshotV2NetworkMmioOwners<SystemVmnetInterfaceBackend>;
+    RestoredProcessSnapshotV2NetworkMmioOwners<ProcessVmnetInterfaceBackend>;
 
 #[cfg(target_os = "macos")]
 impl SystemRestoredProcessSnapshotV2NetworkMmioOwners {
@@ -29743,38 +29837,6 @@ impl SystemRestoredProcessSnapshotV2NetworkMmioOwners {
             resources: std::mem::take(&mut self.resources),
         })
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn restore_process_snapshot_v2_network_mmio(
-    platform: HvfSnapshotV2PlatformState,
-    memory: HvfSnapshotV2NetworkMmioMemoryInput,
-    process_shell: HvfSnapshotV2RestoredSerialShell,
-    serial_input: Option<SerialStdioInput>,
-    platform_plan: HvfSnapshotV2NetworkMmioPlatformPlan,
-    resource_plan: PreparedProcessSnapshotV2NetworkResourcePlan,
-    destination_instance_id: &str,
-    mmds_data_store_limit_bytes: usize,
-    now: Instant,
-    cancelled: impl FnMut(ProcessSnapshotV2NetworkMmioRestoreStage) -> bool,
-) -> Result<
-    SystemRestoredProcessSnapshotV2NetworkMmioOwners,
-    ProcessSnapshotV2NetworkMmioRestoreError,
-> {
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-    restore_process_snapshot_v2_network_mmio_with_factory(
-        platform,
-        memory,
-        process_shell,
-        serial_input,
-        platform_plan,
-        resource_plan,
-        destination_instance_id,
-        mmds_data_store_limit_bytes,
-        &mut factory,
-        now,
-        cancelled,
-    )
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -30057,7 +30119,7 @@ where
 }
 
 type SystemRestoredProcessSnapshotV2NetworkPciOwners =
-    RestoredProcessSnapshotV2NetworkPciOwners<SystemVmnetInterfaceBackend>;
+    RestoredProcessSnapshotV2NetworkPciOwners<ProcessVmnetInterfaceBackend>;
 
 #[cfg(target_os = "macos")]
 impl SystemRestoredProcessSnapshotV2NetworkPciOwners {
@@ -30136,36 +30198,6 @@ impl SystemRestoredProcessSnapshotV2NetworkPciOwners {
             resources: std::mem::take(&mut self.resources),
         })
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn restore_process_snapshot_v2_network_pci(
-    platform: HvfSnapshotV2PlatformState,
-    memory: HvfSnapshotV2NetworkPciMemoryInput,
-    process_shell: HvfSnapshotV2RestoredSerialShell,
-    serial_input: Option<SerialStdioInput>,
-    platform_plan: HvfSnapshotV2NetworkPciPlatformPlan,
-    resource_plan: PreparedProcessSnapshotV2NetworkResourcePlan,
-    destination_instance_id: &str,
-    mmds_data_store_limit_bytes: usize,
-    now: Instant,
-    cancelled: impl FnMut(ProcessSnapshotV2NetworkPciRestoreStage) -> bool,
-) -> Result<SystemRestoredProcessSnapshotV2NetworkPciOwners, ProcessSnapshotV2NetworkPciRestoreError>
-{
-    let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-    restore_process_snapshot_v2_network_pci_with_factory(
-        platform,
-        memory,
-        process_shell,
-        serial_input,
-        platform_plan,
-        resource_plan,
-        destination_instance_id,
-        mmds_data_store_limit_bytes,
-        &mut factory,
-        now,
-        cancelled,
-    )
 }
 
 #[derive(Debug)]
@@ -30304,16 +30336,32 @@ trait ProcessVmnetPacketIoBackendFactory {
     type Backend: VmnetInterfaceBackend;
 
     fn new_backend(&mut self, iface_id: &str) -> Self::Backend;
+
+    fn backend_source(&self) -> Option<ProcessVmnetBackendSource> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
-struct SystemProcessVmnetPacketIoBackendFactory;
+struct SystemProcessVmnetPacketIoBackendFactory {
+    source: ProcessVmnetBackendSource,
+}
+
+impl SystemProcessVmnetPacketIoBackendFactory {
+    const fn new(source: ProcessVmnetBackendSource) -> Self {
+        Self { source }
+    }
+}
 
 impl ProcessVmnetPacketIoBackendFactory for SystemProcessVmnetPacketIoBackendFactory {
-    type Backend = SystemVmnetInterfaceBackend;
+    type Backend = ProcessVmnetInterfaceBackend;
 
     fn new_backend(&mut self, _iface_id: &str) -> Self::Backend {
-        SystemVmnetInterfaceBackend::new()
+        self.source.new_backend()
+    }
+
+    fn backend_source(&self) -> Option<ProcessVmnetBackendSource> {
+        Some(self.source.clone())
     }
 }
 
@@ -37271,7 +37319,6 @@ mod tests {
         VmmActionError, VmmController, VmmData,
     };
     use bangbang_session::SessionId;
-    use bangbang_session::VmnetAuthority;
     #[cfg(target_os = "macos")]
     use bangbang_session::macos::socket_broker::{
         SocketBrokerMessage, receive_socket_broker_message, send_socket_broker_message,
@@ -37280,6 +37327,7 @@ mod tests {
     use bangbang_session::macos::vhost_user_broker::{
         VhostUserBrokerMessage, receive_vhost_user_broker_message, send_vhost_user_broker_message,
     };
+    use bangbang_session::{VmnetAuthority, VmnetBackendRoute};
 
     #[cfg(target_os = "macos")]
     use crate::contained_session::{
@@ -37358,11 +37406,11 @@ mod tests {
         ProcessSnapshotV2RootLoadRequest, ProcessSnapshotV2RootLoadSuccess,
         ProcessSnapshotV2SerialLoadRequest, ProcessSnapshotV2StorageLoadRequest,
         ProcessSnapshotV2StorageLoadSuccess, ProcessSnapshotV2VsockLoadRequest, ProcessVmm,
-        ProcessVmnetAuthority, ProcessVmnetPacketIoBackendFactory, SerialGrantState,
-        SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        native_snapshot_load_logger_outcome, native_v2_platform_capture_is_terminal,
-        prepare_process_snapshot_v2_network_restore_plan,
+        ProcessVmnetAuthority, ProcessVmnetBackendSource, ProcessVmnetPacketIoBackendFactory,
+        SerialGrantState, SnapshotCreateSession, SnapshotV1LoadSuccess, SnapshotV2LoadSuccess,
+        SystemProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, native_snapshot_load_logger_outcome,
+        native_v2_platform_capture_is_terminal, prepare_process_snapshot_v2_network_restore_plan,
         prepare_process_snapshot_v2_vsock_candidate, require_native_v1_composite_record,
         snapshot_destination_machine_config, vsock_capture_error_from_boot_run_loop_command,
     };
@@ -37439,8 +37487,17 @@ mod tests {
         session_byte: u8,
         authority: VmnetAuthority,
     ) -> ProcessVmnetAuthority {
-        ProcessVmnetAuthority::contained(SessionId::from_bytes([session_byte; 32]), authority)
-            .expect("test session identity must not be the reserved pre-session value")
+        let route = if authority.is_denied() {
+            VmnetBackendRoute::Denied
+        } else {
+            VmnetBackendRoute::LocalSystem
+        };
+        ProcessVmnetAuthority::contained(
+            SessionId::from_bytes([session_byte; 32]),
+            authority,
+            route,
+        )
+        .expect("test session identity must not be the reserved pre-session value")
     }
 
     #[derive(Debug)]
@@ -45093,6 +45150,7 @@ mod tests {
         direct_virtio_headers: VecDeque<(bool, bool)>,
         stop_boundary_checks: VecDeque<((u64, u64), Option<PathBuf>)>,
         next_realized_mac: u8,
+        backend_source: Option<ProcessVmnetBackendSource>,
     }
 
     impl RecordingVmnetPacketIoBackendFactory {
@@ -45110,6 +45168,11 @@ mod tests {
 
         fn recording_packet_event_lifecycle(mut self) -> Self {
             self.record_packet_event_lifecycle = true;
+            self
+        }
+
+        fn with_backend_source(mut self, source: ProcessVmnetBackendSource) -> Self {
+            self.backend_source = Some(source);
             self
         }
 
@@ -45224,6 +45287,10 @@ mod tests {
                 direct_virtio_header: self.direct_virtio_headers.pop_front(),
                 stop_boundary_check: self.stop_boundary_checks.pop_front(),
             }
+        }
+
+        fn backend_source(&self) -> Option<ProcessVmnetBackendSource> {
+            self.backend_source.clone()
         }
     }
 
@@ -53179,7 +53246,12 @@ mod tests {
             .expect("test bridge authority should validate");
 
         assert!(
-            ProcessVmnetAuthority::contained(SessionId::pre_session(), authority).is_none(),
+            ProcessVmnetAuthority::contained(
+                SessionId::pre_session(),
+                authority,
+                VmnetBackendRoute::LocalSystem,
+            )
+            .is_none(),
             "the greeting identity must never become live network authority"
         );
         let owner = contained_vmnet_authority_for_session(0xa5, authority);
@@ -53209,6 +53281,75 @@ mod tests {
         assert!(matches!(
             error,
             ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+        ));
+        assert!(recorded_events(&events).is_empty());
+    }
+
+    #[test]
+    fn authenticated_remote_route_rejects_local_backend_source_before_acquisition() {
+        let authority =
+            VmnetAuthority::try_new(false, true, 1, &[]).expect("shared authority should validate");
+        let owner = ProcessVmnetAuthority::contained(
+            SessionId::from_bytes([0x34; 32]),
+            authority,
+            VmnetBackendRoute::RemoteProvider,
+        )
+        .expect("remote authority should validate");
+        let mut factory =
+            SystemProcessVmnetPacketIoBackendFactory::new(ProcessVmnetBackendSource::LocalSystem);
+
+        let error = ProcessNetworkPacketIoRegistry::from_network_configs_and_mmds_detour_with_factory_and_owner(
+            &[],
+            None,
+            owner,
+            &mut factory,
+        )
+        .expect_err("remote route must never use the ambient local backend");
+
+        assert!(matches!(
+            error,
+            ProcessNetworkPacketIoProviderBuildError::AuthorityMismatch
+        ));
+    }
+
+    #[test]
+    fn authenticated_remote_restore_rejects_local_backend_source_before_acquisition() {
+        let authority =
+            VmnetAuthority::try_new(false, true, 1, &[]).expect("shared authority should validate");
+        let owner = ProcessVmnetAuthority::contained(
+            SessionId::from_bytes([0x35; 32]),
+            authority,
+            VmnetBackendRoute::RemoteProvider,
+        )
+        .expect("remote authority should validate");
+        let plan = prepare_process_snapshot_v2_network_restore_plan(
+            prepared_native_v2_network_restore_candidate(
+                fake_vmnet_network_state_without_requested_mac(),
+                &["vmnet:shared"],
+            ),
+            owner,
+        )
+        .expect("remote restore plan should validate");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_backend_source(ProcessVmnetBackendSource::LocalSystem);
+        let events = factory.events();
+
+        let error = super::prepare_process_snapshot_v2_network_restore_resources_with_factory(
+            plan,
+            "private-route-substitution",
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+            &mut factory,
+            |_| false,
+        )
+        .expect_err("remote restore must never use the ambient local backend");
+
+        assert_eq!(
+            error.disposition(),
+            super::ProcessSnapshotV2NetworkRestoreResourceDisposition::Terminal
+        );
+        assert!(matches!(
+            error.kind,
+            super::ProcessSnapshotV2NetworkRestoreResourceErrorKind::CandidateMismatch
         ));
         assert!(recorded_events(&events).is_empty());
     }
@@ -61848,6 +61989,7 @@ mod tests {
                 ProcessNetworkPacketIoProvider::from_controller(
                     &source_controller,
                     ProcessVmnetAuthority::Direct,
+                    &ProcessVmnetBackendSource::LocalSystem,
                 )
                 .expect("cancelled storage packet I/O should prepare");
             let cancellation = NativeV2SnapshotCaptureCancellation::default();
@@ -61935,6 +62077,7 @@ mod tests {
                 ProcessNetworkPacketIoProvider::from_controller(
                     &source_controller,
                     ProcessVmnetAuthority::Direct,
+                    &ProcessVmnetBackendSource::LocalSystem,
                 )
                 .expect("committed storage packet I/O should prepare");
             let (session, controller_commit, returned_serial) = if pci_enabled {
@@ -62173,6 +62316,7 @@ mod tests {
                 ProcessNetworkPacketIoProvider::from_controller(
                     &source_controller,
                     ProcessVmnetAuthority::Direct,
+                    &ProcessVmnetBackendSource::LocalSystem,
                 )
                 .expect("cancelled serial packet I/O should prepare");
             let cancellation = NativeV2SnapshotCaptureCancellation::default();
@@ -62213,6 +62357,7 @@ mod tests {
                 ProcessNetworkPacketIoProvider::from_controller(
                     &source_controller,
                     ProcessVmnetAuthority::Direct,
+                    &ProcessVmnetBackendSource::LocalSystem,
                 )
                 .expect("committed serial packet I/O should prepare");
             let (mut destination, controller_commit) =
@@ -62519,6 +62664,7 @@ mod tests {
             let (packet_io, mmds_metrics) = ProcessNetworkPacketIoProvider::from_controller(
                 &source_controller,
                 ProcessVmnetAuthority::Direct,
+                &ProcessVmnetBackendSource::LocalSystem,
             )
             .expect("serial-storage packet I/O should prepare");
             let (mut destination, controller_commit) =

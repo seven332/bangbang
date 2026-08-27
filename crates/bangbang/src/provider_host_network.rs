@@ -16,3 +16,9 @@ const _: fn(
     &vmnet::VmnetInterfaceConfig,
 ) -> Result<vmnet::VmnetInterfaceConfig, std::collections::TryReserveError> =
     vmnet::VmnetInterfaceConfig::try_clone;
+
+// The networkless worker view constructs this descriptor without touching
+// local vmnet/XPC authority; the provider-only library view does not compile
+// that adapter but must keep the shared constructor live.
+const _: fn(&vmnet::VmnetInterfaceConfig) -> vmnet::VmnetInterfaceDescriptor =
+    vmnet::VmnetInterfaceDescriptor::remote;

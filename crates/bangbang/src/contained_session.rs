@@ -5,7 +5,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use bangbang_session::{
-    GrantId, SessionId, SnapshotOutputChild, SocketChild, VmnetAuthority, WorkerPolicy,
+    GrantId, SessionId, SnapshotOutputChild, SocketChild, VmnetAuthority, VmnetBackendRoute,
+    WorkerPolicy,
 };
 #[cfg(not(target_os = "macos"))]
 use bangbang_session::{Readiness, TerminalCategory};
@@ -20,10 +21,14 @@ fn started_vmnet_session_authority(
     policy: WorkerPolicy,
     session: Option<SessionId>,
     started: bool,
-) -> Result<(SessionId, VmnetAuthority), ContainedSessionError> {
+) -> Result<(SessionId, VmnetAuthority, VmnetBackendRoute), ContainedSessionError> {
     let session = session.filter(|session| !session.is_pre_session());
     match (started, session) {
-        (true, Some(session)) => Ok((session, policy.vmnet_authority())),
+        (true, Some(session)) => Ok((
+            session,
+            policy.vmnet_authority(),
+            policy.vmnet_backend_route(),
+        )),
         (false, _) | (true, None) => Err(ContainedSessionError),
     }
 }
@@ -112,7 +117,7 @@ mod reference_tests {
     use std::path::{Path, PathBuf};
 
     use bangbang_session::{MAX_GRANT_ID_BYTES, MAX_SNAPSHOT_OUTPUT_CHILD_BYTES};
-    use bangbang_session::{SessionId, VmnetAuthority, WorkerPolicy};
+    use bangbang_session::{SessionId, VmnetAuthority, VmnetBackendRoute, WorkerPolicy};
 
     use super::{
         ContainedSessionError, GrantClaimError, grant_reference_id, snapshot_output_reference,
@@ -272,11 +277,11 @@ mod reference_tests {
         );
         assert_eq!(
             started_vmnet_session_authority(first_policy, Some(first_session), true),
-            Ok((first_session, first))
+            Ok((first_session, first, VmnetBackendRoute::LocalSystem))
         );
         assert_eq!(
             started_vmnet_session_authority(second_policy, Some(second_session), true),
-            Ok((second_session, second))
+            Ok((second_session, second, VmnetBackendRoute::LocalSystem))
         );
         assert_ne!(
             started_vmnet_session_authority(first_policy, Some(first_session), true),
@@ -358,7 +363,7 @@ mod platform {
     };
 
     use super::{
-        ContainedSessionError, GrantClaimError, SocketChild, grant_reference_id,
+        ContainedSessionError, GrantClaimError, SocketChild, VmnetBackendRoute, grant_reference_id,
         snapshot_output_reference, socket_directory_reference,
     };
 
@@ -826,8 +831,24 @@ mod platform {
         registry: Arc<Mutex<Option<ConnectedStreamGrantRegistry>>>,
     }
 
+    type VmnetProviderInvalidation = Arc<dyn Fn() + Send + Sync>;
+
+    /// Shared one-time authority for the launcher-connected remote vmnet provider.
+    #[derive(Clone)]
+    pub(crate) struct VmnetProviderGrantAuthority {
+        registry: Arc<Mutex<Option<ConnectedStreamGrantRegistry>>>,
+        invalidation: Arc<Mutex<Option<VmnetProviderInvalidation>>>,
+    }
+
     /// One claimed pager stream and its redacted authenticated source metadata.
     pub(crate) struct ClaimedPagerStream {
+        stream: UnixStream,
+        source_identity: ObjectIdentity,
+        peer: ConnectedUnixPeer,
+    }
+
+    /// One claimed provider control stream and its redacted authenticated metadata.
+    pub(crate) struct ClaimedVmnetProviderStream {
         stream: UnixStream,
         source_identity: ObjectIdentity,
         peer: ConnectedUnixPeer,
@@ -865,6 +886,28 @@ mod platform {
         }
     }
 
+    impl fmt::Debug for ClaimedVmnetProviderStream {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("ClaimedVmnetProviderStream")
+                .field("stream", &"<owned>")
+                .field("source_identity", &"<redacted>")
+                .field("peer", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl ClaimedVmnetProviderStream {
+        pub(crate) fn into_stream(self) -> UnixStream {
+            let Self {
+                stream,
+                source_identity: _source_identity,
+                peer: _peer,
+            } = self;
+            stream
+        }
+    }
+
     impl std::fmt::Debug for PagerGrantAuthority {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -875,10 +918,8 @@ mod platform {
     }
 
     impl PagerGrantAuthority {
-        fn new(registry: ConnectedStreamGrantRegistry) -> Self {
-            Self {
-                registry: Arc::new(Mutex::new(Some(registry))),
-            }
+        fn new(registry: Arc<Mutex<Option<ConnectedStreamGrantRegistry>>>) -> Self {
+            Self { registry }
         }
 
         pub(crate) fn is_active(&self) -> bool {
@@ -894,7 +935,7 @@ mod platform {
                 .lock()
                 .map_err(|_| ContainedSessionError)?
                 .as_ref()
-                .map(ConnectedStreamGrantRegistry::is_empty)
+                .map(|registry| !registry.contains_role(ResourceRole::SnapshotPagerStream))
                 .ok_or(ContainedSessionError)
         }
 
@@ -937,6 +978,74 @@ mod platform {
                 Err(error) => error.into_inner(),
             };
             registry.take();
+        }
+    }
+
+    impl fmt::Debug for VmnetProviderGrantAuthority {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("VmnetProviderGrantAuthority")
+                .field("registry", &"<redacted>")
+                .finish()
+        }
+    }
+
+    impl VmnetProviderGrantAuthority {
+        fn new(registry: Arc<Mutex<Option<ConnectedStreamGrantRegistry>>>) -> Self {
+            Self {
+                registry,
+                invalidation: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        pub(crate) fn register_invalidation(
+            &self,
+            invalidation: VmnetProviderInvalidation,
+        ) -> Result<(), GrantClaimError> {
+            let registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            if registry.is_none() {
+                return Err(GrantClaimError);
+            }
+            let mut registered = self.invalidation.lock().map_err(|_| GrantClaimError)?;
+            if registered.is_some() {
+                return Err(GrantClaimError);
+            }
+            *registered = Some(invalidation);
+            Ok(())
+        }
+
+        pub(crate) fn claim(&self) -> Result<ClaimedVmnetProviderStream, GrantClaimError> {
+            let mut registry = self.registry.lock().map_err(|_| GrantClaimError)?;
+            let granted: GrantedUnixStream = registry
+                .as_mut()
+                .ok_or(GrantClaimError)?
+                .take_role(ResourceRole::VmnetProviderStream)
+                .map_err(|_| GrantClaimError)?;
+            let source_identity = granted.source_identity();
+            let peer = granted.peer();
+            Ok(ClaimedVmnetProviderStream {
+                stream: granted.into_stream(),
+                source_identity,
+                peer,
+            })
+        }
+
+        fn invalidate(&self) {
+            let invalidation = {
+                let mut registry = match self.registry.lock() {
+                    Ok(registry) => registry,
+                    Err(error) => error.into_inner(),
+                };
+                registry.take();
+                let mut invalidation = match self.invalidation.lock() {
+                    Ok(invalidation) => invalidation,
+                    Err(error) => error.into_inner(),
+                };
+                invalidation.take()
+            };
+            if let Some(invalidation) = invalidation {
+                invalidation();
+            }
         }
     }
 
@@ -4344,6 +4453,7 @@ mod platform {
         reader: Option<JoinHandle<()>>,
         grants: GrantAuthority,
         pager_grants: PagerGrantAuthority,
+        vmnet_provider_grants: VmnetProviderGrantAuthority,
         directory_grants: DirectoryGrantAuthority,
         socket_broker: SocketBrokerAuthority,
         vhost_user_broker: VhostUserBrokerAuthority,
@@ -4863,7 +4973,25 @@ mod platform {
                 BlockControlBrokerAuthority::new(block_control_socket, session, parent)?;
             let file_grants =
                 GrantAuthority::new_with_block_control(grants.take_file_registry(), block_control);
-            let pager_grants = PagerGrantAuthority::new(grants.take_stream_registry());
+            let stream_registry = grants.take_stream_registry();
+            let provider_granted = stream_registry.contains_role(ResourceRole::VmnetProviderStream);
+            let route_coherent = match policy.vmnet_backend_route() {
+                bangbang_session::VmnetBackendRoute::Denied => {
+                    policy.vmnet_authority().is_denied() && !provider_granted
+                }
+                bangbang_session::VmnetBackendRoute::LocalSystem => {
+                    !policy.vmnet_authority().is_denied() && !provider_granted
+                }
+                bangbang_session::VmnetBackendRoute::RemoteProvider => {
+                    !policy.vmnet_authority().is_denied() && provider_granted
+                }
+            };
+            if !route_coherent {
+                return Err(ContainedSessionError.into());
+            }
+            let stream_registry = Arc::new(Mutex::new(Some(stream_registry)));
+            let pager_grants = PagerGrantAuthority::new(Arc::clone(&stream_registry));
+            let vmnet_provider_grants = VmnetProviderGrantAuthority::new(stream_registry);
             let directory_grants = DirectoryGrantAuthority::new(grants.take_directory_registry());
             let socket_broker = SocketBrokerAuthority::new(broker_socket, session, parent);
             let vhost_user_broker =
@@ -4906,6 +5034,7 @@ mod platform {
                     ReaderRevocationAuthorities {
                         grants: file_grants.clone(),
                         pager_grants: pager_grants.clone(),
+                        vmnet_provider_grants: vmnet_provider_grants.clone(),
                         vhost_user_broker: vhost_user_broker.clone(),
                         restore_generations: restore_generations.clone(),
                     },
@@ -4927,6 +5056,7 @@ mod platform {
                 reader,
                 grants: file_grants,
                 pager_grants,
+                vmnet_provider_grants,
                 directory_grants,
                 socket_broker,
                 vhost_user_broker,
@@ -5034,9 +5164,16 @@ mod platform {
             self.started.then(|| self.pager_grants.clone())
         }
 
+        pub(crate) fn vmnet_provider_grant_authority(&self) -> Option<VmnetProviderGrantAuthority> {
+            (self.started
+                && self.policy.vmnet_backend_route()
+                    == bangbang_session::VmnetBackendRoute::RemoteProvider)
+                .then(|| self.vmnet_provider_grants.clone())
+        }
+
         pub(crate) fn vmnet_session_authority(
             &self,
-        ) -> Result<(SessionId, VmnetAuthority), ContainedSessionError> {
+        ) -> Result<(SessionId, VmnetAuthority, VmnetBackendRoute), ContainedSessionError> {
             let session = self
                 .lifecycle
                 .lock()
@@ -5105,10 +5242,42 @@ mod platform {
             file_size: Option<u64>,
             daemonized: bool,
         ) -> Result<(), ContainedSessionError> {
+            if !self.policy.vmnet_authority().is_denied()
+                || self.policy.vmnet_backend_route() != bangbang_session::VmnetBackendRoute::Denied
+            {
+                return Err(ContainedSessionError);
+            }
+            self.verify_launch_policy_common(no_file, file_size, daemonized)
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        pub(crate) fn verify_vmnet_provider_launch_policy(
+            &self,
+        ) -> Result<(), ContainedSessionError> {
+            let authority = self.policy.vmnet_authority();
+            if self.policy.vmnet_backend_route()
+                != bangbang_session::VmnetBackendRoute::RemoteProvider
+                || authority.is_denied()
+                || authority.allows_host()
+                || !authority.allows_shared()
+                || authority.max_interfaces() != Some(1)
+                || authority.bridge_slot(0).is_some()
+            {
+                return Err(ContainedSessionError);
+            }
+            self.verify_launch_policy_common(2048, None, false)
+        }
+
+        #[cfg(feature = "grant-integration-probe")]
+        fn verify_launch_policy_common(
+            &self,
+            no_file: u64,
+            file_size: Option<u64>,
+            daemonized: bool,
+        ) -> Result<(), ContainedSessionError> {
             if self.policy.no_file() != no_file
                 || self.policy.file_size() != file_size
                 || self.policy.is_daemonized() != daemonized
-                || !self.policy.vmnet_authority().is_denied()
                 || [
                     "BANGBANG_POLICY_SECRET",
                     "BANGBANG_ORDINARY_AMBIENT",
@@ -5219,6 +5388,7 @@ mod platform {
             self.control.closing.store(true, Ordering::Release);
             self.grants.invalidate();
             self.pager_grants.invalidate();
+            self.vmnet_provider_grants.invalidate();
             self.directory_grants.invalidate();
             self.socket_broker.invalidate();
             self.vhost_user_broker.invalidate();
@@ -5532,6 +5702,7 @@ mod platform {
     struct ReaderRevocationAuthorities {
         grants: GrantAuthority,
         pager_grants: PagerGrantAuthority,
+        vmnet_provider_grants: VmnetProviderGrantAuthority,
         vhost_user_broker: VhostUserBrokerAuthority,
         restore_generations: ContainedSnapshotRestoreGenerationAuthority,
     }
@@ -5552,6 +5723,7 @@ mod platform {
                 if !control.closing.load(Ordering::Acquire) {
                     authorities.grants.invalidate();
                     authorities.pager_grants.invalidate();
+                    authorities.vmnet_provider_grants.invalidate();
                     authorities.vhost_user_broker.invalidate();
                     authorities.restore_generations.invalidate();
                     if state == ControlState::Disconnected {
@@ -5685,7 +5857,7 @@ mod platform {
         use std::path::{Path, PathBuf};
         use std::rc::Rc;
         use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::{Arc, Barrier};
+        use std::sync::{Arc, Barrier, Mutex};
 
         use std::thread;
         use std::time::{Duration, Instant};
@@ -5696,7 +5868,7 @@ mod platform {
         };
         use bangbang_session::macos::bookmark::create_implicit_bookmark;
         use bangbang_session::macos::grant_registry::{
-            DirectoryGrantRegistry, GrantRegistry, StagedGrantBatch,
+            ConnectedStreamGrantRegistry, DirectoryGrantRegistry, GrantRegistry, StagedGrantBatch,
         };
         use bangbang_session::macos::grant_transport::ReceivedGrant;
         use bangbang_session::macos::runtime::WorkerSocketNamespace;
@@ -5713,11 +5885,37 @@ mod platform {
             BlockControlBrokerAuthority, BlockControlResponse,
             ContainedSnapshotRestoreDriveRequest, ContainedSnapshotRestoreFileRequest,
             DirectoryGrantAuthority, GrantAuthority, GrantClaimError, SocketBrokerAuthority,
-            VhostUserBrokerAuthority, VhostUserBrokerConnectError, checked_observed_geometry,
-            exact_resource_limit,
+            VhostUserBrokerAuthority, VhostUserBrokerConnectError, VmnetProviderGrantAuthority,
+            checked_observed_geometry, exact_resource_limit,
         };
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        #[test]
+        fn vmnet_provider_session_invalidation_notifies_an_active_consumer_once() {
+            let authority = VmnetProviderGrantAuthority::new(Arc::new(Mutex::new(Some(
+                ConnectedStreamGrantRegistry::default(),
+            ))));
+            let notifications = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&notifications);
+            authority
+                .register_invalidation(Arc::new(move || {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                }))
+                .expect("active authority should register one invalidation consumer");
+            assert!(
+                authority.register_invalidation(Arc::new(|| {})).is_err(),
+                "a second consumer must not replace the session-bound owner"
+            );
+
+            authority.invalidate();
+            authority.invalidate();
+            assert_eq!(notifications.load(Ordering::Acquire), 1);
+            assert!(
+                authority.register_invalidation(Arc::new(|| {})).is_err(),
+                "retired authority must not accept a later consumer"
+            );
+        }
 
         #[cfg(feature = "elevated-bootstrap-probe")]
         #[test]
@@ -8458,6 +8656,9 @@ mod platform {
     #[derive(Debug, Clone)]
     pub(crate) struct PagerGrantAuthority;
 
+    #[derive(Debug, Clone)]
+    pub(crate) struct VmnetProviderGrantAuthority;
+
     pub(crate) struct ClaimedPagerStream {
         stream: UnixStream,
         source_identity: ObjectIdentity,
@@ -8671,12 +8872,17 @@ mod platform {
             None
         }
 
+        pub(crate) fn vmnet_provider_grant_authority(&self) -> Option<VmnetProviderGrantAuthority> {
+            None
+        }
+
         pub(crate) fn vmnet_session_authority(
             &self,
         ) -> Result<
             (
                 bangbang_session::SessionId,
                 bangbang_session::VmnetAuthority,
+                bangbang_session::VmnetBackendRoute,
             ),
             ContainedSessionError,
         > {
@@ -8713,7 +8919,7 @@ pub(crate) use platform::api_directory_authority_for_test;
 pub(crate) use platform::{
     ClaimedSocketDirectory, ContainedSession, DirectoryGrantAuthority, GrantAuthority,
     PagerGrantAuthority, PreparedDriveBackingClaim, PreparedFileGrantClaim,
-    PreparedSocketDirectoryClaim,
+    PreparedSocketDirectoryClaim, VmnetProviderGrantAuthority,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use platform::{

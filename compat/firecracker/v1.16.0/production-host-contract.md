@@ -58,8 +58,8 @@ vmnet and a privilege-dropped owner are feasible without that entitlement, so
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` become
 `missing-platform-feasible`; it does not change this production-host result.
 
-#1378 now has a credential-free protocol foundation plus a checked production
-runner: strict private config and redacted result handling, a retained
+#1378 now has a credential-free protocol and contained-worker adapter plus a
+checked production runner: strict private config and redacted result handling, a retained
 digest-pinned fixture exchange, a direct-rootfs-v110 DHCP/TCP guest oracle,
 two-package inspection, descriptor-rooted grants, and the fixed 21-case
 policy/API/process/death matrix. Portable injection cannot turn fixture state

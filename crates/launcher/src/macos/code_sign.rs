@@ -29,10 +29,20 @@ impl fmt::Debug for WorkerProfile {
 }
 
 impl WorkerProfile {
-    pub(crate) fn admits(&self, authority: bangbang_session::VmnetAuthority) -> bool {
-        match self {
-            Self::Networkless => authority.is_denied(),
-            Self::Vmnet { .. } => !authority.is_denied(),
+    pub(crate) fn vmnet_backend_route(
+        &self,
+        authority: bangbang_session::VmnetAuthority,
+        provider_granted: bool,
+    ) -> Option<bangbang_session::VmnetBackendRoute> {
+        match (self, authority.is_denied(), provider_granted) {
+            (Self::Networkless, true, false) => Some(bangbang_session::VmnetBackendRoute::Denied),
+            (Self::Networkless, false, true) => {
+                Some(bangbang_session::VmnetBackendRoute::RemoteProvider)
+            }
+            (Self::Vmnet { .. }, false, false) => {
+                Some(bangbang_session::VmnetBackendRoute::LocalSystem)
+            }
+            (Self::Networkless | Self::Vmnet { .. }, _, _) => None,
         }
     }
 }
@@ -673,10 +683,22 @@ mod tests {
             application_identifier: "APPID12345.dev.bangbang.worker".to_owned(),
             team_identifier: "TEAM123456".to_owned(),
         };
-        assert!(networkless.admits(denied));
-        assert!(!networkless.admits(allowed));
-        assert!(!vmnet.admits(denied));
-        assert!(vmnet.admits(allowed));
+        assert_eq!(
+            networkless.vmnet_backend_route(denied, false),
+            Some(bangbang_session::VmnetBackendRoute::Denied)
+        );
+        assert_eq!(
+            networkless.vmnet_backend_route(allowed, true),
+            Some(bangbang_session::VmnetBackendRoute::RemoteProvider)
+        );
+        assert_eq!(networkless.vmnet_backend_route(allowed, false), None);
+        assert_eq!(networkless.vmnet_backend_route(denied, true), None);
+        assert_eq!(vmnet.vmnet_backend_route(denied, false), None);
+        assert_eq!(vmnet.vmnet_backend_route(allowed, true), None);
+        assert_eq!(
+            vmnet.vmnet_backend_route(allowed, false),
+            Some(bangbang_session::VmnetBackendRoute::LocalSystem)
+        );
     }
 
     #[test]

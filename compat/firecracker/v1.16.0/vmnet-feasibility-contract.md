@@ -132,8 +132,10 @@ The later [`provider-v1` contract](../../../docs/vmnet-provider-protocol.md)
 freezes the bounded wire, role state, and descriptor ownership for the split
 topology. #1934 adds the minimal broker/owner process foundation and extends
 this exact-host workflow with its real provider data/cancellation/repeat proof.
-That successor changes neither disposition: sandbox/launcher assembly, a guest
-through the remote provider, and product certification remain separate work.
+That successor changes neither disposition. #1936 then adds the credential-free
+contained grant, remote-only route, client pumps, and process-registry adapter;
+elevated launcher/provider assembly, a real guest through the remote provider,
+and product certification remain separate work.
 
 #1930 does not claim any of the following:
 
@@ -147,5 +149,6 @@ through the remote provider, and product certification remain separate work.
 
 These are the historical nonclaims of the #1930 inventory transition. #1934
 subsequently implements the privileged provider protocol/broker foundation, but
-does not retroactively turn #1930 into production evidence or remove the other
-nonclaims.
+does not retroactively turn #1930 into production evidence. #1936 subsequently
+implements the sandbox-worker remote provider adapter, but likewise supplies no
+elevated product assembly or positive connectivity evidence.

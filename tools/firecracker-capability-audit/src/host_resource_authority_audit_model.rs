@@ -85,6 +85,7 @@ pub enum HostResourceRole {
     SnapshotOutputDirectory,
     VhostUserSocketDirectory,
     SnapshotPagerStream,
+    VmnetProviderStream,
 }
 
 /// Exact access authority accepted by a resource role.

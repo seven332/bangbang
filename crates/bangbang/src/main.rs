@@ -54,6 +54,8 @@ use bangbang_hvf::HvfBackend;
 #[cfg(target_os = "macos")]
 use contained_session::PagerGrantAuthority;
 use contained_session::{ContainedSession, GrantAuthority};
+#[cfg(target_os = "macos")]
+use host_network::remote_vmnet::{ProcessVmnetBackendSource, RemoteVmnetProviderSource};
 use periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
@@ -282,16 +284,39 @@ fn run(
                     ))
                 })?;
             }
-            let vmnet_authority = match contained.as_ref() {
+            #[cfg(target_os = "macos")]
+            let (vmnet_authority, vmnet_backend_source) = match contained.as_ref() {
                 Some(session) => {
-                    let (session_id, authority) = session
+                    let (session_id, authority, route) = session
                         .vmnet_session_authority()
                         .map_err(|_| ProcessError::ContainedSession)?;
-                    ProcessVmnetAuthority::contained(session_id, authority)
-                        .ok_or(ProcessError::ContainedSession)?
+                    let process_authority =
+                        ProcessVmnetAuthority::contained(session_id, authority, route)
+                            .ok_or(ProcessError::ContainedSession)?;
+                    let backend_source = match route {
+                        bangbang_session::VmnetBackendRoute::RemoteProvider => {
+                            let grant = session
+                                .vmnet_provider_grant_authority()
+                                .ok_or(ProcessError::ContainedSession)?;
+                            ProcessVmnetBackendSource::Remote(
+                                RemoteVmnetProviderSource::new(session_id, authority, grant)
+                                    .ok_or(ProcessError::ContainedSession)?,
+                            )
+                        }
+                        bangbang_session::VmnetBackendRoute::Denied
+                        | bangbang_session::VmnetBackendRoute::LocalSystem => {
+                            ProcessVmnetBackendSource::LocalSystem
+                        }
+                    };
+                    (process_authority, backend_source)
                 }
-                None => ProcessVmnetAuthority::Direct,
+                None => (
+                    ProcessVmnetAuthority::Direct,
+                    ProcessVmnetBackendSource::LocalSystem,
+                ),
             };
+            #[cfg(not(target_os = "macos"))]
+            let vmnet_authority = ProcessVmnetAuthority::Direct;
             let grant_authority = contained
                 .as_ref()
                 .and_then(ContainedSession::grant_authority);
@@ -361,6 +386,10 @@ fn run(
             .with_snapshot_capture_cancellation(snapshot_cancellation.clone())
             .with_grant_authority(grant_authority.clone())
             .with_vmnet_authority(vmnet_authority);
+            #[cfg(target_os = "macos")]
+            let vmnet_cancellation_source = vmnet_backend_source.clone();
+            #[cfg(target_os = "macos")]
+            let vmm = vmm.with_vmnet_backend_source(vmnet_backend_source);
             #[cfg(all(target_os = "macos", feature = "elevated-bootstrap-probe"))]
             let vmm = vmm.with_guest_evidence_authority(
                 contained
@@ -617,6 +646,10 @@ fn run(
                         .map_err(|_| ProcessError::ContainedSession)
                 });
                 let category = process_terminal_category(&result, contained.as_ref());
+                #[cfg(target_os = "macos")]
+                if category == ProcessTerminalCategory::Cancelled {
+                    vmnet_cancellation_source.cancel_from_launcher();
+                }
                 finish_process_with_terminal_observability(&mut vmm, result, category)
             }));
             match execution {

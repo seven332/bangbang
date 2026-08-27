@@ -23,7 +23,7 @@ pub const PRODUCTION_HOST_AUDIT_PATH: &str =
 pub const PRODUCTION_HOST_CAPABILITY_ID: &str = PRODUCTION_HOST_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "1496c8f593877845bd2480ca2ec2348edab97172b74455d5c030f48e7f64a139";
+    "315f61e3b6fa8df867cbd929d20fdb7f5b5ed47a969c831e79e9ae25793cb3e3";
 
 const PROFILE_IDS: [ProductionHostEvidenceProfileId; 7] = [
     ProductionHostEvidenceProfileId::ContainmentAndIdentity,

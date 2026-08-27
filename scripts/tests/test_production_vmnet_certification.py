@@ -84,8 +84,8 @@ def fixture_source(mode: str = "success") -> str:
         fi
 
         IFS= read -r prepare || exit 23
-        case_value=$(printf '%s' "$prepare" | sed -n 's/^{{"case":"\([^"]*\)".*/\\1/p')
-        nonce=$(printf '%s' "$prepare" | sed -n 's/.*"nonce":"\([^"]*\)".*/\\1/p')
+        case_value=$(printf '%s' "$prepare" | sed -n 's/^{{"case":"\\([^"]*\\)".*/\\1/p')
+        nonce=$(printf '%s' "$prepare" | sed -n 's/.*"nonce":"\\([^"]*\\)".*/\\1/p')
         response_nonce=$nonce
         if [ "$behavior" = wrong-nonce ]; then
           response_nonce=0000000000000000000000000000000000000000000000000000000000000000

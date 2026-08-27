@@ -28,7 +28,7 @@ const ENVELOPE_DELIMITER: &str = "--";
 const MANIFEST_VERSION: u16 = 1;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SOURCE_PATH_BYTES: usize = 4096;
-const PAGER_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const CONNECTED_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Parsed launcher-only input and byte-preserved worker arguments.
 pub(crate) struct LaunchInput {
@@ -209,6 +209,7 @@ fn parse_role(value: &str) -> Result<ResourceRole, LauncherError> {
         "snapshot-output-directory" => Ok(ResourceRole::SnapshotOutputDirectory),
         "vhost-user-socket-directory" => Ok(ResourceRole::VhostUserSocketDirectory),
         "snapshot-pager-stream" => Ok(ResourceRole::SnapshotPagerStream),
+        "vmnet-provider-stream" => Ok(ResourceRole::VmnetProviderStream),
         _ => Err(LauncherError::InvalidGrantInput),
     }
 }
@@ -432,7 +433,7 @@ impl PreparedGrantBatch {
         let mut records = Vec::new();
         let mut bookmark_bytes = 0_u32;
         for grant in grants {
-            let prepared = if grant.role == ResourceRole::SnapshotPagerStream {
+            let prepared = if grant.role.is_connected_stream() {
                 connect_resource(&grant)?
             } else {
                 open_resource(&grant)?
@@ -497,7 +498,7 @@ impl PreparedGrantBatch {
                         evidence_readback: None,
                     });
                 }
-            } else if grant.role == ResourceRole::SnapshotPagerStream {
+            } else if grant.role.is_connected_stream() {
                 records.push(PreparedRecord {
                     record: GrantRecord::ConnectedStream {
                         id: grant.id,
@@ -942,6 +943,24 @@ impl PreparedGrantBatch {
                 descriptor: record.descriptor.as_ref().map(AsRawFd::as_raw_fd),
             })
             .collect()
+    }
+
+    /// Returns whether the exact singleton remote-provider authority is retained.
+    pub(crate) fn has_vmnet_provider_stream(&self) -> bool {
+        self.records
+            .iter()
+            .filter(|prepared| {
+                matches!(
+                    &prepared.record,
+                    GrantRecord::ConnectedStream {
+                        role: ResourceRole::VmnetProviderStream,
+                        access: GrantAccess::ReadWrite,
+                        ..
+                    }
+                )
+            })
+            .count()
+            == 1
     }
 
     /// Borrows the exact retained anchor for one singleton socket-directory role.
@@ -1426,7 +1445,7 @@ fn open_evidence_readback(
 }
 
 fn connect_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherError> {
-    if grant.role != ResourceRole::SnapshotPagerStream || grant.access != GrantAccess::ReadWrite {
+    if !grant.role.is_connected_stream() || grant.access != GrantAccess::ReadWrite {
         return Err(LauncherError::GrantPreparation);
     }
     let mut components = resource_path_components(&grant.source)?;
@@ -1463,17 +1482,31 @@ fn connect_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherE
             inode: anchor_stat.st_ino,
         },
         &name,
-        PAGER_CONNECT_TIMEOUT,
+        CONNECTED_STREAM_CONNECT_TIMEOUT,
     )
     .map_err(|_| LauncherError::GrantPreparation)?;
     let source_identity = connected.source_identity();
-    let stream = connected.into_stream();
-    let peer = peer_identity(stream.as_raw_fd()).map_err(|_| LauncherError::GrantPreparation)?;
     // SAFETY: Effective identity calls have no pointer or ownership contract.
     let expected_uid = unsafe { libc::geteuid() };
     // SAFETY: Effective identity calls have no pointer or ownership contract.
     let expected_gid = unsafe { libc::getegid() };
-    if peer.uid != expected_uid || peer.gid != expected_gid {
+    prepare_connected_stream(
+        connected.into_stream(),
+        source_identity,
+        Some((expected_uid, expected_gid)),
+    )
+}
+
+fn prepare_connected_stream(
+    stream: std::os::unix::net::UnixStream,
+    source_identity: ObjectIdentity,
+    expected_peer: Option<(u32, u32)>,
+) -> Result<PreparedResource, LauncherError> {
+    if source_identity.inode == 0 {
+        return Err(LauncherError::GrantPreparation);
+    }
+    let peer = peer_identity(stream.as_raw_fd()).map_err(|_| LauncherError::GrantPreparation)?;
+    if expected_peer.is_some_and(|(uid, gid)| peer.uid != uid || peer.gid != gid) {
         return Err(LauncherError::GrantPreparation);
     }
     let process_id = u32::try_from(peer.pid).map_err(|_| LauncherError::GrantPreparation)?;
@@ -2422,6 +2455,44 @@ mod tests {
         let debug = format!("{batch:?} {prepared:?}");
         assert!(!debug.contains(path_text_for_test(&socket)));
         assert!(!debug.contains("pager"));
+    }
+
+    #[test]
+    fn provider_stream_manifest_connects_once_and_is_classified_for_remote_routing() {
+        let root = TestDir::new();
+        let socket = root.path().join("provider.sock");
+        let listener = UnixListener::bind(&socket).expect("provider listener should bind");
+        let manifest = serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "id": "vmnet-provider",
+                "role": "vmnet-provider-stream",
+                "access": "read-write",
+                "source": socket,
+            }]
+        });
+        let grants = parse_manifest(
+            &serde_json::to_vec(&manifest).expect("provider manifest should serialize"),
+        )
+        .expect("provider manifest should parse");
+        assert_eq!(grants[0].role, ResourceRole::VmnetProviderStream);
+        let batch = PreparedGrantBatch::prepare(grants).expect("provider stream should prepare");
+        let (_accepted, _) = listener.accept().expect("provider stream should connect");
+        assert!(batch.has_vmnet_provider_stream());
+        assert_eq!(
+            batch
+                .records
+                .iter()
+                .filter(|record| matches!(
+                    record.record,
+                    GrantRecord::ConnectedStream {
+                        role: ResourceRole::VmnetProviderStream,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
