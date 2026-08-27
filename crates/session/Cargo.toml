@@ -9,6 +9,7 @@ elevated-bootstrap-probe = []
 test-support = []
 
 [dependencies]
+bangbang-unix-stream = { path = "../unix-stream" }
 getrandom = "0.3"
 libc = "0.2"
 

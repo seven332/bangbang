@@ -3935,6 +3935,29 @@ terminal platform/architecture, operator-owned, implementation-specific, or
 external outcomes. It adds no runtime path, host mutation, credential, or
 deployment claim; only #1378's two positive vmnet records remain nonterminal.
 
+## Private vmnet provider boundary
+
+The portable [`provider-v1` contract](vmnet-provider-protocol.md) freezes a
+future least-authority split without claiming the split is assembled. Worker
+input can select only six bootstrap-owned slots and bounded typed parameters;
+it cannot carry a path, bridge name, command, credential, PID, framework value,
+or arbitrary string. Every frame is bound to the private lifecycle session and
+an exact nonwrapping sequence. Per-interface packet streams additionally bind
+the interface and generation.
+
+Only a fully validated `Started` transition can expose one transferred,
+connected, close-on-exec Unix stream. The transport adopts rights immediately,
+forbids them outside the header range of that message, and closes them on every
+malformed, stale, cross-scope, timeout, EOF, or poisoned path. Cancellation
+consumes and retires a raced stream internally. Errors and diagnostics remain
+categorical and redact descriptor, peer, session, and packet values.
+
+This boundary is not authority by itself. A later production implementation
+must separately prove the minimal root broker, irreversible dropped owner,
+sandbox grant and adapter, crash reclamation, bundle/signature split, and real
+guest connectivity. The current protocol executes none of those operations and
+needs no Apple authorization.
+
 ## Current Non-Goals
 
 The current scaffold does not implement:

@@ -227,6 +227,7 @@ dependencies = [
 name = "bangbang-session"
 version = "0.1.0"
 dependencies = [
+ "bangbang-unix-stream",
  "getrandom",
  "libc",
 ]
@@ -244,9 +245,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bangbang-unix-stream"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "bangbang-vhost-user"
 version = "0.1.0"
 dependencies = [
+ "bangbang-unix-stream",
  "libc",
 ]
 

@@ -12,6 +12,7 @@ mod grant;
 #[cfg(target_os = "macos")]
 pub mod macos;
 mod state;
+pub mod vmnet_provider;
 
 pub use codec::{
     CancelSignal, Frame, FrameDecoder, MAX_VMNET_ACTIVE_INTERFACES, MAX_VMNET_BRIDGE_NAME_BYTES,

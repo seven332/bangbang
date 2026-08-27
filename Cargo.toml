@@ -6,6 +6,7 @@ members = [
     "crates/pager",
     "crates/runtime",
     "crates/session",
+    "crates/unix-stream",
     "crates/vhost-user",
     "crates/bangbang",
     "tools/cpu-template-helper",

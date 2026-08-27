@@ -2963,6 +2963,31 @@ It does not support a root-direct production VMM or implement #1378's minimal
 provider/broker, privilege-dropped service owner, sandbox remote provider,
 crash reclamation, or concurrent production topology.
 
+### Private vmnet provider protocol
+
+The portable `provider-v1` foundation is tested without root, vmnet, a bundle,
+or Apple credentials. `bangbang-unix-stream` owns exact partial I/O,
+one-deadline operations, close-on-exec rights adoption, connected-stream
+typing, and cleanup on malformed ancillary data. `bangbang-session` owns the
+80-byte frame, fixed policy slots, four-interface control lifecycle,
+cancellation race, per-generation packet state, and atomic frame/stream
+envelope. The vhost-user frontend consumes the same low-level transport.
+
+```sh
+cargo test -p bangbang-unix-stream --all-features --locked
+cargo test -p bangbang-session --all-features --locked
+cargo test -p bangbang-vhost-user --all-features --locked
+```
+
+Tests include every message kind and split point, malformed and over-limit
+frames, exact sequence/scope poisoning, generation reuse, a raced transferred
+stream that is retired without exposure, readiness/read/write correlation,
+partial write completion, wrong/excess/body-attached descriptors, clean and
+partial EOF, timeout, and a real combined control-to-data socket lifecycle. See
+the [protocol contract](vmnet-provider-protocol.md). This layer adds no broker
+binary, vmnet call, worker adapter or grant, privilege transition, packaging,
+sudo path, positive product evidence, or capability promotion.
+
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
 absent final paths. Its producer captures the complete non-memory state and
