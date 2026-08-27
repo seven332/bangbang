@@ -36,7 +36,7 @@ jobs:
   rust:
     name: rust
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -195,6 +195,7 @@ jobs:
           cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
           cargo clippy -p bangbang-launcher --test production_bundle_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
           cargo clippy -p bangbang-cpu-template-helper --test hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
+          cargo clippy -p bangbang-vmnet-provider --test elevated_vmnet_provider_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
 
       - name: Build documentation
         env:
