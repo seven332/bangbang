@@ -1319,26 +1319,32 @@ denied by vmnet as the ordinary user. The already-root runner has closed stdin
 and environment, accepts only that package and its owning nonzero uid/gid, and
 cannot build, download, sign, discover accounts, or obtain elevation.
 
-The first positive case starts one real shared-vmnet backend as root, validates
-the returned parameter classes, clears supplementary groups, irreversibly drops
-real/effective gid and uid to the package owner, proves root cannot be regained,
-then performs bounded callback, read, fixed-frame write, and stop operations.
-The second positive case runs the ad-hoc Hypervisor-signed direct VMM as exact
-root and boots the pinned v111 guest twice. The static no-std guest accepts only
-a digest-bound control sector, obtains a strict DHCP lease, derives its host
-endpoint solely from the accepted router, completes one nonce-bound TCP
-exchange, and reverses guest network state. Every process, socket, listener,
-file, and owner created by the harness must be absent after each bounded case.
+The root phase first starts the exact entitlement-free provider image as a
+one-shot broker. It pins and validates the suspended owner image, starts one
+real shared-vmnet backend in that owner while root, then clears supplementary
+groups, irreversibly drops real/effective gid and uid to the package owner, and
+re-attests that identity before provider-v1 packet service. The evidence proves
+Hello/readiness/read/write/stop/shutdown, correlated control Stop, cancellation,
+repeat, exact reap, and empty residue. An independent direct dropped-owner case
+retains the original callback/read/fixed-frame-write/stop proof. The final cases
+run the ad-hoc Hypervisor-signed direct VMM as exact root and boot the pinned
+v111 guest twice. The static no-std guest accepts only a digest-bound control
+sector, obtains a strict DHCP lease, derives its host endpoint solely from the
+accepted router, completes one nonce-bound TCP exchange, and reverses guest
+network state. Every process, socket, listener, file, and owner created by the
+harness must be absent after each bounded case.
 
 This authority is deliberately evidence-only. Running the VMM as root is not a
 supported production topology; root is not treated as the restricted Apple
 entitlement; and no password, authorization token, account name, path,
 interface, address, packet, nonce, PID, or raw framework/process output is
-recorded. The intended #1378 product remains an unprivileged launcher, minimal
-one-shot root provider, per-interface owner that drops privilege after vmnet
-start, and sandboxed HVF worker using a remote packet provider. Provider/broker
-protocols, contained integration, crash reclamation, concurrency, and the
-optional Apple-authorized matrix remain undelivered.
+recorded. #1934 now supplies the minimal one-shot root provider and the
+per-interface owner that drops privilege after vmnet start. The intended #1378
+product still requires an unprivileged launcher bootstrap and a sandboxed HVF
+worker using the transferred remote packet provider. Production authorization,
+bundle assembly, contained integration, guest-through-provider certification,
+concurrent production topology, and the optional Apple-authorized matrix remain
+undelivered.
 
 The vmnet path requires the host to satisfy macOS vmnet authorization,
 entitlement, and code-signing requirements. Apple's
@@ -3937,13 +3943,13 @@ deployment claim; only #1378's two positive vmnet records remain nonterminal.
 
 ## Private vmnet provider boundary
 
-The portable [`provider-v1` contract](vmnet-provider-protocol.md) freezes a
-future least-authority split without claiming the split is assembled. Worker
-input can select only six bootstrap-owned slots and bounded typed parameters;
-it cannot carry a path, bridge name, command, credential, PID, framework value,
-or arbitrary string. Every frame is bound to the private lifecycle session and
-an exact nonwrapping sequence. Per-interface packet streams additionally bind
-the interface and generation.
+The portable [`provider-v1` contract](vmnet-provider-protocol.md) and the
+`bangbang-vmnet-provider` package now implement the process foundation of the
+least-authority split. Worker-facing input can select only six bootstrap-owned
+slots and bounded typed parameters; it cannot carry a path, bridge name,
+command, credential, PID, framework value, or arbitrary string. Every frame is
+bound to the private lifecycle session and an exact nonwrapping sequence.
+Per-interface packet streams additionally bind the interface and generation.
 
 Only a fully validated `Started` transition can expose one transferred,
 connected, close-on-exec Unix stream. The transport adopts rights immediately,
@@ -3952,11 +3958,26 @@ malformed, stale, cross-scope, timeout, EOF, or poisoned path. Cancellation
 consumes and retires a raced stream internally. Errors and diagnostics remain
 categorical and redact descriptor, peer, session, and packet values.
 
-This boundary is not authority by itself. A later production implementation
-must separately prove the minimal root broker, irreversible dropped owner,
-sandbox grant and adapter, crash reclamation, bundle/signature split, and real
-guest connectivity. The current protocol executes none of those operations and
-needs no Apple authorization.
+The broker executable has only fixed broker and owner modes. It accepts
+already-connected fixed descriptors, pins its root-owned single-link image,
+starts each owner suspended with default-close descriptors, directly matches
+the first executable mapping's vnode identity, and resumes only after the
+identity gate. The broker validates
+provider-v1 control and owns child cancellation/reap but never opens guest
+artifacts, constructs a VM, listens for API traffic, or handles a packet. The
+owner alone starts `SystemVmnetInterfaceBackend` while root. Its packet-capable
+type is constructible only after the production credential primitive proves an
+irreversible setgid-before-setuid transition and exact re-attestation.
+
+The descriptor-free internal supervision family contains only Bootstrap,
+Ready/Failed, Stop, and Final ownership facts. Clean data-first shutdown waits
+for correlated control retirement; cancellation is deterministic; and a crash,
+missing Final, timeout, mismatch, or unprovable stop becomes terminal cleanup
+uncertainty. Exact-host evidence proves this boundary without Apple
+authorization, but it is not authority or production assembly by itself. The
+sandbox grant/adapter, unprivileged launcher-to-root authorization, bundle and
+signature policy, and real guest connectivity through this provider remain
+separate successor gates.
 
 ## Current Non-Goals
 
@@ -3966,7 +3987,8 @@ The current scaffold does not implement:
 - Developer ID possession, notarization, kernel launch constraints, or an
   automatic restart/reconnect policy
 - a Firecracker-jailer replacement
-- privilege dropping
+- a production launcher-to-root authorization/bootstrap path or sandboxed
+  remote-network adapter, despite the implemented per-interface credential drop
 - general-purpose host resource brokering beyond the fixed granted-vsock
   port-only and contained vhost-user exact-child connection facets
 - Firecracker artifact compatibility, Linux UFFD wire identity, current

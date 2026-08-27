@@ -88,8 +88,8 @@ const EVIDENCE: [EvidenceSpec; 3] = [
                 "fn dropped_owner_retains_bounded_vmnet_io()",
             ),
             (
-                "crates/bangbang/tests/elevated_host_network/mod.rs",
-                "pub mod vmnet",
+                "crates/bangbang/src/host_network/vmnet.rs",
+                "pub struct SystemVmnetInterfaceBackend",
             ),
             (
                 "crates/session/src/macos/credential.rs",

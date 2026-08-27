@@ -256,6 +256,15 @@ impl VmnetAuthority {
             })
     }
 
+    /// Returns one bootstrap-owned bridge slot by canonical index.
+    #[must_use]
+    pub fn bridge_slot(&self, index: usize) -> Option<&str> {
+        self.bridges
+            .get(..usize::from(self.bridge_count))
+            .and_then(|bridges| bridges.get(index))
+            .and_then(|encoded| std::str::from_utf8(bridge_name_bytes(encoded)).ok())
+    }
+
     const fn flags(self) -> u8 {
         (if self.allow_host { VMNET_FLAG_HOST } else { 0 })
             | (if self.allow_shared {
@@ -1105,6 +1114,9 @@ mod tests {
         for bridge in ["en0", "bridge_1", "a.b-c", "abcdefghijklmno"] {
             assert!(authority.allows_bridge(bridge));
         }
+        assert_eq!(authority.bridge_slot(0), Some("en0"));
+        assert_eq!(authority.bridge_slot(3), Some("abcdefghijklmno"));
+        assert_eq!(authority.bridge_slot(4), None);
         assert!(!authority.allows_bridge("EN0"));
         assert!(!authority.allows_bridge("en"));
 

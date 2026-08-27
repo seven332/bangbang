@@ -8,6 +8,7 @@ members = [
     "crates/session",
     "crates/unix-stream",
     "crates/vhost-user",
+    "crates/vmnet-provider",
     "crates/bangbang",
     "tools/cpu-template-helper",
     "tools/firecracker-capability-audit",

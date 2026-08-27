@@ -111,8 +111,8 @@
         },
         {
           "kind": "local",
-          "path": "crates/bangbang/tests/elevated_host_network/mod.rs",
-          "anchor": "pub mod vmnet"
+          "path": "crates/bangbang/src/host_network/vmnet.rs",
+          "anchor": "pub struct SystemVmnetInterfaceBackend"
         },
         {
           "kind": "local",

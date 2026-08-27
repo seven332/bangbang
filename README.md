@@ -56,8 +56,9 @@ Each detailed subject has one primary document:
   owner and repeated guest-connectivity gates, and the `383/0/2/33` handoff.
 - [Private vmnet Provider Protocol](docs/vmnet-provider-protocol.md) freezes the
   bounded session/control/data wire, state, packet, deadline, and descriptor
-  ownership contract needed by the no-Apple-authorization split topology. It
-  is portable nonproduction machinery and promotes no capability.
+  ownership contract and documents the minimal root broker plus irreversibly
+  dropped per-interface owner. Production launcher/sandbox integration remains
+  separate, and this foundation promotes no capability.
 - [Production vmnet certification runner](docs/testing.md#production-vmnet-certification-foundation)
   owns the private config, retained fixture, guest DHCP/TCP oracle, two-package
   inspection, descriptor-grant assembly, fixed 21-case production matrix, and
@@ -118,6 +119,8 @@ crates/session    Private launcher/worker lifecycle, grant, and vmnet-provider p
 crates/unix-stream
                   Shared exact Unix-stream and SCM_RIGHTS transport primitive
 crates/vhost-user Portable vhost-user frontend protocol foundations
+crates/vmnet-provider
+                  Minimal root vmnet broker and privilege-dropped interface owner
 tools/firecracker-capability-audit
                   Checked Firecracker source/capability inventory validator
 tools/cpu-template-helper

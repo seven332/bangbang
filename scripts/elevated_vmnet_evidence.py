@@ -20,6 +20,8 @@ LOG_NAME = "prepare.log"
 FILES = (
     ("bangbang", 0o555, 512 * 1024 * 1024),
     ("elevated-vmnet-e2e", 0o555, 512 * 1024 * 1024),
+    ("bangbang-vmnet-provider", 0o555, 512 * 1024 * 1024),
+    ("elevated-vmnet-provider-e2e", 0o555, 512 * 1024 * 1024),
     ("vmlinux-6.1.155", 0o444, 256 * 1024 * 1024),
     ("ubuntu-24.04-512M-direct-boot-v111.ext4", 0o444, 2 * 1024 * 1024 * 1024),
     (
@@ -171,11 +173,20 @@ def _validate_sidecar(root: Path, records: list[dict[str, object]]) -> None:
         root / "ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json",
         64 * 1024,
     )
+    rootfs = next(
+        (
+            record
+            for record in records
+            if record.get("name") == "ubuntu-24.04-512M-direct-boot-v111.ext4"
+        ),
+        None,
+    )
     if (
-        sidecar.get("schema_version") != 1
+        rootfs is None
+        or sidecar.get("schema_version") != 1
         or sidecar.get("variant") != "direct-boot-v111"
-        or sidecar.get("output_sha256") != records[3]["sha256"]
-        or sidecar.get("output_size_bytes") != records[3]["size_bytes"]
+        or sidecar.get("output_sha256") != rootfs["sha256"]
+        or sidecar.get("output_size_bytes") != rootfs["size_bytes"]
     ):
         _fail("sidecar")
 
