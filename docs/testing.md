@@ -2973,8 +2973,11 @@ Success moves only `corpus:network-setup` and
 It does not support a root-direct production VMM. The minimal provider/broker,
 privilege-dropped service owner, and bounded process reclamation now exist as a
 foundation, but the workflow does not assemble a production launcher bootstrap,
-sandbox remote provider, guest-through-provider path, or concurrent production
-topology.
+guest-through-provider path, or concurrent production topology. The separate
+#1936 credential-free tests now exercise the contained remote adapter against a
+fake Provider-v1 peer both portably and inside the ad-hoc-signed networkless
+App Sandbox worker; that evidence does not replace this exact-root workflow or
+promote either row.
 
 ### Private vmnet provider protocol
 
@@ -2987,13 +2990,20 @@ cancellation race, per-generation packet state, and atomic frame/stream
 envelope. `bangbang-vmnet-provider` owns the canonical root bootstrap,
 descriptor-free broker/owner supervision, policy ledger, typed credential
 boundary, exact suspended child-image gate, deterministic reap, and system
-backend adapter. The vhost-user frontend consumes the same low-level transport.
+backend adapter. `bangbang` owns the distinct provider grant, authenticated
+backend route, lazy control handshake, sole-owner control/data pumps, fixed-slot
+mapping, readiness demultiplexing, data-first/control-final cleanup, and process
+registry reuse across startup, runtime mutation, and restore. The vhost-user
+frontend consumes the same low-level transport.
 
 ```sh
 cargo test -p bangbang-unix-stream --all-features --locked
 cargo test -p bangbang-session --all-features --locked
 cargo test -p bangbang-vhost-user --all-features --locked
+cargo test -p bangbang --all-features --locked host_network::remote_vmnet::tests::
 cargo test -p bangbang-vmnet-provider --all-features --locked
+scripts/run-integration-tests.sh --test production_bundle -- \
+  --exact signed_networkless_worker_uses_authenticated_remote_provider_without_apple_authorization
 ```
 
 Tests include every message kind and split point, malformed and over-limit
@@ -3004,10 +3014,14 @@ partial EOF, timeout, and a real combined control-to-data socket lifecycle.
 Provider tests add hostile fixed records, four-owner/reuse policy, credential
 and packet-service order, data-first completion, cancellation cleanup, image
 mismatch, pre-resume failure, static linkage limits, and redaction. See the
-[protocol contract](vmnet-provider-protocol.md). The private binary and real
-root evidence add no worker adapter/grant, production bootstrap, packaged sudo
-path, Apple authorization, guest-through-provider claim, or capability
-promotion.
+[protocol contract](vmnet-provider-protocol.md). The signed bundle case proves
+that the networkless worker authenticates the remote-only route, never creates
+a local vmnet/XPC descriptor, performs readiness/read/write and ordered cleanup
+twice, and closes an unclaimed provider grant without sending protocol bytes.
+It uses ad-hoc signing and a local fake peer, so it requires neither an Apple
+developer identity nor a vmnet provisioning profile. It adds no elevated
+launcher/provider assembly, packaged sudo path, Apple-authorized connectivity,
+real guest-through-provider claim, or capability promotion.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
@@ -4187,8 +4201,9 @@ add Running/Paused PUT, rescan, real MMDS exchange, sysfs removal, DELETE,
 live-config projection, exact BDF/capacity reuse, and clean shutdown; the
 contained case proves this needs no vmnet entitlement and that unauthorized
 non-MMDS insertion rolls back. The tests do not execute direct-vmnet external
-connectivity. The networkless production test additionally rejects positive
-host, shared, and bridged launch policies before any session is created.
+connectivity. The providerless networkless production test additionally rejects
+positive host, shared, and bridged launch policies before any session is
+created; #1936's separate fake-provider cases cover the admitted remote route.
 Unsigned injected-system, runtime, transport, HVF-loop, and
 process-registry tests cover returned MAC/MTU/maximum-packet/UUID/batch
 reconciliation, allocated-MAC uniqueness, finite start/stop deadlines,

@@ -430,6 +430,37 @@ impl ConnectedStreamGrantRegistry {
         self.entries.is_empty()
     }
 
+    /// Returns whether one exact singleton connected-stream role remains.
+    #[must_use]
+    pub fn contains_role(&self, role: ResourceRole) -> bool {
+        role.is_connected_stream()
+            && self
+                .entries
+                .values()
+                .filter(|stream| stream.role == role)
+                .count()
+                == 1
+    }
+
+    /// Adopts the unique connected local stream for one exact singleton role.
+    pub fn take_role(
+        &mut self,
+        role: ResourceRole,
+    ) -> Result<GrantedUnixStream, GrantRegistryError> {
+        if !role.is_connected_stream() {
+            return Err(GrantRegistryError);
+        }
+        let mut matching = self
+            .entries
+            .iter()
+            .filter_map(|(id, stream)| (stream.role == role).then_some(id.clone()));
+        let id = matching.next().ok_or(GrantRegistryError)?;
+        if matching.next().is_some() {
+            return Err(GrantRegistryError);
+        }
+        take_connected_stream(&mut self.entries, &id, role)
+    }
+
     /// Validates one exact connected local stream without adopting it.
     #[must_use]
     pub fn validates_connected_stream(&self, id: &GrantId, role: ResourceRole) -> bool {
@@ -452,7 +483,7 @@ impl ConnectedStreamGrantRegistry {
         stream: GrantedUnixStream,
     ) -> Result<(), GrantRegistryError> {
         if self.entries.contains_key(&id)
-            || stream.role != ResourceRole::SnapshotPagerStream
+            || !stream.role.is_connected_stream()
             || stream.access != GrantAccess::ReadWrite
         {
             return Err(GrantRegistryError);
@@ -739,7 +770,7 @@ fn matches_connected_stream(
         entries.get(id),
         Some(stream)
             if stream.role == role
-                && role == ResourceRole::SnapshotPagerStream
+                && role.is_connected_stream()
                 && stream.access == GrantAccess::ReadWrite
     )
 }
@@ -1423,7 +1454,7 @@ impl StagedGrantBatch {
                 peer,
             } => {
                 self.require_open_batch()?;
-                if role != ResourceRole::SnapshotPagerStream
+                if !role.is_connected_stream()
                     || access != GrantAccess::ReadWrite
                     || identity.inode == 0
                     || source_identity.inode == 0
@@ -2253,10 +2284,10 @@ mod tests {
     }
 
     #[test]
-    fn connected_stream_is_revalidated_committed_and_adopted_once() {
+    fn provider_stream_is_revalidated_committed_and_adopted_by_singleton_role_once() {
         let session = SessionId::from_bytes([33; 32]);
         let batch = BatchId::from_bytes([34; 16]);
-        let id = GrantId::parse("snapshot-pager").expect("ID should parse");
+        let id = GrantId::parse("vmnet-provider").expect("ID should parse");
         let (stream, peer_stream) = UnixStream::pair().expect("stream pair should open");
         stream
             .set_nonblocking(true)
@@ -2304,7 +2335,7 @@ mod tests {
                 1,
                 GrantRecord::ConnectedStream {
                     id: id.clone(),
-                    role: ResourceRole::SnapshotPagerStream,
+                    role: ResourceRole::VmnetProviderStream,
                     access: GrantAccess::ReadWrite,
                     identity,
                     source_identity,
@@ -2337,21 +2368,23 @@ mod tests {
             format!("{streams:?}"),
             "ConnectedStreamGrantRegistry { entries: \"<redacted>\" }"
         );
-        assert!(streams.validates_connected_stream(&id, ResourceRole::SnapshotPagerStream));
+        assert!(streams.contains_role(ResourceRole::VmnetProviderStream));
+        assert!(streams.validates_connected_stream(&id, ResourceRole::VmnetProviderStream));
         assert!(!streams.validates_connected_stream(&id, ResourceRole::SnapshotStateInput));
         assert_eq!(streams.len(), 1);
         let granted = streams
-            .take_connected_stream(&id, ResourceRole::SnapshotPagerStream)
-            .expect("matching stream should adopt");
+            .take_role(ResourceRole::VmnetProviderStream)
+            .expect("matching singleton stream should adopt");
         assert_eq!(granted.identity(), identity);
         assert_eq!(granted.source_identity(), source_identity);
         assert_eq!(granted.peer(), peer);
         assert_eq!(granted.status_flags(), status_flags);
         assert!(streams.is_empty());
-        assert!(!streams.validates_connected_stream(&id, ResourceRole::SnapshotPagerStream));
+        assert!(!streams.contains_role(ResourceRole::VmnetProviderStream));
+        assert!(!streams.validates_connected_stream(&id, ResourceRole::VmnetProviderStream));
         assert!(
             streams
-                .take_connected_stream(&id, ResourceRole::SnapshotPagerStream)
+                .take_role(ResourceRole::VmnetProviderStream)
                 .is_err()
         );
         let adopted = granted.into_stream();

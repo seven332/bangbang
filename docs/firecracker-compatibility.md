@@ -1459,7 +1459,7 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multip
 The checked
 [host-resource authority contract](../compat/firecracker/v1.16.0/host-resource-authority-contract.md)
 maps 30 ordered clauses from the pinned Firecracker design, jailer,
-network-setup, and production-host documents onto the exact 17-role/five-access
+network-setup, and production-host documents onto the exact 18-role/five-access
 production surface. Strict no-follow manifest preparation, typed descriptors
 and anchored directories, failure-atomic one-time adoption, fixed
 session-bound socket/vsock/vhost-user/block facets, transactional
@@ -5389,7 +5389,11 @@ and capture; another session is rejected before backend or callback work even
 for MMDS-only paths. The identity is redacted and excluded from detached state.
 Direct mode is unchanged and all-MMDS consumes no vmnet capacity.
 The default App Sandbox plus Hypervisor worker is an exact profile-absent
-networkless profile and rejects every positive authority before spawn/resume.
+networkless profile. It accepts positive authority only with exactly one
+authenticated provider-stream grant and the remote-only route; without that
+grant it rejects positive authority before spawn/resume. The remote source is
+claimed lazily, sends only fixed policy slots, and is retained through startup,
+runtime mutation, and fresh-owner restore without local fallback.
 An explicit caller-approved vmnet package profile requires a named identity,
 bounded captured profile, exact five-key signature, profile-listed signing
 leaf, and successful disposable current-host authorization probe before
@@ -5435,9 +5439,11 @@ authorization and records only categorical output. Therefore
 `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` are now
 `missing-platform-feasible`, not implemented. Production launcher-to-broker
-authorization/assembly, the sandbox remote provider, a guest through that
+authorization/assembly, a guest through the now-implemented contained remote
 provider, concurrent production certification, and the optional Apple-authorized
-matrix remain #1378 work.
+matrix remain #1378 work. #1936 adds only the credential-free grant, route,
+client pumps, process-registry integration, and fake-broker evidence; it does
+not change either disposition.
 
 ## Validation Expectations
 

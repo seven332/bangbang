@@ -59,6 +59,11 @@ use bangbang_runtime::snapshot_network_v2_11::{
     SnapshotV2NetworkBackendClass, SnapshotV2NetworkLimiterState, SnapshotV2NetworkState,
 };
 use bangbang_runtime::vsock::VSOCK_HOST_LOCAL_PORT_BASE;
+use bangbang_session::vmnet_provider::{
+    ControlBrokerEvent, DataOwnerEvent, MAX_PROVIDER_TIMEOUT, ProviderCleanup,
+    RealizedVmnetParameters, VmnetControlBroker, VmnetDataOwner, VmnetGeneration, VmnetPacketBatch,
+    VmnetPolicySlot, VmnetProviderTransport,
+};
 use bangbang_session::{
     BLOCK_CONTROL_BROKER_FD, Frame, FrameDecoder, GRANT_FD, Message, SESSION_ENV_KEY,
     SESSION_ENV_VALUE, SESSION_FD, SOCKET_BROKER_FD, SessionId, VHOST_USER_BROKER_FD, WorkerPolicy,
@@ -182,6 +187,11 @@ const PAGER_PROBE_READY: &str = "status: pager integration probe ready";
 const PAGER_PEER_LISTENING: &str = "status: pager reference peer listening";
 const PAGER_PEER_PATH_ENV: &str = "BANGBANG_PAGER_REFERENCE_PATH";
 const PAGER_PEER_MODE_ENV: &str = "BANGBANG_PAGER_REFERENCE_MODE";
+const VMNET_PROVIDER_GRANT_ID: &str = "probe-vmnet-provider";
+const VMNET_PROVIDER_GRANT_REF: &str = "bangbang-grant:probe-vmnet-provider";
+const VMNET_PROVIDER_PEER_LISTENING: &str = "status: vmnet provider peer listening";
+const VMNET_PROVIDER_PEER_PATH_ENV: &str = "BANGBANG_VMNET_PROVIDER_REFERENCE_PATH";
+const VMNET_PROVIDER_PEER_MODE_ENV: &str = "BANGBANG_VMNET_PROVIDER_REFERENCE_MODE";
 const BLOCK_CONTROL_GRANT_ID: &str = "probe-block-control";
 const BLOCK_CONTROL_GRANT_REF: &str = "bangbang-grant:probe-block-control";
 const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
@@ -719,6 +729,244 @@ fn pager_reference_peer_child() {
             thread::sleep(Duration::from_secs(2));
         }
         _ => panic!("unexpected pager reference mode"),
+    }
+}
+
+#[test]
+fn vmnet_provider_reference_peer_child() {
+    let Some(path) = std::env::var_os(VMNET_PROVIDER_PEER_PATH_ENV) else {
+        return;
+    };
+    let mode = std::env::var(VMNET_PROVIDER_PEER_MODE_ENV)
+        .expect("vmnet provider peer mode should be present");
+    let listener =
+        UnixListener::bind(PathBuf::from(path)).expect("vmnet provider listener should bind");
+    println!("{VMNET_PROVIDER_PEER_LISTENING}");
+    std::io::stdout()
+        .flush()
+        .expect("vmnet provider readiness should flush");
+    let (mut stream, _) = listener
+        .accept()
+        .expect("vmnet provider stream should accept");
+    match mode.as_str() {
+        "complete" => serve_vmnet_provider(&stream),
+        "unused" => {
+            let mut descriptor = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `descriptor` is one live poll entry whose stream stays
+            // owned for the bounded wait.
+            assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 5_000) }, 1);
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                stream
+                    .read(&mut byte)
+                    .expect("unused provider stream should close"),
+                0,
+                "an unclaimed provider grant must transfer no protocol bytes"
+            );
+        }
+        _ => panic!("unexpected vmnet provider peer mode"),
+    }
+}
+
+fn serve_vmnet_provider(stream: &UnixStream) {
+    let mut transport = VmnetProviderTransport::new(
+        stream
+            .try_clone()
+            .expect("vmnet control stream should clone"),
+        MAX_PROVIDER_TIMEOUT,
+    )
+    .expect("vmnet control transport should construct");
+    let hello = transport
+        .receive()
+        .expect("vmnet control hello should arrive");
+    let session = hello.frame().session();
+    let mut broker =
+        VmnetControlBroker::new(session).expect("vmnet control broker should construct");
+    assert!(matches!(
+        broker
+            .receive(hello)
+            .expect("vmnet control hello should validate"),
+        ControlBrokerEvent::Hello
+    ));
+    transport
+        .send(
+            broker
+                .hello_ack()
+                .expect("vmnet control hello ack should construct"),
+        )
+        .expect("vmnet control hello ack should send");
+
+    let mut data_owner = None;
+    loop {
+        let event = broker
+            .receive(
+                transport
+                    .receive()
+                    .expect("vmnet control command should arrive"),
+            )
+            .expect("vmnet control command should validate");
+        match event {
+            ControlBrokerEvent::Start {
+                interface,
+                policy_slot,
+                requested,
+            } => {
+                assert_eq!(policy_slot, VmnetPolicySlot::Shared);
+                assert_eq!(requested.mtu(), Some(1500));
+                let generation = VmnetGeneration::new(1).expect("vmnet generation should validate");
+                let parameters = RealizedVmnetParameters::new([2, 0, 0, 0, 0, 73], 1500, 2048)
+                    .expect("vmnet parameters should validate")
+                    .with_batch_limits(Some(4), Some(4))
+                    .expect("vmnet batch limits should validate");
+                let (client, owner) =
+                    UnixStream::pair().expect("vmnet data stream pair should construct");
+                data_owner = Some(thread::spawn(move || {
+                    serve_vmnet_data_owner(owner, session, interface, generation, parameters);
+                }));
+                transport
+                    .send(
+                        broker
+                            .started(generation, parameters, client)
+                            .expect("vmnet started response should construct"),
+                    )
+                    .expect("vmnet started response should send");
+            }
+            ControlBrokerEvent::Stop { .. } => {
+                data_owner
+                    .take()
+                    .expect("vmnet data owner should exist")
+                    .join()
+                    .expect("vmnet data owner should finish");
+                transport
+                    .send(
+                        broker
+                            .stopped(ProviderCleanup::Complete)
+                            .expect("vmnet stopped response should construct"),
+                    )
+                    .expect("vmnet stopped response should send");
+            }
+            ControlBrokerEvent::Shutdown => {
+                assert!(data_owner.is_none());
+                transport
+                    .send(
+                        broker
+                            .shutdown_ack()
+                            .expect("vmnet shutdown ack should construct"),
+                    )
+                    .expect("vmnet shutdown ack should send");
+                return;
+            }
+            ControlBrokerEvent::Cancel { .. } => {
+                if let Some(owner) = data_owner.take() {
+                    owner
+                        .join()
+                        .expect("cancelled vmnet data owner should finish");
+                }
+                transport
+                    .send(
+                        broker
+                            .cancelled(ProviderCleanup::Complete)
+                            .expect("vmnet cancelled response should construct"),
+                    )
+                    .expect("vmnet cancelled response should send");
+                return;
+            }
+            ControlBrokerEvent::PeerTerminal { .. } => return,
+            ControlBrokerEvent::Hello => panic!("duplicate vmnet control hello"),
+        }
+    }
+}
+
+fn serve_vmnet_data_owner(
+    stream: UnixStream,
+    session: SessionId,
+    interface: bangbang_session::vmnet_provider::VmnetInterfaceId,
+    generation: VmnetGeneration,
+    parameters: RealizedVmnetParameters,
+) {
+    let mut transport = VmnetProviderTransport::new(stream, MAX_PROVIDER_TIMEOUT)
+        .expect("vmnet data transport should construct");
+    let mut owner = VmnetDataOwner::new(session, interface, generation, parameters)
+        .expect("vmnet data owner should construct");
+    assert!(matches!(
+        owner
+            .receive(transport.receive().expect("vmnet data hello should arrive"))
+            .expect("vmnet data hello should validate"),
+        DataOwnerEvent::Hello
+    ));
+    transport
+        .send(
+            owner
+                .hello_ack()
+                .expect("vmnet data hello ack should construct"),
+        )
+        .expect("vmnet data hello ack should send");
+
+    loop {
+        let event = owner
+            .receive(
+                transport
+                    .receive()
+                    .expect("vmnet data command should arrive"),
+            )
+            .expect("vmnet data command should validate");
+        match event {
+            DataOwnerEvent::Write { packets, .. } => {
+                assert_eq!(packets.packet_count(), 1);
+                assert_eq!(packets.packet(0), Some(&[0x5a_u8; 60][..]));
+                transport
+                    .send(
+                        owner
+                            .write_result(1)
+                            .expect("vmnet write result should construct"),
+                    )
+                    .expect("vmnet write result should send");
+            }
+            DataOwnerEvent::Read { .. } => {
+                transport
+                    .send(
+                        owner
+                            .readiness(1)
+                            .expect("vmnet readiness should construct"),
+                    )
+                    .expect("vmnet readiness should send");
+                let packet = [0xa5_u8; 60];
+                let packets =
+                    VmnetPacketBatch::read(&[&packet]).expect("vmnet read batch should validate");
+                transport
+                    .send(
+                        owner
+                            .read_result(packets)
+                            .expect("vmnet read result should construct"),
+                    )
+                    .expect("vmnet read result should send");
+            }
+            DataOwnerEvent::Stop => {
+                transport
+                    .send(
+                        owner
+                            .stopped(ProviderCleanup::Complete)
+                            .expect("vmnet data stopped response should construct"),
+                    )
+                    .expect("vmnet data stopped response should send");
+            }
+            DataOwnerEvent::Shutdown => {
+                transport
+                    .send(
+                        owner
+                            .shutdown_ack()
+                            .expect("vmnet data shutdown ack should construct"),
+                    )
+                    .expect("vmnet data shutdown ack should send");
+                return;
+            }
+            DataOwnerEvent::PeerTerminal { .. } => return,
+            DataOwnerEvent::Hello => panic!("duplicate vmnet data hello"),
+        }
     }
 }
 
@@ -13622,6 +13870,32 @@ fn signed_pager_grant_completes_and_repeats_under_unchanged_entitlements() {
 }
 
 #[test]
+fn signed_networkless_worker_uses_authenticated_remote_provider_without_apple_authorization() {
+    let bundle = grant_test_bundle();
+    assert_exact_networkless_bundle_entitlements(&bundle);
+
+    let fixture = VmnetProviderGrantFixture::new("complete-repeat");
+    for cycle in 0..2 {
+        let mut peer = fixture.start_peer("complete");
+        let output = run_vmnet_provider_probe(&bundle, &fixture, "vmnet-provider-complete");
+        peer.wait_success(&format!("vmnet provider reference cycle {cycle}"));
+        assert_output_success(&output, "signed contained remote vmnet provider probe");
+        assert_vmnet_provider_output_redacted(&output, &fixture);
+        fixture.clear_socket();
+        assert!(session_entries().is_empty());
+    }
+
+    let unused = VmnetProviderGrantFixture::new("unused");
+    let mut peer = unused.start_peer("unused");
+    let output = run_vmnet_provider_probe(&bundle, &unused, "vmnet-provider-unused");
+    peer.wait_success("unused vmnet provider reference");
+    assert_output_success(&output, "signed unclaimed vmnet provider probe");
+    assert_vmnet_provider_output_redacted(&output, &unused);
+    unused.clear_socket();
+    assert!(session_entries().is_empty());
+}
+
+#[test]
 fn signed_pager_consumer_chain_runs_inside_app_sandbox() {
     let bundle = grant_test_bundle();
     let fixture = PagerGrantFixture::new("consumer-chain");
@@ -18161,6 +18435,222 @@ fn assert_redacted_private_grant_fault(
         assert!(
             !response.contains(&sensitive),
             "grant fault leaked private data"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct VmnetProviderGrantFixture {
+    _root: TestDir,
+    socket: PathBuf,
+    manifest: PathBuf,
+}
+
+impl VmnetProviderGrantFixture {
+    fn new(case: &str) -> Self {
+        let socket_id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let root = TestDir(
+            PathBuf::from("/private/tmp")
+                .join(format!("bbv-{}-{socket_id}-{case}", std::process::id())),
+        );
+        fs::create_dir(root.path()).expect("short vmnet provider root should create");
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("vmnet provider root should canonicalize");
+        let socket = canonical_root.join("provider.sock");
+        let manifest = canonical_root.join("provider-grant-manifest.json");
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "id": VMNET_PROVIDER_GRANT_ID,
+                "role": "vmnet-provider-stream",
+                "access": "read-write",
+                "source": path_text(&socket),
+            }],
+        });
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&manifest_json).expect("vmnet provider manifest should serialize"),
+        )
+        .expect("vmnet provider manifest should write");
+        Self {
+            _root: root,
+            socket,
+            manifest,
+        }
+    }
+
+    fn start_peer(&self, mode: &str) -> VmnetProviderPeerProcess {
+        assert!(
+            !self.socket.exists(),
+            "vmnet provider socket path must be absent before peer bind"
+        );
+        VmnetProviderPeerProcess::start(&self.socket, mode, self.sensitive_strings())
+    }
+
+    fn clear_socket(&self) {
+        if self.socket.exists() {
+            fs::remove_file(&self.socket).expect("vmnet provider socket path should remove");
+        }
+    }
+
+    fn sensitive_strings(&self) -> Vec<String> {
+        [
+            path_text(&self.socket),
+            path_text(&self.manifest),
+            VMNET_PROVIDER_GRANT_ID,
+            VMNET_PROVIDER_GRANT_REF,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+#[derive(Debug)]
+struct VmnetProviderPeerProcess {
+    child: Child,
+    stdout_reader: Option<JoinHandle<String>>,
+    stderr_reader: Option<JoinHandle<String>>,
+    sensitive: Vec<String>,
+    completed: bool,
+}
+
+impl VmnetProviderPeerProcess {
+    fn start(path: &Path, mode: &str, sensitive: Vec<String>) -> Self {
+        let mut child =
+            Command::new(std::env::current_exe().expect("test executable should exist"))
+                .args([
+                    "--exact",
+                    "vmnet_provider_reference_peer_child",
+                    "--nocapture",
+                ])
+                .env(VMNET_PROVIDER_PEER_PATH_ENV, path)
+                .env(VMNET_PROVIDER_PEER_MODE_ENV, mode)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("vmnet provider reference peer should start");
+        let (ready, stdout_reader) =
+            read_stdout_until_line(&mut child, VMNET_PROVIDER_PEER_LISTENING);
+        let stderr_reader = read_stream(
+            child
+                .stderr
+                .take()
+                .expect("vmnet provider peer stderr should be piped"),
+        );
+        if let Err(error) = ready.recv_timeout(PROCESS_TIMEOUT) {
+            kill_child_group(&mut child);
+            let _ = child.wait();
+            let stdout = stdout_reader
+                .join()
+                .expect("vmnet provider peer stdout should join");
+            let stderr = stderr_reader
+                .join()
+                .expect("vmnet provider peer stderr should join");
+            panic!(
+                "vmnet provider peer should listen: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+        Self {
+            child,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+            sensitive,
+            completed: false,
+        }
+    }
+
+    fn wait_success(&mut self, context: &str) {
+        let status = if wait_for_child_exit(&self.child, PROCESS_TIMEOUT) {
+            self.child
+                .wait()
+                .expect("vmnet provider peer wait should succeed")
+        } else {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+            panic!("timed out waiting for {context}");
+        };
+        self.completed = true;
+        let stdout = self
+            .stdout_reader
+            .take()
+            .expect("vmnet provider peer stdout reader should exist")
+            .join()
+            .expect("vmnet provider peer stdout reader should join");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("vmnet provider peer stderr reader should exist")
+            .join()
+            .expect("vmnet provider peer stderr reader should join");
+        let combined = format!("{stdout}{stderr}");
+        for sensitive in &self.sensitive {
+            assert!(
+                !combined.contains(sensitive),
+                "vmnet provider peer diagnostics must be redacted"
+            );
+        }
+        assert!(
+            status.success(),
+            "{context} should succeed: {status:?}\n{combined}"
+        );
+    }
+}
+
+impl Drop for VmnetProviderPeerProcess {
+    fn drop(&mut self) {
+        if !self.completed {
+            kill_child_group(&mut self.child);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn vmnet_provider_probe_command(
+    bundle: &Path,
+    fixture: &VmnetProviderGrantFixture,
+    case: &str,
+) -> Command {
+    let policy_args = vec![
+        OsString::from("--vmnet-allow"),
+        OsString::from("shared"),
+        OsString::from("--vmnet-max-interfaces"),
+        OsString::from("1"),
+    ];
+    let mut command =
+        jailer_command_with_policy(bundle, "remote-vmnet-provider", &[], false, &policy_args);
+    command
+        .arg(GRANT_MANIFEST_OPTION)
+        .arg(&fixture.manifest)
+        .arg("--")
+        .arg(GRANT_PROBE_OPTION)
+        .arg(case);
+    command
+}
+
+fn run_vmnet_provider_probe(
+    bundle: &Path,
+    fixture: &VmnetProviderGrantFixture,
+    case: &str,
+) -> Output {
+    run_with_timeout(
+        &mut vmnet_provider_probe_command(bundle, fixture, case),
+        PROCESS_TIMEOUT,
+        "signed vmnet provider grant probe",
+    )
+}
+
+fn assert_vmnet_provider_output_redacted(output: &Output, fixture: &VmnetProviderGrantFixture) {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for sensitive in fixture.sensitive_strings() {
+        assert!(
+            !combined.contains(&sensitive),
+            "vmnet provider diagnostics must redact configured authority"
         );
     }
 }

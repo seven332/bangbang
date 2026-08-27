@@ -23,7 +23,7 @@ pub const MULTIPROCESS_ISOLATION_AUDIT_PATH: &str =
 pub const MULTIPROCESS_ISOLATION_CAPABILITY_ID: &str = MULTIPROCESS_ISOLATION_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "c5ca23b2e587e1eb02db05f7f21b0bcd5b11a344c5635bddd4c32a824ef7c08c";
+    "8ef0d3602893599ca24feaab9039cbd8b2b27d553813c953b88ca314caa151b7";
 
 const PROFILE_IDS: [MultiprocessEvidenceProfileId; 8] = [
     MultiprocessEvidenceProfileId::ProcessPerVmBoundary,

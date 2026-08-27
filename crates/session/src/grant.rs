@@ -198,6 +198,8 @@ pub enum ResourceRole {
     VhostUserSocketDirectory = 16,
     /// One launcher-connected snapshot pager stream.
     SnapshotPagerStream = 17,
+    /// One launcher-connected remote vmnet provider control stream.
+    VmnetProviderStream = 18,
 }
 
 impl ResourceRole {
@@ -225,6 +227,12 @@ impl ResourceRole {
         )
     }
 
+    /// Returns whether this role carries one already-connected local stream.
+    #[must_use]
+    pub const fn is_connected_stream(self) -> bool {
+        matches!(self, Self::SnapshotPagerStream | Self::VmnetProviderStream)
+    }
+
     /// Checks the only access modes accepted for this role.
     #[must_use]
     pub const fn permits(self, access: GrantAccess) -> bool {
@@ -246,7 +254,9 @@ impl ResourceRole {
             | Self::VsockSocketDirectory
             | Self::SnapshotOutputDirectory => matches!(access, GrantAccess::CreateChildren),
             Self::VhostUserSocketDirectory => matches!(access, GrantAccess::ConnectChildren),
-            Self::SnapshotPagerStream => matches!(access, GrantAccess::ReadWrite),
+            Self::SnapshotPagerStream | Self::VmnetProviderStream => {
+                matches!(access, GrantAccess::ReadWrite)
+            }
         }
     }
 
@@ -269,6 +279,7 @@ impl ResourceRole {
             15 => Ok(Self::SnapshotOutputDirectory),
             16 => Ok(Self::VhostUserSocketDirectory),
             17 => Ok(Self::SnapshotPagerStream),
+            18 => Ok(Self::VmnetProviderStream),
             _ => Err(ProtocolError::InvalidFrame),
         }
     }
@@ -966,7 +977,7 @@ fn valid_connected_stream(
     identity: ObjectIdentity,
     source_identity: ObjectIdentity,
 ) -> bool {
-    role == ResourceRole::SnapshotPagerStream
+    role.is_connected_stream()
         && access == GrantAccess::ReadWrite
         && identity.inode != 0
         && source_identity.inode != 0
@@ -1197,18 +1208,23 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_pager_stream_is_singleton_bidirectional_and_redacted() {
-        let role = ResourceRole::SnapshotPagerStream;
-        assert!(!role.is_repeatable());
-        assert!(!role.is_scoped_directory());
-        assert!(role.permits(GrantAccess::ReadWrite));
-        for access in [
-            GrantAccess::ReadOnly,
-            GrantAccess::WriteOnly,
-            GrantAccess::CreateChildren,
-            GrantAccess::ConnectChildren,
+    fn connected_stream_roles_are_singleton_bidirectional_and_redacted() {
+        for role in [
+            ResourceRole::SnapshotPagerStream,
+            ResourceRole::VmnetProviderStream,
         ] {
-            assert!(!role.permits(access));
+            assert!(role.is_connected_stream());
+            assert!(!role.is_repeatable());
+            assert!(!role.is_scoped_directory());
+            assert!(role.permits(GrantAccess::ReadWrite));
+            for access in [
+                GrantAccess::ReadOnly,
+                GrantAccess::WriteOnly,
+                GrantAccess::CreateChildren,
+                GrantAccess::ConnectChildren,
+            ] {
+                assert!(!role.permits(access));
+            }
         }
         let peer = ConnectedUnixPeer::new(501, 20, 42).expect("positive peer PID should validate");
         assert_eq!(peer.user_id(), 501);
@@ -1238,6 +1254,28 @@ mod tests {
             peer: ConnectedUnixPeer::new(501, 20, 1234).expect("peer identity should validate"),
         });
         let encoded = encode_grant_frame(&valid).expect("connected stream should encode");
+        let provider = frame(GrantRecord::ConnectedStream {
+            id: stream_id.clone(),
+            role: ResourceRole::VmnetProviderStream,
+            access: GrantAccess::ReadWrite,
+            identity: ObjectIdentity {
+                device: 41,
+                inode: 42,
+            },
+            source_identity: ObjectIdentity {
+                device: 43,
+                inode: 44,
+            },
+            status_flags: 6,
+            peer: ConnectedUnixPeer::new(501, 20, 1234).expect("peer identity should validate"),
+        });
+        assert_eq!(
+            decode_grant_frame(
+                &encode_grant_frame(&provider).expect("provider stream should encode")
+            )
+            .expect("provider stream should decode"),
+            provider
+        );
         let record_offset = GRANT_HEADER_BYTES + 20 + stream_id.as_bytes().len();
         let mut zero_pid = encoded.clone();
         zero_pid[record_offset + 28..record_offset + 32].fill(0);

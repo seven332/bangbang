@@ -17,7 +17,7 @@ pub mod vmnet_provider;
 pub use codec::{
     CancelSignal, Frame, FrameDecoder, MAX_VMNET_ACTIVE_INTERFACES, MAX_VMNET_BRIDGE_NAME_BYTES,
     MAX_VMNET_BRIDGE_NAMES, Message, ProtocolError, Readiness, Role, SessionId, TerminalCategory,
-    VmnetAuthority, VmnetAuthorityError, WorkerPolicy, encode_frame,
+    VmnetAuthority, VmnetAuthorityError, VmnetBackendRoute, WorkerPolicy, encode_frame,
 };
 pub use grant::{
     BatchId, BlockDeviceGrant, ConnectedUnixPeer, GRANT_HEADER_BYTES, GrantAccess, GrantFrame,

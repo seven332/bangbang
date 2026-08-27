@@ -61,7 +61,9 @@ The closed grant roles cover:
 - repeatable read-only or read-write block and pmem backings;
 - singleton write-only logger, metrics, and serial sinks;
 - create-children API, vsock, and snapshot-output directories; and
-- repeatable connect-only vhost-user socket directories.
+- repeatable connect-only vhost-user socket directories; and
+- one connected read-write vmnet-provider stream for the authenticated remote
+  route.
 
 Mutable-directory authority is anchor- and identity-bound. API and vsock
 listeners are published exclusively through the signed worker boundary;
@@ -70,8 +72,9 @@ launcher facets that exchange only the validated selector and connected stream
 descriptor. Snapshot publication records exact staging identities so cleanup
 removes only an owned inode and preserves replacements.
 
-Networkless production rejects positive vmnet authority before worker spawn.
-The explicit vmnet profile binds the documented entitlement dictionary,
+Networkless production rejects positive vmnet authority before worker spawn
+unless the prepared batch contains exactly one provider stream and authenticates
+the remote-only route. The explicit local vmnet profile binds the documented entitlement dictionary,
 application/team relationship, bridge allowlist, and active-interface maximum.
 It does not claim repository-owned signing credentials or certified external
 vmnet connectivity.
@@ -240,7 +243,7 @@ residual classification, nonclaims, and scoped command are in the
 #1916 separately certifies
 `semantic.isolation:host-resource-authority-and-brokerage` from 30 ordered
 clauses in the pinned design, jailer, network-setup, and production-host
-documents. Strict no-follow preflight, the exact 17-role/five-access grant
+documents. Strict no-follow preflight, the exact 18-role/five-access grant
 surface, failure-atomic descriptor and anchored-directory adoption, fixed
 session broker facets, transactional storage/snapshot authority, output and
 device bounds, replacement-safe cleanup, cancellation, and concurrent

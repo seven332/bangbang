@@ -23,7 +23,7 @@ pub const JAILER_AGGREGATE_CAPABILITY_IDS: [&str; 2] =
     ["corpus:jailer", "tool-operation:jailer/run"];
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "a6ac735858a26b4d7119a0c9df0d1157c15a515780be9e65e419e8035c58c9d3";
+    "6f0bf3fd1b33dc841ed55d17822c21b4f431058e31ee238ecbcced5939ea4897";
 
 const PROFILE_IDS: [JailerEvidenceProfileId; 9] = [
     JailerEvidenceProfileId::GrammarAndEarlyCommands,

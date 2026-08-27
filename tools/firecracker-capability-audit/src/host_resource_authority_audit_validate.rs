@@ -25,7 +25,7 @@ pub const HOST_RESOURCE_AUTHORITY_AUDIT_PATH: &str =
 pub const HOST_RESOURCE_AUTHORITY_CAPABILITY_ID: &str = HOST_RESOURCE_AUTHORITY_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "d3b14c81f9b2d9173e60a312411c6f30626f46e853c8916e7b176fc3327d9be7";
+    "fe268291c594ff41ff6bdc71e33a3aa71ee6d7b4997ec112d45dc9a21927e7a1";
 
 const PROFILE_IDS: [HostResourceEvidenceProfileId; 11] = [
     HostResourceEvidenceProfileId::ManifestPreflight,
@@ -616,7 +616,7 @@ struct ResourceSpec {
     profiles: &'static [HostResourceEvidenceProfileId],
 }
 
-const RESOURCE_SURFACE: [ResourceSpec; 17] = [
+const RESOURCE_SURFACE: [ResourceSpec; 18] = [
     ResourceSpec {
         role: HostResourceRole::StartupConfig,
         kinds: &[HostResourceObjectKind::RegularFile],
@@ -756,12 +756,20 @@ const RESOURCE_SURFACE: [ResourceSpec; 17] = [
         consumer: "snapshot-userfault-pager",
         profiles: &[HostResourceEvidenceProfileId::SnapshotAndPagerAuthority],
     },
+    ResourceSpec {
+        role: HostResourceRole::VmnetProviderStream,
+        kinds: &[HostResourceObjectKind::ConnectedUnixStream],
+        access: &[HostResourceAccess::ReadWrite],
+        lifetime: HostResourceLifetime::OneTimeClaim,
+        consumer: "contained-remote-vmnet-provider",
+        profiles: &[HostResourceEvidenceProfileId::NetworkPolicyBoundary],
+    },
 ];
 
 fn validate_resource_surface(audit: &HostResourceAuthorityAudit, errors: &mut Vec<String>) {
     if audit.resource_surface.len() != RESOURCE_SURFACE.len() {
         errors
-            .push("host-resource authority requires exactly 17 ordered resource roles".to_string());
+            .push("host-resource authority requires exactly 18 ordered resource roles".to_string());
     }
     let mut seen = BTreeSet::new();
     for (index, (record, expected)) in audit
@@ -1391,27 +1399,39 @@ fn expected_evidence(
         HostResourceEvidenceProfileId::NetworkPolicyBoundary => (
             &[
                 (
-                    "crates/bangbang/src/host_network/vmnet.rs",
-                    "pub struct VmnetInterfaceConfig",
+                    "crates/bangbang/src/contained_session.rs",
+                    "pub(crate) struct VmnetProviderGrantAuthority",
+                ),
+                (
+                    "crates/bangbang/src/host_network/remote_vmnet.rs",
+                    "pub(crate) struct RemoteVmnetProviderSource",
                 ),
                 (
                     "crates/launcher/src/launch_policy.rs",
                     "pub(crate) struct LaunchRequest",
                 ),
-                ("crates/session/src/codec.rs", "pub struct VmnetAuthority"),
+                ("crates/session/src/codec.rs", "pub enum VmnetBackendRoute"),
             ],
             &[
                 (
+                    "crates/bangbang/src/host_network/remote_vmnet.rs",
+                    "fn remote_pumps_route_readiness_packets_and_ordered_cleanup()",
+                ),
+                (
+                    "crates/launcher/src/grant_manifest.rs",
+                    "fn provider_stream_manifest_connects_once_and_is_classified_for_remote_routing()",
+                ),
+                (
+                    "crates/launcher/src/launch_policy.rs",
+                    "fn networkless_profile_routes_positive_authority_only_through_provider_grant()",
+                ),
+                (
                     "crates/launcher/tests/production_bundle_e2e.rs",
-                    "fn networkless_bundle_rejects_every_positive_vmnet_mode_before_session_creation()",
+                    "fn signed_networkless_worker_uses_authenticated_remote_provider_without_apple_authorization()",
                 ),
                 (
                     "crates/session/src/codec.rs",
-                    "fn vmnet_authority_debug_and_errors_do_not_reveal_policy_values()",
-                ),
-                (
-                    "crates/session/src/codec.rs",
-                    "fn vmnet_authority_validates_exact_bounded_modes_and_names()",
+                    "fn vmnet_backend_route_round_trips_and_fails_closed_against_authority()",
                 ),
             ],
         ),
@@ -1601,7 +1621,7 @@ mod tests {
     #[test]
     fn fixed_host_resource_populations_are_closed() {
         assert_eq!(SOURCE_CLAUSES.len(), 30);
-        assert_eq!(RESOURCE_SURFACE.len(), 17);
+        assert_eq!(RESOURCE_SURFACE.len(), 18);
         assert_eq!(TERMINAL_DEPENDENCIES.len(), 15);
         assert_eq!(EXTERNAL_DEPENDENCIES.len(), 4);
         assert_eq!(PROFILE_IDS.len(), 11);

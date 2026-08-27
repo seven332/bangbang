@@ -23,7 +23,7 @@ pub const JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH: &str =
 pub const JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID: &str = JAILER_SECCOMP_CONTAINMENT_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "6814700a121fee3eeaca71e2b69a1165a47c1fc7a5c9f2cfa7642d56ad37ca63";
+    "a918fc032188b8eec2845d9d837716a4dbd4573ad42e8eba0ff182971c00e13e";
 
 const PROFILE_IDS: [ContainmentEvidenceProfileId; 8] = [
     ContainmentEvidenceProfileId::SignedCodeAndEntitlements,

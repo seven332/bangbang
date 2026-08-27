@@ -33,11 +33,18 @@ use bangbang_runtime::snapshot_restore::{
 };
 use bangbang_runtime::virtio_queue::VirtqueueAvailableRing;
 use bangbang_runtime::vsock::VsockBackendSelector;
-use bangbang_session::{GrantAccess, GrantId, GrantObjectKind, ObjectIdentity, ResourceRole};
+use bangbang_session::{
+    GrantAccess, GrantId, GrantObjectKind, ObjectIdentity, ResourceRole, VmnetBackendRoute,
+};
 
 use crate::contained_session::{
     ContainedSession, ContainedSessionError, ContainedSnapshotRestoreAuthority,
     ContainedSnapshotRestoreErrorKind,
+};
+use crate::host_network::remote_vmnet::{ProcessVmnetBackendSource, RemoteVmnetProviderSource};
+use crate::host_network::vmnet::{
+    StartedVmnetPacketIoBackend, VmnetInterfaceConfig, VmnetPacketAvailableCallback,
+    VmnetPacketIoBackend, VmnetReadPacket, VmnetWritePacket,
 };
 use crate::snapshot_restore_resources::{
     PreparedSnapshotRootRestoreCompletion, RequestedSnapshotRestoreResource,
@@ -104,6 +111,10 @@ pub(crate) fn run(
     if let Some(pager) = PagerProbeCase::parse(probe_args)? {
         session.verify_launch_policy(2048, None, false)?;
         return verify_pager_in_containment(session, pager);
+    }
+    if let Some(vmnet_provider) = VmnetProviderProbeCase::parse(probe_args)? {
+        session.verify_vmnet_provider_launch_policy()?;
+        return verify_vmnet_provider_in_containment(session, vmnet_provider);
     }
     let probe = ProbeCase::parse(probe_args)?;
     session.verify_launch_policy(probe.expected_no_file, probe.expected_file_size, false)?;
@@ -486,6 +497,73 @@ fn verify_pager_in_containment(
                 .map(|_| ())
         }
     }
+}
+
+fn verify_vmnet_provider_in_containment(
+    session: &ContainedSession,
+    probe: VmnetProviderProbeCase,
+) -> Result<(), ContainedSessionError> {
+    let (session_id, authority, route) = session.vmnet_session_authority()?;
+    if route != VmnetBackendRoute::RemoteProvider
+        || authority.is_denied()
+        || !authority.allows_shared()
+        || authority.max_interfaces() != Some(1)
+    {
+        return Err(ContainedSessionError);
+    }
+    let grant = session
+        .vmnet_provider_grant_authority()
+        .ok_or(ContainedSessionError)?;
+    let source = RemoteVmnetProviderSource::new(session_id, authority, grant)
+        .ok_or(ContainedSessionError)?;
+    if probe == VmnetProviderProbeCase::Unused {
+        return Ok(());
+    }
+
+    let config = VmnetInterfaceConfig::shared().with_mtu(Some(1500));
+    let (mut backend, mut interface) = StartedVmnetPacketIoBackend::start(
+        ProcessVmnetBackendSource::Remote(source).new_backend(),
+        &config,
+    )
+    .map_err(|_| ContainedSessionError)?;
+    if backend.parameters().effective_mtu() != 1500
+        || backend.parameters().maximum_packet_size() != 2048
+        || backend.parameters().read_max_packets() != Some(4)
+        || backend.parameters().write_max_packets() != Some(4)
+    {
+        return Err(ContainedSessionError);
+    }
+
+    let readiness = Arc::new(AtomicBool::new(false));
+    let published = Arc::clone(&readiness);
+    backend
+        .enable_packet_available_callback(VmnetPacketAvailableCallback::new(move |estimate| {
+            if estimate == Some(1) {
+                published.store(true, Ordering::Release);
+            }
+        }))
+        .map_err(|_| ContainedSessionError)?;
+
+    let write_bytes = [0x5a_u8; 60];
+    let mut write = VmnetWritePacket::new(&write_bytes).map_err(|_| ContainedSessionError)?;
+    backend
+        .write_packet(&mut interface, &mut write)
+        .map_err(|_| ContainedSessionError)?;
+
+    let mut read_bytes = [0_u8; 2048];
+    let mut read = VmnetReadPacket::new(&mut read_bytes).map_err(|_| ContainedSessionError)?;
+    let read_length = backend
+        .read_packet(&mut interface, &mut read)
+        .map_err(|_| ContainedSessionError)?
+        .ok_or(ContainedSessionError)?;
+    drop(read);
+    if read_length != 60
+        || read_bytes.get(..read_length) != Some(&[0xa5_u8; 60][..])
+        || !readiness.load(Ordering::Acquire)
+    {
+        return Err(ContainedSessionError);
+    }
+    backend.stop().map_err(|_| ContainedSessionError)
 }
 
 fn run_lazy_consumer_pager(
@@ -1393,6 +1471,31 @@ impl PagerProbeCase {
             Some("pager-terminal") => Some(Self::Terminal),
             Some("pager-wait") => Some(Self::Wait),
             Some(value) if value.starts_with("pager-") => return Err(ContainedSessionError),
+            _ => None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmnetProviderProbeCase {
+    Complete,
+    Unused,
+}
+
+impl VmnetProviderProbeCase {
+    fn parse(args: &[OsString]) -> Result<Option<Self>, ContainedSessionError> {
+        let [option, value] = args else {
+            return Err(ContainedSessionError);
+        };
+        if option != OPTION {
+            return Err(ContainedSessionError);
+        }
+        Ok(match value.to_str() {
+            Some("vmnet-provider-complete") => Some(Self::Complete),
+            Some("vmnet-provider-unused") => Some(Self::Unused),
+            Some(value) if value.starts_with("vmnet-provider-") => {
+                return Err(ContainedSessionError);
+            }
             _ => None,
         })
     }

@@ -308,6 +308,37 @@ pub struct WorkerPolicy {
     file_size: Option<u64>,
     daemonized: bool,
     vmnet_authority: VmnetAuthority,
+    vmnet_backend_route: VmnetBackendRoute,
+}
+
+/// Authenticated contained-worker vmnet acquisition route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum VmnetBackendRoute {
+    /// No host vmnet acquisition is authorized.
+    Denied = 0,
+    /// The statically vmnet-authorized worker may call the local system backend.
+    LocalSystem = 1,
+    /// The networkless worker must use its granted remote provider stream.
+    RemoteProvider = 2,
+}
+
+impl VmnetBackendRoute {
+    const fn decode(value: u16) -> Result<Self, ProtocolError> {
+        match value {
+            0 => Ok(Self::Denied),
+            1 => Ok(Self::LocalSystem),
+            2 => Ok(Self::RemoteProvider),
+            _ => Err(ProtocolError::InvalidFrame),
+        }
+    }
+
+    const fn coherent(self, authority: VmnetAuthority) -> bool {
+        matches!(
+            (self, authority.is_denied()),
+            (Self::Denied, true) | (Self::LocalSystem | Self::RemoteProvider, false)
+        )
+    }
 }
 
 impl WorkerPolicy {
@@ -327,6 +358,7 @@ impl WorkerPolicy {
             file_size,
             daemonized,
             vmnet_authority: VmnetAuthority::denied(),
+            vmnet_backend_route: VmnetBackendRoute::Denied,
         }
     }
 
@@ -334,7 +366,22 @@ impl WorkerPolicy {
     #[must_use]
     pub const fn with_vmnet_authority(mut self, authority: VmnetAuthority) -> Self {
         self.vmnet_authority = authority;
+        self.vmnet_backend_route = if authority.is_denied() {
+            VmnetBackendRoute::Denied
+        } else {
+            VmnetBackendRoute::LocalSystem
+        };
         self
+    }
+
+    /// Selects one route only when it is coherent with the immutable authority.
+    #[must_use]
+    pub const fn try_with_vmnet_backend_route(mut self, route: VmnetBackendRoute) -> Option<Self> {
+        if !route.coherent(self.vmnet_authority) {
+            return None;
+        }
+        self.vmnet_backend_route = route;
+        Some(self)
     }
 
     /// Retargets only the authenticated worker identity, preserving all other policy.
@@ -380,6 +427,12 @@ impl WorkerPolicy {
     #[must_use]
     pub const fn vmnet_authority(self) -> VmnetAuthority {
         self.vmnet_authority
+    }
+
+    /// Returns the authenticated vmnet acquisition route.
+    #[must_use]
+    pub const fn vmnet_backend_route(self) -> VmnetBackendRoute {
+        self.vmnet_backend_route
     }
 }
 
@@ -580,7 +633,7 @@ fn encode_worker_policy(policy: WorkerPolicy) -> Vec<u8> {
     }
     let mut payload = Vec::with_capacity(WORKER_POLICY_BYTES);
     payload.extend_from_slice(&flags.to_be_bytes());
-    payload.extend_from_slice(&0_u16.to_be_bytes());
+    payload.extend_from_slice(&(policy.vmnet_backend_route as u16).to_be_bytes());
     payload.extend_from_slice(&policy.uid.to_be_bytes());
     payload.extend_from_slice(&policy.gid.to_be_bytes());
     payload.extend_from_slice(&0_u32.to_be_bytes());
@@ -739,9 +792,10 @@ fn decode_message(kind: u16, payload: &[u8]) -> Result<Message, ProtocolError> {
 
 fn decode_worker_policy(payload: &[u8]) -> Result<WorkerPolicy, ProtocolError> {
     let flags = read_u16(payload, 0)?;
-    if flags & !POLICY_FLAGS != 0 || read_u16(payload, 2)? != 0 || read_u32(payload, 12)? != 0 {
+    if flags & !POLICY_FLAGS != 0 || read_u32(payload, 12)? != 0 {
         return Err(ProtocolError::InvalidFrame);
     }
+    let vmnet_backend_route = VmnetBackendRoute::decode(read_u16(payload, 2)?)?;
     let encoded_file_size = read_u64(payload, 24)?;
     let file_size = if flags & POLICY_FLAG_FILE_SIZE == 0 {
         if encoded_file_size != 0 {
@@ -756,14 +810,16 @@ fn decode_worker_policy(payload: &[u8]) -> Result<WorkerPolicy, ProtocolError> {
             .get(CREDENTIAL_POLICY_BYTES..)
             .ok_or(ProtocolError::InvalidFrame)?,
     )?;
-    Ok(WorkerPolicy::new(
+    WorkerPolicy::new(
         read_u32(payload, 4)?,
         read_u32(payload, 8)?,
         read_u64(payload, 16)?,
         file_size,
         flags & POLICY_FLAG_DAEMONIZED != 0,
     )
-    .with_vmnet_authority(vmnet_authority))
+    .with_vmnet_authority(vmnet_authority)
+    .try_with_vmnet_backend_route(vmnet_backend_route)
+    .ok_or(ProtocolError::InvalidFrame)
 }
 
 fn decode_vmnet_authority(payload: &[u8]) -> Result<VmnetAuthority, ProtocolError> {
@@ -1157,6 +1213,50 @@ mod tests {
         decoder.push(&encoded).expect("frame should buffer");
         assert_eq!(decoder.next_frame(), Ok(Some(frame)));
         assert_eq!(policy.vmnet_authority(), authority);
+    }
+
+    #[test]
+    fn vmnet_backend_route_round_trips_and_fails_closed_against_authority() {
+        let authority =
+            VmnetAuthority::try_new(false, true, 2, &[]).expect("authority should validate");
+        let policy = WorkerPolicy::new(501, 20, 2048, None, false)
+            .with_vmnet_authority(authority)
+            .try_with_vmnet_backend_route(VmnetBackendRoute::RemoteProvider)
+            .expect("remote route should match positive authority");
+        let frame = Frame {
+            session: id(0x74),
+            sequence: 1,
+            message: Message::Start(policy),
+        };
+        let encoded = encode_frame(frame).expect("remote policy should encode");
+        assert_eq!(
+            &encoded[HEADER_BYTES + 2..HEADER_BYTES + 4],
+            &(VmnetBackendRoute::RemoteProvider as u16).to_be_bytes()
+        );
+        let mut decoder = FrameDecoder::default();
+        decoder.push(&encoded).expect("frame should buffer");
+        assert_eq!(decoder.next_frame(), Ok(Some(frame)));
+        assert_eq!(
+            policy.vmnet_backend_route(),
+            VmnetBackendRoute::RemoteProvider
+        );
+
+        assert!(
+            WorkerPolicy::new(501, 20, 2048, None, false)
+                .try_with_vmnet_backend_route(VmnetBackendRoute::RemoteProvider)
+                .is_none()
+        );
+        assert!(
+            WorkerPolicy::new(501, 20, 2048, None, false)
+                .with_vmnet_authority(authority)
+                .try_with_vmnet_backend_route(VmnetBackendRoute::Denied)
+                .is_none()
+        );
+        let mut unknown = encoded;
+        unknown[HEADER_BYTES + 2..HEADER_BYTES + 4].copy_from_slice(&3_u16.to_be_bytes());
+        let mut decoder = FrameDecoder::default();
+        decoder.push(&unknown).expect("bounded frame should buffer");
+        assert_eq!(decoder.next_frame(), Err(ProtocolError::InvalidFrame));
     }
 
     #[test]

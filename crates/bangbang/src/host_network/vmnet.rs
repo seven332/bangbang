@@ -421,6 +421,7 @@ impl std::error::Error for VmnetInterfaceConfigError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmnetInterfaceDescriptorError {
     CreateDictionaryFailed,
+    CopyConfigurationFailed,
     InteriorNulInBridgedInterfaceName,
     InteriorNulInMacAddress,
     MissingVmnetKey(&'static str),
@@ -431,6 +432,9 @@ impl fmt::Display for VmnetInterfaceDescriptorError {
         match self {
             Self::CreateDictionaryFailed => {
                 f.write_str("failed to create vmnet interface descriptor")
+            }
+            Self::CopyConfigurationFailed => {
+                f.write_str("failed to copy vmnet interface configuration")
             }
             Self::InteriorNulInBridgedInterfaceName => {
                 f.write_str("vmnet bridged interface name must not contain NUL bytes")
@@ -537,6 +541,27 @@ pub struct VmnetInterfaceParameters {
 }
 
 impl VmnetInterfaceParameters {
+    pub fn from_provider(
+        config: &VmnetInterfaceConfig,
+        realized: bangbang_session::vmnet_provider::RealizedVmnetParameters,
+    ) -> Result<Self, VmnetInterfaceParameterError> {
+        RawVmnetInterfaceParameters {
+            returned_mac: Some(GuestMacAddress::from_bytes(realized.mac())),
+            effective_mtu: u64::from(realized.effective_mtu()),
+            maximum_packet_size: u64::from(realized.maximum_packet_bytes()),
+            interface_id: realized.backend_interface_id(),
+            read_max_packets: realized.read_max_packets().map(u64::from),
+            write_max_packets: realized.write_max_packets().map(u64::from),
+        }
+        .validate(VmnetInterfaceResultPolicy {
+            mode: config.mode(),
+            requested_mac: config.guest_mac(),
+            requested_mtu: config.mtu(),
+            direct_virtio_header_available: realized.direct_virtio_header_available(),
+            direct_virtio_header_enabled: realized.direct_virtio_header_enabled(),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test(
         realized_mac: GuestMacAddress,
@@ -672,14 +697,17 @@ pub enum VmnetInterfaceStartError {
 }
 
 impl VmnetInterfaceStartError {
-    const fn start(source: VmnetError, disposition: VmnetInterfaceStartDisposition) -> Self {
+    pub(crate) const fn start(
+        source: VmnetError,
+        disposition: VmnetInterfaceStartDisposition,
+    ) -> Self {
         Self::Start {
             source,
             disposition,
         }
     }
 
-    const fn parameters(
+    pub(crate) const fn parameters(
         source: VmnetInterfaceParameterError,
         disposition: VmnetInterfaceStartDisposition,
     ) -> Self {
@@ -852,7 +880,7 @@ impl VmnetPacketAvailableCallback {
         }
     }
 
-    fn publish(&self, estimated_packets: Option<u64>) {
+    pub(crate) fn publish(&self, estimated_packets: Option<u64>) {
         (self.publish)(estimated_packets);
     }
 
@@ -897,7 +925,7 @@ impl fmt::Debug for VmnetInterfaceResultPolicy {
 }
 
 pub struct VmnetInterfaceDescriptor {
-    dictionary: OwnedXpcObject,
+    dictionary: Option<OwnedXpcObject>,
     result_policy: VmnetInterfaceResultPolicy,
 }
 
@@ -985,7 +1013,7 @@ impl VmnetInterfaceDescriptor {
         }
 
         Ok(Self {
-            dictionary,
+            dictionary: Some(dictionary),
             result_policy: VmnetInterfaceResultPolicy {
                 mode: config.mode(),
                 requested_mac: config.guest_mac(),
@@ -996,8 +1024,23 @@ impl VmnetInterfaceDescriptor {
         })
     }
 
+    pub(crate) const fn remote(config: &VmnetInterfaceConfig) -> Self {
+        Self {
+            dictionary: None,
+            result_policy: VmnetInterfaceResultPolicy {
+                mode: config.mode(),
+                requested_mac: config.guest_mac(),
+                requested_mtu: config.mtu(),
+                direct_virtio_header_available: false,
+                direct_virtio_header_enabled: false,
+            },
+        }
+    }
+
     pub fn as_raw_xpc_object(&self) -> *mut c_void {
-        self.dictionary.as_ptr()
+        self.dictionary
+            .as_ref()
+            .map_or(ptr::null_mut(), |dictionary| dictionary.as_ptr())
     }
 }
 
@@ -1005,7 +1048,7 @@ impl fmt::Debug for VmnetInterfaceDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VmnetInterfaceDescriptor")
-            .field("dictionary", &"<owned>")
+            .field("dictionary", &self.dictionary.as_ref().map(|_| "<owned>"))
             .field("result_policy", &self.result_policy)
             .finish()
     }
@@ -3888,7 +3931,7 @@ mod tests {
 
         // SAFETY: The descriptor owns a live XPC dictionary, and the key comes
         // from the vmnet SDK symbol wrapper.
-        unsafe { super::xpc::xpc_dictionary_get_uint64(descriptor.dictionary.as_ptr(), key) }
+        unsafe { super::xpc::xpc_dictionary_get_uint64(descriptor.as_raw_xpc_object(), key) }
     }
 
     fn descriptor_has_value(
@@ -3897,7 +3940,7 @@ mod tests {
     ) -> bool {
         // SAFETY: The descriptor owns a live dictionary and the caller passes
         // a live vmnet key.
-        !unsafe { super::xpc::xpc_dictionary_get_value(descriptor.dictionary.as_ptr(), key) }
+        !unsafe { super::xpc::xpc_dictionary_get_value(descriptor.as_raw_xpc_object(), key) }
             .is_null()
     }
 
@@ -3907,7 +3950,7 @@ mod tests {
     ) -> bool {
         // SAFETY: The descriptor owns a live dictionary and the test only uses
         // keys populated with an XPC Boolean.
-        unsafe { super::xpc::xpc_dictionary_get_bool(descriptor.dictionary.as_ptr(), key) }
+        unsafe { super::xpc::xpc_dictionary_get_bool(descriptor.as_raw_xpc_object(), key) }
     }
 
     fn descriptor_uint64(
@@ -3916,7 +3959,7 @@ mod tests {
     ) -> u64 {
         // SAFETY: The descriptor owns a live dictionary and the test only uses
         // keys populated with an XPC uint64.
-        unsafe { super::xpc::xpc_dictionary_get_uint64(descriptor.dictionary.as_ptr(), key) }
+        unsafe { super::xpc::xpc_dictionary_get_uint64(descriptor.as_raw_xpc_object(), key) }
     }
 
     fn descriptor_string(
@@ -3926,7 +3969,7 @@ mod tests {
         // SAFETY: The descriptor owns a live dictionary and the key comes from
         // vmnet. XPC owns the returned C string.
         let value =
-            unsafe { super::xpc::xpc_dictionary_get_string(descriptor.dictionary.as_ptr(), key) };
+            unsafe { super::xpc::xpc_dictionary_get_string(descriptor.as_raw_xpc_object(), key) };
         if value.is_null() {
             None
         } else {
@@ -5406,6 +5449,18 @@ mod tests {
             error.to_string(),
             "vmnet bridged interface name must not contain ASCII control characters"
         );
+    }
+
+    #[test]
+    fn remote_interface_descriptor_retains_policy_without_local_xpc_object() {
+        let config = VmnetInterfaceConfig::shared().with_mtu(Some(1500));
+        let descriptor = VmnetInterfaceDescriptor::remote(&config);
+
+        assert!(descriptor.as_raw_xpc_object().is_null());
+        assert_eq!(descriptor.result_policy.mode, VmnetMode::Shared);
+        assert_eq!(descriptor.result_policy.requested_mtu, Some(1500));
+        assert!(!descriptor.result_policy.direct_virtio_header_available);
+        assert!(!descriptor.result_policy.direct_virtio_header_enabled);
     }
 
     #[test]

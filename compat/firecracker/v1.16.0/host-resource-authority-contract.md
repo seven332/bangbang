@@ -56,7 +56,7 @@ pins every blob, so the result cannot float to another upstream revision.
 
 ## Closed resource surface
 
-The authority pins exactly 17 resource roles and five access modes:
+The current authority pins exactly 18 resource roles and five access modes:
 read-only, write-only, read-write, create-children, and connect-children.
 
 | Role | Object/access | Lifetime and consumer |
@@ -78,6 +78,7 @@ read-only, write-only, read-write, create-children, and connect-children.
 | `snapshot-output-directory` | directory, create-children | Transactional state/memory/staging publication |
 | `vhost-user-socket-directory` | directory, connect-children | Session-retained exact-child connections |
 | `snapshot-pager-stream` | connected Unix stream, read-write | One-time pager claim |
+| `vmnet-provider-stream` | connected Unix stream, read-write | One-time contained remote-provider claim |
 
 The strict v1 manifest is bounded to 256 KiB and 64 grants. IDs and singleton
 roles are unique; paths are absolute and bounded; opens are no-follow; type,
@@ -94,9 +95,11 @@ authority on abort and consume it exactly on commit. Ordinary API publication
 uses one authenticated worker request, launcher-owned private staging, a
 durable record before exclusive rename, and one exact listener reply; later
 vsock activation carries the same broker sequence. API/vsock publication,
-vhost-user exact-child connects, retained block control, and pager streams each
-use separate bounded session/sequence protocols rather than a general dynamic
-resource broker.
+vhost-user exact-child connects, retained block control, pager streams, and the
+remote vmnet provider stream each use separate bounded session/sequence
+protocols rather than a general dynamic resource broker. The provider role is
+one-time, cannot substitute for the pager role, and is accepted only with the
+authenticated `RemoteProvider` worker-policy route.
 
 Output grants, `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, and device token buckets bound
 the product-owned surfaces. Replacement-safe cleanup removes only recorded
@@ -106,12 +109,20 @@ same-ID concurrent noninterchangeability are signed production outcomes.
 ## Network and operator boundary
 
 `VmnetAuthority` is canonical, immutable, redacted, profile-bound, and paired
-with an active-interface maximum. Networkless production rejects every positive
-mode before session creation. That is the complete authority result here.
+with an active-interface maximum. A networkless worker accepts positive policy
+only with exactly one authenticated provider stream and the `RemoteProvider`
+route; a statically vmnet-authorized worker accepts only `LocalSystem` and no
+provider grant; denied policy accepts neither. The worker never falls back
+between routes, and MMDS-only work leaves remote authority unclaimed. The
+ad-hoc-signed networkless process gate repeats the complete fake-provider
+packet lifecycle and proves that an unclaimed grant sends no protocol bytes;
+it needs no Apple developer identity, vmnet profile, or local vmnet/XPC
+descriptor.
 
-Positive vmnet connectivity, Apple-approved credentials, real packet movement,
-service failure taxonomy, teardown, cancellation, SIGKILL reclamation, repeat,
-and concurrency remain exclusively owned by #1378. `corpus:network-setup` and
+Positive production vmnet connectivity, elevated launcher-to-provider assembly,
+Apple-approved credentials, real guest packet movement through the contained
+provider, service failure taxonomy, SIGKILL reclamation, repeat, and concurrency
+remain exclusively owned by #1378. `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` were audit-required
 at this checkpoint. #1930 later proves the narrower entitlement-free
 root-direct feasibility boundary and reclassifies them as

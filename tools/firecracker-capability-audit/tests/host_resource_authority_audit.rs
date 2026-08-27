@@ -115,7 +115,7 @@ fn checked_host_resource_authority_is_canonical_and_fail_closed() {
         validate_host_resource_authority_audit(&resource_missing, &manifest, &inventory, &root)
             .expect_err("missing resource must fail")
             .to_string()
-            .contains("exactly 17")
+            .contains("exactly 18")
     );
     let mut resource_access_drift = audit.clone();
     resource_access_drift.resource_surface[0].access = vec![HostResourceAccess::ReadWrite];
