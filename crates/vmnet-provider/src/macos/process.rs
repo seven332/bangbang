@@ -1,4 +1,4 @@
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, OsString, c_char, c_void};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -11,12 +11,19 @@ use std::time::{Duration, Instant};
 
 use crate::broker::BrokerError;
 
-use super::{BOOTSTRAP_FD, PRIVATE_OWNER_MODE, PROVIDER_FD};
+use super::{
+    BOOTSTRAP_FD, PRIVATE_DAEMON_BROKER_MODE, PRIVATE_LAUNCHER_TRANSITION_MODE, PRIVATE_OWNER_MODE,
+    PROVIDER_FD, VMNET_DAEMON_ENV_KEY, VMNET_DAEMON_ENV_VALUE,
+};
+use bangbang_session::vmnet_topology::{
+    VMNET_TOPOLOGY_ENV_KEY, VMNET_TOPOLOGY_ENV_VALUE, VMNET_TOPOLOGY_FD, VMNET_TOPOLOGY_PROVIDER_FD,
+};
 
 const MIN_SOURCE_FD: RawFd = 10;
 const CHILD_WAIT: Duration = Duration::from_secs(2);
 const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
 const MAX_PATH_BYTES: usize = 1024;
+const LAUNCHER_INHERITED_OUTPUT_FDS: [RawFd; 2] = [libc::STDOUT_FILENO, libc::STDERR_FILENO];
 
 unsafe extern "C" {
     fn proc_pidinfo(
@@ -25,6 +32,10 @@ unsafe extern "C" {
         argument: u64,
         buffer: *mut c_void,
         buffer_size: libc::c_int,
+    ) -> libc::c_int;
+    fn posix_spawn_file_actions_addinherit_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        descriptor: libc::c_int,
     ) -> libc::c_int;
 }
 
@@ -80,7 +91,7 @@ struct ProcRegionWithPathInfo {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
+pub(super) struct FileIdentity {
     device: u64,
     inode: u64,
     link_count: u64,
@@ -98,6 +109,10 @@ pub(super) struct PinnedExecutable {
 impl PinnedExecutable {
     pub(super) fn current() -> Result<Self, BrokerError> {
         let path = std::env::current_exe().map_err(|error| BrokerError::Io(error.kind()))?;
+        Self::at(&path)
+    }
+
+    pub(super) fn at(path: &std::path::Path) -> Result<Self, BrokerError> {
         if !path.is_absolute() {
             return Err(BrokerError::Process);
         }
@@ -124,8 +139,18 @@ impl PinnedExecutable {
         })
     }
 
-    fn validate_child(&self, pid: libc::pid_t) -> Result<(), BrokerError> {
+    pub(super) fn validate_child(&self, pid: libc::pid_t) -> Result<(), BrokerError> {
         require_exact_identity(self.identity, identity_for_process_image(pid)?)
+    }
+
+    pub(super) fn revalidate_path(&self) -> Result<(), BrokerError> {
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(self.path.to_bytes()));
+        let current = Self::at(path)?;
+        require_exact_identity(self.identity, current.identity)
+    }
+
+    pub(super) fn path(&self) -> &std::ffi::CStr {
+        &self.path
     }
 }
 
@@ -139,6 +164,171 @@ pub(super) struct SpawnedOwner {
     pub(super) child: OwnedChild,
     pub(super) supervision: UnixStream,
     pub(super) client_data: UnixStream,
+}
+
+pub(super) struct SpawnedLauncherTransition {
+    pub(super) child: OwnedChild,
+    pub(super) topology: UnixStream,
+    pub(super) provider: UnixStream,
+}
+
+impl std::fmt::Debug for SpawnedLauncherTransition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SpawnedLauncherTransition(<redacted>)")
+    }
+}
+
+pub(super) struct SpawnedDaemonBroker {
+    pub(super) child: OwnedChild,
+    pub(super) handoff: UnixStream,
+}
+
+impl std::fmt::Debug for SpawnedDaemonBroker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SpawnedDaemonBroker(<redacted>)")
+    }
+}
+
+pub(super) fn spawn_daemon_broker(
+    executable: &PinnedExecutable,
+    launcher_args: &[OsString],
+) -> Result<SpawnedDaemonBroker, BrokerError> {
+    let (handoff, child_handoff) =
+        UnixStream::pair().map_err(|error| BrokerError::Io(error.kind()))?;
+    let child_handoff = duplicate_stream(child_handoff)?;
+    let null = open_null()?;
+    let mode = CString::new(PRIVATE_DAEMON_BROKER_MODE).map_err(|_| BrokerError::Process)?;
+    let delimiter = CString::new("--").map_err(|_| BrokerError::Process)?;
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(launcher_args.len().saturating_add(3))
+        .map_err(|_| BrokerError::InvalidConfiguration)?;
+    arguments.push(CString::from(executable.path()));
+    arguments.push(mode);
+    arguments.push(delimiter);
+    for argument in launcher_args {
+        arguments
+            .push(CString::new(argument.as_os_str().as_bytes()).map_err(|_| BrokerError::Process)?);
+    }
+    let mut argv = arguments
+        .iter()
+        .map(|argument| argument.as_ptr().cast_mut())
+        .chain(std::iter::once(ptr::null_mut::<c_char>()))
+        .collect::<Vec<_>>();
+    let marker = CString::new(format!("{VMNET_DAEMON_ENV_KEY}={VMNET_DAEMON_ENV_VALUE}"))
+        .map_err(|_| BrokerError::Process)?;
+    let mut environment = [marker.as_ptr().cast_mut(), ptr::null_mut::<c_char>()];
+    let mut attributes = SpawnAttributes::new()?;
+    attributes.configure()?;
+    let mut actions = SpawnFileActions::new()?;
+    for standard in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        actions.duplicate(null.as_raw_fd(), standard)?;
+    }
+    actions.duplicate(child_handoff.as_raw_fd(), BOOTSTRAP_FD)?;
+    actions.close(child_handoff.as_raw_fd())?;
+    actions.close(null.as_raw_fd())?;
+
+    let mut pid = 0;
+    // SAFETY: All C strings, pointer arrays, spawn attributes/actions, and PID
+    // storage remain live for this synchronous call.
+    let result = unsafe {
+        libc::posix_spawn(
+            &raw mut pid,
+            executable.path.as_ptr(),
+            actions.as_ptr(),
+            attributes.as_ptr(),
+            argv.as_mut_ptr(),
+            environment.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(BrokerError::Process);
+    }
+    let mut child = OwnedChild::new_suspended(pid).map_err(|_| BrokerError::CleanupUncertain)?;
+    let validation = executable.validate_child(pid);
+    complete_suspended_identity_gate(&mut child, validation)?;
+    drop(child_handoff);
+    Ok(SpawnedDaemonBroker { child, handoff })
+}
+
+pub(super) fn spawn_launcher_transition(
+    executable: &PinnedExecutable,
+    launcher_args: &[OsString],
+) -> Result<SpawnedLauncherTransition, BrokerError> {
+    let (topology, child_topology) =
+        UnixStream::pair().map_err(|error| BrokerError::Io(error.kind()))?;
+    let (provider, child_provider) =
+        UnixStream::pair().map_err(|error| BrokerError::Io(error.kind()))?;
+    let child_topology = duplicate_stream(child_topology)?;
+    let child_provider = duplicate_stream(child_provider)?;
+    let null = open_null()?;
+
+    let mode = CString::new(PRIVATE_LAUNCHER_TRANSITION_MODE).map_err(|_| BrokerError::Process)?;
+    let delimiter = CString::new("--").map_err(|_| BrokerError::Process)?;
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(launcher_args.len().saturating_add(3))
+        .map_err(|_| BrokerError::InvalidConfiguration)?;
+    arguments.push(CString::from(executable.path()));
+    arguments.push(mode);
+    arguments.push(delimiter);
+    for argument in launcher_args {
+        arguments
+            .push(CString::new(argument.as_os_str().as_bytes()).map_err(|_| BrokerError::Process)?);
+    }
+    let mut argv = arguments
+        .iter()
+        .map(|argument| argument.as_ptr().cast_mut())
+        .chain(std::iter::once(ptr::null_mut::<c_char>()))
+        .collect::<Vec<_>>();
+    let marker = CString::new(format!(
+        "{VMNET_TOPOLOGY_ENV_KEY}={VMNET_TOPOLOGY_ENV_VALUE}"
+    ))
+    .map_err(|_| BrokerError::Process)?;
+    let mut environment = [marker.as_ptr().cast_mut(), ptr::null_mut::<c_char>()];
+    let mut attributes = SpawnAttributes::new()?;
+    attributes.configure()?;
+    let mut actions = SpawnFileActions::new()?;
+    actions.duplicate(null.as_raw_fd(), libc::STDIN_FILENO)?;
+    for standard in LAUNCHER_INHERITED_OUTPUT_FDS {
+        actions.inherit(standard)?;
+    }
+    actions.duplicate(child_topology.as_raw_fd(), VMNET_TOPOLOGY_FD)?;
+    actions.duplicate(child_provider.as_raw_fd(), VMNET_TOPOLOGY_PROVIDER_FD)?;
+    if child_topology.as_raw_fd() != VMNET_TOPOLOGY_FD {
+        actions.close(child_topology.as_raw_fd())?;
+    }
+    if child_provider.as_raw_fd() != VMNET_TOPOLOGY_PROVIDER_FD {
+        actions.close(child_provider.as_raw_fd())?;
+    }
+    actions.close(null.as_raw_fd())?;
+
+    let mut pid = 0;
+    // SAFETY: All C strings, pointer arrays, spawn attributes/actions, and PID
+    // storage remain live for this synchronous call.
+    let result = unsafe {
+        libc::posix_spawn(
+            &raw mut pid,
+            executable.path.as_ptr(),
+            actions.as_ptr(),
+            attributes.as_ptr(),
+            argv.as_mut_ptr(),
+            environment.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(BrokerError::Process);
+    }
+    let mut child = OwnedChild::new_suspended(pid).map_err(|_| BrokerError::CleanupUncertain)?;
+    let validation = executable.validate_child(pid);
+    complete_suspended_identity_gate(&mut child, validation)?;
+    drop(child_topology);
+    drop(child_provider);
+    Ok(SpawnedLauncherTransition {
+        child,
+        topology,
+        provider,
+    })
 }
 
 impl std::fmt::Debug for SpawnedOwner {
@@ -220,6 +410,10 @@ impl OwnedChild {
         self.signal(libc::SIGCONT)
     }
 
+    pub(super) const fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
     pub(super) fn signal(&self, signal: libc::c_int) -> Result<(), BrokerError> {
         if self.status.is_some() {
             return Err(BrokerError::Process);
@@ -279,6 +473,33 @@ impl OwnedChild {
             Some(_) => Err(BrokerError::Process),
             None => Err(BrokerError::Timeout),
         }
+    }
+
+    pub(super) fn wait(&mut self) -> Result<ExitStatus, BrokerError> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let mut raw = 0;
+        loop {
+            // SAFETY: `pid` is this object's exact unreaped child and `raw` is
+            // writable for the synchronous wait.
+            let result = unsafe { libc::waitpid(self.pid, &raw mut raw, 0) };
+            if result == self.pid {
+                let status = ExitStatus::from_raw(raw);
+                self.status = Some(status);
+                return Ok(status);
+            }
+            if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(BrokerError::Process);
+        }
+    }
+
+    pub(super) fn release(mut self) -> libc::pid_t {
+        let pid = self.pid;
+        self.status = Some(ExitStatus::from_raw(0));
+        pid
     }
 
     pub(super) fn terminate_and_reap(&mut self) -> Result<(), BrokerError> {
@@ -369,16 +590,25 @@ fn duplicate_stream(stream: UnixStream) -> Result<UnixStream, BrokerError> {
 
 fn open_null() -> Result<OwnedFd, BrokerError> {
     // SAFETY: Fixed NUL-terminated path; success is immediately owned.
-    let descriptor = unsafe {
+    let source = unsafe {
         libc::open(
             c"/dev/null".as_ptr(),
             libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
+    if source < 0 {
+        return Err(BrokerError::Io(io::Error::last_os_error().kind()));
+    }
+    // SAFETY: `source` is a fresh successful open result.
+    let source = unsafe { OwnedFd::from_raw_fd(source) };
+    // SAFETY: The source is live; success returns a fresh close-on-exec
+    // descriptor above every fixed child destination.
+    let descriptor =
+        unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, MIN_SOURCE_FD) };
     if descriptor < 0 {
         return Err(BrokerError::Io(io::Error::last_os_error().kind()));
     }
-    // SAFETY: `descriptor` is a fresh successful open result.
+    // SAFETY: `descriptor` is a fresh uniquely owned duplicate.
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
@@ -471,6 +701,45 @@ fn require_exact_identity(expected: FileIdentity, actual: FileIdentity) -> Resul
     }
 }
 
+pub(super) fn validate_child_credentials(
+    pid: libc::pid_t,
+    target: bangbang_session::credential::CredentialTarget,
+) -> Result<(), BrokerError> {
+    if pid <= 0 {
+        return Err(BrokerError::Process);
+    }
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(|_| BrokerError::Process)?;
+    // SAFETY: `info` is writable for exactly `size`; the fixed Darwin flavor
+    // initializes one complete `proc_bsdinfo` record.
+    let result = unsafe {
+        proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if result != size {
+        return Err(BrokerError::Process);
+    }
+    // SAFETY: The exact successful result initialized the complete record.
+    let info = unsafe { info.assume_init() };
+    let actual_pid = i32::try_from(info.pbi_pid).map_err(|_| BrokerError::Process)?;
+    let expected = (target.uid(), target.gid());
+    if actual_pid == pid
+        && (info.pbi_uid, info.pbi_gid) == expected
+        && (info.pbi_ruid, info.pbi_rgid) == expected
+        && (info.pbi_svuid, info.pbi_svgid) == expected
+    {
+        Ok(())
+    } else {
+        Err(BrokerError::Process)
+    }
+}
+
 struct SpawnAttributes {
     value: MaybeUninit<libc::posix_spawnattr_t>,
     initialized: bool,
@@ -545,6 +814,14 @@ impl SpawnFileActions {
         // are interpreted by the child-side spawn implementation.
         cvt_spawn(unsafe {
             libc::posix_spawn_file_actions_adddup2(self.value.as_mut_ptr(), source, destination)
+        })
+    }
+
+    fn inherit(&mut self, descriptor: RawFd) -> Result<(), BrokerError> {
+        // SAFETY: The action object is initialized and the fixed descriptor is
+        // interpreted only by the child-side spawn implementation.
+        cvt_spawn(unsafe {
+            posix_spawn_file_actions_addinherit_np(self.value.as_mut_ptr(), descriptor)
         })
     }
 
@@ -653,6 +930,21 @@ mod tests {
             }),
             Err(BrokerError::Process)
         );
+    }
+
+    #[test]
+    fn launcher_transition_inherits_only_output_standard_descriptors() {
+        assert_eq!(
+            LAUNCHER_INHERITED_OUTPUT_FDS,
+            [libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        );
+        assert!(!LAUNCHER_INHERITED_OUTPUT_FDS.contains(&libc::STDIN_FILENO));
+    }
+
+    #[test]
+    fn null_source_cannot_collide_with_fixed_child_descriptors() {
+        let null = open_null().expect("open fixed null source");
+        assert!(null.as_raw_fd() >= MIN_SOURCE_FD);
     }
 
     #[test]

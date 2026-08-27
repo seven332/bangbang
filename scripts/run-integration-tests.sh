@@ -245,8 +245,10 @@ build_production_bundle_tests() {
   cargo build \
     -p bangbang \
     -p bangbang-launcher \
+    -p bangbang-vmnet-provider \
     --bin bangbang \
     --bin bangbang-launcher \
+    --bin bangbang-vmnet-provider \
     --release \
     --no-default-features \
     --locked \
@@ -288,6 +290,7 @@ PY
   "$repo_root/target/release/bangbang-bundle" \
     --launcher "$repo_root/target/$target_triple/release/bangbang-launcher" \
     --worker "$repo_root/target/$target_triple/release/bangbang" \
+    --vmnet-provider "$repo_root/target/$target_triple/release/bangbang-vmnet-provider" \
     --output "$production_bundle_path" \
     --signing-identity - \
     --worker-profile networkless \
@@ -314,6 +317,7 @@ PY
   "$repo_root/target/release/bangbang-bundle" \
     --launcher "$repo_root/target/$target_triple/release/bangbang-launcher" \
     --worker "$repo_root/target/$target_triple/release/bangbang" \
+    --vmnet-provider "$repo_root/target/$target_triple/release/bangbang-vmnet-provider" \
     --output "$production_grant_test_bundle_path" \
     --signing-identity - \
     --worker-profile networkless \

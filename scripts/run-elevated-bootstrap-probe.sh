@@ -128,6 +128,7 @@ if [[ "$bundle" != /* || "$(/usr/bin/basename "$bundle")" != "Bangbang.app" || !
 fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 launcher="$bundle/Contents/MacOS/bangbang"
+provider="$bundle/Contents/Helpers/bangbang-vmnet-provider"
 worker_bundle="$bundle/Contents/Helpers/BangbangWorker.app"
 worker="$worker_bundle/Contents/MacOS/bangbang-worker"
 worker_resources="$worker_bundle/Contents/Resources"
@@ -135,7 +136,7 @@ guest_sidecar="${bundle}.elevated-guest-sidecar"
 marker="$worker_bundle/Contents/Resources/elevated-bootstrap-probe.enabled"
 grant_marker="$worker_bundle/Contents/Resources/grant-integration-probe.enabled"
 runtime_marker="$worker_bundle/Contents/Resources/target-runtime-grant-probe.enabled"
-for entry in "$launcher" "$worker" "$marker" "$grant_marker" "$runtime_marker"; do
+for entry in "$launcher" "$provider" "$worker" "$marker" "$grant_marker" "$runtime_marker"; do
   if [[ ! -f "$entry" || -L "$entry" ]]; then
     echo "invalid evidence bundle" >&2
     exit 1
@@ -267,6 +268,7 @@ bundle_directories=(
 bundle_files=(
   "Contents/_CodeSignature/CodeResources"
   "Contents/MacOS/bangbang"
+  "Contents/Helpers/bangbang-vmnet-provider"
   "Contents/Helpers/BangbangWorker.app/Contents/_CodeSignature/CodeResources"
   "Contents/Helpers/BangbangWorker.app/Contents/MacOS/bangbang-worker"
   "Contents/Helpers/BangbangWorker.app/Contents/Resources/elevated-bootstrap-probe.enabled"
@@ -290,6 +292,7 @@ is_staged_relative() {
       | "Bangbang.app/Contents/MacOS" \
       | "Bangbang.app/Contents/MacOS/bangbang" \
       | "Bangbang.app/Contents/Helpers" \
+      | "Bangbang.app/Contents/Helpers/bangbang-vmnet-provider" \
       | "Bangbang.app/Contents/Helpers/BangbangWorker.app" \
       | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents" \
       | "Bangbang.app/Contents/Helpers/BangbangWorker.app/Contents/_CodeSignature" \
@@ -391,6 +394,7 @@ stage_inherited_root() {
     local mode=0644
     case "$relative" in
       "Contents/MacOS/bangbang" \
+        | "Contents/Helpers/bangbang-vmnet-provider" \
         | "Contents/Helpers/BangbangWorker.app/Contents/MacOS/bangbang-worker")
         mode=0755
         ;;
@@ -452,7 +456,7 @@ validate_staged_root() {
     seen="${seen}${relative}|"
     lines+=("$relative"$'\t'"$identity"$'\t'"$kind")
   done < "$ledger"
-  if [[ "${#lines[@]}" -ne 27 ]]; then
+  if [[ "${#lines[@]}" -ne 28 ]]; then
     return 1
   fi
 
@@ -479,7 +483,7 @@ validate_staged_root() {
 
   local count
   count="$(/usr/bin/find -x "$root" -mindepth 1 -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  if [[ "$count" != "27" ]] \
+  if [[ "$count" != "28" ]] \
     || ! validate_source_bundle_shape \
     || ! /usr/bin/cmp -s /usr/lib/dyld "$root/usr/lib/dyld" \
     || ! /usr/bin/codesign --verify --strict "$root/usr/lib/dyld" >/dev/null 2>&1 \

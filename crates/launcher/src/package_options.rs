@@ -19,6 +19,8 @@ pub struct PackageOptions {
     pub launcher_binary: PathBuf,
     /// Already-built direct VMM executable copied into the sandbox worker app.
     pub worker_binary: PathBuf,
+    /// Already-built entitlement-free vmnet bootstrap/provider helper.
+    pub vmnet_provider_binary: PathBuf,
     /// Final output, whose file name must be `Bangbang.app` and must not exist.
     pub output_bundle: PathBuf,
     /// One identity for both separately signed code objects; `-` selects ad-hoc signing.

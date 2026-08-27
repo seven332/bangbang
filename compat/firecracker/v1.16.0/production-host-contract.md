@@ -49,17 +49,22 @@ hazard, not a requirement to reproduce that unsafe handler design. Developer
 ID/notarization and deployment remain independently owned; no credential is
 enumerated or claimed.
 
-The positive production vmnet start, packets, connectivity, service failures,
-teardown, SIGKILL reclamation, repeat execution, concurrency, and Apple-approved
+The complete positive production vmnet guest connectivity, service-failure, teardown,
+SIGKILL reclamation, repeat/concurrency, and optional Apple-approved
 identity/profile evidence remain exclusively owned by #1378. Sudo or root does
 not confer the restricted entitlement. #1930 later proves that direct shared
 vmnet and a privilege-dropped owner are feasible without that entitlement, so
 `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` become
 `missing-platform-feasible`; it does not change this production-host result.
+#1938 subsequently packages and supervises the entitlement-free provider,
+ordinary launcher, sandbox worker, and dropped owner with real provider I/O,
+signals, daemon handoff, and cleanup. It neither changes this result nor
+substitutes for the remaining guest and complete lifecycle matrix.
 
-#1378 now has a credential-free protocol and contained-worker adapter plus a
-checked production runner: strict private config and redacted result handling, a retained
+#1378 now has a credential-free protocol, contained-worker adapter, packaged
+no-Apple topology, and a checked optional production runner: strict private
+config and redacted result handling, a retained
 digest-pinned fixture exchange, a direct-rootfs-v110 DHCP/TCP guest oracle,
 two-package inspection, descriptor-rooted grants, and the fixed 21-case
 policy/API/process/death matrix. Portable injection cannot turn fixture state

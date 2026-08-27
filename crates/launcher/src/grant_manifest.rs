@@ -8,6 +8,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -34,6 +35,40 @@ const CONNECTED_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) struct LaunchInput {
     pub(crate) worker_args: Vec<OsString>,
     manifest: Option<PathBuf>,
+}
+
+/// One provider endpoint inherited only from the elevated product topology.
+pub(crate) struct InheritedVmnetProvider {
+    stream: UnixStream,
+    source_identity: ObjectIdentity,
+    expected_peer_pid: u32,
+}
+
+impl InheritedVmnetProvider {
+    pub(crate) fn new(
+        stream: UnixStream,
+        source_identity: ObjectIdentity,
+        expected_peer_pid: u32,
+    ) -> Result<Self, LauncherError> {
+        if source_identity.device == 0
+            || source_identity.inode == 0
+            || expected_peer_pid == 0
+            || expected_peer_pid > i32::MAX as u32
+        {
+            return Err(LauncherError::GrantPreparation);
+        }
+        Ok(Self {
+            stream,
+            source_identity,
+            expected_peer_pid,
+        })
+    }
+}
+
+impl std::fmt::Debug for InheritedVmnetProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InheritedVmnetProvider(<redacted>)")
+    }
 }
 
 impl std::fmt::Debug for LaunchInput {
@@ -75,13 +110,30 @@ impl LaunchInput {
     }
 
     pub(crate) fn prepare(self) -> Result<(Vec<OsString>, PreparedGrantBatch), LauncherError> {
+        self.prepare_inner(None)
+    }
+
+    pub(crate) fn prepare_with_vmnet_provider(
+        self,
+        provider: InheritedVmnetProvider,
+    ) -> Result<(Vec<OsString>, PreparedGrantBatch), LauncherError> {
+        self.prepare_inner(Some(provider))
+    }
+
+    fn prepare_inner(
+        self,
+        provider: Option<InheritedVmnetProvider>,
+    ) -> Result<(Vec<OsString>, PreparedGrantBatch), LauncherError> {
         let grants = self
             .manifest
             .as_deref()
             .map(load_manifest)
             .transpose()?
             .unwrap_or_default();
-        let batch = PreparedGrantBatch::prepare(grants)?;
+        let batch = match provider {
+            Some(provider) => PreparedGrantBatch::prepare_inner(grants, Some(provider))?,
+            None => PreparedGrantBatch::prepare(grants)?,
+        };
         Ok((self.worker_args, batch))
     }
 }
@@ -426,9 +478,30 @@ impl std::fmt::Debug for PreparedGrantBatch {
 
 impl PreparedGrantBatch {
     fn prepare(grants: Vec<ManifestGrant>) -> Result<Self, LauncherError> {
+        Self::prepare_inner(grants, None)
+    }
+
+    fn prepare_inner(
+        grants: Vec<ManifestGrant>,
+        inherited_provider: Option<InheritedVmnetProvider>,
+    ) -> Result<Self, LauncherError> {
         let batch = BatchId::generate().map_err(|_| LauncherError::GrantPreparation)?;
-        let grant_count =
-            u16::try_from(grants.len()).map_err(|_| LauncherError::GrantPreparation)?;
+        let provider_id =
+            GrantId::parse("vmnet-provider").map_err(|_| LauncherError::GrantPreparation)?;
+        if inherited_provider.is_some()
+            && grants.iter().any(|grant| {
+                grant.role == ResourceRole::VmnetProviderStream || grant.id == provider_id
+            })
+        {
+            return Err(LauncherError::InvalidGrantInput);
+        }
+        let grant_count = u16::try_from(
+            grants
+                .len()
+                .checked_add(usize::from(inherited_provider.is_some()))
+                .ok_or(LauncherError::GrantPreparation)?,
+        )
+        .map_err(|_| LauncherError::GrantPreparation)?;
         let mut identities = HashSet::new();
         let mut records = Vec::new();
         let mut bookmark_bytes = 0_u32;
@@ -531,6 +604,35 @@ impl PreparedGrantBatch {
                     evidence_readback,
                 });
             }
+        }
+        if let Some(inherited) = inherited_provider {
+            let prepared = prepare_connected_stream(
+                inherited.stream,
+                inherited.source_identity,
+                Some((0, 0)),
+            )?;
+            let peer = prepared.peer.ok_or(LauncherError::GrantPreparation)?;
+            if peer.process_id() != inherited.expected_peer_pid
+                || prepared.source_identity != Some(inherited.source_identity)
+                || prepared.identity == inherited.source_identity
+                || !identities.insert(prepared.identity)
+            {
+                return Err(LauncherError::GrantPreparation);
+            }
+            records.push(PreparedRecord {
+                record: GrantRecord::ConnectedStream {
+                    id: provider_id,
+                    role: ResourceRole::VmnetProviderStream,
+                    access: GrantAccess::ReadWrite,
+                    identity: prepared.identity,
+                    source_identity: inherited.source_identity,
+                    status_flags: prepared.status_flags,
+                    peer,
+                },
+                descriptor: Some(prepared.descriptor),
+                #[cfg(feature = "elevated-bootstrap-probe")]
+                evidence_readback: None,
+            });
         }
         let record_count = records
             .len()

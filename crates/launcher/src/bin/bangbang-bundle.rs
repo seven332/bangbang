@@ -69,6 +69,7 @@ where
     };
     let mut launcher_binary = None;
     let mut worker_binary = None;
+    let mut vmnet_provider_binary = None;
     let mut output_bundle = None;
     let mut signing_identity = None;
     let mut profile = None;
@@ -88,6 +89,15 @@ where
                 set_once(
                     &mut worker_binary,
                     PathBuf::from(required_value(&mut args, "--worker requires a path")?),
+                )?;
+            }
+            Some("--vmnet-provider") => {
+                set_once(
+                    &mut vmnet_provider_binary,
+                    PathBuf::from(required_value(
+                        &mut args,
+                        "--vmnet-provider requires a path",
+                    )?),
                 )?;
             }
             Some("--output") => {
@@ -155,6 +165,7 @@ where
     let options = PackageOptions {
         launcher_binary: launcher_binary.ok_or("--launcher is required")?,
         worker_binary: worker_binary.ok_or("--worker is required")?,
+        vmnet_provider_binary: vmnet_provider_binary.ok_or("--vmnet-provider is required")?,
         output_bundle: output_bundle.ok_or("--output is required")?,
         signing_identity: signing_identity.unwrap_or_else(|| OsString::from("-")),
         profile,
@@ -191,13 +202,13 @@ fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), &'static str> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  bangbang-bundle [build] --launcher PATH --worker PATH --output PATH [--signing-identity IDENTITY] [--worker-profile networkless|vmnet] [--provisioning-profile PATH]\n  bangbang-bundle preflight --launcher PATH --worker PATH --output PATH --signing-identity IDENTITY --worker-profile vmnet --provisioning-profile PATH"
+        "Usage:\n  bangbang-bundle [build] --launcher PATH --worker PATH --vmnet-provider PATH --output PATH [--signing-identity IDENTITY] [--worker-profile networkless|vmnet] [--provisioning-profile PATH]\n  bangbang-bundle preflight --launcher PATH --worker PATH --vmnet-provider PATH --output PATH --signing-identity IDENTITY --worker-profile vmnet --provisioning-profile PATH"
     );
 }
 
 fn print_usage_error() {
     eprintln!(
-        "Usage:\n  bangbang-bundle [build] --launcher PATH --worker PATH --output PATH [--signing-identity IDENTITY] [--worker-profile networkless|vmnet] [--provisioning-profile PATH]\n  bangbang-bundle preflight --launcher PATH --worker PATH --output PATH --signing-identity IDENTITY --worker-profile vmnet --provisioning-profile PATH"
+        "Usage:\n  bangbang-bundle [build] --launcher PATH --worker PATH --vmnet-provider PATH --output PATH [--signing-identity IDENTITY] [--worker-profile networkless|vmnet] [--provisioning-profile PATH]\n  bangbang-bundle preflight --launcher PATH --worker PATH --vmnet-provider PATH --output PATH --signing-identity IDENTITY --worker-profile vmnet --provisioning-profile PATH"
     );
 }
 
@@ -212,6 +223,8 @@ mod tests {
             OsString::from("launcher"),
             OsString::from("--worker"),
             OsString::from("worker"),
+            OsString::from("--vmnet-provider"),
+            OsString::from("provider"),
             OsString::from("--output"),
             OsString::from("Bangbang.app"),
         ])
@@ -234,6 +247,8 @@ mod tests {
                 OsString::from("launcher"),
                 OsString::from("--worker"),
                 OsString::from("worker"),
+                OsString::from("--vmnet-provider"),
+                OsString::from("provider"),
                 OsString::from("--output"),
                 OsString::from("Bangbang.app"),
                 OsString::from("--signing-identity"),

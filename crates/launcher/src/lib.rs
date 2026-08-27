@@ -29,7 +29,8 @@ pub use error::ElevatedDaemonStage;
 pub use error::{JailerIsolationArgument, LauncherError, PackageError};
 pub use layout::{
     BundleLayout, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME, OUTER_BUNDLE_NAME,
-    WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
+    VMNET_PROVIDER_EXECUTABLE_NAME, VMNET_PROVIDER_IDENTIFIER, WORKER_BUNDLE_IDENTIFIER,
+    WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 pub use package::{build_bundle, preflight_bundle};
 pub use package_options::{PackageOptions, PackageProfile};

@@ -137,8 +137,10 @@ cargo build \
   --quiet \
   -p bangbang \
   -p bangbang-launcher \
+  -p bangbang-vmnet-provider \
   --bin bangbang \
   --bin bangbang-launcher \
+  --bin bangbang-vmnet-provider \
   --release \
   --no-default-features \
   --locked \
@@ -155,6 +157,7 @@ cargo build \
   preflight \
   --launcher "$repo_root/target/$target_triple/release/bangbang-launcher" \
   --worker "$repo_root/target/$target_triple/release/bangbang" \
+  --vmnet-provider "$repo_root/target/$target_triple/release/bangbang-vmnet-provider" \
   --output "$output" \
   --signing-identity "$signing_identity" \
   --worker-profile vmnet \

@@ -7,7 +7,7 @@ use bangbang_session::{
     credential::CredentialTarget,
 };
 
-use crate::grant_manifest::{LaunchInput, PreparedGrantBatch};
+use crate::grant_manifest::{InheritedVmnetProvider, LaunchInput, PreparedGrantBatch};
 use crate::{JailerIsolationArgument, LauncherError};
 
 pub(crate) const JAILER_ACTIVATION: &str = "--bangbang-jailer-v1";
@@ -94,14 +94,14 @@ impl LaunchIdentity {
         matches!(self, Self::Current { .. })
     }
 
-    const fn uid(self) -> u32 {
+    pub(crate) const fn uid(self) -> u32 {
         match self {
             Self::Current { uid, .. } => uid,
             Self::RootRetained(target) | Self::RootTransition(target) => target.uid(),
         }
     }
 
-    const fn gid(self) -> u32 {
+    pub(crate) const fn gid(self) -> u32 {
         match self {
             Self::Current { gid, .. } => gid,
             Self::RootRetained(target) | Self::RootTransition(target) => target.gid(),
@@ -276,12 +276,43 @@ impl LaunchRequest {
         daemonized: bool,
         worker_profile: crate::macos::code_sign::WorkerProfile,
     ) -> Result<PreparedLaunch, LauncherError> {
+        self.prepare_inner(worker_executable, timing, daemonized, worker_profile, None)
+    }
+
+    pub(crate) fn prepare_with_vmnet_provider(
+        self,
+        worker_executable: &Path,
+        timing: LaunchTiming,
+        daemonized: bool,
+        worker_profile: crate::macos::code_sign::WorkerProfile,
+        provider: InheritedVmnetProvider,
+    ) -> Result<PreparedLaunch, LauncherError> {
+        self.prepare_inner(
+            worker_executable,
+            timing,
+            daemonized,
+            worker_profile,
+            Some(provider),
+        )
+    }
+
+    fn prepare_inner(
+        self,
+        worker_executable: &Path,
+        timing: LaunchTiming,
+        daemonized: bool,
+        worker_profile: crate::macos::code_sign::WorkerProfile,
+        provider: Option<InheritedVmnetProvider>,
+    ) -> Result<PreparedLaunch, LauncherError> {
         let identity = self.validate(worker_executable, daemonized)?;
         let vmnet_authority = self
             .jailer
             .as_ref()
             .map_or_else(VmnetAuthority::denied, |jailer| jailer.vmnet_authority);
-        let (mut worker_args, grants) = self.grants.prepare()?;
+        let (mut worker_args, grants) = match provider {
+            Some(provider) => self.grants.prepare_with_vmnet_provider(provider)?,
+            None => self.grants.prepare()?,
+        };
         let vmnet_backend_route = worker_profile
             .vmnet_backend_route(vmnet_authority, grants.has_vmnet_provider_stream())
             .ok_or(LauncherError::InvalidLaunchPolicy)?;

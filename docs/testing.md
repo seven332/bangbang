@@ -2287,7 +2287,7 @@ input with `/dev/null`, so elevation input cannot flow into the launcher or
 signed worker.
 
 The inherited branch stages exactly the complete signed evidence bundle and
-current `/usr/lib/dyld` in a root-owned private root. A 22-entry private ledger
+current `/usr/lib/dyld` in a root-owned private root. A 28-entry private ledger
 binds every device/inode/owner/group/type/mode; preactivation negatives cover a
 writable, missing, symlinked, and inode-replaced loader, a missing nested
 worker, and an unexpected entry. The wrapper retains the #1373 direct denial,
@@ -2507,15 +2507,16 @@ signs both app bundles before runtime validation may be skipped.
 
 The `production_bundle` target exercises the shipped topology instead of the
 minimal App Sandbox fixtures. It first performs an explicit no-default-feature
-release build for the normal fixed outer app and separately signed nested
-worker. It then builds a visibly test-only second bundle with only the
+release build for the normal fixed outer app, entitlement-free provider, and
+separately signed nested worker. It then builds a visibly test-only second bundle with only the
 `grant-integration-probe` feature and marker resource, and compiles the
 disabled-by-default `production_bundle_e2e` target before an unsupported runner
 may skip execution. On supported Apple Silicon it proves:
 
-- exact launcher and worker identifiers, Hardened Runtime on both, no launcher
-  App Sandbox/Hypervisor authority, and exactly those two worker entitlements
-  with no embedded profile in the default networkless artifact;
+- exact launcher, provider, and worker identifiers, Hardened Runtime on all
+  three, no launcher/provider App Sandbox, Hypervisor, or vmnet authority, and
+  exactly App Sandbox plus Hypervisor on the worker with no embedded profile in
+  the default networkless artifact;
 - unchanged help/output and representative nonzero worker exit forwarding
   through the structured lifecycle session;
 - exact early jailer help/version output and closed policy parsing, including
@@ -2970,14 +2971,12 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 Success moves only `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` from
 `audit-required` to `missing-platform-feasible`, giving exact `383/0/2/33`.
-It does not support a root-direct production VMM. The minimal provider/broker,
-privilege-dropped service owner, and bounded process reclamation now exist as a
-foundation, but the workflow does not assemble a production launcher bootstrap,
-guest-through-provider path, or concurrent production topology. The separate
-#1936 credential-free tests now exercise the contained remote adapter against a
-fake Provider-v1 peer both portably and inside the ad-hoc-signed networkless
-App Sandbox worker; that evidence does not replace this exact-root workflow or
-promote either row.
+It does not support a root-direct production VMM. The later #1934 and #1936
+slices add the minimal provider/broker, privilege-dropped service owner, and
+contained remote adapter. #1938 separately assembles their fixed product
+topology as described below. None of those successor results replaces this
+direct guest evidence or promotes either row; real guest-through-provider and
+the complete concurrent production certification remain outstanding.
 
 ### Private vmnet provider protocol
 
@@ -3019,9 +3018,66 @@ that the networkless worker authenticates the remote-only route, never creates
 a local vmnet/XPC descriptor, performs readiness/read/write and ordered cleanup
 twice, and closes an unclaimed provider grant without sending protocol bytes.
 It uses ad-hoc signing and a local fake peer, so it requires neither an Apple
-developer identity nor a vmnet provisioning profile. It adds no elevated
-launcher/provider assembly, packaged sudo path, Apple-authorized connectivity,
-real guest-through-provider claim, or capability promotion.
+developer identity nor a vmnet provisioning profile. The later product topology
+gate composes the real provider and launcher; this fake-peer case still adds no
+Apple-authorized connectivity, real guest-through-provider claim, or capability
+promotion.
+
+### Production vmnet topology without Apple authorization
+
+#1938 packages the entitlement-free provider beside the outer launcher and
+networkless App Sandbox + Hypervisor worker. Preparation must run as the
+ordinary target user and publishes one ad-hoc-signed bundle to an absent
+absolute path:
+
+```sh
+scripts/prepare-production-vmnet-topology.sh \
+  --output /absolute/absent/Bangbang.app
+```
+
+The caller then authorizes only the fixed provider helper by starting the
+runner with exact root authority and the uid/gid that own the prepared bundle:
+
+```sh
+sudo -- /usr/bin/python3 scripts/run-production-vmnet-topology.py \
+  --prepared /absolute/absent/Bangbang.app \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+```
+
+The runner itself never invokes `sudo`, reads a password, builds, signs,
+downloads, enumerates accounts, or inherits stdin. It validates the target-owned
+prepared bundle, copies it with the fixed system tool into a fresh mode-`0700`
+root-owned stage, normalizes the immutable bundle modes, and revalidates all
+three code identities, Hardened Runtime, and exact entitlement dictionaries
+before opening traversal to the target. The root
+provider accepts no product path: it derives only its sibling launcher and
+worker, runs the normal outer only after a same-image child has irreversibly
+dropped to the requested identity, and hands over only fixed connected
+descriptors.
+
+The gate runs real shared-provider start/read/write/stop twice through the
+signed networkless worker, sends SIGTERM separately to the ordinary outer and
+root provider, exercises provider-owned daemon handoff, and requires exact
+process and stage cleanup. Process inspection is restricted to
+pid/ppid/state/comm, and output contains only fixed categories. Success is
+exactly:
+
+```text
+bangbang production vmnet topology proof: provider=passed repeat=passed outer-signal=passed provider-signal=passed daemon=passed cleanup=passed
+```
+
+Portable runner policy coverage requires neither root nor Apple credentials:
+
+```sh
+python3 -m unittest scripts.tests.test_production_vmnet_topology
+```
+
+This certifies packaging, transition, inherited authority, foreground/daemon
+supervision, signals, and cleanup. It does not boot a guest through the provider
+or execute the final concurrency/death matrix, so the inventory remains exactly
+`383/0/2/33` and global final validation still fails only on the two retained
+network rows.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two

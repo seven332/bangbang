@@ -11,7 +11,9 @@ Direct mode follows Firecracker's one-VMM-process-per-microVM model. One
 startup path, and the host resources configured for that microVM. Production
 bundle mode adds one outer supervisor and one authenticated private process
 session while retaining exactly one sandbox worker and one VMM ownership domain
-per invocation.
+per invocation. The no-Apple-authorization vmnet form additionally uses the
+fixed entitlement-free provider as a root broker plus one irreversibly dropped
+owner per active interface.
 
 Direct startup uses non-clobbering fd-table preallocation as a Firecracker-style
 performance guard. Failing to read the descriptor limit or duplicate a
@@ -19,11 +21,12 @@ descriptor is non-fatal; failing to close a successfully duplicated descriptor
 is fatal. The setup does not overwrite inherited high-numbered descriptors.
 Production launch instead uses Darwin's default-close spawn mode and explicitly
 retains only open standard streams plus fixed private lifecycle, startup-grant,
-vsock-broker, and vhost-user-broker descriptors.
+vsock-broker, vhost-user-broker, retained-block-control, and, when selected,
+vmnet-topology/provider descriptors.
 
 Direct mode trusts the host user account and local filesystem permissions around
 configured paths. Production bundle mode additionally trusts its outer launcher,
-fixed metadata, and signed nested worker, while App Sandbox limits that worker
+fixed metadata, signed provider, and signed nested worker, while App Sandbox limits that worker
 to container/sealed resources plus an explicitly prepared startup grant batch
 and the fixed launcher-owned vsock and vhost-user connection facets.
 API clients, API request bodies,
@@ -74,7 +77,8 @@ inputs.
 Apple App Sandbox is a supportable containment building block, not a direct
 jailer port. The lower-level signed target packages real binaries as minimal
 apps and proves the complete HVF lifecycle plus container allow/deny behavior.
-The production target separately proves the fixed outer app and nested worker,
+The production target separately proves the fixed outer app, entitlement-free
+provider, and nested worker,
 exact entitlement split, static and dynamic code validation, descriptor closure,
 bounded protocol rejection, signal cancellation, both surviving-process cleanup
 directions, empty-namespace both-killed recovery, concurrent namespace isolation, owned socket
@@ -167,7 +171,9 @@ platform exclusions. That leaf transition did not by itself complete
 `corpus:jailer`, `corpus:production-host`, or `jailer/run`; #1912 later
 certifies the two jailer aggregates from the complete argument, operation, and
 corpus authority, while `corpus:production-host` remains independent. No #1904
-product adapter or new elevated runtime path was merged.
+product adapter was merged. The later #1938 vmnet-specific one-shot transition
+does not construct a jail root or implement the Firecracker uid/gid operation
+and therefore does not change this terminal result.
 
 ## Jailer configurable-chroot fixed-topology platform limit
 
@@ -648,9 +654,10 @@ only after paused-profile and namespace preflight.
 bangbang has two explicit execution modes. The direct CLI is one uncontained
 macOS process running as the invoking host user; its controls are the host user
 account, filesystem permissions, API socket directory, and per-resource
-validation. The production bundle has an unsandboxed outer launcher and one
-separately signed nested VMM worker constrained by App Sandbox. The launcher has
-no Hypervisor or App Sandbox entitlement and the worker has exactly both. This
+validation. The production bundle has an unsandboxed outer launcher, an
+entitlement-free provider helper, and one separately signed nested VMM worker
+constrained by App Sandbox. The launcher and provider have no Hypervisor or App
+Sandbox entitlement and the worker has exactly both. This
 is a real deployed containment boundary, but it is not Firecracker's Linux
 jailer. It now preauthorizes bounded startup resources; existing public path
 consumers for startup config, startup metadata, kernel, initrd, block, pmem,
@@ -661,8 +668,8 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | Boundary or option | Current behavior | Future direction |
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, vhost-user sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized create-children directory and safe child; contained vhost-user use requires one exact preauthorized connect-only directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
-| HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher cannot enter HVF. Both code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
-| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI and outer launcher are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, connect-only vhost-user-socket, and connected vmnet-provider authority form the current contained mode. Lifecycle v5 binds vmnet policy and the denied/local/remote route to the exact static profile and grant shape. | Elevated provider assembly, real connectivity, and restricted local-entitlement evidence remain external gates; any optional general dynamic delivery surface requires a separately challenged design. |
+| HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher and provider cannot enter HVF. All three code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI, outer launcher, and provider are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, connect-only vhost-user-socket, and connected vmnet-provider authority form the current contained mode. Lifecycle v5 binds vmnet policy and the denied/local/remote route to the exact static profile and grant shape. | Real guest-through-provider lifecycle/concurrency and restricted local-entitlement evidence remain external gates; any optional general dynamic delivery surface requires a separately challenged design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; uid/gid root-retained/root-transition and configurable-chroot requests have separate terminal fixed-topology rejections; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep the uid/gid and configurable-chroot exclusions fail-closed unless a fresh public-platform Challenge changes the accepted topology result; keep seccomp, namespaces, cgroups, and parent-cgroup controls rejected. |
 
@@ -1027,30 +1034,34 @@ Bangbang.app                         identifier dev.bangbang
 └── Contents
     ├── Info.plist
     ├── MacOS/bangbang              outer launcher
-    └── Helpers/BangbangWorker.app  identifier dev.bangbang.worker
-        └── Contents
-            ├── Info.plist
-            └── MacOS/bangbang-worker
+    └── Helpers
+        ├── bangbang-vmnet-provider identifier dev.bangbang.vmnet-provider
+        └── BangbangWorker.app      identifier dev.bangbang.worker
+            └── Contents
+                ├── Info.plist
+                └── MacOS/bangbang-worker
 ```
 
-The package tool accepts already built regular launcher and worker files, an
-absent final `Bangbang.app`, and one signing identity. It assembles a private
-mode-0700 sibling staging tree, signs the worker first with exactly App Sandbox
-and Hypervisor entitlements, signs the outer app last without an entitlement
-file, and requires Hardened Runtime on both. It inspects plist identity and
-executable fields, signatures, entitlement separation, and strict recursive
-validity before a same-volume exclusive rename publishes the final bundle.
+The package tool accepts already built regular launcher, provider, and worker
+files, an absent final `Bangbang.app`, and one signing identity. It assembles a
+private mode-0700 sibling staging tree, separately signs the provider with no
+entitlements and the worker with exactly App Sandbox and Hypervisor
+entitlements, signs the outer app last without an entitlement file, and
+requires Hardened Runtime on all three code objects. It inspects plist identity
+and executable fields, signatures, entitlement separation, and strict
+recursive validity before a same-volume exclusive rename publishes the final bundle.
 Existing destinations are never replaced or merged. Failed assembly removes
 only the private unpublished staging tree; tool output, identities, paths, and
 worker data are omitted from product errors.
 
-At runtime the launcher derives the worker from its own exact bundle location;
-there is no working-directory or user-path override. It rejects symlinked,
-missing, nonregular, wrongly identified, or invalidly signed code, any outer
-entitlement, and any worker entitlement dictionary other than exactly App
-Sandbox and Hypervisor set to Boolean true. Security.framework validates the
-outer and worker static requirements with strict, all-architecture, nested, and
-symlink-restriction checks and requires Hardened Runtime. It also validates the
+At runtime the launcher derives the provider and worker from its own exact
+bundle location; there is no working-directory or user-path override. It
+rejects symlinked, missing, nonregular, wrongly identified, or invalidly signed
+code, any outer or provider entitlement, and any worker entitlement dictionary
+other than exactly App Sandbox and Hypervisor set to Boolean true.
+Security.framework validates all three static requirements with strict,
+all-architecture, nested, and symlink-restriction checks and requires Hardened
+Runtime. It also validates the
 spawned worker's dynamic code by PID while that process is suspended and again
 after the resumed bootstrap has used its session endpoint. The requirements do
 not anchor a certificate or Team ID, so they do not authenticate a wholly
@@ -1122,6 +1133,36 @@ responsible for signals, worker reap, grants, sockets, and namespace cleanup.
 No ambient PID-file path, orphaned worker, restart service, or privilege change
 is introduced.
 
+The no-Apple-authorization vmnet entry is a separate one-shot form of the same
+fixed product. An operator invokes only the fixed provider helper with explicit
+numeric nonroot uid/gid through caller-owned `sudo` authorization. The product
+never invokes `sudo` or reads, stores, forwards, or logs its password. The root
+runner keeps its copy private until all signatures and entitlement dictionaries
+pass. The bootstrap accepts no executable, bundle, socket, manifest, account,
+signing, or helper path; it derives and pins only itself and its sibling outer
+and worker.
+
+Root suspended-spawns only the same minimal provider image. That private child
+uses fixed inherited descriptors, clears supplementary groups, changes gid then
+uid, attests the irreversible target, revalidates the pinned outer, and only
+then execs it with `/dev/null` standard input. Thus no sudo input reaches the
+outer or worker, and no outer loader, argument or manifest parser, API/HVF code,
+or worker supervisor runs as root. The root parent independently validates the
+post-exec outer image, PID, credentials, correlation, and inherited peer before
+allowing ordinary launch preparation.
+
+A descriptor-free 192-byte topology protocol binds that target, the lifecycle
+session, exact vmnet authority, foreground/daemon mode, readiness,
+cancellation, and terminal ownership. The ordinary launcher consumes the fixed
+topology and provider descriptors once and turns the verified root peer into
+the unique `vmnet-provider-stream` grant; no provider listener path exists.
+Worker resume waits for the root broker's correlated activation. The broker
+owns launcher and interface-owner termination while the launcher owns worker
+termination. Foreground and provider-owned daemon modes both require bounded
+acknowledgement, reap, and empty residue. Root parses no VM resources and sees
+no guest packet bytes; an interface owner alone starts vmnet while root and
+performs packet work only after its permanent credential drop.
+
 The launcher kqueue watches both graceful signals, the session stream, grant
 socket writability, broker input, and the unreaped child. The first signal sends one bounded cancellation and starts a
 five-second grace deadline; later signals are coalesced, and expiry kills only
@@ -1135,7 +1176,7 @@ death; a later worker scans at most 128 names and removes only valid empty
 unlocked identity-stable residue after both were killed. There is no automatic
 restart or reconnect.
 
-The outer launcher, fixed metadata, and signed nested code are trusted package
+The outer launcher, provider helper, fixed metadata, and signed nested code are trusted package
 components. API requests, guest data, device input, host path arguments, and
 HVF exits remain untrusted worker inputs. Container/sealed resources plus the
 committed startup registry and fixed vsock connection facet are the current
@@ -1349,13 +1390,12 @@ supported production topology; root is not treated as the restricted Apple
 entitlement; and no password, authorization token, account name, path,
 interface, address, packet, nonce, PID, or raw framework/process output is
 recorded. #1934 now supplies the minimal one-shot root provider and the
-per-interface owner that drops privilege after vmnet start. The intended #1378
-product still requires an unprivileged launcher bootstrap and a sandboxed HVF
-worker using the transferred remote packet provider. Production authorization,
-elevated launcher-to-provider assembly, guest-through-provider certification,
-concurrent production topology, and the optional Apple-authorized matrix remain
-undelivered. The contained adapter itself is now credential-free and uses the
-authenticated remote route.
+per-interface owner that drops privilege after vmnet start. #1936 supplies the
+credential-free contained remote adapter, and #1938 now supplies the fixed
+drop-before-outer-exec bootstrap, inherited provider grant, packaged
+provider/launcher/worker/owner assembly, and foreground/daemon supervision.
+Guest-through-provider certification, the complete concurrent production
+matrix, and the optional Apple-authorized matrix remain undelivered.
 
 The local vmnet worker path requires the host to satisfy macOS vmnet
 authorization, entitlement, and code-signing requirements. The split provider
@@ -2819,11 +2859,12 @@ Real Hypervisor.framework execution requires macOS support, Apple Silicon, and
 the `com.apple.security.hypervisor` entitlement on binaries that enter HVF.
 
 In the production bundle only `dev.bangbang.worker` receives that entitlement,
-paired with `com.apple.security.app-sandbox`; `dev.bangbang` receives neither.
-The two code objects are independently signed with one identity and Hardened
-Runtime, then recursively verified before publication and again through the
-launcher at execution. The default ad-hoc identity is local validation, not
-Developer ID or notarization evidence.
+paired with `com.apple.security.app-sandbox`; `dev.bangbang` and
+`dev.bangbang.vmnet-provider` receive neither. The three code objects are
+independently signed with one identity and Hardened Runtime, then recursively
+verified before publication and again through the product boundary at
+execution. The default ad-hoc identity is local validation, not Developer ID or
+notarization evidence.
 
 The unsigned Rust test path runs only non-HVF unit tests. Real HVF integration
 tests must run through `scripts/run-integration-tests.sh`. This wrapper builds
@@ -3007,9 +3048,9 @@ ambient network entitlement, dynamic Mach service, root requirement, private
 API, entitlement weakening, or host-wide setting.
 
 The final production signing gate parses the effective entitlement plist
-rather than relying on substring checks. The outer launcher must have an empty
-entitlement dictionary. The nested worker must have exactly two Boolean-true
-entries: App Sandbox and Hypervisor. Existing tamper cases reject false
+rather than relying on substring checks. The outer launcher and provider must
+each have an empty entitlement dictionary. The nested worker must have exactly
+two Boolean-true entries: App Sandbox and Hypervisor. Existing tamper cases reject false
 sandbox, extra network/vmnet authority, provisioning profiles, and missing
 hardened runtime before worker execution.
 
@@ -3957,8 +3998,8 @@ deployment claim; only #1378's two positive vmnet records remain nonterminal.
 
 ## Private vmnet provider boundary
 
-The portable [`provider-v1` contract](vmnet-provider-protocol.md) and the
-`bangbang-vmnet-provider` package now implement the process foundation of the
+The portable [`provider-v1` contract](vmnet-provider-protocol.md), packaged
+`bangbang-vmnet-provider`, and fixed topology protocol now implement the
 least-authority split. Worker-facing input can select only six bootstrap-owned
 slots and bounded typed parameters; it cannot carry a path, bridge name,
 command, credential, PID, framework value, or arbitrary string. Every frame is
@@ -3994,10 +4035,13 @@ control/data pumps for start, readiness, packets, stop, runtime hotplug, and
 fresh restore ownership. MMDS-only work leaves the stream unclaimed, bridge
 names are reduced to fixed slots, failure never selects the local backend, and
 normal cleanup is data-first then control-final. A signed networkless worker
-now exercises this adapter against a local fake peer with ad-hoc signing and no
-Apple vmnet authorization. Elevated launcher-to-root
-authorization/assembly and real guest connectivity through the complete
-topology remain separate successor gates.
+exercises this adapter against a local fake peer with ad-hoc signing and no
+Apple vmnet authorization. The separate exact-root product gate now assembles
+the fixed helper, ordinary launcher, sandbox worker, and dropped owner; proves
+real provider start/read/write/stop twice; covers outer/provider signals and
+provider-owned daemon handoff; and requires exact cleanup. Real guest
+connectivity and the complete concurrent production certification matrix remain
+the successor gate.
 
 ## Current Non-Goals
 
@@ -4007,9 +4051,8 @@ The current scaffold does not implement:
 - Developer ID possession, notarization, kernel launch constraints, or an
   automatic restart/reconnect policy
 - a Firecracker-jailer replacement
-- a production launcher-to-root authorization/bootstrap path or elevated
-  four-process assembly, despite the implemented contained remote-network
-  adapter and per-interface credential drop
+- a persistent privileged install/service or general privileged operation
+  beyond the fixed one-shot vmnet bootstrap
 - general-purpose host resource brokering beyond the fixed granted-vsock
   port-only and contained vhost-user exact-child connection facets
 - Firecracker artifact compatibility, Linux UFFD wire identity, current
@@ -4018,8 +4061,10 @@ The current scaffold does not implement:
   frozen native-v1 and native-v2 2.3–2.13 profiles
 - full external-network containment beyond the documented lifecycle-v5 vmnet
   authority, authenticated remote route, and MMDS-only fast path. Networkless
-  production accepts positive policy only through its exact provider grant; a
-  local vmnet profile still depends on operator-owned signing credentials,
+  production accepts positive policy only through its exact provider grant; the
+  no-Apple product gate assembles and supervises that route but does not yet
+  certify a real guest or the complete concurrent lifecycle matrix. A local
+  vmnet profile still depends on operator-owned signing credentials,
   current-host authorization, connectivity policy, and firewall policy. The current
   ownership boundary is summarized in
   [Firecracker Compatibility Scope](firecracker-compatibility.md#aggregate-network-and-mmds-closure).

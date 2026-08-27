@@ -2,6 +2,7 @@ mod backend;
 mod broker_service;
 mod owner_service;
 mod process;
+mod topology;
 mod transport;
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -12,7 +13,12 @@ use bangbang_unix_stream::connected_unix_stream;
 use crate::broker::BrokerError;
 
 pub const PRIVATE_BROKER_MODE: &str = "--private-broker-v1";
+pub const PRIVATE_DAEMON_BROKER_MODE: &str = "--private-daemon-broker-v1";
 pub const PRIVATE_OWNER_MODE: &str = "--private-owner-v1";
+pub const PRIVATE_LAUNCHER_TRANSITION_MODE: &str = "--private-launcher-transition-v1";
+
+const VMNET_DAEMON_ENV_KEY: &str = "BANGBANG_INTERNAL_VMNET_DAEMON_V1";
+const VMNET_DAEMON_ENV_VALUE: &str = "1";
 
 const BOOTSTRAP_FD: RawFd = 3;
 const PROVIDER_FD: RawFd = 4;
@@ -33,6 +39,10 @@ pub fn run_private_owner() -> Result<(), BrokerError> {
     let data = adopt_connected_stream(PROVIDER_FD).map_err(|_| BrokerError::ProviderDescriptor)?;
     owner_service::run(supervision, data)
 }
+
+pub use topology::{
+    run_private_daemon_broker, run_private_launcher_transition, run_public_bootstrap,
+};
 
 fn require_exact_root() -> Result<(), BrokerError> {
     // SAFETY: Darwin credential getters have no pointer or ownership contract.

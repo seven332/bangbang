@@ -227,10 +227,13 @@ before session creation.
   connectivity and a dropped owner in the root-direct evidence topology,
   moving the two rows to `missing-platform-feasible`. #1934 subsequently adds
   the minimal root broker, exact privilege-dropped interface owner, and real
-  provider-v1 lifecycle/cancellation/repeat proof. This contract still does not
-  claim launcher/bootstrap assembly, the contained remote data plane, a guest
-  through that provider, concurrent production sessions, or the optional
-  Apple-authorized matrix.
+  provider-v1 lifecycle/cancellation/repeat proof; #1936 adds the contained
+  remote data plane. #1938 packages the fixed provider/launcher/worker/owner
+  topology and proves repeated real provider I/O, signals, daemon handoff, and
+  cleanup without Apple authorization. This contract still does not claim a
+  real guest through that production provider, the complete concurrent
+  lifecycle/death matrix, capability promotion, or the optional Apple-authorized
+  matrix.
 - The checked [Wave 6 snapshot contract](snapshot-wave6-contract.md) makes
   Diff, version/tool composition, exact 2.11 network/MMDS bytes,
   reconstruction, overrides, and clone-session freshness terminal. Current

@@ -24,8 +24,8 @@ use crate::layout::{
 use crate::provisioning_profile::{ApprovedProvisioningProfile, MAX_PROVISIONING_PROFILE_BYTES};
 use crate::{
     LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME, OUTER_BUNDLE_NAME, PackageError,
-    PackageOptions, PackageProfile, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME,
-    WORKER_EXECUTABLE_NAME,
+    PackageOptions, PackageProfile, VMNET_PROVIDER_EXECUTABLE_NAME, VMNET_PROVIDER_IDENTIFIER,
+    WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 
 const LAUNCHER_INFO_PLIST: &[u8] = include_bytes!("../../../packaging/macos/Bangbang-Info.plist");
@@ -210,6 +210,9 @@ fn assemble_bundle_with(
     let staged_worker = staged_worker_bundle
         .join("Contents/MacOS")
         .join(WORKER_EXECUTABLE_NAME);
+    let staged_provider = staged_bundle
+        .join("Contents/Helpers")
+        .join(VMNET_PROVIDER_EXECUTABLE_NAME);
     let staged_outer_info = staged_bundle.join("Contents/Info.plist");
     let staged_worker_info = staged_worker_bundle.join("Contents/Info.plist");
     let entitlement_file = staging.path().join("BangbangWorker.entitlements.plist");
@@ -218,6 +221,7 @@ fn assemble_bundle_with(
     create_dir(&staged_worker_bundle.join("Contents/MacOS"))?;
     copy_executable(&inputs.launcher_binary, &staged_launcher)?;
     copy_executable(&inputs.worker_binary, &staged_worker)?;
+    copy_executable(&inputs.vmnet_provider_binary, &staged_provider)?;
     write_file(&staged_outer_info, LAUNCHER_INFO_PLIST)?;
     write_file(&staged_worker_info, WORKER_INFO_PLIST)?;
 
@@ -241,6 +245,7 @@ fn assemble_bundle_with(
         copy_test_resources(resources, &destination)?;
     }
 
+    sign_provider(tools, &inputs.signing_identity, &staged_provider)?;
     sign_worker(
         tools,
         &inputs.signing_identity,
@@ -250,12 +255,15 @@ fn assemble_bundle_with(
     sign_outer(tools, &inputs.signing_identity, &staged_bundle)?;
     inspect_bundle(
         tools,
-        &staged_bundle,
-        &staged_worker_bundle,
-        &staged_outer_info,
-        &staged_worker_info,
-        &profile,
-        staging.path(),
+        &BundleInspection {
+            outer_bundle: &staged_bundle,
+            worker_bundle: &staged_worker_bundle,
+            provider: &staged_provider,
+            outer_info: &staged_outer_info,
+            worker_info: &staged_worker_info,
+            profile: &profile,
+            scratch: staging.path(),
+        },
     )?;
 
     Ok(AssembledBundle {
@@ -308,6 +316,7 @@ impl ResolvedProfile {
 struct ValidatedInputs {
     launcher_binary: PathBuf,
     worker_binary: PathBuf,
+    vmnet_provider_binary: PathBuf,
     output_parent: PathBuf,
     output_bundle: PathBuf,
     signing_identity: OsString,
@@ -319,6 +328,7 @@ impl ValidatedInputs {
     fn new(options: &PackageOptions) -> Result<Self, PackageError> {
         require_plain_file(&options.launcher_binary)?;
         require_plain_file(&options.worker_binary)?;
+        require_plain_file(&options.vmnet_provider_binary)?;
         if options.signing_identity.is_empty() {
             return Err(PackageError::InvalidInput);
         }
@@ -374,6 +384,7 @@ impl ValidatedInputs {
         Ok(Self {
             launcher_binary: options.launcher_binary.clone(),
             worker_binary: options.worker_binary.clone(),
+            vmnet_provider_binary: options.vmnet_provider_binary.clone(),
             output_parent,
             output_bundle,
             signing_identity: options.signing_identity.clone(),
@@ -685,6 +696,21 @@ fn sign_worker(
     Ok(())
 }
 
+fn sign_provider(
+    tools: &dyn ToolRunner,
+    identity: &OsStr,
+    provider: &Path,
+) -> Result<(), PackageError> {
+    let mut args = signing_args(identity);
+    args.extend([
+        OsString::from("--identifier"),
+        OsString::from(VMNET_PROVIDER_IDENTIFIER),
+        provider.as_os_str().to_os_string(),
+    ]);
+    run_success(tools, Path::new(CODESIGN), &args, "provider signing")?;
+    Ok(())
+}
+
 fn sign_outer(
     tools: &dyn ToolRunner,
     identity: &OsStr,
@@ -710,15 +736,29 @@ fn signing_args(identity: &OsStr) -> Vec<OsString> {
     args
 }
 
+struct BundleInspection<'a> {
+    outer_bundle: &'a Path,
+    worker_bundle: &'a Path,
+    provider: &'a Path,
+    outer_info: &'a Path,
+    worker_info: &'a Path,
+    profile: &'a ResolvedProfile,
+    scratch: &'a Path,
+}
+
 fn inspect_bundle(
     tools: &dyn ToolRunner,
-    outer_bundle: &Path,
-    worker_bundle: &Path,
-    outer_info: &Path,
-    worker_info: &Path,
-    profile: &ResolvedProfile,
-    scratch: &Path,
+    inspection: &BundleInspection<'_>,
 ) -> Result<(), PackageError> {
+    let BundleInspection {
+        outer_bundle,
+        worker_bundle,
+        provider,
+        outer_info,
+        worker_info,
+        profile,
+        scratch,
+    } = inspection;
     inspect_plist_value(
         tools,
         outer_info,
@@ -738,6 +778,15 @@ fn inspect_bundle(
         profile,
         &scratch.join("worker-signing-certificate"),
     )?;
+    verify_requirement(
+        tools,
+        provider,
+        &format!(
+            "identifier \"{VMNET_PROVIDER_IDENTIFIER}\" and entitlement[\"{APP_SANDBOX_ENTITLEMENT}\"] absent and entitlement[\"{HYPERVISOR_ENTITLEMENT}\"] absent and entitlement[\"{VMNET_ENTITLEMENT}\"] absent and entitlement[\"{APPLICATION_IDENTIFIER_ENTITLEMENT}\"] absent and entitlement[\"{TEAM_IDENTIFIER_ENTITLEMENT}\"] absent"
+        ),
+    )?;
+    inspect_runtime_flag(tools, provider)?;
+    inspect_outer_entitlements(tools, provider)?;
     verify_requirement(
         tools,
         outer_bundle,
@@ -1240,11 +1289,14 @@ mod tests {
     fn options(test_dir: &TestDir) -> PackageOptions {
         let launcher = test_dir.0.join("launcher");
         let worker = test_dir.0.join("worker");
+        let provider = test_dir.0.join("vmnet-provider");
         fs::write(&launcher, b"launcher").expect("launcher should be written");
         fs::write(&worker, b"worker").expect("worker should be written");
+        fs::write(&provider, b"provider").expect("provider should be written");
         PackageOptions {
             launcher_binary: launcher,
             worker_binary: worker,
+            vmnet_provider_binary: provider,
             output_bundle: test_dir.0.join(OUTER_BUNDLE_NAME),
             signing_identity: OsString::from("-"),
             profile: PackageProfile::Networkless,
@@ -1288,6 +1340,12 @@ mod tests {
         assert!(
             published
                 .join("Contents/Helpers")
+                .join(VMNET_PROVIDER_EXECUTABLE_NAME)
+                .is_file()
+        );
+        assert!(
+            published
+                .join("Contents/Helpers")
                 .join(WORKER_BUNDLE_NAME)
                 .join("Contents/MacOS")
                 .join(WORKER_EXECUTABLE_NAME)
@@ -1306,16 +1364,23 @@ mod tests {
             .iter()
             .filter(|call| call.iter().any(|argument| argument == "--sign"))
             .collect::<Vec<_>>();
-        assert_eq!(signing_calls.len(), 2);
+        assert_eq!(signing_calls.len(), 3);
         assert!(
             signing_calls[0]
+                .last()
+                .expect("provider sign target should exist")
+                .to_string_lossy()
+                .ends_with(VMNET_PROVIDER_EXECUTABLE_NAME)
+        );
+        assert!(
+            signing_calls[1]
                 .last()
                 .expect("worker sign target should exist")
                 .to_string_lossy()
                 .contains(WORKER_BUNDLE_NAME)
         );
         assert!(
-            !signing_calls[1]
+            !signing_calls[2]
                 .last()
                 .expect("outer sign target should exist")
                 .to_string_lossy()
@@ -1364,10 +1429,11 @@ mod tests {
             .filter_map(|call| call.last())
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(sign_targets.len(), 3);
-        assert!(sign_targets[0].contains(WORKER_BUNDLE_NAME));
-        assert!(sign_targets[1].ends_with(OUTER_BUNDLE_NAME));
-        assert!(sign_targets[2].contains(AUTHORIZATION_PROBE_BUNDLE_NAME));
+        assert_eq!(sign_targets.len(), 4);
+        assert!(sign_targets[0].ends_with(VMNET_PROVIDER_EXECUTABLE_NAME));
+        assert!(sign_targets[1].contains(WORKER_BUNDLE_NAME));
+        assert!(sign_targets[2].ends_with(OUTER_BUNDLE_NAME));
+        assert!(sign_targets[3].contains(AUTHORIZATION_PROBE_BUNDLE_NAME));
         assert!(calls.iter().any(|call| {
             call.iter()
                 .any(|argument| argument == "--extract-certificates")
@@ -1672,7 +1738,7 @@ mod tests {
                 &RecordingAuthorization::default(),
                 &RenamePublisher,
             ),
-            Err(PackageError::ToolFailure("worker signing"))
+            Err(PackageError::ToolFailure("provider signing"))
         );
         assert!(!options.output_bundle.exists());
         let residue = fs::read_dir(&test_dir.0)

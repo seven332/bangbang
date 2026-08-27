@@ -7,12 +7,14 @@ per interface. Exact-host evidence calls the real vmnet API under explicit root
 authority and requires no Apple-approved vmnet entitlement, provisioning
 profile, or signing identity.
 
-The networkless contained worker now accepts one authenticated
+The networkless contained worker accepts one authenticated
 `vmnet-provider-stream` startup grant and adapts it to the existing process
-network registry. This is still not a final production network path: no
-launcher-to-root bootstrap, operator authorization workflow, elevated product
-assembly, or real guest-through-provider certification exists in this slice.
-Neither retained network capability is promoted.
+network registry. The production bundle now includes the separately signed,
+entitlement-free provider and an explicitly elevated one-shot bootstrap. The
+complete launcher/provider/worker/owner topology is assembled and supervised
+without an Apple developer identity or vmnet provisioning profile. Full real
+guest-through-provider lifecycle and concurrency certification remains a
+separate slice, so neither retained network capability is promoted here.
 
 ## Components
 
@@ -27,6 +29,9 @@ Neither retained network capability is promoted.
   resolution, broker/owner supervision, exact child lifetime, credential
   type-state boundary, and the macOS adapter to the existing
   `SystemVmnetInterfaceBackend`.
+- `bangbang-launcher` packages the provider at one fixed sibling path, adopts
+  its inherited connected stream as the unique provider grant, binds it to the
+  lifecycle and launch policy, and supervises the sandbox worker.
 - `bangbang` owns the contained client adapter. A session-scoped control pump
   and one data pump per interface are the only readers and writers of their
   Provider-v1 streams; the existing process network registry continues to own
@@ -38,6 +43,50 @@ Neither retained network capability is promoted.
 
 The same shared Unix-stream primitive backs the existing portable vhost-user
 frontend without changing its public protocol.
+
+## Packaged elevated topology
+
+`Bangbang.app/Contents/Helpers/bangbang-vmnet-provider` is a separately signed
+code object with fixed identifier `dev.bangbang.vmnet-provider`, Hardened
+Runtime, and no App Sandbox, Hypervisor, vmnet, application, or team
+entitlement. Its public `--bootstrap-v1` mode accepts only a numeric nonroot
+uid/gid, an optional daemon bit, one delimiter, and opaque launcher arguments.
+It accepts no executable, bundle, socket, config, account, signing, or helper
+path and never handles sudo credentials. The caller invokes this exact helper
+through its chosen elevation mechanism; repository code does not invoke
+`sudo`.
+
+Root executes only the minimal provider image. The bootstrap pins its own image
+and the fixed sibling outer and worker layout, then suspended-spawns the same
+provider image in a descriptor-gated private transition mode. That child clears
+supplementary groups, changes gid before uid, attests the irreversible target
+identity, revalidates the pinned outer, fixes standard input to `/dev/null`, and
+only then execs it. Consequently no sudo input reaches the outer or worker, and
+the outer loader, runtime, argument and manifest parsing, API/HVF work, and
+worker supervision all begin as the ordinary target user. The root parent validates
+the post-exec outer image, PID, credential, and correlation before allowing it
+to proceed.
+
+The root broker and ordinary launcher exchange only canonical descriptor-free
+192-byte topology frames. The protocol binds the target credential, lifecycle
+session, exact host/shared/bridge-slot/count authority, process roles, launch
+mode, readiness, cancellation, and terminal acknowledgement. The launcher
+adopts the fixed topology and provider descriptors once, validates the root
+peer independently, and converts the provider endpoint into the unique
+`vmnet-provider-stream` grant using the verified provider executable as its
+source identity. It never publishes or reconnects through a filesystem socket,
+and pager/provider roles cannot substitute for each other.
+
+Foreground mode retains the caller-attached root broker. Daemon mode uses a
+bounded same-image root handoff and the same drop-before-outer-exec sequence;
+the detached broker owns the ordinary launcher, which owns the sandbox worker,
+while the broker also owns every dropped interface owner. Broker, launcher,
+worker, or owner failure, signal, EOF, protocol error, or timeout cancels the
+whole topology, and success requires correlated terminal acknowledgement,
+owner retirement, process reap, and empty topology residue. Root never parses
+VM resources or handles guest packets; only the per-interface process starts
+vmnet while root and performs sustained packet work after its irreversible
+drop.
 
 ## Contained worker route and ownership
 
@@ -237,10 +286,34 @@ adds real provider-v1 data lifecycle, control cancellation, clean repeat, and
 empty-residue cases before the existing dropped-owner and repeated guest gates.
 Its fixed successful status explicitly records `apple-vmnet=absent`.
 
+The production topology gate builds and signs as the ordinary target user, then
+uses one caller-authorized exact-root invocation. It verifies the fixed three-
+code-object layout and entitlement split, real shared-provider start/read/write/
+stop twice, outer and provider signal convergence, provider-owned daemon
+handoff, and exact cleanup. The runner never invokes `sudo`, consumes no stdin,
+and reports only fixed categories:
+
+```sh
+scripts/prepare-production-vmnet-topology.sh \
+  --output /absolute/absent/Bangbang.app
+sudo -- /usr/bin/python3 scripts/run-production-vmnet-topology.py \
+  --prepared /absolute/absent/Bangbang.app \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+```
+
+Its exact success line is:
+
+```text
+bangbang production vmnet topology proof: provider=passed repeat=passed outer-signal=passed provider-signal=passed daemon=passed cleanup=passed
+```
+
 This implementation deliberately changes no capability disposition. The
 checked inventory remains `383 implemented / 0 audit-required / 2
 missing-platform-feasible / 33 proven-platform-impossible`; the two retained
 rows are `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity`. Elevated launcher
-bootstrap, a real guest through this provider, production death/reclamation and
-concurrency evidence, and final lifecycle certification remain successor work.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity`. The packaged
+elevated bootstrap and foreground/daemon supervision are now implemented. A
+real guest through this production provider, the complete concurrent
+lifecycle/death matrix, optional Apple-authorized evidence, and final capability
+certification remain successor work.

@@ -420,6 +420,13 @@ scripts/fetch-firecracker-rootfs.sh >/dev/null
 scripts/build-guest-boot-initrd.py --check >/dev/null
 
 cargo build \
+  -p bangbang-vmnet-provider \
+  --bin bangbang-vmnet-provider \
+  --release \
+  --locked \
+  --target "$target_triple"
+
+cargo build \
   -p bangbang-launcher \
   --bin bangbang-bundle \
   --release \
@@ -506,6 +513,7 @@ sidecar_published=true
 "$repo_root/target/release/bangbang-bundle" build \
   --launcher "$launcher_bin" \
   --worker "$worker_bin" \
+  --vmnet-provider "$repo_root/target/$target_triple/release/bangbang-vmnet-provider" \
   --output "$output" \
   --signing-identity - \
   --worker-profile networkless \

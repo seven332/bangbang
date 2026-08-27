@@ -1179,10 +1179,11 @@ an open-ended “full logging and metrics” placeholder.
 
 The ordinary `bangbang` CLI remains the direct, uncontained process entry point.
 The separate production `Bangbang.app` entry point has a fixed unsandboxed
-launcher and one nested `dev.bangbang.worker` VMM. The worker is separately
-signed with exactly App Sandbox and Hypervisor entitlements, while the launcher
-has neither; both use Hardened Runtime. Assembly is private and no-clobber,
-inspects both code objects before exclusive publication, and runtime launch
+launcher, one fixed `dev.bangbang.vmnet-provider` helper, and one nested
+`dev.bangbang.worker` VMM. The worker is separately signed with exactly App
+Sandbox and Hypervisor entitlements, while launcher and provider have none; all
+three use Hardened Runtime. Assembly is private and no-clobber, inspects all
+three code objects before exclusive publication, and runtime launch
 fails closed on wrong placement, symlinks, missing or modified code, signature,
 identifier, or required-entitlement failures.
 
@@ -1192,8 +1193,10 @@ That policy binds the fixed executable, current uid/gid, one validated ID,
 launcher-owned timing, repeatable last-value `fsize`/`no-file` values, and
 optional daemon mode. Darwin's default-close spawn policy supplies only a
 private marker environment, standard streams, and fixed lifecycle,
-startup-grant, dormant vsock-broker, and dedicated vhost-user-broker endpoints
-to the worker.
+startup-grant, dormant vsock-broker, dedicated vhost-user-broker, and retained
+block-control endpoints to the worker. The no-Apple remote-network form also
+adopts fixed topology/provider endpoints before launch and commits the provider
+stream through the same typed grant transaction.
 It validates the suspended live worker, resumes only the
 private bootstrap, authenticates the child-attributed socket peer and live code,
 and then binds a random 256-bit identity to a versioned, 4-KiB-bounded protocol
@@ -3459,7 +3462,10 @@ authorization. The separate #1930 exact-root evidence gate proves shared-vmnet
 DHCP and router-derived TCP packet movement twice without that authorization,
 plus bounded I/O after its interface owner irreversibly drops privilege. That
 root-direct topology is not production, and the 16-interface config cap does
-not enforce Apple's per-guest resource policy.
+not enforce Apple's per-guest resource policy. #1938 separately proves the
+packaged provider/launcher/worker/owner topology and real provider I/O without
+booting a guest through it; that remaining guest and lifecycle matrix is still
+required for capability promotion.
 
 The operator-owned live vmnet host policy boundary is documented in
 [`docs/security.md`](security.md#vmnet-host-policy-boundary).
@@ -4950,6 +4956,15 @@ but intentionally avoid echoing path-like request values.
 The initial blocking API server also uses a short per-connection timeout so an
 incomplete request cannot hold the single server loop indefinitely.
 
+#1938 now composes the entitlement-free provider, ordinary launcher,
+networkless App Sandbox worker, and dropped interface owner as one packaged
+production topology. Its exact-root gate proves the drop-before-outer-exec
+boundary, inherited session-bound provider grant, real shared-provider packet
+I/O twice, foreground signal convergence, provider-owned daemon handoff, and
+empty cleanup without Apple authorization. It does not run a real guest through
+that provider or the complete concurrency/death matrix and therefore changes no
+inventory disposition.
+
 API request bodies, path identifiers, and host resource paths are untrusted
 input. Future implementations must validate them before mutating VMM state and
 redact sensitive host path details from error messages. API parsing and response
@@ -5438,12 +5453,14 @@ DHCP/router-derived nonce-TCP executions remain. The workflow uses no Apple
 authorization and records only categorical output. Therefore
 `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` are now
-`missing-platform-feasible`, not implemented. Production launcher-to-broker
-authorization/assembly, a guest through the now-implemented contained remote
-provider, concurrent production certification, and the optional Apple-authorized
-matrix remain #1378 work. #1936 adds only the credential-free grant, route,
-client pumps, process-registry integration, and fake-broker evidence; it does
-not change either disposition.
+`missing-platform-feasible`, not implemented. #1936 adds the credential-free
+grant, route, client pumps, process-registry integration, and fake-broker
+evidence. #1938 then packages the fixed entitlement-free provider, starts the
+outer only after irreversible drop, activates the inherited provider grant,
+and proves foreground/daemon supervision, signals, repeated real provider I/O,
+and cleanup. Neither slice changes either disposition. A real guest through the
+production provider, the complete concurrent production certification, and the
+optional Apple-authorized matrix remain #1378 work.
 
 ## Validation Expectations
 

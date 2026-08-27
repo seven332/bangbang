@@ -26,6 +26,7 @@ where
     #[cfg(target_os = "macos")]
     {
         let args = args.into_iter().collect::<Vec<_>>();
+        let mut vmnet_topology_bootstrap = crate::macos::vmnet_topology::child_bootstrap()?;
         #[cfg(feature = "elevated-bootstrap-probe")]
         let elevated_child_bootstrap = crate::macos::elevated_daemon::child_bootstrap()?;
         #[cfg(feature = "elevated-bootstrap-probe")]
@@ -73,10 +74,16 @@ where
         let command = crate::launch_policy::LaunchCommand::parse(args)?;
         let request = match command {
             crate::launch_policy::LaunchCommand::Help => {
+                if vmnet_topology_bootstrap.is_some() {
+                    return Err(LauncherError::VmnetTopology);
+                }
                 print!("{}", crate::launch_policy::help());
                 return Ok(LauncherExit(0));
             }
             crate::launch_policy::LaunchCommand::Version => {
+                if vmnet_topology_bootstrap.is_some() {
+                    return Err(LauncherError::VmnetTopology);
+                }
                 println!("Jailer v{}", env!("CARGO_PKG_VERSION"));
                 return Ok(LauncherExit(0));
             }
@@ -85,6 +92,31 @@ where
         let executable = std::env::current_exe().map_err(|_| LauncherError::InvalidBundleLayout)?;
         let layout = BundleLayout::from_launcher_executable(&executable)?;
         let worker_profile = crate::macos::code_sign::validate_bundle(&layout)?;
+        if let Some(mut topology) = vmnet_topology_bootstrap.take() {
+            #[cfg(feature = "elevated-bootstrap-probe")]
+            if elevated_probe.is_some() || elevated_child_notifier.is_some() {
+                return Err(LauncherError::InvalidLaunchPolicy);
+            }
+            if child_bootstrap.is_some() {
+                return Err(LauncherError::InvalidLaunchPolicy);
+            }
+            let daemonized = topology.daemonized();
+            let identity = request.validate_current(layout.worker_executable(), daemonized)?;
+            topology.validate_request(
+                identity.uid(),
+                identity.gid(),
+                request.requests_daemonize(),
+            )?;
+            let provider = topology.take_provider(&layout)?;
+            let launch = request.prepare_with_vmnet_provider(
+                layout.worker_executable(),
+                timing,
+                daemonized,
+                worker_profile,
+                provider,
+            )?;
+            return launch_vmnet_topology_prepared(&layout, launch, topology);
+        }
         #[cfg(feature = "elevated-bootstrap-probe")]
         if let Some(mut notifier) = elevated_child_notifier.take() {
             let result = (|| {
@@ -1857,6 +1889,72 @@ fn probe_error_category(
         | LauncherError::InvalidLaunchPolicy => ProbeErrorCategory::InvalidInput,
         _ => ProbeErrorCategory::Other,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_vmnet_topology_prepared(
+    layout: &BundleLayout,
+    launch: crate::launch_policy::PreparedLaunch,
+    mut topology: crate::macos::vmnet_topology::ChildBootstrap,
+) -> Result<LauncherExit, LauncherError> {
+    let result = launch_vmnet_topology_session(layout, launch, &mut topology);
+    let terminal = result.as_ref().map(|exit| exit.code());
+    topology.finish(terminal)?;
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn launch_vmnet_topology_session(
+    layout: &BundleLayout,
+    launch: crate::launch_policy::PreparedLaunch,
+    topology: &mut crate::macos::vmnet_topology::ChildBootstrap,
+) -> Result<LauncherExit, LauncherError> {
+    use std::os::fd::AsRawFd;
+
+    use bangbang_session::{LauncherLifecycle, SessionId};
+
+    if !launch.identity.is_current() {
+        return Err(LauncherError::InvalidLaunchPolicy);
+    }
+    let session_id = SessionId::generate().map_err(|_| LauncherError::SessionProtocol)?;
+    topology.activate(session_id, launch.worker_policy.vmnet_authority())?;
+    let wakeups = crate::macos::supervise::SignalWakeups::install()?;
+    let mut lifecycle = LauncherLifecycle::new(session_id);
+    let mut spawned =
+        crate::macos::spawn::spawn_suspended(layout.worker_executable(), launch.worker_args)?;
+    if crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?
+        != launch.worker_profile
+    {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
+    spawned.worker.resume()?;
+    crate::macos::supervise::read_bootstrap_hello(&mut spawned.session, &mut lifecycle)?;
+    bangbang_session::macos::verify_peer(spawned.session.as_raw_fd(), spawned.worker.pid())
+        .map_err(|_| LauncherError::InvalidWorkerIdentity)?;
+    if crate::macos::code_sign::validate_worker_process(spawned.worker.pid())?
+        != launch.worker_profile
+    {
+        return Err(LauncherError::InvalidWorkerIdentity);
+    }
+    let start = lifecycle
+        .start(launch.worker_policy)
+        .map_err(|_| LauncherError::SessionProtocol)?;
+    crate::macos::supervise::write_frame(&mut spawned.session, start)?;
+    let status = crate::macos::supervise::wait_session(
+        &mut spawned.worker,
+        &mut spawned.session,
+        crate::macos::supervise::AuxiliaryChannels::new(
+            &mut spawned.grants,
+            &mut spawned.socket_broker,
+            &mut spawned.vhost_user_broker,
+            &mut spawned.block_control_broker,
+        ),
+        lifecycle,
+        wakeups,
+        &launch.grants,
+        Some(topology),
+    )?;
+    map_exit_status(status)
 }
 
 #[cfg(target_os = "macos")]
