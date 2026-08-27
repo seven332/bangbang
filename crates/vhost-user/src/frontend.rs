@@ -813,7 +813,7 @@ mod tests {
     use crate::notifier::{
         CallDrainOutcome, KickSignalOutcome, create_call_notifier, create_kick_notifier,
     };
-    use crate::transport::{recvmsg_once, sendmsg_once};
+    use bangbang_unix_stream::{MAX_ATTACHED_DESCRIPTORS, UnixStreamTransport};
 
     use super::*;
 
@@ -824,27 +824,25 @@ mod tests {
     }
 
     fn receive_peer_request(stream: &mut UnixStream) -> PeerRequest {
-        let mut header_bytes = [0_u8; HEADER_BYTES];
-        let mut header_received = 0_usize;
-        let mut descriptors = Vec::new();
-        while header_received < HEADER_BYTES {
-            let attempt = recvmsg_once(stream.as_raw_fd(), &mut header_bytes[header_received..])
-                .expect("request header should receive");
-            assert_ne!(attempt.bytes, 0, "request header must not reach EOF");
-            header_received += attempt.bytes;
-            descriptors.extend(attempt.descriptors);
-        }
+        let transport = UnixStreamTransport::new(
+            stream.try_clone().expect("peer stream should clone"),
+            Duration::from_secs(1),
+        )
+        .expect("peer transport should initialize");
+        let header_bytes = transport
+            .receive_exact(HEADER_BYTES, MAX_ATTACHED_DESCRIPTORS)
+            .expect("request header should receive");
+        let (header_bytes, mut descriptors) = header_bytes.into_parts();
         let header = Header::decode(&header_bytes).expect("request header should decode");
         assert!(!header.is_reply);
-        let mut body = vec![0_u8; header.body_size];
-        let mut body_received = 0_usize;
-        while body_received < body.len() {
-            let attempt = recvmsg_once(stream.as_raw_fd(), &mut body[body_received..])
-                .expect("request body should receive");
-            assert_ne!(attempt.bytes, 0, "request body must not reach EOF");
-            body_received += attempt.bytes;
-            descriptors.extend(attempt.descriptors);
-        }
+        let body = transport
+            .receive_exact(
+                header.body_size,
+                MAX_ATTACHED_DESCRIPTORS.saturating_sub(descriptors.len()),
+            )
+            .expect("request body should receive");
+        let (body, body_descriptors) = body.into_parts();
+        descriptors.extend(body_descriptors);
         PeerRequest {
             header,
             body,
@@ -867,7 +865,13 @@ mod tests {
 
     fn send_peer_reply(stream: &mut UnixStream, request: Request, body: &[u8]) {
         let encoded = reply_frame(request, body).expect("reply should encode");
-        stream.write_all(&encoded).expect("reply should send");
+        UnixStreamTransport::new(
+            stream.try_clone().expect("peer stream should clone"),
+            Duration::from_secs(1),
+        )
+        .expect("peer transport should initialize")
+        .send(&encoded, &[])
+        .expect("reply should send");
     }
 
     fn send_peer_reply_with_fd(
@@ -877,13 +881,13 @@ mod tests {
         descriptor: BorrowedFd<'_>,
     ) {
         let encoded = reply_frame(request, body).expect("reply should encode");
-        let sent = sendmsg_once(stream.as_raw_fd(), &encoded, &[descriptor.as_raw_fd()])
-            .expect("descriptor reply should send");
-        if sent < encoded.len() {
-            stream
-                .write_all(&encoded[sent..])
-                .expect("reply remainder should send");
-        }
+        UnixStreamTransport::new(
+            stream.try_clone().expect("peer stream should clone"),
+            Duration::from_secs(1),
+        )
+        .expect("peer transport should initialize")
+        .send(&encoded, &[descriptor])
+        .expect("descriptor reply should send");
     }
 
     fn send_peer_reply_with_fds(
@@ -893,14 +897,13 @@ mod tests {
         descriptors: &[BorrowedFd<'_>],
     ) {
         let encoded = reply_frame(request, body).expect("reply should encode");
-        let raw: Vec<_> = descriptors.iter().map(AsRawFd::as_raw_fd).collect();
-        let sent =
-            sendmsg_once(stream.as_raw_fd(), &encoded, &raw).expect("descriptor reply should send");
-        if sent < encoded.len() {
-            stream
-                .write_all(&encoded[sent..])
-                .expect("reply remainder should send");
-        }
+        UnixStreamTransport::new(
+            stream.try_clone().expect("peer stream should clone"),
+            Duration::from_secs(1),
+        )
+        .expect("peer transport should initialize")
+        .send(&encoded, descriptors)
+        .expect("descriptor reply should send");
     }
 
     fn acknowledge_if_requested(stream: &mut UnixStream, request: &PeerRequest) {
@@ -1281,7 +1284,7 @@ mod tests {
             UnixStream::pair().expect("stream pair should open");
         let mut writers = Vec::new();
         let mut readers = Vec::new();
-        for _ in 0..(MAX_ATTACHED_FDS + 1) {
+        for _ in 0..MAX_ATTACHED_FDS {
             let (writer, reader) = create_kick_notifier().expect("pipe should open");
             writers.push(writer);
             readers.push(reader);

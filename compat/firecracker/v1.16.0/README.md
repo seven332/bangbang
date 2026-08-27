@@ -170,6 +170,12 @@ two-row evidence transition, and
 [`docs/testing.md`](../../../docs/testing.md#entitlement-free-vmnet-feasibility)
 for the canonical commands.
 
+The portable
+[`provider-v1` contract](../../../docs/vmnet-provider-protocol.md) now freezes
+the closed session/control/data wire and descriptor ownership needed by the
+next implementation slices. It intentionally leaves this inventory and both
+`missing-platform-feasible` dispositions unchanged.
+
 ## Guest workflow artifact authority
 
 The guest-workflow audit deliberately separates the pinned Firecracker v1.16.0

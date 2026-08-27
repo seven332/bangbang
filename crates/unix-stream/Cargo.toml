@@ -1,11 +1,10 @@
 [package]
-name = "bangbang-vhost-user"
+name = "bangbang-unix-stream"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
 [dependencies]
-bangbang-unix-stream = { path = "../unix-stream" }
 libc = "0.2"
 
 [lints]

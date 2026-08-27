@@ -124,6 +124,13 @@ delivery validation requires that authority and the exact `383/0/2/33`
 partition. Global `validate --final` must still fail, and it must identify only
 the same two `missing-platform-feasible` records.
 
+The later portable
+[`provider-v1` contract](../../../docs/vmnet-provider-protocol.md) freezes the
+bounded wire, role state, and descriptor ownership for a future split topology.
+It consumes none of this evidence, calls no vmnet API, and changes neither
+disposition; broker/owner assembly and product certification remain separate
+successor work.
+
 #1930 does not claim any of the following:
 
 - a root direct VMM as production;

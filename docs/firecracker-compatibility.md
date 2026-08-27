@@ -4,6 +4,11 @@ This document describes bangbang's intended Firecracker compatibility scope. It
 is a planning reference for future API, VMM, and backend work; it does not mean
 the current scaffold implements all listed API behavior.
 
+The portable [private vmnet provider protocol](vmnet-provider-protocol.md)
+freezes the bounded control/data and descriptor contract for the remaining
+network handoff. It adds no broker process, vmnet call, sandbox adapter,
+production assembly, Apple authorization, or positive compatibility evidence.
+
 The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
