@@ -71,7 +71,11 @@ class GuestArtifactPolicyTests(unittest.TestCase):
         self.assertEqual(list(manifest.downloads), ["kernel", "rootfs"])
         self.assertEqual(
             list(manifest.recipes),
-            ["rootfs-ext4", "rootfs-ext4-direct-boot-v110"],
+            [
+                "rootfs-ext4",
+                "rootfs-ext4-direct-boot-v110",
+                "rootfs-ext4-direct-boot-v111",
+            ],
         )
 
         source = policy.MANIFEST_PATH.read_text(encoding="utf-8")
@@ -106,6 +110,10 @@ class GuestArtifactPolicyTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             policy._parse_args(["fetch", "kernel", "--url", "https://example.invalid"])
         self.assertEqual(caught.exception.code, 2)
+        parsed = policy._parse_args(
+            ["prepare-ext4", "--variant", "direct-boot-v111", "--size", "512M"]
+        )
+        self.assertEqual(parsed.variant, "direct-boot-v111")
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             policy._parse_args(["prepare-ext4", "--variant", "custom", "--size", "1G"])
         self.assertEqual(caught.exception.code, 2)

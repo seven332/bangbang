@@ -160,6 +160,13 @@ production-vmnet guest oracle in addition to the existing helpers; it does not
 reuse historical v109 sidecars. The public workflow above never selects that
 oracle and remains networkless.
 
+The explicit `--direct-boot-init direct-boot-v111` selector is a separate
+recipe for the entitlement-free vmnet feasibility workflow. It installs the
+static no-std `/bangbang-elevated-vmnet-certification` guest oracle instead of
+the v110 Python oracle and requires its own sidecar and filename. It is not a
+public guest-workflow mode and does not make root-direct VMM execution a
+supported deployment topology.
+
 ## Troubleshooting
 
 - `the macOS guest workflow requires Apple Silicon`: run on Darwin arm64; cross

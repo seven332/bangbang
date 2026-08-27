@@ -51,6 +51,8 @@ mod tracing_model;
 mod tracing_validate;
 mod upstream;
 mod validate;
+mod vmnet_feasibility_audit_model;
+mod vmnet_feasibility_audit_validate;
 mod wave7_aggregate_audit_model;
 mod wave7_aggregate_audit_validate;
 mod wave7_aggregate_certify;
@@ -236,6 +238,15 @@ pub use tracing_model::{
 pub use tracing_validate::{TRACING_CALL_SITE_IDS, validate_tracing_audit};
 pub use upstream::{derive_source_manifest, ensure_pinned_checkout};
 pub use validate::{ValidationErrors, validate};
+pub use vmnet_feasibility_audit_model::{
+    VmnetFeasibilityAudit, VmnetFeasibilityBoundary, VmnetFeasibilityDispositionCounts,
+    VmnetFeasibilityEvidence, VmnetFeasibilityEvidenceId, VmnetFeasibilityNonclaim,
+    VmnetFeasibilityPinnedSource, VmnetFeasibilityPlatformSource, VmnetFeasibilityTransition,
+};
+pub use vmnet_feasibility_audit_validate::{
+    VMNET_FEASIBILITY_AUDIT_PATH, VMNET_FEASIBILITY_AUDIT_SCHEMA_VERSION,
+    VMNET_FEASIBILITY_CAPABILITY_IDS, validate_vmnet_feasibility_audit,
+};
 pub use wave7_aggregate_audit_model::{
     Wave7AggregateAudit, Wave7AggregateEvidence, Wave7AggregateNonclaim, Wave7ApiPopulation,
     Wave7DesignOutcome, Wave7DesignRecord, Wave7DesignSection, Wave7DeviceApiDimension,
@@ -529,6 +540,16 @@ pub fn read_production_host_audit(path: &Path) -> Result<ProductionHostAudit, Au
         .map_err(|error| AuditError::new(format!("failed to parse production-host audit: {error}")))
 }
 
+/// Read and parse the checked entitlement-free vmnet feasibility authority.
+pub fn read_vmnet_feasibility_audit(path: &Path) -> Result<VmnetFeasibilityAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!("failed to read vmnet feasibility audit: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!("failed to parse vmnet feasibility audit: {error}"))
+    })
+}
+
 /// Read and parse the checked targeted formal-verification authority.
 pub fn read_formal_verification_audit(path: &Path) -> Result<FormalVerificationAudit, AuditError> {
     let bytes = std::fs::read(path).map_err(|error| {
@@ -693,6 +714,11 @@ pub fn jailer_seccomp_containment_audit_json(
 /// Serialize the checked production-host authority using canonical pretty JSON.
 pub fn production_host_audit_json(audit: &ProductionHostAudit) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "production-host audit")
+}
+
+/// Serialize the checked entitlement-free vmnet feasibility authority using canonical pretty JSON.
+pub fn vmnet_feasibility_audit_json(audit: &VmnetFeasibilityAudit) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "vmnet feasibility audit")
 }
 
 /// Serialize the checked targeted formal-verification authority using canonical pretty JSON.

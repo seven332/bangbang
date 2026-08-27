@@ -23,7 +23,7 @@ pub const PRODUCTION_HOST_AUDIT_PATH: &str =
 pub const PRODUCTION_HOST_CAPABILITY_ID: &str = PRODUCTION_HOST_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "7d856c4f0a437618268e601ff024f3495f9955c0149b3557aef8abb4ebb81c86";
+    "1496c8f593877845bd2480ca2ec2348edab97172b74455d5c030f48e7f64a139";
 
 const PROFILE_IDS: [ProductionHostEvidenceProfileId; 7] = [
     ProductionHostEvidenceProfileId::ContainmentAndIdentity,
@@ -236,10 +236,19 @@ fn validate_inventory_transition(
     {
         errors.push("production-host target counts must be exactly 383/2/0/33".to_string());
     }
-    if disposition_counts(inventory) != (383, 2, 0, 33) {
-        errors.push("production-host live inventory must be exactly 383/2/0/33".to_string());
+    if !matches!(
+        disposition_counts(inventory),
+        (383, 2, 0, 33) | (383, 0, 2, 33)
+    ) {
+        errors.push(
+            "production-host live inventory must be exactly 383/2/0/33 or its 383/0/2/33 vmnet-feasibility successor"
+                .to_string(),
+        );
     }
-    if classify_inventory_phase(inventory) != Ok(InventoryPhase::ProductionHost) {
+    if !matches!(
+        classify_inventory_phase(inventory),
+        Ok(InventoryPhase::ProductionHost | InventoryPhase::NetworkVmnetFeasibility)
+    ) {
         errors.push("production-host live inventory has an inexact successor phase".to_string());
     }
 
@@ -712,6 +721,7 @@ fn validate_external_dependencies(
         .iter()
         .map(|capability| (capability.id.as_str(), capability))
         .collect::<BTreeMap<_, _>>();
+    let phase = classify_inventory_phase(inventory).ok();
     for (index, (record, expected)) in audit
         .external_dependencies
         .iter()
@@ -738,6 +748,14 @@ fn validate_external_dependencies(
                     && capability.implementation.is_empty()
                     && capability.validation.is_empty()
                     && capability.delivery_issue.is_none()
+                    && capability.exclusion.is_none() => {}
+            Some(capability)
+                if phase == Some(InventoryPhase::NetworkVmnetFeasibility)
+                    && capability.disposition == Disposition::MissingPlatformFeasible
+                    && capability.implementation.is_empty()
+                    && capability.validation.is_empty()
+                    && capability.delivery_issue.as_deref()
+                        == Some("https://github.com/seven332/bangbang/issues/1378")
                     && capability.exclusion.is_none() => {}
             Some(_) => errors.push(format!(
                 "production-host external dependency changed disposition, ownership, or evidence: {}",

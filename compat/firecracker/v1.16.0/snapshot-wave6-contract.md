@@ -3,9 +3,11 @@
 This is the checked umbrella ledger for the exact 70 identities selected by
 Wave 6 of the Firecracker v1.16.0 audit. The immutable upstream baseline is
 Firecracker commit `d83d72b710361a10294480131377b1b00b163af8`.
-Sixty-eight identities are `implemented-and-verified`. Only the two broad
-network aggregates remain `audit-required`, with explicit owners outside this
-wave. This contract composes the narrower producer contracts; it does not
+At the Wave 6 checkpoint, sixty-eight identities were
+`implemented-and-verified` and the two broad network aggregates were
+`audit-required`, with explicit owners outside this wave. #1930 later moves
+those rows to `missing-platform-feasible` without rewriting this historical
+ledger. This contract composes the narrower producer contracts; it does not
 replace their detailed invariants or tests.
 
 ## Pinned source boundary

@@ -152,8 +152,9 @@ only the exact Wave 8 one-row successor, the later exact uid/gid-only
 the aggregate-jailer 379/3/3/33 successor, the multiprocess-isolation
 380/3/2/33 successor, the host-resource-authority 381/3/1/33 successor, and
 the jailer/seccomp-containment 382/3/0/33 successor, and the current
-production-host 383/2/0/33 successor while retaining only the two #1378
-external outcomes. See the
+production-host 383/2/0/33 successor, followed by the current exact
+network/vmnet-feasibility 383/0/2/33 successor. The two #1378 outcomes remain
+undelivered but are now `missing-platform-feasible` rather than unaudited. See the
 [Wave 8 contract](wave8-certification-contract.md) for the checked transitions,
 the [aggregate jailer contract](jailer-aggregate-contract.md) for its two-row
 transition, the [multiprocess isolation contract](multiprocess-isolation-contract.md)
@@ -164,7 +165,9 @@ its one-row transition, the
 for its one-row transition, the
 [production-host contract](production-host-contract.md) for the current
 one-row transition, and
-[`docs/testing.md`](../../../docs/testing.md#production-host-corpus-certification)
+the [vmnet feasibility contract](vmnet-feasibility-contract.md) for the
+two-row evidence transition, and
+[`docs/testing.md`](../../../docs/testing.md#entitlement-free-vmnet-feasibility)
 for the canonical commands.
 
 ## Guest workflow artifact authority
@@ -183,12 +186,13 @@ digest/size, and a successful `e2fsck -fn`. The sidecar is committed last as a
 validity marker; the image and sidecar are not claimed to be one crash-atomic
 transaction.
 
-The current direct recipe identity is `rootfs-ext4-direct-boot-v110`. It adds
-the exact mode-`0555` production-vmnet guest DHCP/TCP oracle as a tracked input
-alongside the two static Rust helpers and generated init. The new helper bytes
-are not aliased onto historical `direct-boot-v109`; current policy and sidecar
-validation reject that old variant. This recipe transition is protocol
-foundation only and does not change either #1378 capability disposition.
+The default direct recipe identity remains `rootfs-ext4-direct-boot-v110`. It
+adds the exact mode-`0555` Apple-authorized production-vmnet Python oracle as a
+tracked input alongside the two static Rust helpers and generated init. The
+separate `rootfs-ext4-direct-boot-v111` identity replaces that oracle with the
+static no-std entitlement-free guest oracle used only by #1930. Neither recipe
+aliases historical sidecars; v111 is feasibility evidence and does not itself
+implement either #1378 capability.
 
 Runtime sidecars stay under the ignored cache root and never count as checked
 inventory or terminal workflow evidence.

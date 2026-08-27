@@ -29,6 +29,7 @@ bangbang-cpu-template-helper = { path = "../../tools/cpu-template-helper" }
 bangbang-session = { path = "../session", features = ["test-support"] }
 crc64 = "2.0.0"
 plist = "1"
+sha2 = "0.11.0"
 
 [[test]]
 name = "executable_hvf_e2e"
@@ -38,6 +39,11 @@ test = false
 [[test]]
 name = "app_sandbox_process_e2e"
 path = "tests/app_sandbox_process_e2e.rs"
+test = false
+
+[[test]]
+name = "elevated_vmnet_e2e"
+path = "tests/elevated_vmnet_e2e.rs"
 test = false
 
 [lints]

@@ -112,8 +112,11 @@ mode before session creation. That is the complete authority result here.
 Positive vmnet connectivity, Apple-approved credentials, real packet movement,
 service failure taxonomy, teardown, cancellation, SIGKILL reclamation, repeat,
 and concurrency remain exclusively owned by #1378. `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity` remain
-audit-required. The contract does not borrow their unexecuted evidence.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` were audit-required
+at this checkpoint. #1930 later proves the narrower entitlement-free
+root-direct feasibility boundary and reclassifies them as
+`missing-platform-feasible`; this contract does not borrow that evidence into
+its historical transition.
 
 Host TAP/bridge/address/routing/NAT/firewall construction and shared-state
 cleanup remain operator responsibilities. CPU, memory, and blkio policy,
@@ -174,7 +177,9 @@ audit-required. The sole remaining #1351 feasible row was
 At the later exact `382/3/0/33` successor, #1918 certifies that containment row
 without changing this #1916 transition or its terminal host-resource claim.
 At `383/2/0/33`, #1920 separately certifies the production-host corpus; only
-the two #1378 records remain audit-required.
+the two #1378 records remain audit-required. #1930 then moves exactly those two
+records to `missing-platform-feasible`, producing the current `383/0/2/33`
+successor without changing the terminal #1916 row.
 
 ## Terminal host-resource authority outcome
 

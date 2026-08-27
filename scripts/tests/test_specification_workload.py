@@ -117,7 +117,7 @@ class SpecificationWorkloadParserTests(unittest.TestCase):
 
 
 class SpecificationWorkloadBuildBoundaryTests(unittest.TestCase):
-    def test_direct_rootfs_installs_both_helpers_with_identical_closed_flags(self) -> None:
+    def test_direct_rootfs_variants_install_helpers_with_identical_closed_flags(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             temp = Path(raw_temp)
             populate = temp / "rootfs"
@@ -201,6 +201,7 @@ else:
             environment.update(
                 {
                     "BANGBANG_GUEST_POLICY_INTERNAL": "1",
+                    "BANGBANG_GUEST_POLICY_VARIANT": "direct-boot-v110",
                     "BANGBANG_RUSTC": os.fspath(fake_rustc),
                     "FAKE_RUST_LOG": os.fspath(log_path),
                     "FAKE_RUST_SYSROOT": os.fspath(sysroot),
@@ -263,6 +264,49 @@ else:
             self.assertIn("-C", normalized[0])
             self.assertIn("link-arg=-static", normalized[0])
             self.assertIn("relocation-model=static", normalized[0])
+
+            v111_root = temp / "rootfs-v111"
+            v111_root.mkdir()
+            v111_log = temp / "rustc-v111.jsonl"
+            v111_environment = dict(environment)
+            v111_environment["BANGBANG_GUEST_POLICY_VARIANT"] = "direct-boot-v111"
+            v111_environment["FAKE_RUST_LOG"] = os.fspath(v111_log)
+            v111_result = subprocess.run(
+                (
+                    os.fspath(REPOSITORY_ROOT / "scripts/fetch-firecracker-rootfs.sh"),
+                    "--internal-populate-direct",
+                    os.fspath(v111_root),
+                ),
+                env=v111_environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(v111_result.returncode, 0, v111_result.stderr)
+            v111_entry = v111_root / "bangbang-elevated-vmnet-certification"
+            self.assertTrue(v111_entry.is_file())
+            self.assertEqual(stat.S_IMODE(v111_entry.stat().st_mode), 0o755)
+            v111_invocations = [
+                json.loads(line)
+                for line in v111_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(v111_invocations), 3)
+            self.assertEqual(
+                [Path(arguments[0]).name for arguments in v111_invocations],
+                [
+                    "arm64-id-register-report.rs",
+                    "specification-benchmark.rs",
+                    "elevated_vmnet_certification.rs",
+                ],
+            )
+            v111_normalized: list[list[str]] = []
+            for arguments in v111_invocations:
+                output_index = arguments.index("-o")
+                v111_normalized.append(
+                    ["<source>", *arguments[1:output_index], "-o", "<output>"]
+                )
+            self.assertEqual(v111_normalized, [normalized[0]] * 3)
+            self.assertIn("-D", v111_normalized[2])
+            self.assertIn("warnings", v111_normalized[2])
 
             for mode, expected_error in (
                 ("missing-target", "Rust target aarch64-unknown-linux-musl is required"),
@@ -329,6 +373,23 @@ else:
             artifact_policy, "_sha256", side_effect=changed_helper
         ):
             self.assertNotEqual(artifact_policy._recipe_digest(recipe), baseline)
+
+        v111 = next(
+            recipe
+            for recipe in manifest["ext4_recipes"]
+            if recipe["id"] == "rootfs-ext4-direct-boot-v111"
+        )
+        self.assertEqual(
+            v111["tracked_inputs"],
+            [
+                "compat/firecracker/v1.16.0/guest-workflow-audit.json",
+                "scripts/fetch-firecracker-rootfs.sh",
+                "scripts/guest/arm64-id-register-report.rs",
+                "scripts/guest/elevated_vmnet_certification.rs",
+                "scripts/guest/specification-benchmark.rs",
+                "scripts/guest_artifact_policy.py",
+            ],
+        )
 
 
 if __name__ == "__main__":

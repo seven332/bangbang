@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1378",
+  "delivery_issue": "#1930",
+  "upstream_source": {
+    "manifest_id": "corpus:network-setup",
+    "path": "docs/network-setup.md",
+    "anchor": "entire-file",
+    "git_blob": "c161b6661d4362a49d1978e0cafc5e7a6e5cebf6"
+  },
+  "platform_sources": [
+    {
+      "id": "apple-vmnet",
+      "reference": {
+        "kind": "authoritative",
+        "url": "https://developer.apple.com/documentation/vmnet"
+      },
+      "reviewed_claim": "public-vmnet-packet-and-shared-network-api"
+    },
+    {
+      "id": "apple-vm-networking-entitlement",
+      "reference": {
+        "kind": "authoritative",
+        "url": "https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_vm_networking"
+      },
+      "reviewed_claim": "restricted-entitlement-enables-vmnet-without-root-escalation"
+    }
+  ],
+  "boundary": {
+    "platform": "macos-arm64-hvf",
+    "preparation_identity": "ordinary-user",
+    "runtime_authority": "explicit-exact-root",
+    "apple_authorization": "absent",
+    "root_direct_topology": "evidence-only",
+    "elevated_build_download_or_discovery": "forbidden",
+    "diagnostic_class": "fixed-categorical-only"
+  },
+  "previous_counts": {
+    "implemented_and_verified": 383,
+    "audit_required": 2,
+    "missing_platform_feasible": 0,
+    "proven_platform_impossible": 33
+  },
+  "target_counts": {
+    "implemented_and_verified": 383,
+    "audit_required": 0,
+    "missing_platform_feasible": 2,
+    "proven_platform_impossible": 33
+  },
+  "unrelated_inventory_sha256": "591e35dd9aa7ce0ac077fa835f3fb31e448cf4e70a21fd6f7e71020c74b77941",
+  "evidence": [
+    {
+      "id": "ordinary-user-denial",
+      "repetitions": 1,
+      "outcome": "passed",
+      "required_checks": [
+        "same-ad-hoc-hvf-signed-binary",
+        "http-400",
+        "vmnet-start-interface-denied",
+        "normal-process-and-socket-cleanup"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/elevated_vmnet_e2e.rs",
+          "anchor": "fn ordinary_user_vmnet_start_is_denied()"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/prepare-elevated-vmnet-evidence.sh",
+          "anchor": "bangbang elevated vmnet prepare: ordinary denial failed"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_elevated_vmnet_evidence.py",
+          "anchor": "class ElevatedVmnetEvidenceTests"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/run-elevated-vmnet-evidence.sh",
+          "anchor": "denial=passed"
+        }
+      ]
+    },
+    {
+      "id": "dropped-owner-data-plane",
+      "repetitions": 1,
+      "outcome": "passed",
+      "required_checks": [
+        "root-start",
+        "parameter-bounds",
+        "irreversible-uid-gid-and-groups-drop",
+        "callback",
+        "bounded-read",
+        "bounded-write",
+        "stop",
+        "no-residue"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/elevated_vmnet_e2e.rs",
+          "anchor": "fn dropped_owner_retains_bounded_vmnet_io()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/elevated_host_network/mod.rs",
+          "anchor": "pub mod vmnet"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/macos/credential.rs",
+          "anchor": "pub fn transition_process"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-elevated-vmnet-evidence.sh",
+          "anchor": "dropped owner failed"
+        }
+      ]
+    },
+    {
+      "id": "direct-guest-connectivity",
+      "repetitions": 2,
+      "outcome": "passed",
+      "required_checks": [
+        "public-unix-http-api",
+        "direct-boot-v111",
+        "shared-vmnet",
+        "strict-dhcp",
+        "router-derived-endpoint",
+        "nonce-bound-request-response",
+        "normal-stop",
+        "no-residue",
+        "clean-repeat"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/tests/elevated_vmnet_e2e.rs",
+          "anchor": "fn elevated_direct_guest_uses_shared_vmnet()"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/guest/elevated_vmnet_certification.rs",
+          "anchor": "pub extern \"C\" fn _start()"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/fetch-firecracker-rootfs.sh",
+          "anchor": "bangbang.elevated-vmnet-certification=1"
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "scripts/run-elevated-vmnet-evidence.sh",
+          "anchor": "guest=passed repeat=passed cleanup=passed"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/vmnet-feasibility-contract.md",
+          "anchor": "## Exact evidence result"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/vmnet_feasibility_audit.rs",
+          "anchor": "fn checked_vmnet_feasibility_audit_is_canonical_and_fail_closed()"
+        }
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "capability_id": "corpus:network-setup",
+      "previous_disposition": "audit-required",
+      "target_disposition": "missing-platform-feasible",
+      "delivery_issue": "#1378"
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "previous_disposition": "audit-required",
+      "target_disposition": "missing-platform-feasible",
+      "delivery_issue": "#1378"
+    }
+  ],
+  "nonclaims": [
+    "root-direct-production-topology",
+    "apple-authorized-vmnet-path",
+    "privileged-provider-protocol-or-broker",
+    "sandbox-worker-remote-provider",
+    "production-service-crash-reclamation-and-concurrency",
+    "capability-implementation-or-parent-completion"
+  ]
+}

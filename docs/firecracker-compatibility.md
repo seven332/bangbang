@@ -1413,7 +1413,7 @@ namespace, device-node, or arbitrary credential mechanisms into macOS aliases.
 Exactly `corpus:jailer` and `tool-operation:jailer/run` become
 implemented-and-verified. The transition is `377/5/3/33` to `379/3/3/33`;
 `corpus:production-host`, `corpus:network-setup`, and aggregate vmnet
-connectivity remain audit-required. #1914 later closes the multiprocess
+connectivity remain audit-required at this transition. #1914 later closes the multiprocess
 isolation composite, and #1916 closes the fixed host-resource authority
 composite, leaving only the jailer/seccomp/macOS-containment composite
 missing-platform-feasible. The scoped jailer gate is:
@@ -1516,7 +1516,9 @@ boundary. This is exhaustive source coverage, not host maintenance,
 Developer ID/notarization, hardware certification, or positive vmnet proof.
 
 Only `corpus:production-host` moves, producing `383/2/0/33`; the two #1378
-network/vmnet records remain audit-required. The scoped gate is:
+network/vmnet records remain audit-required at that transition. #1930 later
+moves exactly those rows to `missing-platform-feasible`, producing
+`383/0/2/33`. The scoped gate is:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-host-final
@@ -3446,10 +3448,13 @@ completed packets, partial batches, spoof observations, and bounded latency
 aggregates feed the existing per-interface metrics generation. Teardown
 retires the generation, disables and drains the callback queue, stops vmnet,
 and only then releases the lease and wake ownership; uncertainty is terminal.
-No signed guest test uses Apple's restricted
+No signed production/contained guest test uses Apple's restricted
 [`com.apple.vm.networking`](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.vm.networking)
-authorization or proves external packet movement, and the 16-interface config
-cap does not enforce Apple's per-guest resource policy.
+authorization. The separate #1930 exact-root evidence gate proves shared-vmnet
+DHCP and router-derived TCP packet movement twice without that authorization,
+plus bounded I/O after its interface owner irreversibly drops privilege. That
+root-direct topology is not production, and the 16-interface config cap does
+not enforce Apple's per-guest resource policy.
 
 The operator-owned live vmnet host policy boundary is documented in
 [`docs/security.md`](security.md#vmnet-host-policy-boundary).
@@ -4923,9 +4928,10 @@ implementation. Exact native-v2 2.11 instead restores a fresh lossy session.
 The checked
 [Firecracker v1.16.0 network and MMDS contract](../compat/firecracker/v1.16.0/network-mmds-contract.md)
 owns exactly 35 identities. Thirty-three live, capture, and exact-2.11
-restore/clone outcomes are `implemented-and-verified`; only the network setup
-corpus and broad network semantic record remain `audit-required`. Their ledger
-rows name the exact #1378 and #1491 outcomes still missing.
+restore/clone outcomes are `implemented-and-verified`; the network setup corpus
+and broad network semantic record are `missing-platform-feasible` after the
+entitlement-free #1930 gate. Their ledger rows retain #1378 implementation
+ownership and the exact #1491 portability boundary.
 Focused API/runtime evidence is composed with signed MMIO and PCI transport,
 process isolation/hotplug, capture traversal, exact-2.11 signed V1/V2 restore,
 contained production ownership, and the fail-closed credential preflight. No
@@ -5410,10 +5416,19 @@ Host/bridged connectivity and the two typed service-failure rows stay explicit
 environment gates. Portable dependency-injected tests verify the state machine,
 redaction, and cleanup but are not production evidence. This slice does not
 discover or use restricted credentials, record a successful external run, or
-promote either #1378 row.
+promote either #1378 row by itself.
+
+The separate entitlement-free #1930 workflow prepares `direct-boot-v111` as an
+ordinary user and then runs only prebuilt immutable artifacts under explicit
+exact-root authority. It proves ordinary-user denial, real shared-vmnet
+callback/read/write/stop after an irreversible owner uid/gid drop, and two real
+HVF guest DHCP/router-derived nonce-TCP executions with full cleanup. It uses no
+Apple authorization and records only categorical output. Therefore
 `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity` therefore remain
-`audit-required`.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` are now
+`missing-platform-feasible`, not implemented. The production provider/broker,
+sandbox remote provider, crash reclamation, concurrency, and optional
+Apple-authorized matrix remain #1378 work.
 
 ## Validation Expectations
 

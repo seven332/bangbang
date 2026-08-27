@@ -2108,9 +2108,11 @@ feasible rows. The multiprocess-isolation `380/3/2/33` successor retained
 those three audit rows and two #1351 feasible rows. The
 host-resource-authority `381/3/1/33` successor retained those three audit rows
 and one #1351 feasible row. The containment `382/3/0/33` successor retained
-only those three audit rows. The current production-host `383/2/0/33`
-successor retains only the two #1378 rows. The global `--final` command
-deliberately continues to fail on those two audit records. The Rust
+only those three audit rows. The production-host `383/2/0/33`
+successor retained only the two #1378 rows. #1930 then moves those rows to
+`missing-platform-feasible`, producing the current `383/0/2/33` phase. The
+global `--final` command deliberately continues to fail on those two
+undelivered records. The Rust
 command is offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
 merged-main OID are checked and recorded by the pull-request workflow.
 
@@ -2904,8 +2906,62 @@ production bundle, create no vmnet interface, use no Apple credentials, and
 promote no capability. Until the subsequent caller-approved external execution
 and exact evidence-promotion slice finishes,
 `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity` remain
-`audit-required` and the global final gate remains expected to fail on them.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` are not implemented.
+The separate entitlement-free feasibility gate below has since moved them to
+`missing-platform-feasible`; the optional Apple-authorized matrix here remains
+unexecuted and the global final gate still fails on the same two identities.
+
+### Entitlement-free vmnet feasibility
+
+The #1930 gate assumes no Apple-approved vmnet entitlement, provisioning
+profile, or signing identity. Preparation must run as the ordinary target user
+and publishes one closed, immutable package into an absent private directory:
+
+```sh
+scripts/prepare-elevated-vmnet-evidence.sh \
+  --output /absolute/absent/elevated-vmnet-package
+```
+
+The prepared package includes the exact ad-hoc Hypervisor-signed VMM, prebuilt
+test target, pinned kernel, sidecar-verified `direct-boot-v111` rootfs, and
+manifest. Preparation also proves that the identical VMM reaches vmnet and is
+denied as the ordinary user. It never requests Apple credentials or elevation.
+
+The run wrapper requires a caller that already holds exact root authority; the
+repository wrapper itself never invokes `sudo`, reads a password, builds,
+downloads, signs, discovers accounts, or inherits stdin:
+
+```sh
+sudo -- scripts/run-elevated-vmnet-evidence.sh \
+  --prepared /absolute/absent/elevated-vmnet-package \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+```
+
+Use the uid/gid of the ordinary user that owns the package. The root run starts
+one real shared-vmnet owner and irreversibly drops it to that identity before
+bounded callback/read/write/stop checks. It then starts the real public VMM and
+HVF guest twice; the static no-std v111 oracle performs strict DHCP and derives
+its nonce-bound TCP endpoint only from the accepted router. Every case has a
+fixed deadline and must leave no harness-owned process, socket, file, listener,
+or interface residue. Output is fixed categorical text and excludes paths,
+identities, PIDs, interface names, addresses, packets, nonces, and raw errors.
+
+Portable policy and tamper coverage plus the checked audit run unprivileged:
+
+```sh
+python3 -m unittest scripts.tests.test_elevated_vmnet_evidence
+cargo test -p bangbang-firecracker-capability-audit \
+  --test vmnet_feasibility_audit --locked
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+```
+
+Success moves only `corpus:network-setup` and
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` from
+`audit-required` to `missing-platform-feasible`, giving exact `383/0/2/33`.
+It does not support a root-direct production VMM or implement #1378's minimal
+provider/broker, privilege-dropped service owner, sandbox remote provider,
+crash reclamation, or concurrent production topology.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
@@ -4282,14 +4338,16 @@ fail while independently owned audit-required records remain open.
 
 The scoped #1920 production-host gate consumes the complete pinned
 `docs/prod-host-setup.md` authority and certifies the exact `383/2/0/33`
-successor while retaining only the two #1378 vmnet records:
+historical successor. Delivery validation also accepts the later exact
+`383/0/2/33` vmnet-feasibility successor:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-host-final
 ```
 
 This is exhaustive source accounting, including explicit operator and platform
-boundaries; it is not positive production-vmnet or deployment evidence.
+boundaries; it is not production provider/broker, contained connectivity, or
+deployment evidence.
 
 ## PR Expectations
 

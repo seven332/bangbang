@@ -221,10 +221,15 @@ and two #1378 network/vmnet audit-required records. The checked
 sources, 46 clauses, terminal and external dependencies, current-tree
 evidence, residual classifications, and every nonclaim.
 
-The current production-host successor is exactly `383/2/0/33`: #1920 moves
+The production-host successor is exactly `383/2/0/33`: #1920 moves
 only `corpus:production-host` to implemented-and-verified through complete
 31-clause source accounting. The two #1378 network/vmnet records remain
 audit-required, and all 33 platform exclusions remain unchanged.
+
+The current vmnet-feasibility successor is exactly `383/0/2/33`: #1930 moves
+only those two #1378 rows from audit-required to missing-platform-feasible
+after real entitlement-free root-direct evidence. It does not promote either
+row to implemented or weaken their #1378 ownership.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -248,11 +253,11 @@ at 377/5/3/33, the exact aggregate-jailer successor at 379/3/3/33, or the exact
 multiprocess-isolation successor at 380/3/2/33, the exact
 host-resource-authority successor at 381/3/1/33, or the exact containment
 successor at 382/3/0/33, or the exact production-host successor at
-383/2/0/33; it
+383/2/0/33, or the exact vmnet-feasibility successor at 383/0/2/33; it
 rejects unrelated, count-preserving identity swaps, and partial drift.
 
 The global `--final` mode remains stronger and intentionally fails while the
-two #1378 audit-required external outcomes remain. Neither Wave
+two #1378 `missing-platform-feasible` outcomes remain. Neither Wave
 8 nor any exact later successor weakens that completion gate.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,
@@ -271,7 +276,8 @@ its operator setup.
 
 This certification does not claim:
 
-- completion of the retained root/HVF or approved-vmnet evidence;
+- completion of the retained #1378 provider/broker, contained remote-provider,
+  production lifecycle, or optional approved-vmnet evidence;
 - Linux KVM or Firecracker binary identity;
 - arbitrary guest support or distinct-host snapshot portability;
 - portable performance parity or thresholds;

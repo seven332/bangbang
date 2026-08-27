@@ -51,11 +51,14 @@ Each detailed subject has one primary document:
 - [Production Host Contract](compat/firecracker/v1.16.0/production-host-contract.md)
   owns the complete 31-clause production-host source accounting, terminal
   macOS/platform outcomes, operator boundaries, and exact #1378 handoff.
+- [Entitlement-free vmnet Feasibility Contract](compat/firecracker/v1.16.0/vmnet-feasibility-contract.md)
+  owns the no-Apple-authorization root-direct evidence boundary, exact dropped
+  owner and repeated guest-connectivity gates, and the `383/0/2/33` handoff.
 - [Production vmnet certification runner](docs/testing.md#production-vmnet-certification-foundation)
   owns the private config, retained fixture, guest DHCP/TCP oracle, two-package
   inspection, descriptor-grant assembly, fixed 21-case production matrix, and
-  redacted result. Portable validation does not substitute for the final
-  caller-approved credentialed execution or promote its two capability rows.
+  redacted result. It remains the optional Apple-authorized production matrix;
+  the entitlement-free feasibility workflow does not substitute for it.
 - [Wave 7 Aggregate Authority](compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
   machine-checks the terminal design, device API, release, public-tool, and
   virtio-MMIO closure while retaining every external handoff.
@@ -91,11 +94,12 @@ The Wave 8 contract explains the scoped gate, its historical 377/8/3/30 phase,
 the exact 377/6/3/32 uid/gid successor, the 377/5/3/33 configurable-chroot
 successor, the 379/3/3/33 aggregate-jailer successor, the 380/3/2/33
 multiprocess-isolation successor, the 381/3/1/33 host-resource-authority
-successor, the exact 382/3/0/33 containment successor, and the current exact
-383/2/0/33 production-host successor. See the
-[Testing Guide](docs/testing.md#production-host-corpus-certification) for the
-canonical command and the checked authority for the machine-derived counts and
-exact two #1378 nonterminal identities.
+successor, the exact 382/3/0/33 containment successor, the 383/2/0/33
+production-host successor, and the current exact 383/0/2/33 entitlement-free
+vmnet-feasibility successor. See the
+[Testing Guide](docs/testing.md#entitlement-free-vmnet-feasibility) for the
+real-host command and the checked authority for the two #1378 feasible
+handoffs.
 
 ## Workspace Layout
 

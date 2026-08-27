@@ -25,7 +25,7 @@ pub const HOST_RESOURCE_AUTHORITY_AUDIT_PATH: &str =
 pub const HOST_RESOURCE_AUTHORITY_CAPABILITY_ID: &str = HOST_RESOURCE_AUTHORITY_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "5fd5317191891ea4191c873007672b302f4e35a2613269c2110488361591689e";
+    "d3b14c81f9b2d9173e60a312411c6f30626f46e853c8916e7b176fc3327d9be7";
 
 const PROFILE_IDS: [HostResourceEvidenceProfileId; 11] = [
     HostResourceEvidenceProfileId::ManifestPreflight,
@@ -221,10 +221,10 @@ fn validate_inventory_transition(
     }
     if !matches!(
         disposition_counts(inventory),
-        (381, 3, 1, 33) | (382, 3, 0, 33) | (383, 2, 0, 33)
+        (381, 3, 1, 33) | (382, 3, 0, 33) | (383, 2, 0, 33) | (383, 0, 2, 33)
     ) {
         errors.push(
-            "host-resource authority live inventory must be exactly 381/3/1/33, its 382/3/0/33 containment successor, or its 383/2/0/33 production-host successor"
+            "host-resource authority live inventory must be exactly 381/3/1/33 or one of its exact successors through 383/0/2/33 vmnet feasibility"
                 .to_string(),
         );
     }
@@ -232,7 +232,8 @@ fn validate_inventory_transition(
         classify_inventory_phase(inventory),
         Ok(InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
-            | InventoryPhase::ProductionHost)
+            | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility)
     ) {
         errors.push(
             "host-resource authority live inventory has an inexact successor phase".to_string(),
@@ -980,10 +981,23 @@ fn validate_external_dependencies(
         let completed_successor = (expected.capability_id == JAILER_SECCOMP_CONTAINMENT_ID
             && matches!(
                 phase,
-                Some(InventoryPhase::JailerSeccompContainment | InventoryPhase::ProductionHost)
+                Some(
+                    InventoryPhase::JailerSeccompContainment
+                        | InventoryPhase::ProductionHost
+                        | InventoryPhase::NetworkVmnetFeasibility
+                )
             ))
             || (expected.capability_id == "corpus:production-host"
-                && phase == Some(InventoryPhase::ProductionHost));
+                && matches!(
+                    phase,
+                    Some(InventoryPhase::ProductionHost | InventoryPhase::NetworkVmnetFeasibility)
+                ));
+        let vmnet_feasibility_successor = phase == Some(InventoryPhase::NetworkVmnetFeasibility)
+            && matches!(
+                expected.capability_id,
+                "corpus:network-setup"
+                    | "semantic.network:virtio-net-vmnet-policy-and-connectivity"
+            );
         match capabilities.get(expected.capability_id) {
             Some(capability)
                 if capability.disposition == expected.disposition
@@ -996,6 +1010,14 @@ fn validate_external_dependencies(
                     && !capability.implementation.is_empty()
                     && !capability.validation.is_empty()
                     && capability.delivery_issue.is_none()
+                    && capability.exclusion.is_none() => {}
+            Some(capability)
+                if vmnet_feasibility_successor
+                    && capability.disposition == Disposition::MissingPlatformFeasible
+                    && capability.implementation.is_empty()
+                    && capability.validation.is_empty()
+                    && capability.delivery_issue.as_deref()
+                        == Some("https://github.com/seven332/bangbang/issues/1378")
                     && capability.exclusion.is_none() => {}
             Some(_) => errors.push(format!(
                 "host-resource authority external dependency changed disposition or evidence: {}",

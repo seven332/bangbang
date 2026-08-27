@@ -250,6 +250,18 @@ fn wave8_terminal_transition_is_exact() {
     production_host.disposition = Disposition::AuditRequired;
     production_host.implementation.clear();
     production_host.validation.clear();
+    for id in [
+        "corpus:network-setup",
+        "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+    ] {
+        let capability = historical_wave8
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("network/vmnet handoff must exist");
+        capability.disposition = Disposition::AuditRequired;
+        capability.delivery_issue = None;
+    }
     validate_wave8_certification_compatibility(&manifest, &historical_wave8, &audit, &root)
         .expect("historical 377/8/3/30 Wave 8 phase must remain valid");
 
