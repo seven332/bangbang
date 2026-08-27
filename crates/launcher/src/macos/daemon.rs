@@ -658,6 +658,7 @@ impl FailureCategory {
             LauncherError::ElevatedDaemonHandoff(_) => Self::Other,
             LauncherError::SignalSetup(_)
             | LauncherError::DaemonHandoff
+            | LauncherError::VmnetTopology
             | LauncherError::WorkerWait(_)
             | LauncherError::SignalForward(_)
             | LauncherError::UnsupportedPlatform => Self::Other,

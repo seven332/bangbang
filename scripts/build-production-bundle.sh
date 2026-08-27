@@ -6,8 +6,9 @@ usage() {
 Usage: scripts/build-production-bundle.sh --output PATH [--signing-identity IDENTITY]
        [--worker-profile networkless|vmnet] [--provisioning-profile PATH]
 
-Build the Apple Silicon production launcher and sandbox worker, then publish the
-fixed Bangbang.app bundle without replacing an existing destination.
+Build the Apple Silicon production launcher, entitlement-free vmnet provider,
+and sandbox worker, then publish the fixed Bangbang.app bundle without
+replacing an existing destination.
 
 Options:
   --output PATH                 Absent destination named Bangbang.app.
@@ -178,8 +179,10 @@ target_triple="aarch64-apple-darwin"
 cargo build \
   -p bangbang \
   -p bangbang-launcher \
+  -p bangbang-vmnet-provider \
   --bin bangbang \
   --bin bangbang-launcher \
+  --bin bangbang-vmnet-provider \
   --release \
   --no-default-features \
   --locked \
@@ -195,6 +198,7 @@ bundle_args=(
   build
   --launcher "$repo_root/target/$target_triple/release/bangbang-launcher"
   --worker "$repo_root/target/$target_triple/release/bangbang"
+  --vmnet-provider "$repo_root/target/$target_triple/release/bangbang-vmnet-provider"
   --output "$output"
   --signing-identity "$signing_identity"
   --worker-profile "$worker_profile"

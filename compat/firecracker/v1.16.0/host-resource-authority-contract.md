@@ -119,15 +119,19 @@ packet lifecycle and proves that an unclaimed grant sends no protocol bytes;
 it needs no Apple developer identity, vmnet profile, or local vmnet/XPC
 descriptor.
 
-Positive production vmnet connectivity, elevated launcher-to-provider assembly,
-Apple-approved credentials, real guest packet movement through the contained
-provider, service failure taxonomy, SIGKILL reclamation, repeat, and concurrency
-remain exclusively owned by #1378. `corpus:network-setup` and
+At this checkpoint, positive production vmnet connectivity, elevated
+launcher-to-provider assembly, Apple-approved credentials, real guest packet
+movement through the contained provider, service failure taxonomy, SIGKILL
+reclamation, repeat, and concurrency remain exclusively owned by #1378.
+`corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` were audit-required
 at this checkpoint. #1930 later proves the narrower entitlement-free
 root-direct feasibility boundary and reclassifies them as
 `missing-platform-feasible`; this contract does not borrow that evidence into
-its historical transition.
+its historical transition. #1938 later supplies the packaged no-Apple assembly,
+inherited provider authority, real provider I/O, signals, daemon handoff, and
+cleanup without changing this historical authority or either disposition. Real
+guest and complete lifecycle/concurrency certification remain #1378 work.
 
 Host TAP/bridge/address/routing/NAT/firewall construction and shared-state
 cleanup remain operator responsibilities. CPU, memory, and blkio policy,

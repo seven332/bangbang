@@ -60,9 +60,11 @@ Each detailed subject has one primary document:
   dropped per-interface owner. The networkless contained worker now adopts one
   authenticated provider stream through a fixed remote-only route, with an
   ad-hoc-signed App Sandbox fake-provider test that needs no Apple identity or
-  vmnet profile and constructs no local vmnet/XPC descriptor; elevated
-  launcher-to-broker assembly and real guest connectivity remain separate, and
-  this integration promotes no capability.
+  vmnet profile and constructs no local vmnet/XPC descriptor. The packaged
+  no-Apple topology now supplies the drop-before-outer-exec bootstrap, inherited
+  grant, repeated real provider I/O, signals, daemon handoff, and cleanup. Real
+  guest-through-provider certification remains separate, and this integration
+  promotes no capability.
 - [Production vmnet certification runner](docs/testing.md#production-vmnet-certification-foundation)
   owns the private config, retained fixture, guest DHCP/TCP oracle, two-package
   inspection, descriptor-grant assembly, fixed 21-case production matrix, and
@@ -117,7 +119,7 @@ crates/api        Firecracker-shaped API request and response surface
 crates/runtime    Backend-neutral VM model and device/runtime foundations
 crates/hvf        Hypervisor.framework backend and signed integration tests
 crates/bangbang   VMM process, API server, and startup CLI
-crates/launcher   Production app bundle, nested worker, and supervision
+crates/launcher   Production app bundle, provider helper, nested worker, and supervision
 crates/pager      bangbang-pager-v1 protocol and VMM-side client
 crates/session    Private launcher/worker lifecycle, grant, and vmnet-provider protocols
 crates/unix-stream
@@ -209,8 +211,9 @@ and [Snapshot State Inspection and Reviewed Editing](docs/firecracker-compatibil
 ## Production macOS Bundle
 
 The direct command above runs with the invoking user's ambient authority. The
-production entry point instead assembles a fixed outer launcher and a separately
-signed nested App Sandbox + Hypervisor worker:
+production entry point instead assembles a fixed outer launcher, a separately
+signed entitlement-free vmnet provider, and a separately signed nested App
+Sandbox + Hypervisor worker:
 
 ```sh
 scripts/build-production-bundle.sh --output /private/operator/Bangbang.app
@@ -222,6 +225,24 @@ validation are defined in the
 [security model](docs/security.md#production-bundle-and-signed-worker-boundary).
 Run real HVF-backed verification through the wrapper documented in the
 [testing guide](docs/testing.md#running-tests).
+
+The no-Apple-authorization vmnet topology is prepared entirely as the ordinary
+target user, then run through one caller-authorized exact-root invocation:
+
+```sh
+scripts/prepare-production-vmnet-topology.sh \
+  --output /absolute/absent/Bangbang.app
+sudo -- /usr/bin/python3 scripts/run-production-vmnet-topology.py \
+  --prepared /absolute/absent/Bangbang.app \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+```
+
+`sudo` is the operator authorization boundary. Bangbang never requests, reads,
+stores, forwards, or logs a password, and the runner itself never invokes
+`sudo`. This gate certifies product assembly and supervision without an Apple
+developer identity or vmnet provisioning profile; the full real-guest
+certification remains separate.
 
 ## Development
 

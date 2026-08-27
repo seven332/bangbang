@@ -5253,6 +5253,7 @@ mod platform {
         #[cfg(feature = "grant-integration-probe")]
         pub(crate) fn verify_vmnet_provider_launch_policy(
             &self,
+            daemonized: bool,
         ) -> Result<(), ContainedSessionError> {
             let authority = self.policy.vmnet_authority();
             if self.policy.vmnet_backend_route()
@@ -5265,7 +5266,7 @@ mod platform {
             {
                 return Err(ContainedSessionError);
             }
-            self.verify_launch_policy_common(2048, None, false)
+            self.verify_launch_policy_common(2048, None, daemonized)
         }
 
         #[cfg(feature = "grant-integration-probe")]

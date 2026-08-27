@@ -134,10 +134,16 @@ topology. #1934 adds the minimal broker/owner process foundation and extends
 this exact-host workflow with its real provider data/cancellation/repeat proof.
 That successor changes neither disposition. #1936 then adds the credential-free
 contained grant, remote-only route, client pumps, and process-registry adapter;
-elevated launcher/provider assembly, a real guest through the remote provider,
-and product certification remain separate work.
+#1938 packages the entitlement-free provider, drops before starting the normal
+outer, transfers the inherited provider authority, and proves the foreground
+and provider-owned daemon topology with repeated real provider I/O, signals,
+and cleanup. Neither successor changes a disposition. A real guest through the
+production provider and the complete lifecycle/concurrency certification remain
+separate work.
 
-#1930 does not claim any of the following:
+At its delivery boundary, #1930 itself did not claim any of the following;
+later provider and topology slices do not retroactively change that evidence
+scope:
 
 - a root direct VMM as production;
 - an Apple-authorized vmnet path;

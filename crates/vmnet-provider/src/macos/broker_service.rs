@@ -9,6 +9,7 @@ use bangbang_session::vmnet_provider::{
     ProviderTerminalCode, VmnetControlBroker, VmnetProviderError, VmnetProviderTransport,
 };
 
+use crate::BrokerBootstrap;
 use crate::broker::{BrokerError, BrokerLedger};
 use crate::supervision::{OwnerScope, OwnerSupervisionMessage};
 
@@ -16,13 +17,20 @@ use super::process::{OwnedChild, PinnedExecutable, spawn_owner};
 use super::transport::{POLL_INTERVAL, PollEvent, RecordError, RecordTransport, poll};
 
 pub(super) fn run(bootstrap: UnixStream, control: UnixStream) -> Result<(), BrokerError> {
-    let signals = BrokerSignals::install()?;
     let bootstrap_transport = RecordTransport::new(bootstrap).map_err(map_record_error)?;
     let bootstrap = bootstrap_transport
         .receive_broker_bootstrap()
         .map_err(map_record_error)?;
     bootstrap_transport.shutdown();
 
+    run_bootstrap(bootstrap, control)
+}
+
+pub(super) fn run_bootstrap(
+    bootstrap: BrokerBootstrap,
+    control: UnixStream,
+) -> Result<(), BrokerError> {
+    let signals = BrokerSignals::install()?;
     let executable = PinnedExecutable::current()?;
     let control_poll = control
         .try_clone()

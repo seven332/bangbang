@@ -179,9 +179,13 @@ remote-only route, sole-owner client pumps, and startup/hotplug/restore adapter
 with credential-free portable fake-broker evidence and an ad-hoc-signed
 networkless App Sandbox process case. The remote path creates no local
 vmnet/XPC descriptor and needs no Apple developer identity or vmnet profile.
-Elevated launcher/provider assembly and real guest-through-provider
-certification remain later slices; the inventory and both
-`missing-platform-feasible` dispositions stay unchanged.
+#1938 then packages the entitlement-free provider with the fixed outer and
+worker, starts the outer only after irreversible drop, transfers the inherited
+provider stream, and proves repeated real provider I/O, foreground signal
+convergence, provider-owned daemon handoff, and cleanup. Real
+guest-through-provider lifecycle/concurrency certification remains the next
+slice; the inventory and both `missing-platform-feasible` dispositions stay
+unchanged.
 
 ## Guest workflow artifact authority
 

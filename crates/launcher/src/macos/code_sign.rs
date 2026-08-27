@@ -193,6 +193,17 @@ pub(crate) fn validate_bundle(layout: &BundleLayout) -> Result<WorkerProfile, La
         return Err(LauncherError::InvalidBundleSignature);
     }
 
+    let provider_requirement = requirement(&provider_requirement_text())?;
+    let provider = static_code(layout.vmnet_provider_executable(), false)?;
+    check(
+        &provider,
+        SEC_CS_CHECK_ALL_ARCHITECTURES | SEC_CS_STRICT_VALIDATE | SEC_CS_RESTRICT_SYMLINKS,
+        &provider_requirement,
+    )?;
+    if validate_entitlements(&provider, EntitlementProfile::Outer)?.is_some() {
+        return Err(LauncherError::InvalidBundleSignature);
+    }
+
     let worker_requirement = requirement(&worker_requirement_text())?;
     let worker = static_code(layout.worker_bundle(), true)?;
     check(
@@ -311,6 +322,16 @@ fn worker_requirement_text() -> String {
         crate::WORKER_BUNDLE_IDENTIFIER,
         crate::layout::APP_SANDBOX_ENTITLEMENT,
         crate::layout::HYPERVISOR_ENTITLEMENT
+    )
+}
+
+fn provider_requirement_text() -> String {
+    format!(
+        "identifier \"{}\" and entitlement[\"{}\"] absent and entitlement[\"{}\"] absent and entitlement[\"{}\"] absent",
+        crate::VMNET_PROVIDER_IDENTIFIER,
+        crate::layout::APP_SANDBOX_ENTITLEMENT,
+        crate::layout::HYPERVISOR_ENTITLEMENT,
+        crate::layout::VMNET_ENTITLEMENT,
     )
 }
 

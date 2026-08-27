@@ -35,7 +35,8 @@ use bangbang_hvf::{
 };
 use bangbang_launcher::{
     JailerIsolationArgument, LAUNCHER_BUNDLE_IDENTIFIER, LAUNCHER_EXECUTABLE_NAME,
-    OUTER_BUNDLE_NAME, WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
+    OUTER_BUNDLE_NAME, VMNET_PROVIDER_EXECUTABLE_NAME, VMNET_PROVIDER_IDENTIFIER,
+    WORKER_BUNDLE_IDENTIFIER, WORKER_BUNDLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 use bangbang_pager::{
     PagerError, PagerFrameKind, PagerTransport, PeerSession, ReferencePeer,
@@ -630,6 +631,12 @@ fn worker_bundle(bundle: &Path) -> PathBuf {
     bundle.join("Contents/Helpers").join(WORKER_BUNDLE_NAME)
 }
 
+fn vmnet_provider_executable(bundle: &Path) -> PathBuf {
+    bundle
+        .join("Contents/Helpers")
+        .join(VMNET_PROVIDER_EXECUTABLE_NAME)
+}
+
 fn worker_executable(bundle: &Path) -> PathBuf {
     worker_bundle(bundle)
         .join("Contents/MacOS")
@@ -1011,6 +1018,7 @@ fn run_holding_pager_peer(stream: UnixStream) {
 #[test]
 fn production_bundle_has_exact_nested_signing_contract() {
     let bundle = production_bundle();
+    let provider = vmnet_provider_executable(&bundle);
     let worker = worker_bundle(&bundle);
     let verify = Command::new("/usr/bin/codesign")
         .args(["--verify", "--deep", "--strict", "--verbose=4"])
@@ -1020,19 +1028,30 @@ fn production_bundle_has_exact_nested_signing_contract() {
     assert_output_success(&verify, "strict recursive bundle verification");
 
     let outer_display = codesign_display(&bundle);
+    let provider_display = codesign_display(&provider);
     let worker_display = codesign_display(&worker);
     assert!(
         outer_display.contains(&format!("Identifier={LAUNCHER_BUNDLE_IDENTIFIER}")),
         "outer identifier should match; display:\n{outer_display}"
     );
     assert!(
+        provider_display.contains(&format!("Identifier={VMNET_PROVIDER_IDENTIFIER}")),
+        "provider identifier should match; display:\n{provider_display}"
+    );
+    assert!(
         worker_display.contains(&format!("Identifier={WORKER_BUNDLE_IDENTIFIER}")),
         "worker identifier should match; display:\n{worker_display}"
     );
     assert!(outer_display.contains("runtime"));
+    assert!(provider_display.contains("runtime"));
     assert!(worker_display.contains("runtime"));
 
     assert_exact_networkless_bundle_entitlements(&bundle);
+    let provider_entitlements = codesign_entitlement_dictionary(&provider);
+    assert!(
+        provider_entitlements.is_empty(),
+        "networkless provider entitlement dictionary must be empty: {provider_entitlements:?}"
+    );
     assert!(
         !worker.join("Contents/embedded.provisionprofile").exists(),
         "networkless production worker must not embed a provisioning profile"

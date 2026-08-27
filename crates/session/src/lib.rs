@@ -13,6 +13,7 @@ mod grant;
 pub mod macos;
 mod state;
 pub mod vmnet_provider;
+pub mod vmnet_topology;
 
 pub use codec::{
     CancelSignal, Frame, FrameDecoder, MAX_VMNET_ACTIVE_INTERFACES, MAX_VMNET_BRIDGE_NAME_BYTES,

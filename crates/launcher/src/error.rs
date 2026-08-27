@@ -139,6 +139,8 @@ pub enum LauncherError {
     InvalidDaemonIdentity,
     /// The bounded private launcher-worker protocol failed.
     SessionProtocol,
+    /// The fixed elevated vmnet topology bootstrap or supervision failed.
+    VmnetTopology,
     /// The explicit external-resource manifest or launcher envelope is invalid.
     InvalidGrantInput,
     /// The versioned production launch-control envelope is invalid.
@@ -202,6 +204,7 @@ impl fmt::Display for LauncherError {
                 formatter.write_str("daemon launcher identity validation failed")
             }
             Self::SessionProtocol => formatter.write_str("private worker session failed"),
+            Self::VmnetTopology => formatter.write_str("private vmnet topology failed"),
             Self::InvalidGrantInput => formatter.write_str("invalid resource grant input"),
             Self::InvalidLaunchPolicy => formatter.write_str("invalid production launch policy"),
             Self::UnsupportedJailerIsolation(argument) => write!(

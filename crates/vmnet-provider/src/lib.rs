@@ -9,6 +9,7 @@ mod broker;
 mod owner;
 mod policy;
 mod supervision;
+mod topology;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -23,9 +24,14 @@ pub use policy::{BoundedBridgeName, ResolvedVmnetPolicy, VmnetBrokerPolicy};
 pub use supervision::{
     OWNER_SUPERVISION_BYTES, OwnerBootstrap, OwnerScope, OwnerSupervisionMessage,
 };
+pub use topology::PUBLIC_BOOTSTRAP_MODE;
 
 #[cfg(target_os = "macos")]
-pub use macos::{PRIVATE_BROKER_MODE, PRIVATE_OWNER_MODE, run_private_broker, run_private_owner};
+pub use macos::{
+    PRIVATE_BROKER_MODE, PRIVATE_DAEMON_BROKER_MODE, PRIVATE_LAUNCHER_TRANSITION_MODE,
+    PRIVATE_OWNER_MODE, run_private_broker, run_private_daemon_broker,
+    run_private_launcher_transition, run_private_owner, run_public_bootstrap,
+};
 
 #[cfg(test)]
 mod surface_tests {

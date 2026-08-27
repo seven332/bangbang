@@ -19,18 +19,21 @@ point has one fixed nested topology:
 | Code object | Fixed identity and path | Authority |
 | --- | --- | --- |
 | Outer app | `Bangbang.app`, `dev.bangbang`, `Contents/MacOS/bangbang` | Unsandboxed launcher; no App Sandbox or Hypervisor entitlement in repository-produced bundles |
+| Provider helper | `Contents/Helpers/bangbang-vmnet-provider`, `dev.bangbang.vmnet-provider` | Unsandboxed minimal vmnet bootstrap/broker/owner image; no App Sandbox, Hypervisor, or vmnet entitlement |
 | Worker app | `Contents/Helpers/BangbangWorker.app`, `dev.bangbang.worker`, `Contents/MacOS/bangbang-worker` | VMM worker; exactly App Sandbox and Hypervisor in the networkless profile, with the separately documented vmnet profile when explicitly selected |
 
-Both code objects use Hardened Runtime. Production assembly signs and inspects
-the worker before the outer app, verifies the nested bundle, publishes through
-a private no-clobber staging transaction, and excludes integration-only grant
-probes. Ad-hoc signing supports local validation; it is not Developer ID,
-notarization, or authenticated distribution evidence.
+All three code objects use Hardened Runtime. Production assembly separately
+signs and inspects the entitlement-free provider and nested worker before the
+outer app, verifies the bundle, publishes through a private no-clobber staging
+transaction, and excludes integration-only grant probes. Ad-hoc signing
+supports local validation; it is not Developer ID, notarization, or
+authenticated distribution evidence.
 
-The launcher derives the worker from its own fixed bundle layout, validates
-static and suspended live code, and spawns with default-close descriptor
-inheritance. It passes only standard streams plus the fixed lifecycle, grant,
-vsock-broker, vhost-user-broker, and retained-block-control endpoints. The
+The launcher derives the provider and worker from its own fixed bundle layout,
+validates static and suspended live code, and spawns with default-close
+descriptor inheritance. It passes only standard streams plus the fixed
+lifecycle, grant, vsock-broker, vhost-user-broker, retained-block-control, and,
+when selected, vmnet topology/provider endpoints. The
 worker receives a marker-only environment and enters an identity-checked
 private working directory before public processing.
 
@@ -41,10 +44,22 @@ empty or populated grant transaction before `Proceed`, and reports bounded
 path-free readiness and terminal outcomes. Daemon mode keeps one same-code
 supervisor and publishes its PID only after worker readiness is acknowledged.
 
+The no-Apple-authorization vmnet form starts at the fixed provider helper under
+caller-authorized exact root. Root suspended-spawns only the same pinned
+provider image; its private transition clears groups, changes gid then uid,
+attests the target, and execs the pinned outer only after the drop. The root
+broker validates that post-exec image and credential before the now-ordinary
+launcher may prepare resources. A closed 192-byte topology protocol binds the
+target, lifecycle session, vmnet policy, process roles, foreground/daemon mode,
+and terminal result. The inherited root peer becomes the unique provider grant
+without a filesystem listener. The broker owns the launcher and dropped owners;
+the launcher owns the sandbox worker. Success requires exact terminal
+acknowledgement, reap, and empty residue.
+
 ## Trust and Resource Authority
 
-The fixed launcher, package metadata, and nested worker are trusted product
-components. API/CLI input, guest input, host paths, resource contents, and HVF
+The fixed launcher, provider, package metadata, and nested worker are trusted
+product components. API/CLI input, guest input, host paths, resource contents, and HVF
 exits remain untrusted. Errors expose stable categories rather than paths,
 identities, bookmark bytes, signing output, or worker payloads.
 
@@ -74,7 +89,9 @@ removes only an owned inode and preserves replacements.
 
 Networkless production rejects positive vmnet authority before worker spawn
 unless the prepared batch contains exactly one provider stream and authenticates
-the remote-only route. The explicit local vmnet profile binds the documented entitlement dictionary,
+the remote-only route. The no-Apple product form obtains that stream only from
+the fixed inherited root peer and requires provider activation before worker
+resume. The explicit local vmnet profile binds the documented entitlement dictionary,
 application/team relationship, bridge allowlist, and active-interface maximum.
 It does not claim repository-owned signing credentials or certified external
 vmnet connectivity.
@@ -91,10 +108,10 @@ The exact implementation and security rules are maintained in:
 The following independent outcomes remain under delivery issue
 [#1351](https://github.com/seven332/bangbang/issues/1351):
 
-- broader external vmnet connectivity, cleanup, and per-VM network policy under
-  #1378;
-- positive production vmnet execution and approved credentials under #1378;
-  and
+- real guest-through-provider connectivity and the complete production
+  lifecycle/concurrency matrix under #1378;
+- the optional Apple-authorized vmnet matrix and approved credentials under
+  #1378; and
 - Developer ID/team possession, notarization, launch constraints, and release
   policy.
 
@@ -107,7 +124,8 @@ The final jailer/seccomp/macOS containment composition is terminal under
 external records above were `audit-required` at that transition. #1920 later
 certifies `corpus:production-host`; #1930 reclassifies the remaining two #1378
 network records as `missing-platform-feasible` without changing this terminal
-isolation result.
+isolation result. #1938 assembles the no-Apple product topology without changing
+that inventory or the terminal isolation result.
 
 ## Terminal jailer uid/gid platform limit
 
@@ -298,6 +316,7 @@ The canonical authority and scoped command are in the
 | Claim | Implementation | Validation |
 | --- | --- | --- |
 | Bundle assembly, signing, fixed layout, and exclusive publication | `crates/launcher/src/package.rs`, `crates/launcher/src/macos/code_sign.rs`, `crates/launcher/src/macos/publish.rs` | `crates/launcher/tests/production_bundle_e2e.rs`, `scripts/build-production-bundle.sh` |
+| No-Apple elevated vmnet topology, inherited provider authority, and supervision | `crates/session/src/vmnet_topology.rs`, `crates/vmnet-provider/src/macos/topology.rs`, `crates/launcher/src/macos/vmnet_topology.rs` | portable topology/provider/launcher tests plus `scripts/prepare-production-vmnet-topology.sh` and `scripts/run-production-vmnet-topology.py` |
 | Suspended worker validation, lifecycle, limits, daemon supervision, and cleanup | `crates/launcher/src/supervisor.rs`, `crates/launcher/src/macos/spawn.rs`, `crates/session/src/lib.rs` | launcher/session unit tests and signed production-bundle cases |
 | Typed startup grants and contained resource consumers | `crates/launcher/src/grant_manifest.rs` and the owning VMM/device consumers | focused grant tests plus signed direct and production device/snapshot matrices |
 | Stable Linux-mechanism exclusions | launcher policy parser and process CLI handling | focused unit/process tests, signed production-bundle pre-mutation cases, [compatibility](../../../docs/firecracker-compatibility.md#runtime-isolation-platform-exclusions), and [security](../../../docs/security.md#certified-linux-runtime-isolation-exclusions) |

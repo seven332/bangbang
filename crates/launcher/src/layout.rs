@@ -10,6 +10,10 @@ pub const OUTER_BUNDLE_NAME: &str = "Bangbang.app";
 pub const LAUNCHER_BUNDLE_IDENTIFIER: &str = "dev.bangbang";
 /// Stable outer app executable name.
 pub const LAUNCHER_EXECUTABLE_NAME: &str = "bangbang";
+/// Stable entitlement-free vmnet provider code-signing identifier.
+pub const VMNET_PROVIDER_IDENTIFIER: &str = "dev.bangbang.vmnet-provider";
+/// Stable entitlement-free vmnet provider helper executable name.
+pub const VMNET_PROVIDER_EXECUTABLE_NAME: &str = "bangbang-vmnet-provider";
 /// Stable nested worker app-bundle directory name.
 pub const WORKER_BUNDLE_NAME: &str = "BangbangWorker.app";
 /// Stable nested worker code-signing identifier.
@@ -32,6 +36,7 @@ pub(crate) const TEAM_IDENTIFIER_ENTITLEMENT: &str = "com.apple.developer.team-i
 pub struct BundleLayout {
     outer_bundle: PathBuf,
     launcher_executable: PathBuf,
+    vmnet_provider_executable: PathBuf,
     worker_bundle: PathBuf,
     worker_executable: PathBuf,
 }
@@ -44,12 +49,16 @@ impl BundleLayout {
         let outer_bundle = exact_parent(&contents, "Contents", OUTER_BUNDLE_NAME)?;
 
         let worker_bundle = contents.join("Helpers").join(WORKER_BUNDLE_NAME);
+        let vmnet_provider_executable = contents
+            .join("Helpers")
+            .join(VMNET_PROVIDER_EXECUTABLE_NAME);
         let worker_executable = worker_bundle
             .join("Contents/MacOS")
             .join(WORKER_EXECUTABLE_NAME);
         let layout = Self {
             outer_bundle,
             launcher_executable: path.to_path_buf(),
+            vmnet_provider_executable,
             worker_bundle,
             worker_executable,
         };
@@ -67,6 +76,12 @@ impl BundleLayout {
     #[must_use]
     pub fn launcher_executable(&self) -> &Path {
         &self.launcher_executable
+    }
+
+    /// Returns the fixed entitlement-free vmnet provider helper path.
+    #[must_use]
+    pub fn vmnet_provider_executable(&self) -> &Path {
+        &self.vmnet_provider_executable
     }
 
     /// Returns the nested worker app-bundle path.
@@ -95,6 +110,7 @@ impl BundleLayout {
         require_plain_dir(&self.outer_bundle.join("Contents/MacOS"))?;
         require_plain_file(&self.launcher_executable)?;
         require_plain_dir(&self.outer_bundle.join("Contents/Helpers"))?;
+        require_plain_file(&self.vmnet_provider_executable)?;
         require_plain_dir(&self.worker_bundle)?;
         require_plain_dir(&self.worker_bundle.join("Contents"))?;
         require_plain_dir(&self.worker_bundle.join("Contents/MacOS"))?;
@@ -145,6 +161,7 @@ mod tests {
         root: PathBuf,
         launcher: PathBuf,
         worker: PathBuf,
+        provider: PathBuf,
     }
 
     impl TestBundle {
@@ -161,16 +178,21 @@ mod tests {
                 .join(WORKER_BUNDLE_NAME)
                 .join("Contents/MacOS")
                 .join(WORKER_EXECUTABLE_NAME);
+            let provider = outer
+                .join("Contents/Helpers")
+                .join(VMNET_PROVIDER_EXECUTABLE_NAME);
             fs::create_dir_all(launcher.parent().expect("launcher should have a parent"))
                 .expect("launcher directory should be created");
             fs::create_dir_all(worker.parent().expect("worker should have a parent"))
                 .expect("worker directory should be created");
             fs::write(&launcher, b"launcher").expect("launcher should be written");
             fs::write(&worker, b"worker").expect("worker should be written");
+            fs::write(&provider, b"provider").expect("provider should be written");
             Self {
                 root,
                 launcher,
                 worker,
+                provider,
             }
         }
     }
@@ -187,6 +209,7 @@ mod tests {
         let layout = BundleLayout::from_launcher_executable(&bundle.launcher)
             .expect("valid layout should be accepted");
         assert_eq!(layout.worker_executable(), bundle.worker);
+        assert_eq!(layout.vmnet_provider_executable(), bundle.provider);
         assert_eq!(layout.outer_bundle(), bundle.root.join(OUTER_BUNDLE_NAME));
     }
 

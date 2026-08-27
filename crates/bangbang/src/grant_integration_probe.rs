@@ -10,7 +10,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bangbang_hvf::{HvfBackend, HvfLazyHostFaultBridge, HvfLazyPager, HvfMemoryPermissions};
 use bangbang_pager::{
@@ -59,6 +59,7 @@ const READY_LINE: &str = "status: grant integration probe ready";
 const PAGER_READY_LINE: &str = "status: pager integration probe ready";
 const PAGER_GRANT_REF: &str = "bangbang-grant:probe-pager";
 const PAGER_TIMEOUT: Duration = Duration::from_secs(1);
+const VMNET_LIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTSIDE_FILE: &str = "bangbang-grant-probe-outside";
 const BLOCK_CONTROL_GRANT_REF: &str = "bangbang-grant:probe-block-control";
 const BLOCK_CONTROL_INITIAL_MARKER: &[u8] = b"BANGBANG_BLOCK_CONTROL_INITIAL";
@@ -113,7 +114,10 @@ pub(crate) fn run(
         return verify_pager_in_containment(session, pager);
     }
     if let Some(vmnet_provider) = VmnetProviderProbeCase::parse(probe_args)? {
-        session.verify_vmnet_provider_launch_policy()?;
+        session.verify_vmnet_provider_launch_policy(vmnet_provider.daemonized())?;
+        if vmnet_provider.holds() || vmnet_provider == VmnetProviderProbeCase::Live {
+            session.send_ready(bangbang_session::Readiness::NoApi)?;
+        }
         return verify_vmnet_provider_in_containment(session, vmnet_provider);
     }
     let probe = ProbeCase::parse(probe_args)?;
@@ -519,18 +523,52 @@ fn verify_vmnet_provider_in_containment(
     if probe == VmnetProviderProbeCase::Unused {
         return Ok(());
     }
+    if probe.holds() {
+        println!("{READY_LINE}");
+        std::io::stdout()
+            .flush()
+            .map_err(|_| ContainedSessionError)?;
+        loop {
+            match session.shutdown_requested() {
+                Ok(false) => std::thread::park_timeout(Duration::from_millis(10)),
+                Ok(true) => return Ok(()),
+                Err(_) => return Err(ContainedSessionError),
+            }
+        }
+    }
 
-    let config = VmnetInterfaceConfig::shared().with_mtu(Some(1500));
+    let config = if probe == VmnetProviderProbeCase::Live {
+        VmnetInterfaceConfig::shared()
+    } else {
+        VmnetInterfaceConfig::shared().with_mtu(Some(1500))
+    };
     let (mut backend, mut interface) = StartedVmnetPacketIoBackend::start(
         ProcessVmnetBackendSource::Remote(source).new_backend(),
         &config,
     )
     .map_err(|_| ContainedSessionError)?;
-    if backend.parameters().effective_mtu() != 1500
-        || backend.parameters().maximum_packet_size() != 2048
-        || backend.parameters().read_max_packets() != Some(4)
-        || backend.parameters().write_max_packets() != Some(4)
-    {
+    let (realized_mac, maximum_packet_size, invalid_parameters) = {
+        let parameters = backend.parameters();
+        let invalid = if probe == VmnetProviderProbeCase::Live {
+            parameters.effective_mtu() < 1280
+                || parameters.maximum_packet_size() < usize::from(parameters.effective_mtu())
+                || parameters.read_max_packets().is_none_or(|value| value == 0)
+                || parameters
+                    .write_max_packets()
+                    .is_none_or(|value| value == 0)
+        } else {
+            parameters.effective_mtu() != 1500
+                || parameters.maximum_packet_size() != 2048
+                || parameters.read_max_packets() != Some(4)
+                || parameters.write_max_packets() != Some(4)
+        };
+        (
+            parameters.realized_mac().octets(),
+            parameters.maximum_packet_size(),
+            invalid,
+        )
+    };
+    if invalid_parameters {
         return Err(ContainedSessionError);
     }
 
@@ -538,13 +576,19 @@ fn verify_vmnet_provider_in_containment(
     let published = Arc::clone(&readiness);
     backend
         .enable_packet_available_callback(VmnetPacketAvailableCallback::new(move |estimate| {
-            if estimate == Some(1) {
+            if estimate.is_some_and(|value| value > 0) {
                 published.store(true, Ordering::Release);
             }
         }))
         .map_err(|_| ContainedSessionError)?;
 
-    let write_bytes = [0x5a_u8; 60];
+    let mut write_bytes = [0x5a_u8; 60];
+    if probe == VmnetProviderProbeCase::Live {
+        write_bytes[..6].fill(0xff);
+        write_bytes[6..12].copy_from_slice(&realized_mac);
+        write_bytes[12..14].copy_from_slice(&[0x88, 0xb5]);
+        write_bytes[14..].fill(0);
+    }
     let mut write = VmnetWritePacket::new(&write_bytes).map_err(|_| ContainedSessionError)?;
     backend
         .write_packet(&mut interface, &mut write)
@@ -552,15 +596,35 @@ fn verify_vmnet_provider_in_containment(
 
     let mut read_bytes = [0_u8; 2048];
     let mut read = VmnetReadPacket::new(&mut read_bytes).map_err(|_| ContainedSessionError)?;
-    let read_length = backend
-        .read_packet(&mut interface, &mut read)
-        .map_err(|_| ContainedSessionError)?
-        .ok_or(ContainedSessionError)?;
+    let read_length = if probe == VmnetProviderProbeCase::Live {
+        let deadline = Instant::now()
+            .checked_add(VMNET_LIVE_TIMEOUT)
+            .ok_or(ContainedSessionError)?;
+        loop {
+            if let Some(length) = backend
+                .read_packet(&mut interface, &mut read)
+                .map_err(|_| ContainedSessionError)?
+            {
+                break length;
+            }
+            if Instant::now() >= deadline {
+                return Err(ContainedSessionError);
+            }
+            std::thread::yield_now();
+        }
+    } else {
+        backend
+            .read_packet(&mut interface, &mut read)
+            .map_err(|_| ContainedSessionError)?
+            .ok_or(ContainedSessionError)?
+    };
     drop(read);
-    if read_length != 60
-        || read_bytes.get(..read_length) != Some(&[0xa5_u8; 60][..])
-        || !readiness.load(Ordering::Acquire)
-    {
+    let invalid_read = if probe == VmnetProviderProbeCase::Live {
+        read_length == 0 || read_length > maximum_packet_size
+    } else {
+        read_length != 60 || read_bytes.get(..read_length) != Some(&[0xa5_u8; 60][..])
+    };
+    if invalid_read || !readiness.load(Ordering::Acquire) {
         return Err(ContainedSessionError);
     }
     backend.stop().map_err(|_| ContainedSessionError)
@@ -1479,6 +1543,9 @@ impl PagerProbeCase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmnetProviderProbeCase {
     Complete,
+    Hold,
+    HoldDaemon,
+    Live,
     Unused,
 }
 
@@ -1492,12 +1559,23 @@ impl VmnetProviderProbeCase {
         }
         Ok(match value.to_str() {
             Some("vmnet-provider-complete") => Some(Self::Complete),
+            Some("vmnet-provider-hold") => Some(Self::Hold),
+            Some("vmnet-provider-hold-daemon") => Some(Self::HoldDaemon),
+            Some("vmnet-provider-live") => Some(Self::Live),
             Some("vmnet-provider-unused") => Some(Self::Unused),
             Some(value) if value.starts_with("vmnet-provider-") => {
                 return Err(ContainedSessionError);
             }
             _ => None,
         })
+    }
+
+    const fn holds(self) -> bool {
+        matches!(self, Self::Hold | Self::HoldDaemon)
+    }
+
+    const fn daemonized(self) -> bool {
+        matches!(self, Self::HoldDaemon)
     }
 }
 
@@ -1649,6 +1727,32 @@ mod tests {
     use super::*;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn vmnet_provider_probe_cases_are_closed_and_distinguish_live_io() {
+        for (name, expected) in [
+            ("vmnet-provider-complete", VmnetProviderProbeCase::Complete),
+            ("vmnet-provider-hold", VmnetProviderProbeCase::Hold),
+            (
+                "vmnet-provider-hold-daemon",
+                VmnetProviderProbeCase::HoldDaemon,
+            ),
+            ("vmnet-provider-live", VmnetProviderProbeCase::Live),
+            ("vmnet-provider-unused", VmnetProviderProbeCase::Unused),
+        ] {
+            assert_eq!(
+                VmnetProviderProbeCase::parse(&[OsString::from(OPTION), OsString::from(name)]),
+                Ok(Some(expected))
+            );
+        }
+        assert_eq!(
+            VmnetProviderProbeCase::parse(&[
+                OsString::from(OPTION),
+                OsString::from("vmnet-provider-other"),
+            ]),
+            Err(ContainedSessionError)
+        );
+    }
 
     struct TestDirectory {
         path: std::path::PathBuf,
