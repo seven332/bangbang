@@ -2233,7 +2233,6 @@ fn publish_readiness(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
     use std::sync::MutexGuard;
 
     use bangbang_session::vmnet_provider::{
