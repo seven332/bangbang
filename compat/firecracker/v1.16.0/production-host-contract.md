@@ -52,9 +52,11 @@ enumerated or claimed.
 The positive production vmnet start, packets, connectivity, service failures,
 teardown, SIGKILL reclamation, repeat execution, concurrency, and Apple-approved
 identity/profile evidence remain exclusively owned by #1378. Sudo or root does
-not confer the restricted entitlement. `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity` remain
-`audit-required`.
+not confer the restricted entitlement. #1930 later proves that direct shared
+vmnet and a privilege-dropped owner are feasible without that entitlement, so
+`corpus:network-setup` and
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` become
+`missing-platform-feasible`; it does not change this production-host result.
 
 #1378 now has a credential-free protocol foundation plus a checked production
 runner: strict private config and redacted result handling, a retained
@@ -92,4 +94,4 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --produc
 ```
 
 The global `--final` gate remains intentionally stronger and continues to fail
-on the exact two #1378 production-vmnet records.
+on the exact two #1378 `missing-platform-feasible` records.

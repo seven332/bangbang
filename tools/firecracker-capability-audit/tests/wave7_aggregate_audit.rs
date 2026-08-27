@@ -272,6 +272,18 @@ fn wave7_terminal_distribution_and_transition_are_exact() {
     production_host.disposition = Disposition::AuditRequired;
     production_host.implementation.clear();
     production_host.validation.clear();
+    for id in [
+        "corpus:network-setup",
+        "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+    ] {
+        let capability = historical
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == id)
+            .expect("network/vmnet handoff must exist");
+        capability.disposition = Disposition::AuditRequired;
+        capability.delivery_issue = None;
+    }
     validate_wave7_aggregate_compatibility(&manifest, &historical, &audit, &root)
         .expect("historical 376/9/3/30 Wave 7 phase must remain valid");
 

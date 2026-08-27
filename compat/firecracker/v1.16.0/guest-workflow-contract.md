@@ -74,10 +74,13 @@ not claimed. The optional rootless macOS ext4 recipe is separately
 sidecar-verified and recipe-deterministic only; it is not the public smoke root
 drive.
 
-The checked current direct-test recipe is `direct-boot-v110`. It installs the
-production-vmnet guest oracle as an exact mode-`0555` tracked input; historical
-v109 sidecars are not accepted for those bytes. That selector is inert in both
-public networkless workflow profiles and supplies no positive vmnet evidence.
+The default checked direct-test recipe is `direct-boot-v110`. It installs the
+Apple-authorized production-vmnet Python oracle as an exact mode-`0555` tracked
+input; historical v109 sidecars are not accepted for those bytes. The distinct
+`direct-boot-v111` recipe installs the static no-std entitlement-free vmnet
+oracle instead and has its own exact sidecar identity. Both selectors are inert
+in the public networkless workflow profiles; v111 is owned by #1930's separate
+root-direct feasibility gate, not by this terminal public workflow.
 
 ## API and no-API evidence
 

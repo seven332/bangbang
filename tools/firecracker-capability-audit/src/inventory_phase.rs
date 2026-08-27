@@ -31,6 +31,11 @@ pub(crate) const JAILER_SECCOMP_CONTAINMENT_ID: &str =
 
 pub(crate) const PRODUCTION_HOST_ID: &str = "corpus:production-host";
 
+pub(crate) const NETWORK_VMNET_FEASIBLE_IDS: [&str; 2] = [
+    "corpus:network-setup",
+    "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+];
+
 const WAVE8_AUDIT_IDS: [&str; 8] = [
     "corpus:jailer",
     "corpus:network-setup",
@@ -102,6 +107,7 @@ pub(crate) enum InventoryPhase {
     HostResourceAuthority,
     JailerSeccompContainment,
     ProductionHost,
+    NetworkVmnetFeasibility,
 }
 
 impl InventoryPhase {
@@ -117,6 +123,7 @@ impl InventoryPhase {
             Self::HostResourceAuthority => "host-resource authority 381/3/1/33",
             Self::JailerSeccompContainment => "jailer/seccomp containment 382/3/0/33",
             Self::ProductionHost => "production-host corpus 383/2/0/33",
+            Self::NetworkVmnetFeasibility => "network/vmnet feasibility 383/0/2/33",
         }
     }
 }
@@ -136,6 +143,7 @@ pub(crate) fn classify_inventory_phase(
         (381, 3, 1, 33) => InventoryPhase::HostResourceAuthority,
         (382, 3, 0, 33) => InventoryPhase::JailerSeccompContainment,
         (383, 2, 0, 33) => InventoryPhase::ProductionHost,
+        (383, 0, 2, 33) => InventoryPhase::NetworkVmnetFeasibility,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -196,6 +204,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility
     ) {
         ids.extend(JAILER_UID_GID_IDS);
     }
@@ -207,6 +216,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility
     ) {
         ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
@@ -260,7 +270,8 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         | InventoryPhase::MultiprocessIsolation
         | InventoryPhase::HostResourceAuthority
         | InventoryPhase::JailerSeccompContainment
-        | InventoryPhase::ProductionHost => {
+        | InventoryPhase::ProductionHost
+        | InventoryPhase::NetworkVmnetFeasibility => {
             for id in JAILER_UID_GID_IDS {
                 ids.remove(id);
             }
@@ -268,8 +279,16 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             for id in JAILER_AGGREGATE_IDS {
                 ids.remove(id);
             }
-            if phase == InventoryPhase::ProductionHost {
+            if matches!(
+                phase,
+                InventoryPhase::ProductionHost | InventoryPhase::NetworkVmnetFeasibility
+            ) {
                 ids.remove(PRODUCTION_HOST_ID);
+            }
+            if phase == InventoryPhase::NetworkVmnetFeasibility {
+                for id in NETWORK_VMNET_FEASIBLE_IDS {
+                    ids.remove(id);
+                }
             }
         }
     }
@@ -286,6 +305,7 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility
     ) {
         ids.remove(MULTIPROCESS_ISOLATION_ID);
     }
@@ -294,14 +314,20 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility
     ) {
         ids.remove(HOST_RESOURCE_AUTHORITY_ID);
     }
     if matches!(
         phase,
-        InventoryPhase::JailerSeccompContainment | InventoryPhase::ProductionHost
+        InventoryPhase::JailerSeccompContainment
+            | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility
     ) {
         ids.remove(JAILER_SECCOMP_CONTAINMENT_ID);
+    }
+    if phase == InventoryPhase::NetworkVmnetFeasibility {
+        ids.extend(NETWORK_VMNET_FEASIBLE_IDS);
     }
     ids
 }
@@ -362,10 +388,19 @@ mod tests {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::NetworkVmnetFeasibility)
+        );
+
+        let mut production_host = current.clone();
+        for id in NETWORK_VMNET_FEASIBLE_IDS {
+            set_disposition(&mut production_host, id, Disposition::AuditRequired);
+        }
+        assert_eq!(
+            classify_inventory_phase(&production_host),
             Ok(InventoryPhase::ProductionHost)
         );
 
-        let mut containment = current.clone();
+        let mut containment = production_host;
         set_disposition(
             &mut containment,
             PRODUCTION_HOST_ID,
@@ -450,13 +485,13 @@ mod tests {
         let mut inventory = current_inventory();
         set_disposition(
             &mut inventory,
-            "tool-argument:jailer/uid",
-            Disposition::AuditRequired,
+            "corpus:network-setup",
+            Disposition::ImplementedAndVerified,
         );
         set_disposition(
             &mut inventory,
-            "corpus:production-host",
-            Disposition::ProvenPlatformImpossible,
+            "api-operation:GET /",
+            Disposition::MissingPlatformFeasible,
         );
         assert!(
             classify_inventory_phase(&inventory)
@@ -482,6 +517,9 @@ mod tests {
         );
 
         let mut aggregate_swap = current_inventory();
+        for id in NETWORK_VMNET_FEASIBLE_IDS {
+            set_disposition(&mut aggregate_swap, id, Disposition::AuditRequired);
+        }
         set_disposition(
             &mut aggregate_swap,
             "corpus:jailer",

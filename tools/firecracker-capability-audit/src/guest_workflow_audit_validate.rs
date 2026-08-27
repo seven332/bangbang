@@ -19,7 +19,11 @@ pub const GUEST_WORKFLOW_AUDIT_PATH: &str = "compat/firecracker/v1.16.0/guest-wo
 /// Exact ordered artifact identities owned by the authority.
 pub const GUEST_ARTIFACT_IDS: [&str; 2] = ["kernel", "rootfs"];
 /// Exact ordered ext4 recipe identities owned by the authority.
-pub const GUEST_EXT4_RECIPE_IDS: [&str; 2] = ["rootfs-ext4", "rootfs-ext4-direct-boot-v110"];
+pub const GUEST_EXT4_RECIPE_IDS: [&str; 3] = [
+    "rootfs-ext4",
+    "rootfs-ext4-direct-boot-v110",
+    "rootfs-ext4-direct-boot-v111",
+];
 /// Exact ordered planned workflow identities reserved for the completion slice.
 pub const GUEST_WORKFLOW_PROFILE_IDS: [&str; 2] =
     ["macos-api-rootfs-smoke", "macos-no-api-rootfs-smoke"];
@@ -263,8 +267,8 @@ fn validate_ext4_recipes(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
     }
 
     for (index, recipe) in audit.ext4_recipes.iter().enumerate() {
-        let (variant, template, default_size, inputs): (&str, &str, &str, &[&str]) = if index == 0 {
-            (
+        let (variant, template, default_size, inputs): (&str, &str, &str, &[&str]) = match index {
+            0 => (
                 "normal",
                 "ubuntu-24.04-{size}.ext4",
                 "1G",
@@ -273,9 +277,8 @@ fn validate_ext4_recipes(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
                     "scripts/fetch-firecracker-rootfs.sh",
                     "scripts/guest_artifact_policy.py",
                 ],
-            )
-        } else {
-            (
+            ),
+            1 => (
                 "direct-boot-v110",
                 "ubuntu-24.04-{size}-direct-boot-v110.ext4",
                 "512M",
@@ -287,7 +290,26 @@ fn validate_ext4_recipes(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
                     "scripts/guest/specification-benchmark.rs",
                     "scripts/guest_artifact_policy.py",
                 ],
-            )
+            ),
+            2 => (
+                "direct-boot-v111",
+                "ubuntu-24.04-{size}-direct-boot-v111.ext4",
+                "512M",
+                &[
+                    GUEST_WORKFLOW_AUDIT_PATH,
+                    "scripts/fetch-firecracker-rootfs.sh",
+                    "scripts/guest/arm64-id-register-report.rs",
+                    "scripts/guest/elevated_vmnet_certification.rs",
+                    "scripts/guest/specification-benchmark.rs",
+                    "scripts/guest_artifact_policy.py",
+                ],
+            ),
+            _ => {
+                errors.push(format!(
+                    "guest workflow ext4 recipe at unexpected index {index}"
+                ));
+                continue;
+            }
         };
         if recipe.source_artifact != "rootfs"
             || recipe.variant != variant
@@ -699,7 +721,12 @@ fn validate_source_tokens(repository_root: &Path, errors: &mut Vec<String>) {
         ),
         (
             "scripts/fetch-firecracker-rootfs.sh",
-            &["direct-boot-v110", "guest_artifact_policy.py"][..],
+            &[
+                "direct-boot-v110",
+                "direct-boot-v111",
+                "elevated_vmnet_certification.rs",
+                "guest_artifact_policy.py",
+            ][..],
         ),
         (
             "scripts/build-guest-boot-initrd.py",

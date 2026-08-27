@@ -12,9 +12,9 @@ use bangbang_firecracker_capability_audit::{
     METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
     METRICS_SCHEMA_AUTHORITY_PATH, MULTIPROCESS_ISOLATION_AUDIT_PATH, PRODUCTION_HOST_AUDIT_PATH,
     SOURCE_MANIFEST_PATH, SPECIFICATION_BENCHMARK_AUDIT_PATH, TRACING_AUDIT_PATH,
-    WAVE7_AGGREGATE_AUDIT_PATH, WAVE8_CERTIFICATION_AUDIT_PATH, derive_logger_producer_manifest,
-    derive_metrics_schema_source, derive_source_manifest, logger_producer_manifest_json,
-    metrics_schema_source_candidate_json, read_capability_inventory,
+    VMNET_FEASIBILITY_AUDIT_PATH, WAVE7_AGGREGATE_AUDIT_PATH, WAVE8_CERTIFICATION_AUDIT_PATH,
+    derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
+    logger_producer_manifest_json, metrics_schema_source_candidate_json, read_capability_inventory,
     read_cpu_template_helper_audit, read_formal_verification_audit, read_guest_workflow_audit,
     read_host_resource_authority_audit, read_jailer_aggregate_audit,
     read_jailer_seccomp_containment_audit, read_logger_producer_audit,
@@ -22,8 +22,9 @@ use bangbang_firecracker_capability_audit::{
     read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
     read_metrics_schema_authority, read_multiprocess_isolation_audit, read_production_host_audit,
     read_source_manifest, read_specification_benchmark_audit, read_tracing_audit,
-    read_wave7_aggregate_audit, read_wave8_certification_audit, source_manifest_json, validate,
-    validate_cpu_template_compatibility, validate_cpu_template_fingerprint_compare_compatibility,
+    read_vmnet_feasibility_audit, read_wave7_aggregate_audit, read_wave8_certification_audit,
+    source_manifest_json, validate, validate_cpu_template_compatibility,
+    validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility, validate_cpu_template_helper_audit,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
     validate_cpu_template_strip_compatibility, validate_formal_verification_audit,
@@ -40,9 +41,9 @@ use bangbang_firecracker_capability_audit::{
     validate_multiprocess_isolation_compatibility, validate_production_host_audit,
     validate_production_host_compatibility, validate_production_host_upstream_source,
     validate_specification_benchmark_audit, validate_specification_benchmark_compatibility,
-    validate_tracing_audit, validate_tracing_compatibility, validate_wave7_aggregate_audit,
-    validate_wave7_aggregate_compatibility, validate_wave8_certification_audit,
-    validate_wave8_certification_compatibility,
+    validate_tracing_audit, validate_tracing_compatibility, validate_vmnet_feasibility_audit,
+    validate_wave7_aggregate_audit, validate_wave7_aggregate_compatibility,
+    validate_wave8_certification_audit, validate_wave8_certification_compatibility,
 };
 
 fn main() -> ExitCode {
@@ -177,6 +178,8 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let jailer_seccomp_containment_audit =
         read_jailer_seccomp_containment_audit(&root.join(JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH))?;
     let production_host_audit = read_production_host_audit(&root.join(PRODUCTION_HOST_AUDIT_PATH))?;
+    let vmnet_feasibility_audit =
+        read_vmnet_feasibility_audit(&root.join(VMNET_FEASIBILITY_AUDIT_PATH))?;
     let formal_verification_audit =
         read_formal_verification_audit(&root.join(FORMAL_VERIFICATION_AUDIT_PATH))?;
     let specification_benchmark_audit =
@@ -245,6 +248,12 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             ))
         },
     )?;
+    validate_vmnet_feasibility_audit(&vmnet_feasibility_audit, &manifest, &inventory, &root)
+        .map_err(|errors| {
+            AuditError::new(format!(
+                "vmnet feasibility audit validation errors:\n{errors}"
+            ))
+        })?;
     validate_formal_verification_audit(&formal_verification_audit, &root).map_err(|errors| {
         AuditError::new(format!(
             "formal verification audit validation errors:\n{errors}"
@@ -1637,6 +1646,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
     let host_resource_authority_audit_path = root.join(HOST_RESOURCE_AUTHORITY_AUDIT_PATH);
     let jailer_seccomp_containment_audit_path = root.join(JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH);
     let production_host_audit_path = root.join(PRODUCTION_HOST_AUDIT_PATH);
+    let vmnet_feasibility_audit_path = root.join(VMNET_FEASIBILITY_AUDIT_PATH);
     let formal_verification_audit_path = root.join(FORMAL_VERIFICATION_AUDIT_PATH);
     let specification_benchmark_audit_path = root.join(SPECIFICATION_BENCHMARK_AUDIT_PATH);
     let wave7_aggregate_audit_path = root.join(WAVE7_AGGREGATE_AUDIT_PATH);
@@ -1659,6 +1669,7 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
         &host_resource_authority_audit_path,
         &jailer_seccomp_containment_audit_path,
         &production_host_audit_path,
+        &vmnet_feasibility_audit_path,
         &formal_verification_audit_path,
         &specification_benchmark_audit_path,
         &wave7_aggregate_audit_path,

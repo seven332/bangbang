@@ -13247,11 +13247,12 @@
     {
       "id": "corpus:network-setup",
       "family": "network-and-mmds",
-      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. External gate https://github.com/seven332/bangbang/issues/1378 owns positive production vmnet connectivity and credentialed failure, cleanup, and concurrent-session evidence.",
+      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. Entitlement-free exact-root feasibility now includes ordinary-user denial, root-start followed by irreversible owner drop with callback/read/write/stop, and repeat real guest shared-vmnet DHCP plus bidirectional nonce-bound TCP. Delivery issue https://github.com/seven332/bangbang/issues/1378 still owns the minimal privileged provider, contained production topology, service failure/reclamation, and concurrent-session certification; root-direct execution is evidence only.",
       "source_refs": [
         "corpus:network-setup"
       ],
-      "disposition": "audit-required"
+      "disposition": "missing-platform-feasible",
+      "delivery_issue": "https://github.com/seven332/bangbang/issues/1378"
     },
     {
       "id": "corpus:patch-block",
@@ -16062,13 +16063,14 @@
     {
       "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
       "family": "network-and-mmds",
-      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. External gate https://github.com/seven332/bangbang/issues/1378 owns positive connectivity and credentialed service/crash evidence; Wave 7 https://github.com/seven332/bangbang/issues/1491 owns final performance and observability closure.",
+      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. Entitlement-free exact-root feasibility now proves the real public shared-vmnet path through repeat guest DHCP and bidirectional nonce-bound TCP, plus callback/read/write/stop after irreversible owner drop. Delivery issue https://github.com/seven332/bangbang/issues/1378 owns the minimal privileged provider, sandbox-worker remote backend, production service/crash/reclamation and concurrency evidence; root-direct execution is not a supported topology. Wave 7 https://github.com/seven332/bangbang/issues/1491 retains terminal performance and observability ownership.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:network-setup",
         "corpus:patch-network-interface"
       ],
-      "disposition": "audit-required"
+      "disposition": "missing-platform-feasible",
+      "delivery_issue": "https://github.com/seven332/bangbang/issues/1378"
     },
     {
       "id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",

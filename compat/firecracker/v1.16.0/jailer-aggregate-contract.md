@@ -141,8 +141,10 @@ were `corpus:network-setup`, `corpus:production-host`, and
 and host-resource composites are separately terminal under #1914 and #1916.
 The final jailer/seccomp/macOS-containment composite is terminal under #1918;
 #1920 then certifies the production-host corpus. Only the two #1378 network
-records remain audit-required; no feasible record remains, and the 33 exact
-platform exclusions remain unchanged.
+records remain audit-required at that successor; no feasible record remains,
+and the 33 exact platform exclusions remain unchanged. #1930 later moves those
+two rows to `missing-platform-feasible`, producing `383/0/2/33` without
+changing this historical transition.
 
 This outcome explicitly does not claim Linux jailer mechanism parity, a
 literal per-run executable copy, absence of shared read-only code pages,
@@ -165,6 +167,6 @@ transition, unrelated-record digest, and the two checked contract rows. The
 ordinary delivery command also validates the authority structure.
 
 The global `--final` mode remains stronger and intentionally fails while the
-two #1378 audit-required records remain. The
+two #1378 feasible-but-undelivered records remain. The
 signed producer scenarios run through `scripts/run-integration-tests.sh`
 without `--allow-unsupported`; no sudo is required by this aggregate slice.

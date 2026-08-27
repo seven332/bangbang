@@ -19,6 +19,9 @@ Options:
                    can fetch MMDS, and can select the checked production-vmnet
                    guest oracle when requested by boot args. Only valid with
                    --format ext4.
+  --direct-boot-variant VARIANT
+                   Select direct-boot-v110 or direct-boot-v111. Defaults to
+                   direct-boot-v110 and is valid only with --direct-boot-init.
   -h, --help       Show this help.
 
 Environment:
@@ -33,6 +36,8 @@ format="squashfs"
 ext4_size="1G"
 ext4_size_set=false
 direct_boot_init=false
+direct_boot_variant="direct-boot-v110"
+direct_boot_variant_set=false
 internal_populate_dir=""
 
 while [[ "$#" -gt 0 ]]; do
@@ -65,6 +70,30 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --direct-boot-init)
       direct_boot_init=true
+      ;;
+    --direct-boot-variant)
+      if [[ "$direct_boot_variant_set" == true ]]; then
+        echo "duplicate --direct-boot-variant" >&2
+        usage >&2
+        exit 2
+      fi
+      shift
+      if [[ "$#" -eq 0 || -z "$1" ]]; then
+        echo "--direct-boot-variant requires a value" >&2
+        usage >&2
+        exit 2
+      fi
+      direct_boot_variant="$1"
+      direct_boot_variant_set=true
+      ;;
+    --direct-boot-variant=*)
+      if [[ "$direct_boot_variant_set" == true ]]; then
+        echo "duplicate --direct-boot-variant" >&2
+        usage >&2
+        exit 2
+      fi
+      direct_boot_variant="${1#--direct-boot-variant=}"
+      direct_boot_variant_set=true
       ;;
     --internal-populate-direct)
       if [[ "${BANGBANG_GUEST_POLICY_INTERNAL:-}" != "1" || "$#" -ne 2 ]]; then
@@ -107,6 +136,20 @@ if [[ "$format" != "ext4" && "$direct_boot_init" == true ]]; then
   usage >&2
   exit 2
 fi
+if [[ "$direct_boot_init" != true && "$direct_boot_variant_set" == true ]]; then
+  echo "--direct-boot-variant requires --direct-boot-init" >&2
+  usage >&2
+  exit 2
+fi
+case "$direct_boot_variant" in
+  direct-boot-v110 | direct-boot-v111)
+    ;;
+  *)
+    echo "unsupported direct-boot variant: $direct_boot_variant" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
 
 if [[ ! "$ext4_size" =~ ^([0-9]+)[KkMmGgTt]?$ ]]; then
   echo "invalid ext4 size: $ext4_size" >&2
@@ -120,8 +163,8 @@ if [[ "${BASH_REMATCH[1]}" =~ ^0+$ ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-direct_boot_variant="direct-boot-v110"
 extract_dir=""
+populate_variant="${BANGBANG_GUEST_POLICY_VARIANT:-}"
 
 validate_static_arm64_guest_helper() {
   local helper_path="$1"
@@ -261,6 +304,7 @@ build_static_arm64_guest_helper() {
     --edition 2024 \
     --target aarch64-unknown-linux-musl \
     --remap-path-prefix "$repo_root=/bangbang" \
+    -D warnings \
     -C linker="$rust_lld" \
     -C link-self-contained=no \
     -C link-arg=--build-id=none \
@@ -284,28 +328,36 @@ install_static_arm64_guest_helpers() {
     "${repo_root}/scripts/guest/specification-benchmark.rs" \
     "${extract_dir}/bangbang-specification-benchmark" \
     "arm64 specification benchmark workload"
+  if [[ "$populate_variant" == direct-boot-v111 ]]; then
+    build_static_arm64_guest_helper \
+      "${repo_root}/scripts/guest/elevated_vmnet_certification.rs" \
+      "${extract_dir}/bangbang-elevated-vmnet-certification" \
+      "elevated vmnet certification guest helper"
+  fi
 }
 
-install_production_vmnet_certification_helper() {
-  local helper_source="${repo_root}/scripts/guest/production_vmnet_certification.py"
-  local helper_path="${extract_dir}/bangbang-production-vmnet-certification"
+install_checked_python_helper() {
+  local helper_source="$1"
+  local helper_path="$2"
+  local helper_mode="$3"
+  local helper_description="$4"
 
   if [[ ! -f "$helper_source" || -L "$helper_source" ]]; then
-    echo "production vmnet certification guest helper source is missing or unsafe" >&2
+    echo "$helper_description source is missing or unsafe" >&2
     exit 1
   fi
-  install -m 0555 "$helper_source" "$helper_path"
-  if ! python3 - "$helper_source" "$helper_path" <<'PY'
+  install -m "$helper_mode" "$helper_source" "$helper_path"
+  if ! python3 - "$helper_source" "$helper_path" "$helper_mode" <<'PY'
 import os
 import stat
 import sys
 
-source, installed = sys.argv[1:]
+source, installed, expected_mode = sys.argv[1:]
 metadata = os.lstat(installed)
 if (
     not stat.S_ISREG(metadata.st_mode)
     or stat.S_ISLNK(metadata.st_mode)
-    or stat.S_IMODE(metadata.st_mode) != 0o555
+    or stat.S_IMODE(metadata.st_mode) != int(expected_mode, 8)
 ):
     raise SystemExit("installed helper type or mode drifted")
 with open(source, "rb") as source_file, open(installed, "rb") as installed_file:
@@ -313,9 +365,30 @@ with open(source, "rb") as source_file, open(installed, "rb") as installed_file:
         raise SystemExit("installed helper content drifted")
 PY
   then
-    echo "production vmnet certification guest helper installation drifted" >&2
+    echo "$helper_description installation drifted" >&2
     exit 1
   fi
+}
+
+install_production_vmnet_certification_helper() {
+  local production_source="${repo_root}/scripts/guest/production_vmnet_certification.py"
+  local helper_path="${extract_dir}/bangbang-production-vmnet-certification"
+
+  case "$populate_variant" in
+    direct-boot-v110)
+      install_checked_python_helper \
+        "$production_source" \
+        "$helper_path" \
+        0555 \
+        "production vmnet certification guest helper"
+      ;;
+    direct-boot-v111)
+      ;;
+    *)
+      echo "checked direct-rootfs variant is missing or invalid" >&2
+      exit 1
+      ;;
+  esac
 }
 
 install_direct_boot_init() {
@@ -5283,6 +5356,12 @@ elif cmdline_has bangbang.vsock-host-connect=1; then
   fetch_host_vsock_marker
 elif cmdline_has bangbang.vsock-host-multistream=1; then
   fetch_multi_host_vsock_marker
+elif cmdline_has bangbang.elevated-vmnet-certification=1; then
+  if [ -x /bangbang-elevated-vmnet-certification ]; then
+    /bangbang-elevated-vmnet-certification || true
+  else
+    emit_line BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_INTERNAL
+  fi
 elif cmdline_has bangbang.production-vmnet-certification=1; then
   if [ -x /bangbang-production-vmnet-certification ]; then
     /bangbang-production-vmnet-certification || true
@@ -5303,6 +5382,14 @@ EOF
 }
 
 if [[ -n "$internal_populate_dir" ]]; then
+  case "$populate_variant" in
+    direct-boot-v110 | direct-boot-v111)
+      ;;
+    *)
+      echo "internal rootfs population requires an exact checked variant" >&2
+      exit 2
+      ;;
+  esac
   case "$internal_populate_dir" in
     /*)
       ;;

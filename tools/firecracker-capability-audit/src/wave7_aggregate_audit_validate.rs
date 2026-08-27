@@ -582,14 +582,15 @@ fn validate_scope_and_counts(
             | InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
-            | InventoryPhase::ProductionHost,
+            | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility,
         ) => {}
         Ok(phase) => errors.push(format!(
             "Wave 7 aggregate inventory cannot use the earlier {} phase",
             phase.name()
         )),
         Err(error) => errors.push(format!(
-            "Wave 7 aggregate inventory must be its exact 376/9/3/30 phase, the exact Wave 8 377/8/3/30 successor, the exact post-Wave-8 jailer uid/gid 377/6/3/32 successor, the exact post-uid/gid jailer chroot-base-dir 377/5/3/33 successor, the exact aggregate jailer 379/3/3/33 successor, the exact multiprocess isolation 380/3/2/33 successor, the exact host-resource authority 381/3/1/33 successor, the exact jailer/seccomp containment 382/3/0/33 successor, or the exact production-host 383/2/0/33 successor; found {}/{}/{}/{}: {error}",
+            "Wave 7 aggregate inventory must be its exact phase or an exact successor through 383/0/2/33 vmnet feasibility; found {}/{}/{}/{}: {error}",
             counts.0, counts.1, counts.2, counts.3
         )),
     }
@@ -644,7 +645,9 @@ fn validate_design(
                 .map_or(Disposition::MissingPlatformFeasible, |phase| {
                     expected_disposition(phase, &record.capability_id)
                 }),
-            Wave7DesignOutcome::Handoff1378 => Disposition::AuditRequired,
+            Wave7DesignOutcome::Handoff1378 => phase.map_or(Disposition::AuditRequired, |phase| {
+                expected_disposition(phase, &record.capability_id)
+            }),
             Wave7DesignOutcome::HandoffWave8 => phase.map_or(Disposition::AuditRequired, |phase| {
                 expected_disposition(phase, WAVE8_SUCCESSOR_ID)
             }),
@@ -1126,7 +1129,8 @@ fn validate_tools(
                     | InventoryPhase::MultiprocessIsolation
                     | InventoryPhase::HostResourceAuthority
                     | InventoryPhase::JailerSeccompContainment
-                    | InventoryPhase::ProductionHost,
+                    | InventoryPhase::ProductionHost
+                    | InventoryPhase::NetworkVmnetFeasibility,
                 ),
             ) => (6, 8, 0),
             _ => (
@@ -1464,6 +1468,11 @@ fn validate_handoffs(
                 Some("https://github.com/seven332/bangbang/issues/1351")
             }
             Wave7HandoffOwner::Issue1351 => None,
+            Wave7HandoffOwner::Issue1378
+                if expected_disposition == Disposition::MissingPlatformFeasible =>
+            {
+                Some("https://github.com/seven332/bangbang/issues/1378")
+            }
             Wave7HandoffOwner::Issue1373
             | Wave7HandoffOwner::Issue1378
             | Wave7HandoffOwner::Wave8 => None,
@@ -1495,7 +1504,8 @@ fn validate_handoffs(
         | InventoryPhase::MultiprocessIsolation
         | InventoryPhase::HostResourceAuthority
         | InventoryPhase::JailerSeccompContainment
-        | InventoryPhase::ProductionHost),
+        | InventoryPhase::ProductionHost
+        | InventoryPhase::NetworkVmnetFeasibility),
     ) = phase
     {
         let expected = expected_nonterminal_ids(phase);

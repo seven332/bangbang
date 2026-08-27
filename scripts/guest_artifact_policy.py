@@ -33,6 +33,7 @@ MAX_EXT4_BYTES = 16 * 1024**4
 FILE_MODE = 0o644
 STAGE_MODE = 0o600
 DIRECT_POPULATE_ENV = "BANGBANG_GUEST_POLICY_INTERNAL"
+DIRECT_POPULATE_VARIANT_ENV = "BANGBANG_GUEST_POLICY_VARIANT"
 
 
 class ArtifactPolicyError(RuntimeError):
@@ -380,7 +381,11 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
 
     recipes: dict[str, Ext4Recipe] = {}
     recipe_items = _require_list(root["ext4_recipes"], "ext4_recipes")
-    expected_recipe_ids = ("rootfs-ext4", "rootfs-ext4-direct-boot-v110")
+    expected_recipe_ids = (
+        "rootfs-ext4",
+        "rootfs-ext4-direct-boot-v110",
+        "rootfs-ext4-direct-boot-v111",
+    )
     for index, value in enumerate(recipe_items):
         item = _require_object(
             value,
@@ -399,7 +404,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
             ),
             f"ext4_recipes[{index}]",
         )
-        if len(recipe_items) != 2 or item["id"] != expected_recipe_ids[index]:
+        if len(recipe_items) != len(expected_recipe_ids) or item["id"] != expected_recipe_ids[index]:
             raise ArtifactPolicyError("manifest", "ext4 recipe order or identity drifted")
         if (
             item["source_artifact"] != "rootfs"
@@ -1299,8 +1304,13 @@ def prepare_ext4(
     """Prepare one fixed rootless ext4 recipe and its sidecar validity marker."""
 
     policy = manifest or load_manifest()
-    recipe_id = "rootfs-ext4" if variant == "normal" else "rootfs-ext4-direct-boot-v110"
-    if recipe_id not in policy.recipes or variant not in ("normal", "direct-boot-v110"):
+    recipe_ids = {
+        "normal": "rootfs-ext4",
+        "direct-boot-v110": "rootfs-ext4-direct-boot-v110",
+        "direct-boot-v111": "rootfs-ext4-direct-boot-v111",
+    }
+    recipe_id = recipe_ids.get(variant)
+    if recipe_id is None or recipe_id not in policy.recipes:
         raise ArtifactPolicyError("invocation", f"unknown checked ext4 variant: {variant}")
     recipe = policy.recipes[recipe_id]
     size_token, size_bytes = parse_ext4_size(size, recipe.minimum_size_bytes)
@@ -1346,9 +1356,10 @@ def prepare_ext4(
             )
             if result.returncode != 0:
                 raise ArtifactPolicyError("build", "unsquashfs failed while preparing ext4 rootfs")
-            if variant == "direct-boot-v110":
+            if variant in ("direct-boot-v110", "direct-boot-v111"):
                 environment = dict(os.environ)
                 environment[DIRECT_POPULATE_ENV] = "1"
+                environment[DIRECT_POPULATE_VARIANT_ENV] = variant
                 result = runner(
                     (
                         os.fspath(REPOSITORY_ROOT / "scripts/fetch-firecracker-rootfs.sh"),
@@ -1400,7 +1411,11 @@ def _parse_args(arguments: Optional[Sequence[str]] = None) -> argparse.Namespace
 
     ext4_parser = subparsers.add_parser("prepare-ext4", help="Prepare one checked ext4 recipe.")
     ext4_parser.add_argument("--size", required=True)
-    ext4_parser.add_argument("--variant", required=True, choices=("normal", "direct-boot-v110"))
+    ext4_parser.add_argument(
+        "--variant",
+        required=True,
+        choices=("normal", "direct-boot-v110", "direct-boot-v111"),
+    )
 
     publish_parser = subparsers.add_parser("publish", help="Publish a fixed caller-owned output class.")
     publish_parser.add_argument("kind", choices=("signed",))

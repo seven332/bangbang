@@ -240,8 +240,10 @@ composite at `380/3/2/33`, and #1916 certifies the host-resource authority
 composite at `381/3/1/33`. #1918 certifies the final
 jailer/seccomp/macOS-containment isolation composite at `382/3/0/33`. #1920
 then certifies the complete production-host corpus at `383/2/0/33`. Only the
-two #1378 network records remain audit-required; no platform-feasible
-isolation record remains.
+two #1378 network records remain audit-required at that phase; no
+platform-feasible isolation record remains. #1930 then moves exactly those two
+network records to `missing-platform-feasible` from entitlement-free
+root-direct evidence, producing the current `383/0/2/33` phase.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -1303,8 +1305,40 @@ fixture preparation; fixture state alone is never evidence. Setup failures
 publish nothing. Once setup succeeds, a case failure can publish only a failed
 ledger after driver and session cleanup; uncertain cleanup is marked incomplete
 and takes precedence over success. The checked runner has not been invoked with
-repository-owned restricted credentials, so it leaves both #1378 capability
-rows `audit-required`.
+repository-owned restricted credentials. The separate #1930 gate below does
+not change that credentialed-production fact; it reclassifies both #1378 rows
+as `missing-platform-feasible` from a narrower entitlement-free topology.
+
+### Entitlement-free root-direct vmnet evidence boundary
+
+#1930 assumes the restricted Apple vmnet entitlement, approved provisioning
+profile, and corresponding signing identity are absent. It separates ordinary
+preparation from explicit root execution. Preparation builds, ad-hoc signs,
+validates, and publishes one exact immutable package and proves the same VMM is
+denied by vmnet as the ordinary user. The already-root runner has closed stdin
+and environment, accepts only that package and its owning nonzero uid/gid, and
+cannot build, download, sign, discover accounts, or obtain elevation.
+
+The first positive case starts one real shared-vmnet backend as root, validates
+the returned parameter classes, clears supplementary groups, irreversibly drops
+real/effective gid and uid to the package owner, proves root cannot be regained,
+then performs bounded callback, read, fixed-frame write, and stop operations.
+The second positive case runs the ad-hoc Hypervisor-signed direct VMM as exact
+root and boots the pinned v111 guest twice. The static no-std guest accepts only
+a digest-bound control sector, obtains a strict DHCP lease, derives its host
+endpoint solely from the accepted router, completes one nonce-bound TCP
+exchange, and reverses guest network state. Every process, socket, listener,
+file, and owner created by the harness must be absent after each bounded case.
+
+This authority is deliberately evidence-only. Running the VMM as root is not a
+supported production topology; root is not treated as the restricted Apple
+entitlement; and no password, authorization token, account name, path,
+interface, address, packet, nonce, PID, or raw framework/process output is
+recorded. The intended #1378 product remains an unprivileged launcher, minimal
+one-shot root provider, per-interface owner that drops privilege after vmnet
+start, and sandboxed HVF worker using a remote packet provider. Provider/broker
+protocols, contained integration, crash reclamation, concurrency, and the
+optional Apple-authorized matrix remain undelivered.
 
 The vmnet path requires the host to satisfy macOS vmnet authorization,
 entitlement, and code-signing requirements. Apple's
@@ -1396,8 +1430,9 @@ filters, a host firewall, or a NAT policy, and current signed limiter evidence
 uses MMDS-only packet I/O rather than direct vmnet. Exact native-v2 2.11
 network/MMDS snapshot encoding and fresh-session restoration are separately
 signed. The boundary still lacks packet filtering, production network
-isolation, a repository-owned approved credential and real contained vmnet
-evidence, and full Firecracker public packet-movement parity. The
+isolation, a repository-owned approved credential, the production remote
+provider topology, real contained vmnet evidence, and full Firecracker public
+packet-movement parity. The
 checked
 [network and MMDS closure contract](../compat/firecracker/v1.16.0/network-mmds-contract.md)
 separately pins the implemented deterministic capture/restore state and the
@@ -3715,9 +3750,11 @@ at `380/3/2/33`. #1916 then certifies exactly the host-resource authority row,
 leaving those three audit rows and one #1351 row at `381/3/1/33`. #1918 then
 certifies exactly the final containment row, leaving three audit rows at
 `382/3/0/33`. #1920 then certifies the production-host corpus, producing the
-current `383/2/0/33` successor with only the two #1378 rows. Missing authority
-or credentials alone is not an impossibility proof. Global `--final` stays
-blocked until those external outcomes complete.
+`383/2/0/33` successor with only the two #1378 rows. Missing authority
+or credentials alone is not an impossibility proof. #1930 subsequently proves
+the entitlement-free feasibility boundary and moves those two rows to
+`missing-platform-feasible`, producing `383/0/2/33`. Global `--final` stays
+blocked until the #1378 product outcomes complete.
 
 The elevated same-host gates have now been executed rather than inferred from
 split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root

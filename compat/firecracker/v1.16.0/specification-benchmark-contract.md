@@ -72,8 +72,10 @@ multiprocess-isolation transition then changes its one exact semantic row to
 reach 380/3/2/33. The host-resource-authority transition changes its one exact
 semantic row to reach 381/3/1/33. The containment transition changes its one
 exact semantic row to reach 382/3/0/33. The production-host transition then
-changes only its corpus row to reach the current 383/2/0/33 endpoint. The
-scoped gate accepts only those ten exact phases and
+changes only its corpus row to reach the 383/2/0/33 endpoint. The
+later #1930 vmnet-feasibility transition reclassifies exactly two #1378 rows
+to reach the current 383/0/2/33 endpoint. The scoped gate accepts only those
+exact phases and
 derives every identity-checked difference; none of the totals is a delivery
 quota.
 

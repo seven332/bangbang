@@ -85,6 +85,9 @@ The predecessor is exactly `381/3/1/33`; the successor is exactly
 evidence. Those three audit-required rows and all 33 platform exclusions were
 unchanged by #1918. #1920 later certifies only `corpus:production-host`,
 producing the exact `383/2/0/33` successor while preserving the two #1378 rows.
+#1930 subsequently reclassifies exactly those rows to
+`missing-platform-feasible` from real entitlement-free root-direct evidence,
+producing the exact `383/0/2/33` successor without altering this transition.
 
 ## Terminal jailer/seccomp containment outcome
 
@@ -102,4 +105,5 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer
 ```
 
 The global `--final` gate remains intentionally stronger and continues to fail
-while the two independently owned #1378 audit-required records remain open.
+while the two independently owned #1378 feasible-but-undelivered records remain
+open.

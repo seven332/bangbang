@@ -23,7 +23,7 @@ pub const JAILER_AGGREGATE_CAPABILITY_IDS: [&str; 2] =
     ["corpus:jailer", "tool-operation:jailer/run"];
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "a88723cbefeb6e97f9303701749fa04ff87580d1e2a74d742057db11acfc3b42";
+    "a6ac735858a26b4d7119a0c9df0d1157c15a515780be9e65e419e8035c58c9d3";
 
 const PROFILE_IDS: [JailerEvidenceProfileId; 9] = [
     JailerEvidenceProfileId::GrammarAndEarlyCommands,
@@ -215,10 +215,15 @@ fn validate_inventory_transition(
     }
     if !matches!(
         disposition_counts(inventory),
-        (379, 3, 3, 33) | (380, 3, 2, 33) | (381, 3, 1, 33) | (382, 3, 0, 33) | (383, 2, 0, 33)
+        (379, 3, 3, 33)
+            | (380, 3, 2, 33)
+            | (381, 3, 1, 33)
+            | (382, 3, 0, 33)
+            | (383, 2, 0, 33)
+            | (383, 0, 2, 33)
     ) {
         errors.push(
-            "jailer aggregate live inventory must be exactly 379/3/3/33, its 380/3/2/33 multiprocess successor, its 381/3/1/33 host-resource successor, its 382/3/0/33 containment successor, or its 383/2/0/33 production-host successor"
+            "jailer aggregate live inventory must be exactly 379/3/3/33 or one of its exact successors through 383/0/2/33 vmnet feasibility"
                 .to_string(),
         );
     }
@@ -228,7 +233,8 @@ fn validate_inventory_transition(
             | InventoryPhase::MultiprocessIsolation
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
-            | InventoryPhase::ProductionHost)
+            | InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility)
     ) {
         errors.push("jailer aggregate live inventory has an inexact successor phase".to_string());
     }

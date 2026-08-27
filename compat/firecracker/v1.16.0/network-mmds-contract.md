@@ -2,8 +2,9 @@
 
 This checked #1496 closure ledger owns exactly 35 Firecracker v1.16.0 network
 and MMDS identities. Thirty-three are `implemented-and-verified`, including
-the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
-`audit-required` for work owned by
+the exact native-v2 2.11 snapshot/session rows. Two broad rows are
+`missing-platform-feasible` after the #1930 entitlement-free root-direct gate;
+their implementation remains owned by
 [#1378](https://github.com/seven332/bangbang/issues/1378),
 [#1491](https://github.com/seven332/bangbang/issues/1491).
 
@@ -77,6 +78,13 @@ the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
   Apple-approved start, packet-connectivity, service-error, teardown, crash,
   retry, and concurrent-session results; an injected driver, non-success local
   gate, or fixture declaration is never a passing skip.
+- **ROOT-FEASIBILITY** — #1930 prepares an immutable v111 package as an
+  ordinary user, proves the identical ad-hoc-signed binary is denied without
+  elevation, then uses explicit exact-root authority to start shared vmnet. A
+  separate owner irreversibly drops uid/gid before bounded callback/read/write/
+  stop, and a real HVF guest completes strict DHCP plus a router-derived,
+  nonce-bound TCP exchange twice with cleanup. This proves feasibility without
+  Apple authorization; root-direct execution is evidence only, not production.
 - **W7** — #1798 closes the separate `corpus:network-performance` reference
   interpretation and strict optional-fixture boundary without claiming a
   positive network sample; #1378 retains production connectivity.
@@ -115,11 +123,11 @@ the exact native-v2 2.11 snapshot/session rows. Two broad rows remain
 | `api-schema:PartialNetworkInterface` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `corpus:mmds-design` | `implemented-and-verified` | `API-MMDS + MMDS-CORE + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `corpus:mmds-user-guide` | `implemented-and-verified` | `API-MMDS + MMDS-CORE + SNAPSHOT-CODEC` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-SNAPSHOT` | `terminal` |
-| `corpus:network-setup` | `audit-required` | `API-NET + NET-CORE` applicable live subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CONTAINED + EXTERNAL-GATE` | `EXTERNAL-GATE` |
+| `corpus:network-setup` | `missing-platform-feasible` | `API-NET + NET-CORE` applicable live subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CONTAINED + EXTERNAL-GATE + ROOT-FEASIBILITY` | `#1378` |
 | `corpus:patch-network-interface` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `non-swagger-route:DELETE /network-interfaces/{iface_id}` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-PROCESS + SIGNED-CONTAINED` | `terminal` |
 | `semantic.mmds:tcp-token-session-and-isolation` | `implemented-and-verified` | `MMDS-CORE + SNAPSHOT-CODEC` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-SNAPSHOT` | `terminal` |
-| `semantic.network:virtio-net-vmnet-policy-and-connectivity` | `audit-required` | `API-NET + NET-CORE + MMDS-CORE` live and capture-ready subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-CONTAINED + EXTERNAL-GATE` | `EXTERNAL-GATE + W7` |
+| `semantic.network:virtio-net-vmnet-policy-and-connectivity` | `missing-platform-feasible` | `API-NET + NET-CORE + MMDS-CORE` live and capture-ready subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-CONTAINED + EXTERNAL-GATE + ROOT-FEASIBILITY` | `#1378 + W7` |
 
 ## Observable live contract
 
@@ -215,11 +223,12 @@ before session creation.
 
 ## Explicit nonclaims and handoffs
 
-- #1378 remains open. This contract does not claim an Apple-approved production
-  vmnet start, external packet connectivity, service failure, crash reclamation,
-  or credentialed concurrent connectivity. Its checked foundation and
-  production orchestration change no row: caller-approved execution and exact
-  evidence promotion remain required.
+- #1378 remains open. #1930 proves entitlement-free shared-vmnet packet
+  connectivity and a dropped owner only in the root-direct evidence topology,
+  moving the two rows to `missing-platform-feasible`. This contract still does
+  not claim the production provider/broker, contained remote data plane,
+  service/crash reclamation, concurrent production sessions, or the optional
+  Apple-authorized matrix.
 - The checked [Wave 6 snapshot contract](snapshot-wave6-contract.md) makes
   Diff, version/tool composition, exact 2.11 network/MMDS bytes,
   reconstruction, overrides, and clone-session freshness terminal. Current

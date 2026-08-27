@@ -101,7 +101,10 @@ product choices rather than unimplemented Firecracker compatibility producers.
 
 The final jailer/seccomp/macOS containment composition is terminal under
 #1918. No isolation record remains `missing-platform-feasible`; the three
-external records above remain `audit-required`.
+external records above were `audit-required` at that transition. #1920 later
+certifies `corpus:production-host`; #1930 reclassifies the remaining two #1378
+network records as `missing-platform-feasible` without changing this terminal
+isolation result.
 
 ## Terminal jailer uid/gid platform limit
 
