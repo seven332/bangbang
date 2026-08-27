@@ -260,6 +260,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bangbang-vmnet-provider"
+version = "0.1.0"
+dependencies = [
+ "bangbang",
+ "bangbang-runtime",
+ "bangbang-session",
+ "bangbang-unix-stream",
+ "libc",
+ "signal-hook",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

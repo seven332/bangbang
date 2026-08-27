@@ -284,7 +284,9 @@ impl VmnetDataClient {
                 Ok(DataClientEvent::Ready)
             }
             (
-                DataClientState::Active | DataClientState::AwaitResponse,
+                DataClientState::Active
+                | DataClientState::AwaitResponse
+                | DataClientState::AwaitStopped,
                 Some(DataMessage::Readiness {
                     epoch,
                     estimated_packets,

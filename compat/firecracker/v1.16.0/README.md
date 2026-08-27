@@ -170,11 +170,13 @@ two-row evidence transition, and
 [`docs/testing.md`](../../../docs/testing.md#entitlement-free-vmnet-feasibility)
 for the canonical commands.
 
-The portable
-[`provider-v1` contract](../../../docs/vmnet-provider-protocol.md) now freezes
-the closed session/control/data wire and descriptor ownership needed by the
-next implementation slices. It intentionally leaves this inventory and both
-`missing-platform-feasible` dispositions unchanged.
+The [`provider-v1` contract](../../../docs/vmnet-provider-protocol.md) freezes
+the closed session/control/data wire and descriptor ownership. #1934 now adds
+the minimal root broker, exact per-interface owner process, irreversible
+credential drop, and entitlement-free real-host lifecycle/cancellation/repeat
+proof. Production launcher/sandbox assembly and guest-through-provider
+certification remain later slices; the inventory and both
+`missing-platform-feasible` dispositions stay unchanged.
 
 ## Guest workflow artifact authority
 

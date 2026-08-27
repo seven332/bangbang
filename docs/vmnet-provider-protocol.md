@@ -1,16 +1,17 @@
 # Private vmnet Provider Protocol
 
-The `bangbang-session` crate defines a closed `provider-v1` control and packet
-protocol for a future split vmnet topology. It is portable protocol machinery,
-not a production network path: this revision starts no broker or owner process,
-calls no vmnet API, grants no worker resource, changes no bundle, and requires
-neither root nor Apple authorization.
+The `bangbang-session` crate defines the closed `provider-v1` control and packet
+protocol for a split vmnet topology. The `bangbang-vmnet-provider` package now
+implements its minimal one-shot root broker and one privilege-dropped process
+per interface. Exact-host evidence calls the real vmnet API under explicit root
+authority and requires no Apple-approved vmnet entitlement, provisioning
+profile, or signing identity.
 
-The intended later topology keeps framework authority outside the sandboxed
-worker. A bootstrap-owned broker starts a narrowly scoped interface owner; the
-worker receives only a session-bound packet stream. Later adapters must still
-prove the privilege drop, sandbox grant, crash reclamation, process assembly,
-and real guest connectivity before this becomes supported production behavior.
+This is still not a production network path. No launcher-to-root bootstrap,
+operator authorization workflow, bundle assembly, sandbox grant/adapter, or
+guest-through-provider integration exists in this slice. The contained worker
+does not yet consume the transferred packet stream, and neither retained
+network capability is promoted.
 
 ## Components
 
@@ -21,9 +22,51 @@ and real guest connectivity before this becomes supported production behavior.
   encoding, role-specific state, packet bounds, and descriptor correlation.
 - `VmnetProviderTransport` composes both layers. A transport failure shuts down
   the stream and poisons that transport permanently.
+- `bangbang-vmnet-provider` owns the canonical private bootstrap, bounded policy
+  resolution, broker/owner supervision, exact child lifetime, credential
+  type-state boundary, and the macOS adapter to the existing
+  `SystemVmnetInterfaceBackend`.
+- The `bangbang` library exposes only its host-network backend view to this
+  package. The privileged entry point does not link the VMM, HTTP API, guest,
+  launcher, bundle, grant, or listener modules.
 
 The same shared Unix-stream primitive backs the existing portable vhost-user
 frontend without changing its public protocol.
+
+## Broker and owner process boundary
+
+The private broker accepts only fixed inherited connected Unix streams. Its
+canonical 128-byte bootstrap contains one nonzero lifecycle session, an exact
+nonroot uid/gid target, a one-through-four active-owner limit, and fixed
+host/shared/bridge-slot authority. Provider-v1 can select only those slots and
+bounded typed request parameters; it cannot supply an executable, path,
+command, environment value, raw bridge name, credential, signing value, or
+arbitrary string.
+
+For each accepted Start, the broker assigns a nonwrapping generation and
+self-spawns the same exact provider image in the fixed owner mode. Darwin
+default-close spawn actions retain only `/dev/null` standard streams plus the
+fixed supervision and data endpoints. The root-owned, single-link,
+non-writable executable is opened and its device, inode, link count, uid, gid,
+and mode are pinned. The child starts suspended, the vnode identity of its
+kernel-reported first executable mapping is matched directly to that identity,
+and only then is it resumed. A mismatch or resume failure terminates and reaps
+the exact child before it can call vmnet.
+
+The internal 160-byte supervision family is descriptor-free and closed to
+broker-owned Bootstrap/Stop plus owner-owned Ready/Failed/Final records. It has
+no packet, readiness, read/write, worker-control, path, or command field. The
+owner starts and freezes the existing system vmnet backend while exact root,
+then uses the production credential primitive to clear supplementary groups,
+call setgid before setuid, prove the irreversible prefix, and re-attest the
+configured real/effective identity. Only the resulting `DroppedOwner` type can
+enable callbacks or perform packet reads and writes.
+
+Clean data-first completion remains correlated in the broker ledger until the
+matching control Stop. Control cancellation retires every owner in deterministic
+interface order. Owner death, missing Final, timeout, identity mismatch, or
+unprovable stop is terminal cleanup uncertainty; any broker error runs the same
+session-wide cleanup before exit.
 
 ## Fixed wire contract
 
@@ -99,8 +142,9 @@ Every result or failure echoes the exact request sequence. Returned packets
 must fit the realized per-packet and per-batch limits; write completion is an
 ordered prefix, not permission to retry or reorder the suffix. Operation
 failure is terminal. `Stop` disables readiness and packet work,
-`Stopped(Complete)` permits only `Shutdown`, and uncertain cleanup poisons the
-stream.
+although one readiness record already published before Stop may arrive before
+`Stopped(Complete)`. That acknowledgement permits only `Shutdown`, and uncertain
+cleanup poisons the stream.
 
 ## Descriptor and failure ownership
 
@@ -133,10 +177,22 @@ lifecycle. Run them without elevation:
 cargo test -p bangbang-unix-stream --all-features --locked
 cargo test -p bangbang-session --all-features --locked
 cargo test -p bangbang-vhost-user --all-features --locked
+cargo test -p bangbang-vmnet-provider --all-features --locked
 ```
 
-This protocol deliberately changes no capability disposition. The checked
+Provider tests additionally cover canonical bootstrap/supervision records,
+slot resolution, four-owner capacity, monotonic generation reuse, independent
+failure, data-first retention, ordered cancellation, credential/service order,
+cleanup uncertainty, redaction, exact image mismatch, suspended pre-resume
+cleanup, and the static root linkage surface. The prepared exact-host workflow
+adds real provider-v1 data lifecycle, control cancellation, clean repeat, and
+empty-residue cases before the existing dropped-owner and repeated guest gates.
+Its fixed successful status explicitly records `apple-vmnet=absent`.
+
+This implementation deliberately changes no capability disposition. The checked
 inventory remains `383 implemented / 0 audit-required / 2
 missing-platform-feasible / 33 proven-platform-impossible`; the two retained
 rows are `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity`.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity`. Production
+launcher bootstrap, sandbox-worker consumption, a guest through this provider,
+and final lifecycle certification remain successor work.

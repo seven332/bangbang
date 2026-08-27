@@ -1,0 +1,27 @@
+[package]
+name = "bangbang-vmnet-provider"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+bangbang-session = { path = "../session" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bangbang = { path = "../bangbang", default-features = false }
+bangbang-runtime = { path = "../runtime" }
+bangbang-unix-stream = { path = "../unix-stream" }
+libc = "0.2"
+signal-hook = "0.3"
+
+[[bin]]
+name = "bangbang-vmnet-provider"
+path = "src/main.rs"
+
+[[test]]
+name = "elevated_vmnet_provider_e2e"
+path = "tests/elevated_vmnet_provider_e2e.rs"
+test = false
+
+[lints]
+workspace = true

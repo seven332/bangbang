@@ -165,11 +165,104 @@ fi
 /usr/bin/codesign --force --sign - "$stage/elevated-vmnet-e2e" >>"$log" 2>&1
 /usr/bin/codesign --verify --strict "$stage/elevated-vmnet-e2e" >>"$log" 2>&1
 
+cargo build \
+  -p bangbang-vmnet-provider \
+  --bin bangbang-vmnet-provider \
+  --all-features \
+  --locked \
+  --target aarch64-apple-darwin \
+  --message-format=json \
+  >"$cargo_messages" 2>>"$log" || {
+  echo "bangbang elevated vmnet prepare: provider build failed" >&2
+  exit 1
+}
+provider_source="$(/usr/bin/python3 - "$cargo_messages" <<'PY'
+import json
+import sys
+
+matches = []
+with open(sys.argv[1], encoding="utf-8") as messages:
+    for line in messages:
+        message = json.loads(line)
+        target = message.get("target", {})
+        executable = message.get("executable")
+        if (
+            message.get("reason") == "compiler-artifact"
+            and executable is not None
+            and target.get("name") == "bangbang-vmnet-provider"
+            and "bin" in target.get("kind", [])
+        ):
+            matches.append(executable)
+if len(matches) != 1:
+    raise SystemExit(1)
+sys.stdout.write(matches[0])
+PY
+)" || {
+  echo "bangbang elevated vmnet prepare: provider artifact failed" >&2
+  exit 1
+}
+if [[ ! -f "$provider_source" || -L "$provider_source" ]]; then
+  echo "bangbang elevated vmnet prepare: provider artifact failed" >&2
+  exit 1
+fi
+/bin/cp -p -- "$provider_source" "$stage/bangbang-vmnet-provider"
+/usr/bin/codesign --force --sign - "$stage/bangbang-vmnet-provider" >>"$log" 2>&1
+/usr/bin/codesign --verify --strict "$stage/bangbang-vmnet-provider" >>"$log" 2>&1
+
+cargo test \
+  -p bangbang-vmnet-provider \
+  --test elevated_vmnet_provider_e2e \
+  --all-features \
+  --locked \
+  --target aarch64-apple-darwin \
+  --no-run \
+  --message-format=json \
+  >"$cargo_messages" 2>>"$log" || {
+  echo "bangbang elevated vmnet prepare: provider harness build failed" >&2
+  exit 1
+}
+provider_test_source="$(/usr/bin/python3 - "$cargo_messages" <<'PY'
+import json
+import sys
+
+matches = []
+with open(sys.argv[1], encoding="utf-8") as messages:
+    for line in messages:
+        message = json.loads(line)
+        target = message.get("target", {})
+        executable = message.get("executable")
+        if (
+            message.get("reason") == "compiler-artifact"
+            and executable is not None
+            and target.get("name") == "elevated_vmnet_provider_e2e"
+            and "test" in target.get("kind", [])
+        ):
+            matches.append(executable)
+if len(matches) != 1:
+    raise SystemExit(1)
+sys.stdout.write(matches[0])
+PY
+)" || {
+  echo "bangbang elevated vmnet prepare: provider harness artifact failed" >&2
+  exit 1
+}
+if [[ ! -f "$provider_test_source" || -L "$provider_test_source" ]]; then
+  echo "bangbang elevated vmnet prepare: provider harness artifact failed" >&2
+  exit 1
+fi
+/bin/cp -p -- "$provider_test_source" "$stage/elevated-vmnet-provider-e2e"
+/usr/bin/codesign --force --sign - "$stage/elevated-vmnet-provider-e2e" >>"$log" 2>&1
+/usr/bin/codesign --verify --strict "$stage/elevated-vmnet-provider-e2e" >>"$log" 2>&1
+
 /bin/cp -p -- "$kernel" "$stage/vmlinux-6.1.155"
 /bin/cp -p -- "$rootfs" "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4"
 /bin/cp -p -- "$sidecar" "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json"
 /bin/cp -p -- scripts/elevated_vmnet_evidence.py "$stage/elevated-vmnet-evidence.py"
-/bin/chmod 0555 "$stage/bangbang" "$stage/elevated-vmnet-e2e"
+/bin/chmod 0555 \
+  "$stage/bangbang" \
+  "$stage/elevated-vmnet-e2e" \
+  "$stage/bangbang-vmnet-provider" \
+  "$stage/elevated-vmnet-provider-e2e"
 /bin/chmod 0444 \
   "$stage/vmlinux-6.1.155" \
   "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4" \
@@ -194,6 +287,15 @@ then
   echo "bangbang elevated vmnet prepare: product entitlement failed" >&2
   exit 1
 fi
+provider_entitlements="$(/usr/bin/codesign --display --entitlements - --xml \
+  "$stage/bangbang-vmnet-provider" 2>>"$log")" || {
+  echo "bangbang elevated vmnet prepare: provider signature failed" >&2
+  exit 1
+}
+if [[ -n "$provider_entitlements" ]]; then
+  echo "bangbang elevated vmnet prepare: provider entitlement failed" >&2
+  exit 1
+fi
 /bin/rm -f -- "$entitlements" "$cargo_messages"
 
 ordinary_runs="$(/usr/bin/mktemp -d /private/var/tmp/bbe-prep.XXXXXX)"
@@ -214,6 +316,14 @@ if [[ -n "$(/usr/bin/find -x "$ordinary_runs" -mindepth 1 -print -quit)" ]]; the
 fi
 /bin/rmdir -- "$ordinary_runs"
 ordinary_runs=""
+
+BANGBANG_ELEVATED_VMNET_PROVIDER="$stage/bangbang-vmnet-provider" \
+"$stage/elevated-vmnet-provider-e2e" \
+  --exact macos_arm64::ordinary_user_provider_broker_is_denied \
+  --test-threads=1 >>"$log" 2>&1 || {
+  echo "bangbang elevated vmnet prepare: ordinary provider denial failed" >&2
+  exit 1
+}
 
 printf '' > "$log"
 /bin/chmod 0600 "$log"

@@ -342,6 +342,28 @@ mod tests {
     }
 
     #[test]
+    fn data_accepts_one_already_published_readiness_before_stopped() {
+        let (mut client, mut owner) = data_pair();
+        let stop = client.stop().expect("stop should emit");
+        assert_eq!(
+            client.receive(owner.readiness(1).expect("raced readiness should emit")),
+            Ok(DataClientEvent::Readiness {
+                epoch: VmnetReadinessEpoch::new(1).expect("epoch should validate"),
+                estimated_packets: 1,
+            })
+        );
+        assert_eq!(owner.receive(stop), Ok(DataOwnerEvent::Stop));
+        assert_eq!(
+            client.receive(
+                owner
+                    .stopped(ProviderCleanup::Complete)
+                    .expect("stopped should emit")
+            ),
+            Ok(DataClientEvent::Stopped)
+        );
+    }
+
+    #[test]
     fn stale_readiness_and_wrong_scope_poison_data_state() {
         let (mut client, mut owner) = data_pair();
         client

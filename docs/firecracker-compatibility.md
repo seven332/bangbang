@@ -5425,15 +5425,19 @@ promote either #1378 row by itself.
 
 The separate entitlement-free #1930 workflow prepares `direct-boot-v111` as an
 ordinary user and then runs only prebuilt immutable artifacts under explicit
-exact-root authority. It proves ordinary-user denial, real shared-vmnet
-callback/read/write/stop after an irreversible owner uid/gid drop, and two real
-HVF guest DHCP/router-derived nonce-TCP executions with full cleanup. It uses no
-Apple authorization and records only categorical output. Therefore
+exact-root authority. #1934 extends it with the entitlement-free minimal root
+broker and exact per-interface owner: suspended child-image validation, real
+shared-vmnet start, irreversible uid/gid drop, provider-v1
+Hello/readiness/read/write/stop/shutdown, cancellation, reap, and clean repeat.
+The independent direct dropped-owner gate and two real HVF guest
+DHCP/router-derived nonce-TCP executions remain. The workflow uses no Apple
+authorization and records only categorical output. Therefore
 `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` are now
-`missing-platform-feasible`, not implemented. The production provider/broker,
-sandbox remote provider, crash reclamation, concurrency, and optional
-Apple-authorized matrix remain #1378 work.
+`missing-platform-feasible`, not implemented. Production launcher-to-broker
+authorization/assembly, the sandbox remote provider, a guest through that
+provider, concurrent production certification, and the optional Apple-authorized
+matrix remain #1378 work.
 
 ## Validation Expectations
 

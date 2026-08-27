@@ -38,6 +38,8 @@ def prepared_package(root: Path) -> None:
     payloads = {
         "bangbang": b"product",
         "elevated-vmnet-e2e": b"harness",
+        "bangbang-vmnet-provider": b"provider",
+        "elevated-vmnet-provider-e2e": b"provider-harness",
         "vmlinux-6.1.155": b"kernel",
         "ubuntu-24.04-512M-direct-boot-v111.ext4": b"rootfs",
         "elevated-vmnet-evidence.py": b"helper",
@@ -165,12 +167,15 @@ class ElevatedVmnetEvidenceTests(unittest.TestCase):
         self.assertIn("exec </dev/null", runner)
         self.assertIn("/usr/bin/env -i", runner)
         self.assertIn("dropped_owner_retains_bounded_vmnet_io", runner)
+        self.assertIn("dropped_provider_serves_data_lifecycle", runner)
+        self.assertIn("control_cancellation_reaps_dropped_provider", runner)
+        self.assertEqual(runner.count("dropped_provider_serves_data_lifecycle"), 2)
         self.assertEqual(runner.count("elevated_direct_guest_uses_shared_vmnet"), 2)
         self.assertNotIn("sudo", runner.lower())
         self.assertNotIn("SUDO_", runner)
         self.assertNotIn("dscacheutil", runner)
         self.assertNotIn("ps ", runner)
-        self.assertEqual(runner.count('find -x "$stage/runs"'), 3)
+        self.assertEqual(runner.count('find -x "$stage/runs"'), 6)
 
     def test_guest_oracle_protocol_failures_are_portable(self) -> None:
         compiler = os.environ.get("RUSTC") or shutil.which("rustc")

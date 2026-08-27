@@ -44,11 +44,12 @@ scripts/prepare-elevated-vmnet-evidence.sh --output /absolute/absent/directory
 ```
 
 It fetches and verifies the pinned kernel/rootfs, builds the static aarch64
-guest oracle and exact Rust harness, builds and ad-hoc signs the direct
-Hypervisor-entitled Bangbang executable, validates the closed artifact shape,
-and runs the ordinary-user negative control. The v111 rootfs recipe is a new
-identity; v110 and the optional Apple-authorized production certifier retain
-their existing meaning and digest.
+guest oracle and exact Rust harnesses, builds and ad-hoc signs the direct
+Hypervisor-entitled Bangbang executable, and builds the separately ad-hoc-signed
+entitlement-free `bangbang-vmnet-provider`. It validates the closed artifact
+shape and runs both ordinary-user negative controls. The v111 rootfs recipe is
+a distinct identity; v110 and the optional Apple-authorized production
+certifier retain their existing meaning and digest.
 
 The run wrapper requires that its caller already holds exact root authority:
 
@@ -66,8 +67,10 @@ input, artifact, log field, or child-process descriptor.
 
 The prepared directory and every member have an exact owner, type, link count,
 mode, size limit, digest, sidecar, signature, and entitlement policy. The root
-runner copies that immutable shape into one private root-owned stage and invokes
-only three exact prebuilt test names under a closed environment.
+runner copies that immutable shape into one private root-owned stage. Under a
+closed environment it invokes only four distinct positive prebuilt test names:
+provider data lifecycle, provider cancellation, direct dropped owner, and direct
+guest. The provider data and guest names each run twice for clean-repeat proof.
 
 ## Exact evidence result
 
@@ -77,6 +80,7 @@ checked workflow requires all of the following categorical outcomes:
 | Gate | Required result |
 | --- | --- |
 | Ordinary-user negative control | The identical ad-hoc-signed direct binary reaches the public `vmnet:shared` start, receives exact HTTP 400 with a fixed vmnet denial category, then exits without its API socket or process group. |
+| Minimal provider broker/owner | A root-owned, single-link, non-writable provider image starts one suspended exact-image owner through default-close descriptors. The owner starts shared vmnet while root, irreversibly drops and re-attests the configured ordinary uid/gid, then completes provider-v1 Hello/readiness/read/write/stop/shutdown, correlated control Stop/reap, control cancellation, and clean repeat without residue. The provider carries no entitlement. |
 | Dropped owner | A separate exact-root process starts the real Rust `SystemVmnetInterfaceBackend`, validates bounded realized parameters, clears supplementary groups, irreversibly changes real/effective uid and gid, proves it cannot regain root, then completes callback enable, fixed 60-byte experimental-frame write, bounded read, stop, and residue checks. |
 | Direct guest | The public Unix HTTP API configures the exact kernel, read-only v111 rootfs, read-only schema-v2 control sector, serial sink, and one `vmnet:shared` interface. A real HVF guest validates DHCP offer/request/ack, derives the host endpoint only from the accepted DHCP router, and completes an exact nonce-bound request and response. |
 | Repeat and cleanup | The guest gate succeeds twice in separate VMM processes. Each process stops normally, and every harness-owned API socket, process group, temporary file, listener, and interface owner is gone. |
@@ -85,7 +89,7 @@ The successful fixed output is:
 
 ```text
 platform: macos=<version> sdk=<version> arch=arm64 hvf=supported root=exact apple-vmnet=absent
-bangbang elevated vmnet proof: denial=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed
+bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed
 ```
 
 Tracked evidence and normal output never contain artifact paths, account names,
@@ -124,12 +128,12 @@ delivery validation requires that authority and the exact `383/0/2/33`
 partition. Global `validate --final` must still fail, and it must identify only
 the same two `missing-platform-feasible` records.
 
-The later portable
-[`provider-v1` contract](../../../docs/vmnet-provider-protocol.md) freezes the
-bounded wire, role state, and descriptor ownership for a future split topology.
-It consumes none of this evidence, calls no vmnet API, and changes neither
-disposition; broker/owner assembly and product certification remain separate
-successor work.
+The later [`provider-v1` contract](../../../docs/vmnet-provider-protocol.md)
+freezes the bounded wire, role state, and descriptor ownership for the split
+topology. #1934 adds the minimal broker/owner process foundation and extends
+this exact-host workflow with its real provider data/cancellation/repeat proof.
+That successor changes neither disposition: sandbox/launcher assembly, a guest
+through the remote provider, and product certification remain separate work.
 
 #1930 does not claim any of the following:
 
@@ -140,3 +144,8 @@ successor work.
 - production service/crash reclamation or concurrent-session certification;
 - implementation of either capability or completion of #1378, #1375, #1351,
   or #1348.
+
+These are the historical nonclaims of the #1930 inventory transition. #1934
+subsequently implements the privileged provider protocol/broker foundation, but
+does not retroactively turn #1930 into production evidence or remove the other
+nonclaims.

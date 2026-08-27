@@ -2922,10 +2922,12 @@ scripts/prepare-elevated-vmnet-evidence.sh \
   --output /absolute/absent/elevated-vmnet-package
 ```
 
-The prepared package includes the exact ad-hoc Hypervisor-signed VMM, prebuilt
-test target, pinned kernel, sidecar-verified `direct-boot-v111` rootfs, and
-manifest. Preparation also proves that the identical VMM reaches vmnet and is
-denied as the ordinary user. It never requests Apple credentials or elevation.
+The prepared package includes the exact ad-hoc Hypervisor-signed VMM and its
+test target, the entitlement-free `bangbang-vmnet-provider` and provider test
+target, pinned kernel, sidecar-verified `direct-boot-v111` rootfs, and manifest.
+Preparation proves both ordinary-user denial paths. The provider carries no
+entitlement; the VMM carries only the Hypervisor entitlement. Preparation never
+requests Apple credentials or elevation.
 
 The run wrapper requires a caller that already holds exact root authority; the
 repository wrapper itself never invokes `sudo`, reads a password, builds,
@@ -2938,14 +2940,23 @@ sudo -- scripts/run-elevated-vmnet-evidence.sh \
   --target-gid TARGET_GID
 ```
 
-Use the uid/gid of the ordinary user that owns the package. The root run starts
-one real shared-vmnet owner and irreversibly drops it to that identity before
-bounded callback/read/write/stop checks. It then starts the real public VMM and
-HVF guest twice; the static no-std v111 oracle performs strict DHCP and derives
-its nonce-bound TCP endpoint only from the accepted router. Every case has a
-fixed deadline and must leave no harness-owned process, socket, file, listener,
-or interface residue. Output is fixed categorical text and excludes paths,
+Use the uid/gid of the ordinary user that owns the package. The root run first
+starts the real one-shot broker and per-interface owner. It proves provider-v1
+Hello/readiness/read/write/stop/shutdown, exact control Stop/reap, control
+cancellation, clean repeat, and empty residue after the owner starts shared
+vmnet as root and irreversibly drops to that identity. It then retains the
+independent direct dropped-owner gate and starts the real public VMM/HVF guest
+twice; the static no-std v111 oracle performs strict DHCP and derives its
+nonce-bound TCP endpoint only from the accepted router. Every case has a fixed
+deadline and must leave no harness-owned process, socket, file, listener, or
+interface residue. Output is fixed categorical text and excludes paths,
 identities, PIDs, interface names, addresses, packets, nonces, and raw errors.
+
+The exact success suffix is:
+
+```text
+bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed
+```
 
 Portable policy and tamper coverage plus the checked audit run unprivileged:
 
@@ -2959,34 +2970,44 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 Success moves only `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` from
 `audit-required` to `missing-platform-feasible`, giving exact `383/0/2/33`.
-It does not support a root-direct production VMM or implement #1378's minimal
-provider/broker, privilege-dropped service owner, sandbox remote provider,
-crash reclamation, or concurrent production topology.
+It does not support a root-direct production VMM. The minimal provider/broker,
+privilege-dropped service owner, and bounded process reclamation now exist as a
+foundation, but the workflow does not assemble a production launcher bootstrap,
+sandbox remote provider, guest-through-provider path, or concurrent production
+topology.
 
 ### Private vmnet provider protocol
 
-The portable `provider-v1` foundation is tested without root, vmnet, a bundle,
-or Apple credentials. `bangbang-unix-stream` owns exact partial I/O,
+The portable `provider-v1` foundation and minimal broker/owner core are tested
+without root, vmnet, a bundle, or Apple credentials. `bangbang-unix-stream` owns exact partial I/O,
 one-deadline operations, close-on-exec rights adoption, connected-stream
 typing, and cleanup on malformed ancillary data. `bangbang-session` owns the
 80-byte frame, fixed policy slots, four-interface control lifecycle,
 cancellation race, per-generation packet state, and atomic frame/stream
-envelope. The vhost-user frontend consumes the same low-level transport.
+envelope. `bangbang-vmnet-provider` owns the canonical root bootstrap,
+descriptor-free broker/owner supervision, policy ledger, typed credential
+boundary, exact suspended child-image gate, deterministic reap, and system
+backend adapter. The vhost-user frontend consumes the same low-level transport.
 
 ```sh
 cargo test -p bangbang-unix-stream --all-features --locked
 cargo test -p bangbang-session --all-features --locked
 cargo test -p bangbang-vhost-user --all-features --locked
+cargo test -p bangbang-vmnet-provider --all-features --locked
 ```
 
 Tests include every message kind and split point, malformed and over-limit
 frames, exact sequence/scope poisoning, generation reuse, a raced transferred
 stream that is retired without exposure, readiness/read/write correlation,
 partial write completion, wrong/excess/body-attached descriptors, clean and
-partial EOF, timeout, and a real combined control-to-data socket lifecycle. See
-the [protocol contract](vmnet-provider-protocol.md). This layer adds no broker
-binary, vmnet call, worker adapter or grant, privilege transition, packaging,
-sudo path, positive product evidence, or capability promotion.
+partial EOF, timeout, and a real combined control-to-data socket lifecycle.
+Provider tests add hostile fixed records, four-owner/reuse policy, credential
+and packet-service order, data-first completion, cancellation cleanup, image
+mismatch, pre-resume failure, static linkage limits, and redaction. See the
+[protocol contract](vmnet-provider-protocol.md). The private binary and real
+root evidence add no worker adapter/grant, production bootstrap, packaged sudo
+path, Apple authorization, guest-through-provider claim, or capability
+promotion.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two

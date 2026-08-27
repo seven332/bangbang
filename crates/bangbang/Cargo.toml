@@ -10,6 +10,10 @@ elevated-bootstrap-probe = ["bangbang-session/elevated-bootstrap-probe"]
 grant-integration-probe = ["dep:bangbang-pager", "bangbang-runtime/test-support"]
 tracing = ["bangbang-runtime/tracing"]
 
+[lib]
+path = "src/lib.rs"
+test = false
+
 [dependencies]
 bangbang-api = { path = "../api" }
 bangbang-hvf = { path = "../hvf" }

@@ -8,8 +8,7 @@
 )]
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[path = "elevated_host_network/mod.rs"]
-mod host_network;
+use bangbang::host_network;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos_arm64 {

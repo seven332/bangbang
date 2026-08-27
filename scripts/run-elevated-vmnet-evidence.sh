@@ -113,6 +113,8 @@ fi
 names=(
   bangbang
   elevated-vmnet-e2e
+  bangbang-vmnet-provider
+  elevated-vmnet-provider-e2e
   vmlinux-6.1.155
   ubuntu-24.04-512M-direct-boot-v111.ext4
   ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json
@@ -129,7 +131,7 @@ for name in "${names[@]}"; do
   path="$prepared/$name"
   state="$(/usr/bin/stat -f '%u:%g:%HT:%l' "$path" 2>/dev/null || true)"
   case "$name" in
-    bangbang | elevated-vmnet-e2e)
+    bangbang | elevated-vmnet-e2e | bangbang-vmnet-provider | elevated-vmnet-provider-e2e)
       expected="$target_uid:$target_gid:Regular File:1"
       mode=555
       ;;
@@ -160,7 +162,11 @@ for name in "${names[@]}"; do
 done
 /usr/sbin/chown -R 0:0 "$stage"
 /bin/chmod 0700 "$stage"
-/bin/chmod 0555 "$stage/bangbang" "$stage/elevated-vmnet-e2e"
+/bin/chmod 0555 \
+  "$stage/bangbang" \
+  "$stage/elevated-vmnet-e2e" \
+  "$stage/bangbang-vmnet-provider" \
+  "$stage/elevated-vmnet-provider-e2e"
 /bin/chmod 0444 \
   "$stage/vmlinux-6.1.155" \
   "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4" \
@@ -176,7 +182,9 @@ if ! /usr/bin/python3 "$stage/elevated-vmnet-evidence.py" verify \
 fi
 /bin/mkdir -m 0700 "$stage/runs"
 if ! /usr/bin/codesign --verify --strict "$stage/bangbang" >/dev/null 2>&1 \
-  || ! /usr/bin/codesign --verify --strict "$stage/elevated-vmnet-e2e" >/dev/null 2>&1; then
+  || ! /usr/bin/codesign --verify --strict "$stage/elevated-vmnet-e2e" >/dev/null 2>&1 \
+  || ! /usr/bin/codesign --verify --strict "$stage/bangbang-vmnet-provider" >/dev/null 2>&1 \
+  || ! /usr/bin/codesign --verify --strict "$stage/elevated-vmnet-provider-e2e" >/dev/null 2>&1; then
   echo "bangbang elevated vmnet proof: code validation failed" >&2
   exit 1
 fi
@@ -192,6 +200,15 @@ if value != {"com.apple.security.hypervisor": True}:
 PY
 then
   echo "bangbang elevated vmnet proof: entitlement validation failed" >&2
+  exit 1
+fi
+provider_entitlements="$(/usr/bin/codesign --display --entitlements - --xml \
+  "$stage/bangbang-vmnet-provider" 2>/dev/null)" || {
+  echo "bangbang elevated vmnet proof: provider signature invalid" >&2
+  exit 1
+}
+if [[ -n "$provider_entitlements" ]]; then
+  echo "bangbang elevated vmnet proof: provider entitlement invalid" >&2
   exit 1
 fi
 /bin/rm -f -- "$entitlements"
@@ -213,6 +230,46 @@ run_case() {
       --test-threads=1 \
       >/dev/null 2>&1
 }
+
+run_provider_case() {
+  local test_name="$1"
+  /usr/bin/env -i \
+    LANG=C \
+    LC_ALL=C \
+    TMPDIR="$stage/runs" \
+    BANGBANG_ELEVATED_VMNET_PROVIDER="$stage/bangbang-vmnet-provider" \
+    BANGBANG_ELEVATED_VMNET_TARGET_UID="$target_uid" \
+    BANGBANG_ELEVATED_VMNET_TARGET_GID="$target_gid" \
+    "$stage/elevated-vmnet-provider-e2e" \
+      --exact "$test_name" \
+      --test-threads=1 \
+      >/dev/null 2>&1
+}
+
+if ! run_provider_case macos_arm64::dropped_provider_serves_data_lifecycle; then
+  echo "bangbang elevated vmnet proof: provider data failed" >&2
+  exit 1
+fi
+if [[ -n "$(/usr/bin/find -x "$stage/runs" -mindepth 1 -print -quit)" ]]; then
+  echo "bangbang elevated vmnet proof: provider data residue" >&2
+  exit 1
+fi
+if ! run_provider_case macos_arm64::control_cancellation_reaps_dropped_provider; then
+  echo "bangbang elevated vmnet proof: provider cancellation failed" >&2
+  exit 1
+fi
+if [[ -n "$(/usr/bin/find -x "$stage/runs" -mindepth 1 -print -quit)" ]]; then
+  echo "bangbang elevated vmnet proof: provider cancellation residue" >&2
+  exit 1
+fi
+if ! run_provider_case macos_arm64::dropped_provider_serves_data_lifecycle; then
+  echo "bangbang elevated vmnet proof: provider repeat failed" >&2
+  exit 1
+fi
+if [[ -n "$(/usr/bin/find -x "$stage/runs" -mindepth 1 -print -quit)" ]]; then
+  echo "bangbang elevated vmnet proof: provider repeat residue" >&2
+  exit 1
+fi
 
 if ! run_case macos_arm64::dropped_owner_retains_bounded_vmnet_io; then
   echo "bangbang elevated vmnet proof: dropped owner failed" >&2
@@ -242,4 +299,4 @@ fi
 os_version="$(/usr/bin/sw_vers -productVersion)"
 sdk_version="$(/usr/bin/xcrun --sdk macosx --show-sdk-version)"
 echo "platform: macos=$os_version sdk=$sdk_version arch=arm64 hvf=supported root=exact apple-vmnet=absent"
-echo "bangbang elevated vmnet proof: denial=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed"
+echo "bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed"

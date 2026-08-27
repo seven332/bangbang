@@ -224,10 +224,12 @@ before session creation.
 ## Explicit nonclaims and handoffs
 
 - #1378 remains open. #1930 proves entitlement-free shared-vmnet packet
-  connectivity and a dropped owner only in the root-direct evidence topology,
-  moving the two rows to `missing-platform-feasible`. This contract still does
-  not claim the production provider/broker, contained remote data plane,
-  service/crash reclamation, concurrent production sessions, or the optional
+  connectivity and a dropped owner in the root-direct evidence topology,
+  moving the two rows to `missing-platform-feasible`. #1934 subsequently adds
+  the minimal root broker, exact privilege-dropped interface owner, and real
+  provider-v1 lifecycle/cancellation/repeat proof. This contract still does not
+  claim launcher/bootstrap assembly, the contained remote data plane, a guest
+  through that provider, concurrent production sessions, or the optional
   Apple-authorized matrix.
 - The checked [Wave 6 snapshot contract](snapshot-wave6-contract.md) makes
   Diff, version/tool composition, exact 2.11 network/MMDS bytes,
