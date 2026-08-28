@@ -2171,6 +2171,15 @@ class ElevatedSystemCertificationDriver:
                 if stdout:
                     raise self.vmnet.CertificationError("case-stdout") from error
                 if stderr:
+                    known_output = {
+                        b"bangbang launcher: invalid production launch policy\n": 10,
+                        b"bangbang launcher: invalid production bundle layout\n": 12,
+                        b"bangbang launcher: private vhost-user broker failed\n": 13,
+                    }.get(stderr)
+                    if known_output is not None:
+                        raise self.vmnet.CertificationError(
+                            f"provider-status-{known_output}"
+                        ) from error
                     category = (
                         f"case-stderr-length-{len(stderr)}"
                         if len(stderr) <= 118
