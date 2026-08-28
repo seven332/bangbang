@@ -1159,7 +1159,6 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
         driver.vmnet = vmnet
         driver._spawn = mock.Mock(return_value=process)
-        driver._configure = mock.Mock()
         driver._finish_process = mock.Mock()
         driver._abort_process = mock.Mock()
         with (
@@ -1180,7 +1179,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
                     ("eth1", "vmnet:shared"),
                 ),
             )
-        driver._configure.assert_called_once_with(process)
+        process.wait_ready.assert_called_once_with()
         self.assertEqual(
             api_put.call_args_list,
             [

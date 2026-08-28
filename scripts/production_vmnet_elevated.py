@@ -2151,7 +2151,7 @@ class ElevatedSystemCertificationDriver:
         process = self._spawn(case, allowed=allowed, maximum=maximum)
         try:
             try:
-                self._configure(process)
+                process.wait_ready()
             except self.vmnet.CertificationError as error:
                 raise self.vmnet.CertificationError("policy-configure") from error
             for index, (iface_id, host_dev_name) in enumerate(networks):
