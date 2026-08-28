@@ -1465,6 +1465,13 @@ A simultaneous administrator/kernel destruction of both cleanup actors is
 outside a one-shot process contract and would require the deliberately rejected
 persistent service.
 
+After the requested KILL case has reaped the complete provider group, the
+kernel may retain the API socket name. The ordinary controller may unlink only
+that one expected name after revalidating socket type, target uid/gid, and
+mode. TERM residue, any extra entry, and every identity or mode mismatch remain
+terminal; this deterministic owned-name cleanup is distinct from a forced
+process cleanup.
+
 The fixed #1943 probe carries no guest fixture or result. It proves repeat
 completion and live TERM/KILL using ordinary private API-grant material created
 only after drop. The contained worker's finite `--version` command publishes

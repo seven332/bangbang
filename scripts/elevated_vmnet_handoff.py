@@ -2289,6 +2289,26 @@ def _probe_socket_present(path: Path, process: RemoteProviderProcess) -> bool:
     return True
 
 
+def _remove_killed_probe_socket(path: Path) -> None:
+    try:
+        metadata = os.lstat(path)
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_gid != os.getgid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            _fail("cleanup")
+        path.unlink()
+        if os.path.lexists(path):
+            _fail("cleanup")
+    except HandoffError:
+        raise
+    except OSError as error:
+        raise HandoffError("cleanup") from error
+
+
 def _cleanup_probe_root(root: Path) -> bool:
     forced = False
     try:
@@ -2425,7 +2445,9 @@ def _fixed_signal_probe(
         process.close()
         process = None
         if os.path.lexists(socket_path):
-            _fail("cleanup")
+            if kind != Kind.KILL:
+                _fail("cleanup")
+            _remove_killed_probe_socket(socket_path)
     finally:
         if process is not None:
             process.close()

@@ -3148,6 +3148,12 @@ identities and clean; guardian loss makes the supervisor do the same. Any
 forced or uncertain cleanup fails the gate even when absence is recovered.
 Process observation is only `pid/ppid/state/comm`.
 
+The requested KILL case may leave the kernel-owned API socket name after every
+process is reaped. The ordinary controller removes only that one expected
+socket after revalidating its type, target uid/gid, and mode. Any TERM residue,
+unexpected entry, identity/mode mismatch, or additional cleanup remains
+terminal; this exact owned-name removal is not a fallback process cleanup.
+
 The focused product gate runs two clean version completions and live API-process
 TERM/KILL through the normal bundle. Private API grant material is created only
 after credential drop and is never emitted. After its authenticated contained

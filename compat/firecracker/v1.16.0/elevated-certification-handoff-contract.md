@@ -128,6 +128,12 @@ eventually removed. Simultaneous destruction of both root actors is an external
 administrator/kernel event and would require a persistent service, which this
 contract deliberately excludes.
 
+The requested KILL case may leave the ordinary private API socket name after
+the complete provider group is reaped. The controller may unlink only that
+exact expected socket after revalidating its type, target uid/gid, and mode.
+TERM residue, any extra entry, and every ownership/mode mismatch are terminal;
+this deterministic owned-name step is not fallback process cleanup.
+
 ## Fixed probes and handoff
 
 The #1943 real gate uses the normal bundle for two clean version completions and

@@ -754,6 +754,18 @@ class ProcessTests(unittest.TestCase):
             finally:
                 listener.close()
 
+    def test_killed_probe_socket_has_exact_validated_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "api.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(os.fspath(path))
+            path.chmod(0o600)
+            try:
+                handoff._remove_killed_probe_socket(path)
+                self.assertFalse(os.path.lexists(path))
+            finally:
+                listener.close()
+
     def test_private_probe_cleanup_rejects_unknown_residue_without_deleting_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "probe"
