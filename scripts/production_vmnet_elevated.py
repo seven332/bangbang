@@ -2151,34 +2151,29 @@ class ElevatedSystemCertificationDriver:
         process = self._spawn(case, allowed=allowed, maximum=maximum)
         try:
             try:
-                self._configure(process, networks=networks)
+                self._configure(process)
             except self.vmnet.CertificationError as error:
                 raise self.vmnet.CertificationError("policy-configure") from error
-            try:
-                response = self._start(process)
-            except self.vmnet.CertificationError as error:
-                raise self.vmnet.CertificationError("policy-request") from error
-            try:
-                self.vmnet._require_policy_denial(response)
-            except self.vmnet.CertificationError as error:
-                raise self.vmnet.CertificationError("policy-response") from error
-            try:
-                status, stdout, stderr = process.wait_output()
-            except self.vmnet.CertificationError as error:
-                raise self.vmnet.CertificationError("policy-terminal") from error
-            if status != 0:
-                category = (
-                    f"provider-status-{status}"
-                    if 10 <= status <= 19
-                    else "case-status"
-                )
-                _fail(self.vmnet, category)
-            if stdout != self.vmnet.API_READY_MARKER:
-                _fail(self.vmnet, "case-stdout")
-            if stderr:
-                _fail(self.vmnet, "case-stderr")
-            process.finish_exited()
-            self._retire(process)
+            for index, (iface_id, host_dev_name) in enumerate(networks):
+                try:
+                    response = self.vmnet._api_put(
+                        process,
+                        f"/network-interfaces/{iface_id}",
+                        {
+                            "host_dev_name": host_dev_name,
+                            "iface_id": iface_id,
+                        },
+                    )
+                except self.vmnet.CertificationError as error:
+                    raise self.vmnet.CertificationError("policy-request") from error
+                try:
+                    if index + 1 == len(networks):
+                        self.vmnet._require_policy_denial(response)
+                    else:
+                        self.vmnet._require_no_content(response)
+                except self.vmnet.CertificationError as error:
+                    raise self.vmnet.CertificationError("policy-response") from error
+            self._finish_process(process)
         except BaseException:
             self._abort_process(process)
             raise
