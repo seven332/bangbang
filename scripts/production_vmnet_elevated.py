@@ -1549,11 +1549,17 @@ class RemoteProductionProcess:
             self.process.close()
         except BaseException as error:
             raise _map_handoff_error(self.vmnet, error) from error
-        self._remove_stale_socket()
-        self.vmnet._wait_socket_absent(
-            self.files.api_socket, self.config.timeouts.request_seconds
-        )
-        self.driver.wait_sessions(self.baseline_sessions)
+        try:
+            self._remove_stale_socket()
+            self.vmnet._wait_socket_absent(
+                self.files.api_socket, self.config.timeouts.request_seconds
+            )
+        except self.vmnet.CertificationError as error:
+            raise self.vmnet.CertificationError("socket-cleanup") from error
+        try:
+            self.driver.wait_sessions(self.baseline_sessions)
+        except self.vmnet.CertificationError as error:
+            raise self.vmnet.CertificationError("session-cleanup") from error
         if self._roles is not None:
             for pid in (
                 self._roles.provider,
@@ -1565,7 +1571,10 @@ class RemoteProductionProcess:
                     pid, self.config.timeouts.terminate_seconds
                 )
         if not self._retain_files:
-            self.driver.cleanup_case_files(self.files)
+            try:
+                self.driver.cleanup_case_files(self.files)
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("file-cleanup") from error
         self._closed = True
 
     def terminate(self) -> None:
@@ -1585,11 +1594,17 @@ class RemoteProductionProcess:
             self.process.close()
         except BaseException as error:
             raise _map_handoff_error(self.vmnet, error) from error
-        self._remove_stale_socket()
-        self.vmnet._wait_socket_absent(
-            self.files.api_socket, self.config.timeouts.request_seconds
-        )
-        self.driver.wait_sessions(self.baseline_sessions)
+        try:
+            self._remove_stale_socket()
+            self.vmnet._wait_socket_absent(
+                self.files.api_socket, self.config.timeouts.request_seconds
+            )
+        except self.vmnet.CertificationError as error:
+            raise self.vmnet.CertificationError("socket-cleanup") from error
+        try:
+            self.driver.wait_sessions(self.baseline_sessions)
+        except self.vmnet.CertificationError as error:
+            raise self.vmnet.CertificationError("session-cleanup") from error
         if self._roles is not None:
             for pid in (
                 self._roles.provider,
@@ -1601,7 +1616,10 @@ class RemoteProductionProcess:
                     pid, self.config.timeouts.terminate_seconds
                 )
         if not self._retain_files:
-            self.driver.cleanup_case_files(self.files)
+            try:
+                self.driver.cleanup_case_files(self.files)
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("file-cleanup") from error
         self._closed = True
 
     def retain_files(self) -> None:
