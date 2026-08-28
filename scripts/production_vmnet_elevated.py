@@ -1069,7 +1069,6 @@ def _create_sized_private_file(
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
         or metadata.st_uid != os.getuid()
-        or metadata.st_gid != os.getgid()
         or stat.S_IMODE(metadata.st_mode) != 0o600
         or metadata.st_size != size
         or visible.st_dev != metadata.st_dev
@@ -1156,7 +1155,6 @@ class StagedBarrier:
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_nlink != 1
                 or metadata.st_uid != os.getuid()
-                or metadata.st_gid != os.getgid()
                 or stat.S_IMODE(metadata.st_mode) != 0o600
                 or metadata.st_size != protocol.CONTROL_BYTES
                 or current != expected
@@ -1274,7 +1272,6 @@ class StagedBarrier:
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
             or metadata.st_uid != os.getuid()
-            or metadata.st_gid != os.getgid()
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_size != protocol.CONTROL_BYTES
             or len(value) != protocol.CONTROL_BYTES
@@ -1534,7 +1531,6 @@ class RemoteProductionProcess:
             or not stat.S_ISSOCK(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_uid != os.getuid()
-            or metadata.st_gid != os.getgid()
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_dev != identity.device
             or metadata.st_ino != identity.inode
@@ -1702,7 +1698,6 @@ class ElevatedSystemCertificationDriver:
                 not stat.S_ISDIR(metadata.st_mode)
                 or stat.S_ISLNK(metadata.st_mode)
                 or metadata.st_uid != os.getuid()
-                or metadata.st_gid != os.getgid()
                 or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
                 _fail(self.vmnet, "case-root-cleanup")
