@@ -1165,6 +1165,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         process = mock.Mock()
         files = object()
         first_response = object()
+        second_response = object()
         denied_response = object()
         driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
         driver.vmnet = vmnet
@@ -1177,7 +1178,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             mock.patch.object(
                 vmnet,
                 "_api_put",
-                side_effect=(first_response, denied_response),
+                side_effect=(first_response, second_response, denied_response),
             ) as api_put,
             mock.patch.object(vmnet, "_require_no_content") as require_no_content,
             mock.patch.object(vmnet, "_require_policy_denial") as require_denial,
@@ -1205,9 +1206,17 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
                     "/network-interfaces/eth1",
                     {"host_dev_name": "vmnet:shared", "iface_id": "eth1"},
                 ),
+                mock.call(
+                    process,
+                    "/actions",
+                    {"action_type": "InstanceStart"},
+                ),
             ],
         )
-        require_no_content.assert_called_once_with(first_response)
+        self.assertEqual(
+            require_no_content.call_args_list,
+            [mock.call(first_response), mock.call(second_response)],
+        )
         require_denial.assert_called_once_with(denied_response)
         driver._finish_process.assert_called_once_with(process)
         driver._abort_process.assert_not_called()

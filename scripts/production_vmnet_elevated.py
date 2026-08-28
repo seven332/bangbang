@@ -2258,7 +2258,7 @@ class ElevatedSystemCertificationDriver:
                         f"provider-status-{status}"
                     ) from error
                 raise self.vmnet.CertificationError("policy-configure") from error
-            for index, (iface_id, host_dev_name) in enumerate(networks):
+            for iface_id, host_dev_name in networks:
                 try:
                     response = self.vmnet._api_put(
                         process,
@@ -2271,12 +2271,17 @@ class ElevatedSystemCertificationDriver:
                 except self.vmnet.CertificationError as error:
                     raise self.vmnet.CertificationError("policy-request") from error
                 try:
-                    if index + 1 == len(networks):
-                        self.vmnet._require_policy_denial(response)
-                    else:
-                        self.vmnet._require_no_content(response)
+                    self.vmnet._require_no_content(response)
                 except self.vmnet.CertificationError as error:
                     raise self.vmnet.CertificationError("policy-response") from error
+            try:
+                response = self._start(process)
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("policy-request") from error
+            try:
+                self.vmnet._require_policy_denial(response)
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("policy-response") from error
             self._finish_process(process)
         except BaseException:
             self._abort_process(process)
