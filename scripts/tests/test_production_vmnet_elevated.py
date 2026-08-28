@@ -1139,7 +1139,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         process.wait_output.return_value = (1, b"unexpected", b"")
         driver._retire.reset_mock()
         self.assert_category(
-            "case",
+            "case-stdout",
             lambda: driver._run_missing_policy_denial("missing-policy-denial"),
         )
         process.finish_exited.assert_called_once_with()

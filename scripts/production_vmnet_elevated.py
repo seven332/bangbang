@@ -2161,13 +2161,12 @@ class ElevatedSystemCertificationDriver:
         process = self._spawn(case)
         try:
             status, stdout, stderr = process.wait_output()
-            if (
-                status != 1
-                or stdout
-                or stderr
-                != b"bangbang launcher: invalid production launch policy\n"
-            ):
-                _fail(self.vmnet, "case")
+            if status != 1:
+                _fail(self.vmnet, "case-status")
+            if stdout:
+                _fail(self.vmnet, "case-stdout")
+            if stderr != b"bangbang launcher: invalid production launch policy\n":
+                _fail(self.vmnet, "case-stderr")
             process.finish_exited()
             self._retire(process)
         except BaseException:
