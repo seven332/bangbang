@@ -5471,6 +5471,21 @@ ends with exact API and process cleanup. This evidence uses no Apple
 authorization and leaves both rows `missing-platform-feasible`; production
 provider handoff and the canonical matrix remain later slices.
 
+#1943 adds the nonfinal least-privileged production-provider handoff. A clean
+ordinary preparation builds and recursively manifests the normal ad-hoc
+networkless bundle. One externally authorized exact-root entry stages that
+fixed product, while an irreversibly dropped controller alone owns future
+private inputs. Root retains only an authenticated, sequence-correlated
+4096-byte datagram protocol for fixed-provider spawn, poll/bounded wait,
+TERM/KILL, close, and cleanup; exactly two stdout/stderr descriptors accompany
+spawn success. The configured target transport attests 8192-byte socket
+buffers before using a frame. Reciprocal guardian/supervisor liveness and a
+complete/cleanup/ack boundary cover either single root-actor loss without a
+persistent service. Fixed normal-product completion and live-signal probes use
+no Apple authorization and publish no canonical result. The inventory stays
+`383/0/2/33`; #1944 remains responsible for the private concurrent matrix and
+both retained network dispositions.
+
 ## Validation Expectations
 
 Every future compatibility change should choose validation appropriate to its

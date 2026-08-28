@@ -167,7 +167,10 @@ for its one-row transition, the
 one-row transition, and
 the [vmnet feasibility contract](vmnet-feasibility-contract.md) for the
 two-row evidence transition, and
-[`docs/testing.md`](../../../docs/testing.md#entitlement-free-vmnet-feasibility)
+the [elevated certification handoff contract](elevated-certification-handoff-contract.md)
+for the immutable normal-bundle, dropped-controller, fixed-provider lifecycle,
+and reciprocal cleanup boundary, and
+[`docs/testing.md`](../../../docs/testing.md#least-privileged-elevated-certification-handoff)
 for the canonical commands.
 
 The [`provider-v1` contract](../../../docs/vmnet-provider-protocol.md) freezes
@@ -186,6 +189,15 @@ convergence, provider-owned daemon handoff, and cleanup. Real
 guest-through-provider lifecycle/concurrency certification remains the next
 slice; the inventory and both `missing-platform-feasible` dispositions stay
 unchanged.
+
+#1943 adds the one-shot least-privileged certification bridge without changing
+the provider product ABI or inventory. The normal ad-hoc/networkless bundle is
+bound to clean source in an immutable package. Exact root stages only that
+package and retains a closed descriptor protocol, while all future private
+certification work runs only after the controller has irreversibly dropped to
+the ordinary package owner. Reciprocal guardian/supervisor cleanup covers
+either single root-actor loss, and fixed completion/TERM/KILL product probes
+require no Apple authorization. The canonical matrix and verdict remain #1944.
 
 ## Guest workflow artifact authority
 

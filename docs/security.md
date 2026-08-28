@@ -1410,6 +1410,63 @@ provider/launcher/worker/owner assembly, and foreground/daemon supervision.
 Guest-through-provider certification, the complete concurrent production
 matrix, and the optional Apple-authorized matrix remain undelivered.
 
+### Least-privileged elevated certification handoff boundary
+
+#1943 adds the one-shot privilege split required before the canonical
+certification may use the production provider. Ordinary preparation builds the
+normal ad-hoc/networkless bundle from a clean source and publishes a recursively
+manifested, nonwritable, no-link package to an absent destination. The manifest
+binds source and fixed implementation identity to every relative product node.
+It is a coherence and stale-package boundary. Trust still comes from the
+caller's explicit authorization of the fixed repository entry; code cannot
+authenticate itself against an already modified authorized checkout.
+
+The exact-root entry accepts only the package plus nonzero numeric target uid
+and gid. It never obtains authorization, discovers accounts or credentials, or
+accepts an executable, bundle override, environment, cwd, fixture, result,
+profile, interface, or socket. It validates the target-owned source package,
+copies into a fresh private root stage, root-owns and freezes the copy, repeats
+the manifest/layout/signature/entitlement checks, and opens traversal only
+after the normal networkless product is coherent. The entitlement-free staged
+provider is the only product image root may spawn.
+
+One controller child closes unrelated descriptors and stdio, clears
+supplementary groups, sets gid before uid, and attests ordinary real/effective/
+saved ids and empty groups. Attempts to restore uid 0, gid 0, or a root group
+must fail without changing birth identity. The supervisor independently
+observes the same child identity before sending its session welcome. Only then
+does the child call the controller loader; private plan, API, HVF, fixture, and
+result parsing therefore remain outside root.
+
+Root retains a closed local lifecycle protocol, not general execution. Exact
+4096-byte Unix datagrams use explicitly attested 8192-byte socket buffers,
+monotonic per-role sequences, request correlation, a random 32-byte session,
+SHA-256, zero reserved bytes/tail, closed message kinds, and bounded opaque
+argument encoding. Controller requests carry no descriptors. Successful spawn
+alone carries exactly two distinct read-only pipe descriptors. Root prepends
+the fixed provider bootstrap/target identity and fixes cwd, environment, stdin,
+descriptor closure, and process group; it neither semantically parses nor emits
+the launcher suffix. The provider continues to pin its sibling launcher/worker
+and drops the outer before broad argument parsing.
+
+Guardian and supervisor are reciprocal cleanup authorities. The supervisor
+does not exit successfully until the guardian has verified controller and exact
+staged product absence, removed the stage, and acknowledged cleanup. If either
+root actor is lost alone, the survivor terminates and reaps the controller and
+owned provider groups, scans only exact staged executable paths using
+`pid/ppid/state/comm`, verifies absence, and removes the stage. Forced cleanup,
+identity ambiguity, output overflow, protocol failure, or timeout is terminal.
+A simultaneous administrator/kernel destruction of both cleanup actors is
+outside a one-shot process contract and would require the deliberately rejected
+persistent service.
+
+The fixed #1943 probe carries no guest fixture or result. It proves repeat
+completion and live TERM/KILL using ordinary private API-grant material created
+only after drop. Public output is categorical and contains no path, id, PID,
+session, argument, interface, address, packet, nonce, raw process output, or
+private value. This foundation changes no capability disposition; #1944 alone
+may import it from the ordinary controller and publish the canonical verdict.
+
 The local vmnet worker path requires the host to satisfy macOS vmnet
 authorization, entitlement, and code-signing requirements. The split provider
 path instead relies on explicit operator-authorized root bootstrap followed by
