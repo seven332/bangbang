@@ -1122,7 +1122,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
     def test_missing_policy_requires_exact_provider_side_denial(self) -> None:
         process = mock.Mock()
         process.wait_output.return_value = (
-            1,
+            12,
             b"",
             b"bangbang launcher: invalid production launch policy\n",
         )
@@ -1136,7 +1136,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver._retire.assert_called_once_with(process)
         driver._abort_process.assert_not_called()
 
-        process.wait_output.return_value = (1, b"unexpected", b"")
+        process.wait_output.return_value = (12, b"unexpected", b"")
         driver._retire.reset_mock()
         self.assert_category(
             "case-stdout",

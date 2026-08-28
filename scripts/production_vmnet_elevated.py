@@ -2161,7 +2161,7 @@ class ElevatedSystemCertificationDriver:
         process = self._spawn(case)
         try:
             status, stdout, stderr = process.wait_output()
-            if status != 1:
+            if status != 12:
                 _fail(self.vmnet, "case-status")
             if stdout:
                 _fail(self.vmnet, "case-stdout")
