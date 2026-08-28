@@ -126,6 +126,7 @@ PROBE_FAILURES = (
     "probe-socket-shape",
     "probe-socket-timeout",
     "probe-path",
+    "probe-private-root",
     "probe-private-file",
 )
 CONTROLLER_FAILURES = (
@@ -2182,6 +2183,37 @@ def _write_private_file(path: Path, data: bytes) -> None:
         _fail("probe-private-file")
 
 
+def _create_private_probe_root(
+    parent: Path = Path("/private/var/tmp"),
+) -> Path:
+    root: Optional[Path] = None
+    try:
+        root = Path(tempfile.mkdtemp(prefix="bbhandoff.", dir=parent))
+        os.chown(root, os.getuid(), os.getgid())
+        os.chmod(root, 0o700)
+        metadata = os.lstat(root)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_gid != os.getgid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            _fail("probe-private-root")
+        return root
+    except BaseException as error:
+        if root is not None and os.path.lexists(root):
+            try:
+                shutil.rmtree(root)
+            except OSError as cleanup_error:
+                raise HandoffError("cleanup") from cleanup_error
+        if isinstance(error, HandoffError):
+            raise
+        if isinstance(error, OSError):
+            raise HandoffError("probe-private-root") from error
+        raise
+
+
 def _launcher_arguments(
     layout: ProductLayout,
     uid: int,
@@ -2248,6 +2280,7 @@ def _probe_socket_present(path: Path, process: RemoteProviderProcess) -> bool:
         not stat.S_ISSOCK(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
         _fail("probe-socket-shape")
@@ -2262,6 +2295,7 @@ def _cleanup_probe_root(root: Path) -> bool:
             not stat.S_ISDIR(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_uid != os.getuid()
+            or metadata.st_gid != os.getgid()
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             _fail("cleanup")
@@ -2278,13 +2312,18 @@ def _cleanup_probe_root(root: Path) -> bool:
                 not stat.S_ISDIR(directory_metadata.st_mode)
                 or stat.S_ISLNK(directory_metadata.st_mode)
                 or directory_metadata.st_uid != os.getuid()
+                or directory_metadata.st_gid != os.getgid()
             ):
                 _fail("cleanup")
             for name in (*names, *files):
                 path = base / name
                 child = os.lstat(path)
                 relative = path.relative_to(root).as_posix()
-                if stat.S_ISLNK(child.st_mode) or child.st_uid != os.getuid():
+                if (
+                    stat.S_ISLNK(child.st_mode)
+                    or child.st_uid != os.getuid()
+                    or child.st_gid != os.getgid()
+                ):
                     _fail("cleanup")
                 if stat.S_ISDIR(child.st_mode):
                     kind = "directory"
@@ -2332,10 +2371,9 @@ def _fixed_signal_probe(
     instance: str,
     kind: Kind,
 ) -> None:
-    root = Path(tempfile.mkdtemp(prefix="bbhandoff.", dir="/private/var/tmp"))
+    root = _create_private_probe_root()
     process: Optional[RemoteProviderProcess] = None
     try:
-        os.chmod(root, 0o700)
         api = root / "api"
         api.mkdir(mode=0o700)
         manifest = root / "grants.json"

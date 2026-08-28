@@ -507,6 +507,16 @@ class ProcessTests(unittest.TestCase):
             )
         )
 
+    def test_private_probe_root_has_exact_ordinary_identity_and_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = handoff._create_private_probe_root(Path(directory))
+            try:
+                metadata = os.lstat(root)
+                self.assertEqual((metadata.st_uid, metadata.st_gid), (os.getuid(), os.getgid()))
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o700)
+            finally:
+                handoff._remove_tree(root)
+
     def test_remote_process_drains_both_descriptors_and_closes_once(self) -> None:
         stdout_read, stdout_write = os.pipe()
         stderr_read, stderr_write = os.pipe()
