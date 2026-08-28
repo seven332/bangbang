@@ -42,6 +42,9 @@ MAX_KERNEL_BYTES = 512 * 1024 * 1024
 MAX_ROOTFS_BYTES = 1024 * 1024 * 1024
 MAX_SIDECAR_BYTES = 1024 * 1024
 FIXED_ENVIRONMENT = {"LANG": "C", "LC_ALL": "C"}
+CASE_FILE_CLEANUP_CATEGORIES = frozenset(
+    {"case-remove-cleanup", "case-root-cleanup", "case-tree-cleanup"}
+)
 PAYLOAD_ROLES = {
     FIXTURE_NAME: ("fixture", 0o555),
     KERNEL_NAME: ("kernel", 0o444),
@@ -1574,6 +1577,8 @@ class RemoteProductionProcess:
             try:
                 self.driver.cleanup_case_files(self.files)
             except self.vmnet.CertificationError as error:
+                if error.category in CASE_FILE_CLEANUP_CATEGORIES:
+                    raise
                 raise self.vmnet.CertificationError("file-cleanup") from error
         self._closed = True
 
@@ -1619,6 +1624,8 @@ class RemoteProductionProcess:
             try:
                 self.driver.cleanup_case_files(self.files)
             except self.vmnet.CertificationError as error:
+                if error.category in CASE_FILE_CLEANUP_CATEGORIES:
+                    raise
                 raise self.vmnet.CertificationError("file-cleanup") from error
         self._closed = True
 
@@ -1698,16 +1705,27 @@ class ElevatedSystemCertificationDriver:
                 or metadata.st_gid != os.getgid()
                 or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
-                _fail(self.vmnet, "cleanup")
+                _fail(self.vmnet, "case-root-cleanup")
+        except self.vmnet.CertificationError:
+            raise
+        except (OSError, ValueError) as error:
+            raise self.vmnet.CertificationError("case-root-cleanup") from error
+        try:
             self.vmnet._clean_directory(root)
+        except self.vmnet.CertificationError as error:
+            raise self.vmnet.CertificationError("case-tree-cleanup") from error
+        try:
             os.rmdir(root)
             if os.path.lexists(root):
-                _fail(self.vmnet, "cleanup")
-            self.session.verify()
+                _fail(self.vmnet, "case-remove-cleanup")
         except self.vmnet.CertificationError:
             raise
         except OSError as error:
-            raise self.vmnet.CertificationError("cleanup") from error
+            raise self.vmnet.CertificationError("case-remove-cleanup") from error
+        try:
+            self.session.verify()
+        except self.vmnet.CertificationError as error:
+            raise self.vmnet.CertificationError("session-cleanup") from error
 
     def _files(
         self,
@@ -1980,6 +1998,8 @@ class ElevatedSystemCertificationDriver:
             self._retire(process)
 
     def _abort_process(self, process: RemoteProductionProcess) -> None:
+        if process not in self._active:
+            return
         try:
             process.close()
         finally:
