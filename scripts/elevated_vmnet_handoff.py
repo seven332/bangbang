@@ -126,12 +126,26 @@ SUPERVISOR_PHASES = (
     "controller-exit",
     "cleanup-ack",
 )
+LIFECYCLE_FAILURES = (
+    "guardian",
+    "controller",
+    "spawn",
+    "cleanup",
+    "signal",
+    "lease",
+    "session-timeout",
+    "protocol",
+    "protocol-timeout",
+    "descriptor",
+    "arguments",
+)
 SUPERVISOR_FAILURES = (
     *SUPERVISOR_PHASES,
     "identity-capture",
     "identity-parent",
     "identity-uid",
     "identity-gid",
+    *(f"lifecycle-{category}" for category in LIFECYCLE_FAILURES),
     *(f"controller-{category}" for category in CONTROLLER_FAILURES),
 )
 
@@ -2609,6 +2623,17 @@ def _acknowledge_guardian_cleanup(connection: socket.socket) -> None:
         raise HandoffError("supervisor") from error
 
 
+def _supervisor_failure_category(error: BaseException, phase: int) -> str:
+    fallback = SUPERVISOR_PHASES[phase - 1]
+    if not isinstance(error, HandoffError):
+        return fallback
+    if error.category in SUPERVISOR_FAILURES:
+        return error.category
+    if phase == 5 and error.category in LIFECYCLE_FAILURES:
+        return f"lifecycle-{error.category}"
+    return fallback
+
+
 def _supervisor_entry(
     stage: Stage,
     uid: int,
@@ -2723,12 +2748,7 @@ def _supervisor_entry(
         return 0
     except BaseException as error:
         try:
-            category = (
-                error.category
-                if isinstance(error, HandoffError)
-                and error.category in SUPERVISOR_FAILURES
-                else SUPERVISOR_PHASES[phase - 1]
-            )
+            category = _supervisor_failure_category(error, phase)
             completion.send(
                 bytes((ord("F"), SUPERVISOR_FAILURES.index(category) + 1))
             )

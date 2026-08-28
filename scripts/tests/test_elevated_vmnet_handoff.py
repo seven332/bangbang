@@ -697,6 +697,22 @@ class ProcessTests(unittest.TestCase):
             handoff._wait_supervisor_complete(guardian)
         guardian.close()
 
+    def test_supervisor_lifecycle_failures_remain_fixed_and_categorical(self) -> None:
+        self.assertEqual(
+            handoff._supervisor_failure_category(handoff.HandoffError("spawn"), 5),
+            "lifecycle-spawn",
+        )
+        self.assertEqual(
+            handoff._supervisor_failure_category(
+                handoff.HandoffError("controller-probe"), 5
+            ),
+            "controller-probe",
+        )
+        self.assertEqual(
+            handoff._supervisor_failure_category(ValueError("private"), 5),
+            "lifecycle",
+        )
+
     def test_private_probe_cleanup_removes_exact_socket_and_reports_forcing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "probe"
