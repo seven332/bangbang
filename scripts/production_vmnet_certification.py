@@ -36,6 +36,7 @@ from typing import Any, BinaryIO, Callable, Iterator, Mapping, Optional, Protoco
 
 
 SCHEMA_VERSION = 1
+ELEVATED_SCHEMA_VERSION = 2
 MAX_DOCUMENT_BYTES = 64 * 1024
 MAX_PROFILE_BYTES = 4 * 1024 * 1024
 MAX_FIXTURE_BYTES = 64 * 1024 * 1024
@@ -115,7 +116,7 @@ PLATFORM_VERSION_RE = re.compile(
     r"(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){1,2}\Z"
 )
 
-CASE_NAMES = (
+V1_CASE_NAMES = (
     "entitlement-split",
     "networkless-denial",
     "missing-policy-denial",
@@ -138,7 +139,50 @@ CASE_NAMES = (
     "clean-repeat",
     "concurrent-noninterchangeability",
 )
-ENVIRONMENT_GATED_CASES = frozenset(
+CASE_NAMES = V1_CASE_NAMES
+V1_ENVIRONMENT_GATED_CASES = frozenset(
+    {
+        "host-connectivity",
+        "bridged-connectivity",
+        "not-authorized",
+        "sharing-service-busy",
+    }
+)
+ENVIRONMENT_GATED_CASES = V1_ENVIRONMENT_GATED_CASES
+V2_CASE_NAMES = (
+    "authority-split",
+    "networkless-denial",
+    "missing-policy-denial",
+    "mismatched-policy-denial",
+    "bridge-allowlist-denial",
+    "active-interface-count-exhaustion",
+    "mmds-only-no-consumption",
+    "shared-connectivity",
+    "host-connectivity",
+    "bridged-connectivity",
+    "not-authorized",
+    "sharing-service-busy",
+    "startup-interface-remove",
+    "runtime-hotplug-remove",
+    "normal-teardown",
+    "partial-start-cleanup",
+    "pre-ready-cancellation",
+    "post-ready-cancellation",
+    "provider-startup-death",
+    "broker-runtime-death",
+    "owner-runtime-death",
+    "launcher-first-death",
+    "worker-first-death",
+    "provider-sigkill-reclamation",
+    "broker-sigkill-reclamation",
+    "owner-sigkill-reclamation",
+    "launcher-sigkill-reclamation",
+    "worker-sigkill-reclamation",
+    "clean-repeat",
+    "capture-restore-fresh-ownership",
+    "concurrent-noninterchangeability",
+)
+V2_ENVIRONMENT_GATED_CASES = frozenset(
     {
         "host-connectivity",
         "bridged-connectivity",
@@ -240,6 +284,14 @@ class CertificationConfig:
     fixture: FixtureConfig
     optional_cases: OptionalCases
     timeouts: CertificationTimeouts
+
+
+@dataclass(frozen=True)
+class ElevatedCertificationConfig:
+    fixture: FixtureConfig
+    optional_cases: OptionalCases
+    timeouts: CertificationTimeouts
+    authority_kind: str = "elevated-provider"
 
 
 @dataclass(frozen=True)
@@ -577,7 +629,89 @@ def _parse_timeouts(value: object) -> CertificationTimeouts:
     return CertificationTimeouts(**values)
 
 
-def parse_config_document(document: object) -> CertificationConfig:
+def _parse_fixture(value: object) -> FixtureConfig:
+    fixture_value = _object(value, ("executable", "sha256"), "fixture")
+    fixture_path = _absolute_path(fixture_value["executable"], "fixture")
+    expected_sha256 = _string(fixture_value["sha256"], "fixture", maximum=64)
+    if SHA256_RE.fullmatch(expected_sha256) is None:
+        raise CertificationError("fixture")
+    fixture_fd, fixture_identity = _open_regular(
+        fixture_path,
+        category="fixture",
+        maximum=MAX_FIXTURE_BYTES,
+        private=False,
+        executable=True,
+        digest=True,
+    )
+    os.close(fixture_fd)
+    if fixture_identity.size == 0 or fixture_identity.sha256 != expected_sha256:
+        raise CertificationError("fixture")
+    return FixtureConfig(fixture_path, expected_sha256, fixture_identity)
+
+
+def _parse_optional_cases(value: object) -> OptionalCases:
+    optional_value = _object(
+        value,
+        (
+            "bridged_interface",
+            "host_connectivity",
+            "not_authorized",
+            "sharing_service_busy",
+        ),
+        "optional-cases",
+    )
+    bridge_value = optional_value["bridged_interface"]
+    if bridge_value is not None:
+        bridge_value = _string(bridge_value, "optional-cases", maximum=15)
+        if BRIDGE_RE.fullmatch(bridge_value) is None:
+            raise CertificationError("optional-cases")
+    return OptionalCases(
+        host_connectivity=_bool(
+            optional_value["host_connectivity"], "optional-cases"
+        ),
+        bridged_interface=bridge_value,
+        not_authorized=_bool(optional_value["not_authorized"], "optional-cases"),
+        sharing_service_busy=_bool(
+            optional_value["sharing_service_busy"], "optional-cases"
+        ),
+    )
+
+
+def _parse_elevated_config_document(document: object) -> ElevatedCertificationConfig:
+    root = _object(
+        document,
+        ("authority", "fixture", "optional_cases", "schema_version", "timeouts"),
+        "config",
+    )
+    if (
+        _integer(
+            root["schema_version"],
+            ELEVATED_SCHEMA_VERSION,
+            ELEVATED_SCHEMA_VERSION,
+            "config",
+        )
+        != ELEVATED_SCHEMA_VERSION
+    ):
+        raise CertificationError("config")
+    authority = _object(root["authority"], ("kind",), "authority")
+    if authority["kind"] != "elevated-provider":
+        raise CertificationError("authority")
+    return ElevatedCertificationConfig(
+        fixture=_parse_fixture(root["fixture"]),
+        optional_cases=_parse_optional_cases(root["optional_cases"]),
+        timeouts=_parse_timeouts(root["timeouts"]),
+    )
+
+
+def parse_config_document(
+    document: object,
+) -> CertificationConfig | ElevatedCertificationConfig:
+    if (
+        isinstance(document, dict)
+        and not isinstance(document.get("schema_version"), bool)
+        and document.get("schema_version") == ELEVATED_SCHEMA_VERSION
+    ):
+        return _parse_elevated_config_document(document)
     root = _object(
         document,
         (
@@ -625,59 +759,17 @@ def parse_config_document(document: object) -> CertificationConfig:
     if profile_identity.size == 0:
         raise CertificationError("profile")
 
-    fixture_value = _object(root["fixture"], ("executable", "sha256"), "fixture")
-    fixture_path = _absolute_path(fixture_value["executable"], "fixture")
-    expected_sha256 = _string(fixture_value["sha256"], "fixture", maximum=64)
-    if SHA256_RE.fullmatch(expected_sha256) is None:
-        raise CertificationError("fixture")
-    fixture_fd, fixture_identity = _open_regular(
-        fixture_path,
-        category="fixture",
-        maximum=MAX_FIXTURE_BYTES,
-        private=False,
-        executable=True,
-        digest=True,
-    )
-    os.close(fixture_fd)
-    if fixture_identity.size == 0 or fixture_identity.sha256 != expected_sha256:
-        raise CertificationError("fixture")
-
-    optional_value = _object(
-        root["optional_cases"],
-        (
-            "bridged_interface",
-            "host_connectivity",
-            "not_authorized",
-            "sharing_service_busy",
-        ),
-        "optional-cases",
-    )
-    bridge_value = optional_value["bridged_interface"]
-    if bridge_value is not None:
-        bridge_value = _string(bridge_value, "optional-cases", maximum=15)
-        if BRIDGE_RE.fullmatch(bridge_value) is None:
-            raise CertificationError("optional-cases")
-    optional_cases = OptionalCases(
-        host_connectivity=_bool(
-            optional_value["host_connectivity"], "optional-cases"
-        ),
-        bridged_interface=bridge_value,
-        not_authorized=_bool(optional_value["not_authorized"], "optional-cases"),
-        sharing_service_busy=_bool(
-            optional_value["sharing_service_busy"], "optional-cases"
-        ),
-    )
     return CertificationConfig(
         signing_identity=signing_identity,
         provisioning_profile=profile,
         provisioning_profile_identity=profile_identity,
-        fixture=FixtureConfig(fixture_path, expected_sha256, fixture_identity),
-        optional_cases=optional_cases,
+        fixture=_parse_fixture(root["fixture"]),
+        optional_cases=_parse_optional_cases(root["optional_cases"]),
         timeouts=_parse_timeouts(root["timeouts"]),
     )
 
 
-def read_config(path: Path) -> CertificationConfig:
+def read_config(path: Path) -> CertificationConfig | ElevatedCertificationConfig:
     document, _identity = _read_private_document(path)
     return parse_config_document(document)
 
@@ -689,27 +781,7 @@ def _closed_version(value: object, label: str) -> str:
     return text
 
 
-def validate_result_document(document: object) -> dict[str, Any]:
-    root = _object(
-        document,
-        (
-            "cases",
-            "cleanup",
-            "entitlements",
-            "platform",
-            "schema_version",
-            "source",
-            "verdict",
-        ),
-        "result",
-    )
-    if (
-        _integer(
-            root["schema_version"], SCHEMA_VERSION, SCHEMA_VERSION, "result"
-        )
-        != SCHEMA_VERSION
-    ):
-        raise CertificationError("result")
+def _validate_result_identity(root: Mapping[str, object]) -> None:
     source = _object(root["source"], ("commit", "tree"), "result")
     if any(
         not isinstance(source[key], str) or GIT_OBJECT_RE.fullmatch(source[key]) is None
@@ -719,22 +791,19 @@ def validate_result_document(document: object) -> dict[str, Any]:
     platform = _object(
         root["platform"], ("architecture", "hvf", "macos", "sdk"), "result"
     )
-    if (
-        platform["architecture"] != "arm64"
-        or platform["hvf"] != "supported"
-    ):
+    if platform["architecture"] != "arm64" or platform["hvf"] != "supported":
         raise CertificationError("result")
     _closed_version(platform["macos"], "result")
     _closed_version(platform["sdk"], "result")
-    entitlements = _object(
-        root["entitlements"],
-        ("outer_empty", "worker_app_sandbox_hvf", "worker_vmnet"),
-        "result",
-    )
-    if not all(_bool(value, "result") for value in entitlements.values()):
-        raise CertificationError("result")
+
+
+def _validate_result_cases(
+    root: Mapping[str, object],
+    case_names: Sequence[str],
+    environment_gated: frozenset[str],
+) -> None:
     cases = root["cases"]
-    if not isinstance(cases, list) or len(cases) != len(CASE_NAMES):
+    if not isinstance(cases, list) or len(cases) != len(case_names):
         raise CertificationError("result")
     outcomes: dict[str, str] = {}
     for index, value in enumerate(cases):
@@ -742,13 +811,10 @@ def validate_result_document(document: object) -> dict[str, Any]:
         name = item["name"]
         outcome = item["outcome"]
         if (
-            name != CASE_NAMES[index]
+            name != case_names[index]
             or not isinstance(outcome, str)
             or outcome not in CASE_OUTCOMES
-            or (
-                outcome == "environment-gated"
-                and name not in ENVIRONMENT_GATED_CASES
-            )
+            or (outcome == "environment-gated" and name not in environment_gated)
         ):
             raise CertificationError("result")
         outcomes[name] = outcome
@@ -761,9 +827,9 @@ def validate_result_document(document: object) -> dict[str, Any]:
     ):
         raise CertificationError("result")
     mandatory_outcomes = [
-        outcome for name, outcome in outcomes.items() if name not in ENVIRONMENT_GATED_CASES
+        outcome for name, outcome in outcomes.items() if name not in environment_gated
     ]
-    optional_outcomes = [outcomes[name] for name in ENVIRONMENT_GATED_CASES]
+    optional_outcomes = [outcomes[name] for name in environment_gated]
     expected_verdict = (
         "failed"
         if cleanup == "incomplete" or "failed" in outcomes.values()
@@ -785,7 +851,110 @@ def validate_result_document(document: object) -> dict[str, Any]:
         )
     ):
         raise CertificationError("result")
+
+
+def _validate_v1_result_document(document: object) -> dict[str, Any]:
+    root = _object(
+        document,
+        (
+            "cases",
+            "cleanup",
+            "entitlements",
+            "platform",
+            "schema_version",
+            "source",
+            "verdict",
+        ),
+        "result",
+    )
+    if (
+        _integer(
+            root["schema_version"], SCHEMA_VERSION, SCHEMA_VERSION, "result"
+        )
+        != SCHEMA_VERSION
+    ):
+        raise CertificationError("result")
+    _validate_result_identity(root)
+    entitlements = _object(
+        root["entitlements"],
+        ("outer_empty", "worker_app_sandbox_hvf", "worker_vmnet"),
+        "result",
+    )
+    if not all(_bool(value, "result") for value in entitlements.values()):
+        raise CertificationError("result")
+    _validate_result_cases(root, V1_CASE_NAMES, V1_ENVIRONMENT_GATED_CASES)
     return root
+
+
+def _validate_v2_result_document(document: object) -> dict[str, Any]:
+    root = _object(
+        document,
+        (
+            "authority",
+            "cases",
+            "cleanup",
+            "entitlements",
+            "platform",
+            "schema_version",
+            "source",
+            "verdict",
+        ),
+        "result",
+    )
+    if (
+        _integer(
+            root["schema_version"],
+            ELEVATED_SCHEMA_VERSION,
+            ELEVATED_SCHEMA_VERSION,
+            "result",
+        )
+        != ELEVATED_SCHEMA_VERSION
+    ):
+        raise CertificationError("result")
+    authority = _object(
+        root["authority"],
+        ("controller", "kind", "outer", "owner", "provider", "route"),
+        "result",
+    )
+    if authority != {
+        "controller": "ordinary",
+        "kind": "elevated-provider",
+        "outer": "ordinary",
+        "owner": "irreversibly-ordinary",
+        "provider": "bounded-root",
+        "route": "remote-only",
+    }:
+        raise CertificationError("result")
+    _validate_result_identity(root)
+    entitlements = _object(
+        root["entitlements"],
+        (
+            "outer_empty",
+            "provider_empty",
+            "worker_app_sandbox_hvf",
+            "worker_vmnet",
+        ),
+        "result",
+    )
+    if (
+        _bool(entitlements["outer_empty"], "result") is not True
+        or _bool(entitlements["provider_empty"], "result") is not True
+        or _bool(entitlements["worker_app_sandbox_hvf"], "result") is not True
+        or _bool(entitlements["worker_vmnet"], "result") is not False
+    ):
+        raise CertificationError("result")
+    _validate_result_cases(root, V2_CASE_NAMES, V2_ENVIRONMENT_GATED_CASES)
+    return root
+
+
+def validate_result_document(document: object) -> dict[str, Any]:
+    if (
+        isinstance(document, dict)
+        and not isinstance(document.get("schema_version"), bool)
+        and document.get("schema_version") == ELEVATED_SCHEMA_VERSION
+    ):
+        return _validate_v2_result_document(document)
+    return _validate_v1_result_document(document)
 
 
 def read_result(path: Path) -> dict[str, Any]:
