@@ -1510,12 +1510,26 @@ class RemoteProductionProcess:
         return pid
 
     def _wait_remote(self) -> int:
+        status, _stdout, _stderr = self.wait_output()
+        return status
+
+    def wait_output(self) -> tuple[int, bytes, bytes]:
         try:
             status = self.process.wait(self.config.timeouts.terminate_seconds)
-            self.process.finish_output()
-            return status
+            stdout, stderr = self.process.finish_output()
+            return status, stdout, stderr
         except BaseException as error:
             raise _map_handoff_error(self.vmnet, error) from error
+
+    def finish_exited(self) -> None:
+        try:
+            if self.process.poll() is None:
+                raise self.vmnet.CertificationError("process")
+        except BaseException as error:
+            if isinstance(error, self.vmnet.CertificationError):
+                raise
+            raise _map_handoff_error(self.vmnet, error) from error
+        self._finish()
 
     def _remove_stale_socket(self) -> None:
         path = self.files.api_socket
@@ -2143,6 +2157,23 @@ class ElevatedSystemCertificationDriver:
             self._abort_process(process)
             raise
 
+    def _run_missing_policy_denial(self, case: str) -> None:
+        process = self._spawn(case)
+        try:
+            status, stdout, stderr = process.wait_output()
+            if (
+                status != 1
+                or stdout
+                or stderr
+                != b"bangbang launcher: invalid production launch policy\n"
+            ):
+                _fail(self.vmnet, "case")
+            process.finish_exited()
+            self._retire(process)
+        except BaseException:
+            self._abort_process(process)
+            raise
+
     def _run_mmds_only(self, case: str) -> None:
         process = self._spawn(case, allowed=(), maximum=None)
         try:
@@ -2370,12 +2401,7 @@ class ElevatedSystemCertificationDriver:
             self._run_networkless_denial()
             return
         if case == "missing-policy-denial":
-            self._run_policy_denial(
-                case,
-                allowed=(),
-                maximum=None,
-                networks=(("eth0", "vmnet:shared"),),
-            )
+            self._run_missing_policy_denial(case)
             return
         if case == "mismatched-policy-denial":
             self._run_policy_denial(

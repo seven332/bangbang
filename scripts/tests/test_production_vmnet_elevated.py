@@ -408,6 +408,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         methods = (
             "_run_authority_split",
             "_run_networkless_denial",
+            "_run_missing_policy_denial",
             "_run_policy_denial",
             "_run_mmds_only",
             "_run_connectivity",
@@ -427,15 +428,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             "authority-split": [("_run_authority_split", (), {})],
             "networkless-denial": [("_run_networkless_denial", (), {})],
             "missing-policy-denial": [
-                (
-                    "_run_policy_denial",
-                    ("missing-policy-denial",),
-                    {
-                        "allowed": (),
-                        "maximum": None,
-                        "networks": (("eth0", "vmnet:shared"),),
-                    },
-                )
+                ("_run_missing_policy_denial", ("missing-policy-denial",), {})
             ],
             "mismatched-policy-denial": [
                 (
@@ -1125,6 +1118,33 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             driver._abort_process.call_args_list,
             [mock.call(second), mock.call(first)],
         )
+
+    def test_missing_policy_requires_exact_provider_side_denial(self) -> None:
+        process = mock.Mock()
+        process.wait_output.return_value = (
+            1,
+            b"",
+            b"bangbang launcher: invalid production launch policy\n",
+        )
+        driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
+        driver.vmnet = vmnet
+        driver._spawn = mock.Mock(return_value=process)
+        driver._retire = mock.Mock()
+        driver._abort_process = mock.Mock()
+        driver._run_missing_policy_denial("missing-policy-denial")
+        process.finish_exited.assert_called_once_with()
+        driver._retire.assert_called_once_with(process)
+        driver._abort_process.assert_not_called()
+
+        process.wait_output.return_value = (1, b"unexpected", b"")
+        driver._retire.reset_mock()
+        self.assert_category(
+            "case",
+            lambda: driver._run_missing_policy_denial("missing-policy-denial"),
+        )
+        process.finish_exited.assert_called_once_with()
+        driver._retire.assert_not_called()
+        driver._abort_process.assert_called_once_with(process)
 
 
 if __name__ == "__main__":
