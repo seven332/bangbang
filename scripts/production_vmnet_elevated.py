@@ -89,6 +89,26 @@ def _fail(vmnet: ModuleType, category: str) -> NoReturn:
     raise vmnet.CertificationError(category)
 
 
+def _elevated_launcher_arguments(
+    vmnet: ModuleType,
+    bundle: Path,
+    files: Any,
+    instance: str,
+    allowed: Sequence[str],
+    maximum: Optional[int],
+) -> tuple[str, ...]:
+    arguments = vmnet._launcher_arguments(
+        bundle,
+        files,
+        instance,
+        allowed,
+        maximum,
+    )
+    if arguments[-2:] != ("--id", instance):
+        _fail(vmnet, "internal")
+    return arguments[:-2]
+
+
 def _sha256(path: Path, maximum: int) -> tuple[int, str]:
     descriptor = -1
     digest = hashlib.sha256()
@@ -1979,7 +1999,8 @@ class ElevatedSystemCertificationDriver:
         try:
             process = RemoteProductionProcess(
                 self,
-                self.vmnet._launcher_arguments(
+                _elevated_launcher_arguments(
+                    self.vmnet,
                     self.layout.bundle,
                     files,
                     instance,
@@ -2154,38 +2175,10 @@ class ElevatedSystemCertificationDriver:
                 process.wait_ready()
             except self.vmnet.CertificationError as error:
                 status, stdout, stderr = process.wait_output()
-                if (
-                    case
-                    in (
-                        "mismatched-policy-denial",
-                        "bridge-allowlist-denial",
-                    )
-                    and status == 11
-                    and not stdout
-                    and stderr
-                    == b"bangbang launcher: invalid production launch policy\n"
-                ):
-                    process.finish_exited()
-                    self._retire(process)
-                    return
                 if stdout:
                     raise self.vmnet.CertificationError("case-stdout") from error
                 if stderr:
-                    known_output = {
-                        b"bangbang launcher: invalid production launch policy\n": 10,
-                        b"bangbang launcher: invalid production bundle layout\n": 12,
-                        b"bangbang launcher: private vhost-user broker failed\n": 13,
-                    }.get(stderr)
-                    if known_output is not None:
-                        raise self.vmnet.CertificationError(
-                            f"provider-status-{known_output}"
-                        ) from error
-                    category = (
-                        f"case-stderr-length-{len(stderr)}"
-                        if len(stderr) <= 118
-                        else "case-stderr"
-                    )
-                    raise self.vmnet.CertificationError(category) from error
+                    raise self.vmnet.CertificationError("case-stderr") from error
                 if 10 <= status <= 19:
                     raise self.vmnet.CertificationError(
                         f"provider-status-{status}"

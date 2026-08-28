@@ -1226,15 +1226,32 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             b"bangbang launcher: invalid production launch policy\n",
         )
         driver._abort_process.reset_mock()
-        driver._run_policy_denial(
-            "mismatched-policy-denial",
-            allowed=("host",),
-            maximum=1,
-            networks=(("eth0", "vmnet:shared"),),
+        self.assert_category(
+            "case-stderr",
+            lambda: driver._run_policy_denial(
+                "mismatched-policy-denial",
+                allowed=("host",),
+                maximum=1,
+                networks=(("eth0", "vmnet:shared"),),
+            ),
         )
-        process.finish_exited.assert_called_once_with()
-        driver._retire.assert_called_once_with(process)
-        driver._abort_process.assert_not_called()
+        process.finish_exited.assert_not_called()
+        driver._retire.assert_not_called()
+        driver._abort_process.assert_called_once_with(process)
+
+    def test_elevated_arguments_rely_on_the_jailer_injected_worker_id(self) -> None:
+        instance = "elevated-05-00"
+        arguments = elevated._elevated_launcher_arguments(
+            vmnet,
+            Path("/private/fixed/Bangbang.app"),
+            SimpleNamespace(manifest=Path("/private/session/grants.json")),
+            instance,
+            ("shared",),
+            1,
+        )
+        self.assertEqual(arguments.count("--id"), 1)
+        self.assertEqual(arguments[arguments.index("--id") + 1], instance)
+        self.assertNotEqual(arguments[-2:], ("--id", instance))
 
 
 if __name__ == "__main__":
