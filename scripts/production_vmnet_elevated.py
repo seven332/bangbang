@@ -2162,7 +2162,12 @@ class ElevatedSystemCertificationDriver:
         try:
             status, stdout, stderr = process.wait_output()
             if status != 12:
-                _fail(self.vmnet, "case-status")
+                category = (
+                    f"provider-status-{status}"
+                    if 10 <= status <= 19
+                    else "case-status"
+                )
+                _fail(self.vmnet, category)
             if stdout:
                 _fail(self.vmnet, "case-stdout")
             if stderr != b"bangbang launcher: invalid production launch policy\n":

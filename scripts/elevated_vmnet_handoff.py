@@ -179,6 +179,7 @@ CERTIFICATION_FAILURES = (
     "process-output",
     "process-timeout",
     "profile",
+    *(f"provider-status-{status}" for status in range(10, 20)),
     "result",
     "session",
     "session-cleanup",

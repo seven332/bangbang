@@ -1146,6 +1146,12 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver._retire.assert_not_called()
         driver._abort_process.assert_called_once_with(process)
 
+        process.wait_output.return_value = (14, b"", b"")
+        self.assert_category(
+            "provider-status-14",
+            lambda: driver._run_missing_policy_denial("missing-policy-denial"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
