@@ -1000,6 +1000,15 @@ ELEVATED_VMNET_BOOT_ARGS = (
 ELEVATED_GUEST_BEGIN_MARKER = b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_BEGIN\n"
 ELEVATED_GUEST_SUCCESS_MARKER = b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_OK\n"
 ELEVATED_GUEST_FAILURE_PREFIX = b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_"
+ELEVATED_GUEST_FAILURE_CATEGORIES = {
+    b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_CLEANUP": "guest-cleanup",
+    b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_CONFIGURE": "guest-configure",
+    b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_CONTROL": "guest-control",
+    b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_DHCP": "guest-dhcp",
+    b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_INTERFACE": "guest-interface",
+    b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_INTERNAL": "guest-internal",
+    b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_TCP": "guest-tcp",
+}
 STAGED_TRAFFIC_MAGIC = b"BBEVNET2"
 STAGED_TRAFFIC_VERSION = 2
 STAGED_TRAFFIC_MODE_SHARED = 1
@@ -1081,6 +1090,23 @@ def _wait_direct_boot(
         if time.monotonic() >= deadline:
             _fail(vmnet, "guest-timeout")
         time.sleep(vmnet.POLL_SECONDS)
+
+
+def _staged_traffic_failure_category(vmnet: ModuleType, process: Any) -> Optional[str]:
+    data = vmnet._read_identity_bounded(
+        process.files.serial,
+        process.files.serial_identity,
+        maximum=vmnet.MAX_SERIAL_BYTES,
+        category="guest",
+    )
+    categories = {
+        ELEVATED_GUEST_FAILURE_CATEGORIES[line]
+        for line in data.splitlines()
+        if line in ELEVATED_GUEST_FAILURE_CATEGORIES
+    }
+    if len(categories) == 1:
+        return categories.pop()
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1285,6 +1311,16 @@ class StagedBarrier:
                     and record.kind in protocol.FAILURE_CATEGORIES
                     and record.sequence == 0xFFFF_FFFF_FFFF_FFFF
                 ):
+                    if (
+                        protocol.FAILURE_CATEGORIES[record.kind] == "traffic"
+                        and (
+                            category := _staged_traffic_failure_category(
+                                self.vmnet, process
+                            )
+                        )
+                        is not None
+                    ):
+                        _fail(self.vmnet, category)
                     _fail(
                         self.vmnet,
                         f"guest-staged-{protocol.FAILURE_CATEGORIES[record.kind]}",

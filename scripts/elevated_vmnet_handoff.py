@@ -163,6 +163,15 @@ CERTIFICATION_FAILURES = (
     "fixture-timeout",
     "file-cleanup",
     "guest",
+    *(f"guest-{category}" for category in (
+        "cleanup",
+        "configure",
+        "control",
+        "dhcp",
+        "interface",
+        "internal",
+        "tcp",
+    )),
     *(f"guest-staged-{category}" for category in (
         "control",
         "internal",

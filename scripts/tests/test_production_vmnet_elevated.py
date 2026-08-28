@@ -71,6 +71,9 @@ class BarrierProcess:
         self.config = SimpleNamespace(
             timeouts=SimpleNamespace(guest_seconds=1)
         )
+        self.files = SimpleNamespace(
+            serial=Path("/serial"), serial_identity=object()
+        )
 
     def raise_if_failed(self) -> None:
         pass
@@ -789,12 +792,50 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             with path.open("r+b", buffering=0) as destination:
                 destination.seek(protocol.STATUS_OFFSET)
                 destination.write(failure)
-            self.assert_category(
-                "guest-staged-traffic",
-                lambda: barrier.wait(
-                    BarrierProcess(), 1, protocol.Status.INITIAL_ABSENT
-                ),
+            with mock.patch.object(vmnet, "_read_identity_bounded", return_value=b""):
+                self.assert_category(
+                    "guest-staged-traffic",
+                    lambda: barrier.wait(
+                        BarrierProcess(), 1, protocol.Status.INITIAL_ABSENT
+                    ),
+                )
+
+    def test_staged_barrier_preserves_nested_traffic_failure_category(self) -> None:
+        protocol = elevated.load_staged_protocol()
+        nonce = bytes(range(1, 33))
+        with tempfile.TemporaryDirectory() as raw_temp:
+            path = Path(raw_temp) / "barrier.bin"
+            barrier = elevated.StagedBarrier(
+                vmnet,
+                path,
+                protocol.Scenario.RUNTIME,
+                nonce,
+                create=True,
             )
+            failure = protocol.encode_record(
+                protocol.ROLE_STATUS,
+                barrier.scenario,
+                protocol.FAILURE_KINDS["traffic"],
+                0xFFFF_FFFF_FFFF_FFFF,
+                nonce,
+            )
+            with path.open("r+b", buffering=0) as destination:
+                destination.seek(protocol.STATUS_OFFSET)
+                destination.write(failure)
+            serial = (
+                b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_BEGIN\r\n"
+                b"BANGBANG_ELEVATED_VMNET_CERTIFICATION_FAIL_DHCP\r\n"
+                b"BANGBANG_STAGED_VMNET_FAIL_TRAFFIC\r\n"
+            )
+            with mock.patch.object(
+                vmnet, "_read_identity_bounded", return_value=serial
+            ):
+                self.assert_category(
+                    "guest-dhcp",
+                    lambda: barrier.wait(
+                        BarrierProcess(), 1, protocol.Status.INITIAL_ABSENT
+                    ),
+                )
 
     def test_staged_traffic_control_uses_dhcp_router_endpoint(self) -> None:
         nonce = bytes(range(1, 33))
