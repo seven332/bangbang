@@ -150,7 +150,6 @@ CERTIFICATION_FAILURES = (
     "case-root-cleanup",
     "case-status",
     "case-stderr",
-    *(f"case-stderr-length-{length}" for length in range(119)),
     "case-stdout",
     "case-tree-cleanup",
     "cleanup",

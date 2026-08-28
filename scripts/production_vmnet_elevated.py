@@ -96,6 +96,8 @@ def _elevated_launcher_arguments(
     instance: str,
     allowed: Sequence[str],
     maximum: Optional[int],
+    *,
+    minimal: bool = False,
 ) -> tuple[str, ...]:
     arguments = vmnet._launcher_arguments(
         bundle,
@@ -106,7 +108,18 @@ def _elevated_launcher_arguments(
     )
     if arguments[-2:] != ("--id", instance):
         _fail(vmnet, "internal")
-    return arguments[:-2]
+    arguments = arguments[:-2]
+    if not minimal:
+        return arguments
+    try:
+        delimiter = arguments.index("--")
+    except ValueError as error:
+        raise vmnet.CertificationError("internal") from error
+    if arguments[delimiter + 1 : delimiter + 2] != (
+        vmnet.GRANT_MANIFEST_OPTION,
+    ):
+        _fail(vmnet, "internal")
+    return (*arguments[: delimiter + 1], "--version")
 
 
 def _sha256(path: Path, maximum: int) -> tuple[int, str]:
@@ -1779,6 +1792,60 @@ class ElevatedSystemCertificationDriver:
             control_data=control_data,
         )
 
+    def _policy_files(self, case: str) -> Any:
+        attempt = self._next_attempt(case)
+        index = self.vmnet.V2_CASE_NAMES.index(case)
+        root = self.session.path / f"case-{index:02d}-{attempt:02d}-{case}"
+        api_directory = root / "api"
+        created = False
+        try:
+            self.session.verify()
+            self.vmnet._create_private_directory(root)
+            created = True
+            self.vmnet._create_private_directory(api_directory)
+            serial = root / "serial.out"
+            serial_identity = self.vmnet._write_private_file(serial, b"")
+            manifest = root / "grants.json"
+            self.vmnet._write_private_file(
+                manifest,
+                self.vmnet.canonical_json(
+                    {
+                        "grants": [
+                            {
+                                "access": "create-children",
+                                "id": self.vmnet.API_DIRECTORY_GRANT_ID,
+                                "role": "api-socket-directory",
+                                "source": self.vmnet._path_text(
+                                    api_directory, "session"
+                                ),
+                            }
+                        ],
+                        "version": 1,
+                    }
+                ),
+            )
+            api_socket = api_directory / self.vmnet.API_SOCKET_CHILD
+            if len(os.fsencode(api_socket)) >= 104:
+                _fail(self.vmnet, "socket")
+            return self.vmnet.CaseFiles(
+                root,
+                manifest,
+                api_directory,
+                api_socket,
+                serial,
+                serial_identity,
+                None,
+                None,
+            )
+        except BaseException:
+            if created and os.path.lexists(root):
+                try:
+                    self.vmnet._clean_directory(root)
+                    os.rmdir(root)
+                except (OSError, self.vmnet.CertificationError):
+                    pass
+            raise
+
     def _next_attempt(self, case: str) -> int:
         attempt = self._attempts.get(case, 0)
         if not 0 <= attempt <= 99:
@@ -1991,6 +2058,7 @@ class ElevatedSystemCertificationDriver:
         *,
         allowed: Sequence[str],
         maximum: Optional[int],
+        minimal: bool = False,
     ) -> RemoteProductionProcess:
         instance = (
             f"elevated-{self.vmnet.V2_CASE_NAMES.index(case):02d}-"
@@ -2006,6 +2074,7 @@ class ElevatedSystemCertificationDriver:
                     instance,
                     allowed,
                     maximum,
+                    minimal=minimal,
                 ),
                 files,
             )
@@ -2169,7 +2238,12 @@ class ElevatedSystemCertificationDriver:
         maximum: Optional[int],
         networks: Sequence[tuple[str, str]],
     ) -> None:
-        process = self._spawn(case, allowed=allowed, maximum=maximum)
+        process = self._spawn_files(
+            case,
+            self._policy_files(case),
+            allowed=allowed,
+            maximum=maximum,
+        )
         try:
             try:
                 process.wait_ready()
@@ -2209,7 +2283,13 @@ class ElevatedSystemCertificationDriver:
             raise
 
     def _run_missing_policy_denial(self, case: str) -> None:
-        process = self._spawn(case)
+        process = self._spawn_files(
+            case,
+            self._policy_files(case),
+            allowed=(),
+            maximum=None,
+            minimal=True,
+        )
         try:
             status, stdout, stderr = process.wait_output()
             if status != 11:
@@ -2222,19 +2302,6 @@ class ElevatedSystemCertificationDriver:
             if stdout:
                 _fail(self.vmnet, "case-stdout")
             if stderr != b"bangbang launcher: invalid production launch policy\n":
-                diagnostic = {
-                    b"": 10,
-                    b"bangbang launcher: private vmnet topology failed\n": 12,
-                    b"bangbang launcher: invalid production bundle layout\n": 13,
-                    (
-                        b"bangbang: private launcher session failed\n"
-                        b"bangbang launcher: private vmnet topology failed\n"
-                    ): 14,
-                }.get(stderr)
-                if diagnostic is not None:
-                    _fail(self.vmnet, f"provider-status-{diagnostic}")
-                if len(stderr) <= 118:
-                    _fail(self.vmnet, f"case-stderr-length-{len(stderr)}")
                 _fail(self.vmnet, "case-stderr")
             process.finish_exited()
             self._retire(process)

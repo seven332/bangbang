@@ -1121,6 +1121,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
 
     def test_missing_policy_requires_exact_provider_side_denial(self) -> None:
         process = mock.Mock()
+        files = object()
         process.wait_output.return_value = (
             11,
             b"",
@@ -1128,10 +1129,18 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         )
         driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
         driver.vmnet = vmnet
-        driver._spawn = mock.Mock(return_value=process)
+        driver._policy_files = mock.Mock(return_value=files)
+        driver._spawn_files = mock.Mock(return_value=process)
         driver._retire = mock.Mock()
         driver._abort_process = mock.Mock()
         driver._run_missing_policy_denial("missing-policy-denial")
+        driver._spawn_files.assert_called_once_with(
+            "missing-policy-denial",
+            files,
+            allowed=(),
+            maximum=None,
+            minimal=True,
+        )
         process.finish_exited.assert_called_once_with()
         driver._retire.assert_called_once_with(process)
         driver._abort_process.assert_not_called()
@@ -1154,11 +1163,13 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
 
     def test_api_policy_denial_occurs_at_network_admission(self) -> None:
         process = mock.Mock()
+        files = object()
         first_response = object()
         denied_response = object()
         driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
         driver.vmnet = vmnet
-        driver._spawn = mock.Mock(return_value=process)
+        driver._policy_files = mock.Mock(return_value=files)
+        driver._spawn_files = mock.Mock(return_value=process)
         driver._finish_process = mock.Mock()
         driver._retire = mock.Mock()
         driver._abort_process = mock.Mock()
@@ -1252,6 +1263,17 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         self.assertEqual(arguments.count("--id"), 1)
         self.assertEqual(arguments[arguments.index("--id") + 1], instance)
         self.assertNotEqual(arguments[-2:], ("--id", instance))
+        minimal = elevated._elevated_launcher_arguments(
+            vmnet,
+            Path("/private/fixed/Bangbang.app"),
+            SimpleNamespace(manifest=Path("/private/session/grants.json")),
+            instance,
+            (),
+            None,
+            minimal=True,
+        )
+        self.assertEqual(minimal[-1], "--version")
+        self.assertNotIn(vmnet.GRANT_MANIFEST_OPTION, minimal)
 
 
 if __name__ == "__main__":
