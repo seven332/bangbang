@@ -2153,7 +2153,25 @@ class ElevatedSystemCertificationDriver:
             try:
                 process.wait_ready()
             except self.vmnet.CertificationError as error:
-                status, _stdout, _stderr = process.wait_output()
+                status, stdout, stderr = process.wait_output()
+                if (
+                    case
+                    in (
+                        "mismatched-policy-denial",
+                        "bridge-allowlist-denial",
+                    )
+                    and status == 11
+                    and not stdout
+                    and stderr
+                    == b"bangbang launcher: invalid production launch policy\n"
+                ):
+                    process.finish_exited()
+                    self._retire(process)
+                    return
+                if stdout:
+                    raise self.vmnet.CertificationError("case-stdout") from error
+                if stderr:
+                    raise self.vmnet.CertificationError("case-stderr") from error
                 if 10 <= status <= 19:
                     raise self.vmnet.CertificationError(
                         f"provider-status-{status}"

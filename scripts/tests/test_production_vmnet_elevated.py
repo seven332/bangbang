@@ -1160,6 +1160,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver.vmnet = vmnet
         driver._spawn = mock.Mock(return_value=process)
         driver._finish_process = mock.Mock()
+        driver._retire = mock.Mock()
         driver._abort_process = mock.Mock()
         with (
             mock.patch.object(
@@ -1219,18 +1220,21 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver._abort_process.assert_called_once_with(process)
 
         process.wait_ready.side_effect = vmnet.CertificationError("process")
-        process.wait_output.return_value = (16, b"", b"")
-        driver._abort_process.reset_mock()
-        self.assert_category(
-            "provider-status-16",
-            lambda: driver._run_policy_denial(
-                "mismatched-policy-denial",
-                allowed=("host",),
-                maximum=1,
-                networks=(("eth0", "vmnet:shared"),),
-            ),
+        process.wait_output.return_value = (
+            11,
+            b"",
+            b"bangbang launcher: invalid production launch policy\n",
         )
-        driver._abort_process.assert_called_once_with(process)
+        driver._abort_process.reset_mock()
+        driver._run_policy_denial(
+            "mismatched-policy-denial",
+            allowed=("host",),
+            maximum=1,
+            networks=(("eth0", "vmnet:shared"),),
+        )
+        process.finish_exited.assert_called_once_with()
+        driver._retire.assert_called_once_with(process)
+        driver._abort_process.assert_not_called()
 
 
 if __name__ == "__main__":
