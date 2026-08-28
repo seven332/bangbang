@@ -84,6 +84,7 @@ MAX_CAPTURE_BYTES = 256 * 1024
 
 CONTROLLER_FAILURES = (
     "internal",
+    "credentials",
     "protocol",
     "protocol-timeout",
     "descriptor",
@@ -2355,11 +2356,13 @@ def _controller_child(
     proxy: Optional[ControllerProxy] = None
     session: Optional[SessionSocket] = None
     failure_category = "internal"
+    ready_published = False
     try:
         _redirect_stdio()
         _close_unrelated_descriptors({connection.fileno(), ready_descriptor})
         transition_controller_credentials(uid, gid, supervisor_pid)
-        _write_all(ready_descriptor, b"R")
+        _write_all(ready_descriptor, b"R\x00")
+        ready_published = True
         os.close(ready_descriptor)
         ready_descriptor = -1
         session = SessionSocket(RecordSocket(connection), Role.CONTROLLER)
@@ -2387,6 +2390,19 @@ def _controller_child(
         exit_code = 0
     except HandoffError as error:
         failure_category = error.category
+        if ready_descriptor >= 0 and not ready_published:
+            try:
+                category = (
+                    failure_category
+                    if failure_category in CONTROLLER_FAILURES
+                    else "internal"
+                )
+                _write_all(
+                    ready_descriptor,
+                    bytes((ord("F"), CONTROLLER_FAILURES.index(category) + 1)),
+                )
+            except HandoffError:
+                pass
         if proxy is not None:
             try:
                 proxy.close()
@@ -2406,6 +2422,11 @@ def _controller_child(
             except HandoffError:
                 pass
     except BaseException:
+        if ready_descriptor >= 0 and not ready_published:
+            try:
+                _write_all(ready_descriptor, b"F\x01")
+            except HandoffError:
+                pass
         if proxy is not None:
             try:
                 proxy.close()
@@ -2548,12 +2569,18 @@ def _supervisor_entry(
         _write_all(identity_descriptor, struct.pack("!I", controller_pid))
         os.close(identity_descriptor)
         identity_descriptor = -1
-        if _read_exact(ready_read, 1, PROTOCOL_TIMEOUT) != b"R":
+        phase = 3
+        ready_record = _read_exact(ready_read, 2, PROTOCOL_TIMEOUT)
+        if ready_record != b"R\x00":
+            if (
+                ready_record[0] == ord("F")
+                and 1 <= ready_record[1] <= len(CONTROLLER_FAILURES)
+            ):
+                _fail(f"controller-{CONTROLLER_FAILURES[ready_record[1] - 1]}")
             _fail("credentials")
         os.close(ready_read)
         ready_read = -1
         controller_identity = capture_process(controller_pid)
-        phase = 3
         if (
             controller_identity.parent_pid != os.getpid()
             or (
