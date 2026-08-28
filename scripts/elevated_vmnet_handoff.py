@@ -82,6 +82,28 @@ CLEANUP_TIMEOUT = 10.0
 POLL_SECONDS = 0.05
 MAX_CAPTURE_BYTES = 256 * 1024
 
+CONTROLLER_FAILURES = (
+    "internal",
+    "protocol",
+    "protocol-timeout",
+    "descriptor",
+    "arguments",
+    "output",
+    "timeout",
+    "cleanup",
+    "probe",
+    "controller",
+)
+SUPERVISOR_PHASES = (
+    "initial",
+    "fork",
+    "credentials",
+    "handshake",
+    "lifecycle",
+    "controller-exit",
+    "cleanup-ack",
+)
+
 PROC_PIDTBSDINFO = 3
 PROC_PIDPATHINFO_MAXSIZE = 4096
 
@@ -1667,6 +1689,15 @@ class ProviderSupervisor:
                         raise
                     finally:
                         _close_descriptors(outputs)
+                elif request.kind == Kind.FAILURE:
+                    if (
+                        request.handle
+                        or request.correlation
+                        or request.payload
+                        or not 1 <= request.value <= len(CONTROLLER_FAILURES)
+                    ):
+                        _fail("protocol")
+                    _fail(f"controller-{CONTROLLER_FAILURES[request.value - 1]}")
                 elif request.kind in (Kind.POLL, Kind.WAIT):
                     owned = self._require_handle(request)
                     if request.kind == Kind.POLL:
@@ -2322,6 +2353,8 @@ def _controller_child(
 ) -> NoReturn:
     exit_code = 1
     proxy: Optional[ControllerProxy] = None
+    session: Optional[SessionSocket] = None
+    failure_category = "internal"
     try:
         _redirect_stdio()
         _close_unrelated_descriptors({connection.fileno(), ready_descriptor})
@@ -2352,10 +2385,35 @@ def _controller_child(
         entry(proxy, layout, uid, gid)
         proxy.finish()
         exit_code = 0
+    except HandoffError as error:
+        failure_category = error.category
+        if proxy is not None:
+            try:
+                proxy.close()
+            except HandoffError:
+                pass
+        if session is not None and not session.terminal:
+            try:
+                category = (
+                    failure_category
+                    if failure_category in CONTROLLER_FAILURES
+                    else "internal"
+                )
+                session.send(
+                    Kind.FAILURE,
+                    value=CONTROLLER_FAILURES.index(category) + 1,
+                )
+            except HandoffError:
+                pass
     except BaseException:
         if proxy is not None:
             try:
                 proxy.close()
+            except HandoffError:
+                pass
+        if session is not None and not session.terminal:
+            try:
+                session.send(Kind.FAILURE, value=1)
             except HandoffError:
                 pass
     finally:
@@ -2396,10 +2454,20 @@ def _guardian_lease_alive(descriptor: int) -> bool:
         return False
 
 
+def _receive_completion(connection: socket.socket) -> bytes:
+    message = bytearray()
+    while len(message) < 2:
+        chunk = connection.recv(2 - len(message))
+        if not chunk:
+            raise OSError("completion peer closed")
+        message.extend(chunk)
+    return bytes(message)
+
+
 def _supervisor_complete(connection: socket.socket) -> None:
     try:
         connection.settimeout(CLEANUP_TIMEOUT)
-        if connection.send(b"C") != 1 or connection.recv(2) != b"A":
+        if connection.send(b"C\x00") != 2 or _receive_completion(connection) != b"A\x00":
             _fail("guardian")
     except HandoffError:
         raise
@@ -2410,8 +2478,16 @@ def _supervisor_complete(connection: socket.socket) -> None:
 def _wait_supervisor_complete(connection: socket.socket) -> None:
     try:
         connection.settimeout(SESSION_TIMEOUT + CLEANUP_TIMEOUT)
-        if connection.recv(2) != b"C":
-            _fail("supervisor")
+        message = _receive_completion(connection)
+        if message == b"C\x00":
+            return
+        if (
+            len(message) == 2
+            and message[0] == ord("F")
+            and 1 <= message[1] <= len(SUPERVISOR_PHASES)
+        ):
+            _fail(f"supervisor-{SUPERVISOR_PHASES[message[1] - 1]}")
+        _fail("supervisor")
     except HandoffError:
         raise
     except (OSError, socket.timeout) as error:
@@ -2421,7 +2497,7 @@ def _wait_supervisor_complete(connection: socket.socket) -> None:
 def _acknowledge_guardian_cleanup(connection: socket.socket) -> None:
     try:
         connection.settimeout(CLEANUP_TIMEOUT)
-        if connection.send(b"A") != 1:
+        if connection.send(b"A\x00") != 2:
             _fail("supervisor")
     except HandoffError:
         raise
@@ -2445,7 +2521,9 @@ def _supervisor_entry(
     controller_socket: Optional[socket.socket] = None
     ready_read = ready_write = -1
     guardian_lost = False
+    phase = 1
     try:
+        phase = 2
         supervisor_socket, controller_socket = socket.socketpair(
             socket.AF_UNIX, socket.SOCK_DGRAM
         )
@@ -2475,6 +2553,7 @@ def _supervisor_entry(
         os.close(ready_read)
         ready_read = -1
         controller_identity = capture_process(controller_pid)
+        phase = 3
         if (
             controller_identity.parent_pid != os.getpid()
             or (
@@ -2492,6 +2571,7 @@ def _supervisor_entry(
         ):
             _fail("credentials")
         session_id = secrets.token_bytes(32)
+        phase = 4
         session = SessionSocket(
             RecordSocket(supervisor_socket), Role.SUPERVISOR, session_id
         )
@@ -2518,16 +2598,23 @@ def _supervisor_entry(
             controller_identity,
             guardian_lease,
         )
+        phase = 5
         server.serve()
+        phase = 6
         status = _wait_child(controller_pid, PROTOCOL_TIMEOUT)
         controller_pid = -1
         if os.waitstatus_to_exitcode(status) != 0 or server.providers:
             _fail("controller")
+        phase = 7
         _supervisor_complete(completion)
         if os.path.lexists(stage.root):
             _fail("cleanup")
         return 0
     except BaseException:
+        try:
+            completion.send(bytes((ord("F"), phase)))
+        except OSError:
+            pass
         guardian_lost = not _guardian_lease_alive(guardian_lease)
         if server is not None:
             try:
@@ -2651,7 +2738,7 @@ def run_root(
             identity_read = -1
         try:
             _wait_supervisor_complete(guardian_completion)
-        except HandoffError:
+        except HandoffError as error:
             guardian_completion.close()
             guardian_completion = None
             _waited, status = os.waitpid(supervisor_pid, 0)
@@ -2660,7 +2747,7 @@ def run_root(
                 forced = _retire_pid(controller_identity) or forced
             forced = force_stage_process_cleanup(stage) or forced
             remove_stage(stage)
-            raise HandoffError("session")
+            raise error
         if controller_identity is not None:
             forced = _retire_pid(controller_identity) or forced
         forced = force_stage_process_cleanup(stage) or forced
