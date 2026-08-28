@@ -925,6 +925,35 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             replacement.close()
             path.unlink()
 
+    def test_network_delete_is_strictly_bodyless(self) -> None:
+        process = SimpleNamespace(
+            files=SimpleNamespace(api_socket=Path("/api.sock")),
+            api_authority=mock.Mock(return_value=("socket-identity", 123)),
+        )
+        driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
+        driver.vmnet = vmnet
+        driver.config = SimpleNamespace(
+            timeouts=SimpleNamespace(request_seconds=7)
+        )
+        response = object()
+        with (
+            mock.patch.object(
+                vmnet, "http_exchange", return_value=response
+            ) as exchange,
+            mock.patch.object(vmnet, "_require_no_content") as require,
+        ):
+            driver._network_delete(process)
+        exchange.assert_called_once_with(
+            Path("/api.sock"),
+            "DELETE",
+            "/network-interfaces/eth0",
+            None,
+            7,
+            socket_identity="socket-identity",
+            expected_peer_pid=123,
+        )
+        require.assert_called_once_with(response)
+
     def test_restore_orchestration_requires_fresh_owner_and_exact_barrier(self) -> None:
         protocol = elevated.load_staged_protocol()
         nonce = bytes(range(1, 33))

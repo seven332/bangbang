@@ -2827,7 +2827,11 @@ class ElevatedSystemCertificationDriver:
         _fail(self.vmnet, "internal")
 
     def _api_exchange(
-        self, process: Any, method: str, path: str, body: Mapping[str, object]
+        self,
+        process: Any,
+        method: str,
+        path: str,
+        body: Optional[Mapping[str, object]],
     ) -> Any:
         socket_identity, peer_pid = process.api_authority()
         return self.vmnet.http_exchange(
@@ -2851,7 +2855,7 @@ class ElevatedSystemCertificationDriver:
 
     def _network_delete(self, process: Any) -> None:
         self.vmnet._require_no_content(
-            self._api_exchange(process, "DELETE", "/network-interfaces/eth0", {})
+            self._api_exchange(process, "DELETE", "/network-interfaces/eth0", None)
         )
 
     def _configure_staged(
