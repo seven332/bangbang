@@ -164,7 +164,7 @@
         {
           "kind": "local",
           "path": "scripts/run-elevated-vmnet-evidence.sh",
-          "anchor": "guest=passed repeat=passed cleanup=passed"
+          "anchor": "guest=passed repeat=passed startup=passed runtime=passed restore=passed cleanup=passed"
         },
         {
           "kind": "local",

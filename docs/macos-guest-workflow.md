@@ -167,6 +167,14 @@ the v110 Python oracle and requires its own sidecar and filename. It is not a
 public guest-workflow mode and does not make root-direct VMM execution a
 supported deployment topology.
 
+`direct-boot-v112` extends only that entitlement-free evidence path. It keeps
+the v111 one-shot DHCP/router-derived TCP oracle byte-for-contract and adds a
+mode-`0555` staged coordinator. A separate writable 4096-byte barrier drive
+binds startup, runtime-hotplug, and cross-process restore transitions to one
+scenario and nonce. The guest performs the required PCI rescan/removal while
+the host retains public API ownership. V112 is likewise not a public workflow
+mode or a production topology.
+
 ## Troubleshooting
 
 - `the macOS guest workflow requires Apple Silicon`: run on Darwin arm64; cross

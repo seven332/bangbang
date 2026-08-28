@@ -385,6 +385,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> GuestWorkflowManifest:
         "rootfs-ext4",
         "rootfs-ext4-direct-boot-v110",
         "rootfs-ext4-direct-boot-v111",
+        "rootfs-ext4-direct-boot-v112",
     )
     for index, value in enumerate(recipe_items):
         item = _require_object(
@@ -1308,6 +1309,7 @@ def prepare_ext4(
         "normal": "rootfs-ext4",
         "direct-boot-v110": "rootfs-ext4-direct-boot-v110",
         "direct-boot-v111": "rootfs-ext4-direct-boot-v111",
+        "direct-boot-v112": "rootfs-ext4-direct-boot-v112",
     }
     recipe_id = recipe_ids.get(variant)
     if recipe_id is None or recipe_id not in policy.recipes:
@@ -1356,7 +1358,7 @@ def prepare_ext4(
             )
             if result.returncode != 0:
                 raise ArtifactPolicyError("build", "unsquashfs failed while preparing ext4 rootfs")
-            if variant in ("direct-boot-v110", "direct-boot-v111"):
+            if variant in ("direct-boot-v110", "direct-boot-v111", "direct-boot-v112"):
                 environment = dict(os.environ)
                 environment[DIRECT_POPULATE_ENV] = "1"
                 environment[DIRECT_POPULATE_VARIANT_ENV] = variant
@@ -1414,7 +1416,7 @@ def _parse_args(arguments: Optional[Sequence[str]] = None) -> argparse.Namespace
     ext4_parser.add_argument(
         "--variant",
         required=True,
-        choices=("normal", "direct-boot-v110", "direct-boot-v111"),
+        choices=("normal", "direct-boot-v110", "direct-boot-v111", "direct-boot-v112"),
     )
 
     publish_parser = subparsers.add_parser("publish", help="Publish a fixed caller-owned output class.")

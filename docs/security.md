@@ -1385,6 +1385,19 @@ accepted router, completes one nonce-bound TCP exchange, and reverses guest
 network state. Every process, socket, listener, file, and owner created by the
 harness must be absent after each bounded case.
 
+#1942 adds a separate v112 root-direct foundation without changing authority.
+Its coordinator accepts one fixed 4096-byte block barrier whose header,
+commands, and statuses are versioned, scenario-bound, sequence-bound,
+nonce-bound, SHA-256 checked, and reserved-zero closed. The guest performs
+manual PCI rescan/removal; the host performs the public network PUT/DELETE
+operations. Startup requires two distinct live TCP generations, while runtime
+requires one only after insertion. Restore
+captures only after first-generation traffic, terminates the source process,
+uses an explicit destination network override, and requires second-generation
+traffic before cleanup. Neither live vmnet ownership nor a provider stream is
+serialized. Failure statuses are categorical, and empty serial output is
+allowed because the authenticated block barrier is the success authority.
+
 This authority is deliberately evidence-only. Running the VMM as root is not a
 supported production topology; root is not treated as the restricted Apple
 entitlement; and no password, authorization token, account name, path,

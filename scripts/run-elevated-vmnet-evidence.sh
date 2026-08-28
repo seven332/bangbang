@@ -118,7 +118,11 @@ names=(
   vmlinux-6.1.155
   ubuntu-24.04-512M-direct-boot-v111.ext4
   ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json
+  ubuntu-24.04-512M-direct-boot-v112.ext4
+  ubuntu-24.04-512M-direct-boot-v112.ext4.bangbang.json
   elevated-vmnet-evidence.py
+  staged-vmnet-evidence.py
+  staged-vmnet-certification.py
   manifest.json
   prepare.log
 )
@@ -171,7 +175,11 @@ done
   "$stage/vmlinux-6.1.155" \
   "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4" \
   "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json" \
+  "$stage/ubuntu-24.04-512M-direct-boot-v112.ext4" \
+  "$stage/ubuntu-24.04-512M-direct-boot-v112.ext4.bangbang.json" \
   "$stage/elevated-vmnet-evidence.py" \
+  "$stage/staged-vmnet-evidence.py" \
+  "$stage/staged-vmnet-certification.py" \
   "$stage/manifest.json"
 /bin/chmod 0600 "$stage/prepare.log"
 if ! /usr/bin/python3 "$stage/elevated-vmnet-evidence.py" verify \
@@ -246,6 +254,22 @@ run_provider_case() {
       >/dev/null 2>&1
 }
 
+run_staged_case() {
+  local scenario="$1"
+  /usr/bin/env -i \
+    LANG=C \
+    LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TMPDIR="$stage/runs" \
+    BANGBANG_ELEVATED_VMNET_BANGBANG="$stage/bangbang" \
+    BANGBANG_ELEVATED_VMNET_KERNEL="$stage/vmlinux-6.1.155" \
+    BANGBANG_STAGED_VMNET_ROOTFS="$stage/ubuntu-24.04-512M-direct-boot-v112.ext4" \
+    BANGBANG_STAGED_VMNET_ROOTFS_SIDECAR="$stage/ubuntu-24.04-512M-direct-boot-v112.ext4.bangbang.json" \
+    /usr/bin/python3 "$stage/staged-vmnet-evidence.py" \
+      --scenario "$scenario" \
+      >/dev/null 2>&1
+}
+
 if ! run_provider_case macos_arm64::dropped_provider_serves_data_lifecycle; then
   echo "bangbang elevated vmnet proof: provider data failed" >&2
   exit 1
@@ -296,7 +320,24 @@ if [[ -n "$(/usr/bin/find -x "$stage/runs" -mindepth 1 -print -quit)" ]]; then
   exit 1
 fi
 
+for scenario in startup runtime restore; do
+  if ! run_staged_case "$scenario"; then
+    echo "bangbang elevated vmnet proof: staged $scenario failed" >&2
+    exit 1
+  fi
+  if [[ -n "$(/usr/bin/find -x "$stage/runs" -mindepth 1 -print -quit)" ]]; then
+    echo "bangbang elevated vmnet proof: staged $scenario residue" >&2
+    exit 1
+  fi
+done
+
+final_count="$(/usr/bin/find -x "$stage" -mindepth 1 -maxdepth 1 -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+if [[ "$final_count" != "$((${#names[@]} + 1))" ]]; then
+  echo "bangbang elevated vmnet proof: final package residue" >&2
+  exit 1
+fi
+
 os_version="$(/usr/bin/sw_vers -productVersion)"
 sdk_version="$(/usr/bin/xcrun --sdk macosx --show-sdk-version)"
 echo "platform: macos=$os_version sdk=$sdk_version arch=arm64 hvf=supported root=exact apple-vmnet=absent"
-echo "bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed"
+echo "bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed startup=passed runtime=passed restore=passed cleanup=passed"

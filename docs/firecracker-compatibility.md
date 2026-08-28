@@ -5462,6 +5462,15 @@ and cleanup. Neither slice changes either disposition. A real guest through the
 production provider, the complete concurrent production certification, and the
 optional Apple-authorized matrix remain #1378 work.
 
+#1942 adds `direct-boot-v112` as a nonfinal root-direct oracle foundation. It
+retains the v111 DHCP/router-derived nonce-TCP helper and adds an authenticated
+barrier that separately proves startup removal/re-addition, networkless runtime
+hotplug, and cross-process Full snapshot restore with a fresh destination
+network override. The guest performs manual PCI rescan/removal and each scenario
+ends with exact API and process cleanup. This evidence uses no Apple
+authorization and leaves both rows `missing-platform-feasible`; production
+provider handoff and the canonical matrix remain later slices.
+
 ## Validation Expectations
 
 Every future compatibility change should choose validation appropriate to its

@@ -42,32 +42,37 @@ def prepared_package(root: Path) -> None:
         "elevated-vmnet-provider-e2e": b"provider-harness",
         "vmlinux-6.1.155": b"kernel",
         "ubuntu-24.04-512M-direct-boot-v111.ext4": b"rootfs",
+        "ubuntu-24.04-512M-direct-boot-v112.ext4": b"staged-rootfs",
         "elevated-vmnet-evidence.py": b"helper",
+        "staged-vmnet-evidence.py": b"staged-helper",
+        "staged-vmnet-certification.py": b"staged-protocol",
     }
     for name, payload in payloads.items():
         path = root / name
         path.write_bytes(payload)
         mode = next(mode for candidate, mode, _maximum in evidence.FILES if candidate == name)
         path.chmod(mode)
-    rootfs = payloads["ubuntu-24.04-512M-direct-boot-v111.ext4"]
-    sidecar = root / "ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json"
-    sidecar.write_bytes(
-        canonical(
-            {
-                "filesystem_check": "e2fsck -fn",
-                "output_sha256": hashlib.sha256(rootfs).hexdigest(),
-                "output_size_bytes": len(rootfs),
-                "recipe_sha256": "1" * 64,
-                "requested_size_bytes": len(rootfs),
-                "schema_version": 1,
-                "source_sha256": "2" * 64,
-                "source_size_bytes": len(rootfs),
-                "tool_versions": {},
-                "variant": "direct-boot-v111",
-            }
+    for variant in ("direct-boot-v111", "direct-boot-v112"):
+        name = f"ubuntu-24.04-512M-{variant}.ext4"
+        rootfs = payloads[name]
+        sidecar = root / f"{name}.bangbang.json"
+        sidecar.write_bytes(
+            canonical(
+                {
+                    "filesystem_check": "e2fsck -fn",
+                    "output_sha256": hashlib.sha256(rootfs).hexdigest(),
+                    "output_size_bytes": len(rootfs),
+                    "recipe_sha256": "1" * 64,
+                    "requested_size_bytes": len(rootfs),
+                    "schema_version": 1,
+                    "source_sha256": "2" * 64,
+                    "source_size_bytes": len(rootfs),
+                    "tool_versions": {},
+                    "variant": variant,
+                }
+            )
         )
-    )
-    sidecar.chmod(0o444)
+        sidecar.chmod(0o444)
     log = root / evidence.LOG_NAME
     log.write_bytes(b"")
     log.chmod(0o600)
@@ -114,18 +119,19 @@ class ElevatedVmnetEvidenceTests(unittest.TestCase):
                 with self.assertRaises(evidence.EvidenceError):
                     evidence.verify_manifest(root, os.getuid())
 
-    def test_verifier_rejects_stale_v110_sidecar(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_temp:
-            root = Path(raw_temp)
-            prepared_package(root)
-            sidecar = root / "ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json"
-            value = json.loads(sidecar.read_bytes())
-            value["variant"] = "direct-boot-v110"
-            sidecar.chmod(0o644)
-            sidecar.write_bytes(canonical(value))
-            sidecar.chmod(0o444)
-            with self.assertRaisesRegex(evidence.EvidenceError, "sidecar"):
-                evidence.create_manifest(root, os.getuid())
+    def test_verifier_rejects_stale_sidecars(self) -> None:
+        for variant in ("direct-boot-v111", "direct-boot-v112"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as raw_temp:
+                root = Path(raw_temp)
+                prepared_package(root)
+                sidecar = root / f"ubuntu-24.04-512M-{variant}.ext4.bangbang.json"
+                value = json.loads(sidecar.read_bytes())
+                value["variant"] = "direct-boot-v110"
+                sidecar.chmod(0o644)
+                sidecar.write_bytes(canonical(value))
+                sidecar.chmod(0o444)
+                with self.assertRaisesRegex(evidence.EvidenceError, "sidecar"):
+                    evidence.create_manifest(root, os.getuid())
 
     def test_verifier_rejects_noncanonical_duplicate_and_unknown_manifest(self) -> None:
         for mutation in ("noncanonical", "duplicate", "unknown"):
@@ -160,6 +166,9 @@ class ElevatedVmnetEvidenceTests(unittest.TestCase):
         prepare = PREPARE_PATH.read_text(encoding="utf-8")
         runner = RUN_PATH.read_text(encoding="utf-8")
         self.assertIn("direct-boot-v111", prepare)
+        self.assertIn("direct-boot-v112", prepare)
+        self.assertIn("staged_vmnet_evidence.py", prepare)
+        self.assertIn("staged_vmnet_certification.py", prepare)
         self.assertIn("ordinary_user_vmnet_start_is_denied", prepare)
         self.assertIn("ordinary denial residue", prepare)
         self.assertIn("cargo test", prepare)
@@ -171,11 +180,15 @@ class ElevatedVmnetEvidenceTests(unittest.TestCase):
         self.assertIn("control_cancellation_reaps_dropped_provider", runner)
         self.assertEqual(runner.count("dropped_provider_serves_data_lifecycle"), 2)
         self.assertEqual(runner.count("elevated_direct_guest_uses_shared_vmnet"), 2)
+        self.assertIn('for scenario in startup runtime restore', runner)
+        self.assertIn('run_staged_case "$scenario"', runner)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", runner)
+        self.assertIn('final_count="$(/usr/bin/find -x "$stage"', runner)
         self.assertNotIn("sudo", runner.lower())
         self.assertNotIn("SUDO_", runner)
         self.assertNotIn("dscacheutil", runner)
         self.assertNotIn("ps ", runner)
-        self.assertEqual(runner.count('find -x "$stage/runs"'), 6)
+        self.assertEqual(runner.count('find -x "$stage/runs"'), 7)
 
     def test_guest_oracle_protocol_failures_are_portable(self) -> None:
         compiler = os.environ.get("RUSTC") or shutil.which("rustc")

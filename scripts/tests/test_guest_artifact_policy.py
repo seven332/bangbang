@@ -75,6 +75,7 @@ class GuestArtifactPolicyTests(unittest.TestCase):
                 "rootfs-ext4",
                 "rootfs-ext4-direct-boot-v110",
                 "rootfs-ext4-direct-boot-v111",
+                "rootfs-ext4-direct-boot-v112",
             ],
         )
 
@@ -114,6 +115,10 @@ class GuestArtifactPolicyTests(unittest.TestCase):
             ["prepare-ext4", "--variant", "direct-boot-v111", "--size", "512M"]
         )
         self.assertEqual(parsed.variant, "direct-boot-v111")
+        parsed = policy._parse_args(
+            ["prepare-ext4", "--variant", "direct-boot-v112", "--size", "512M"]
+        )
+        self.assertEqual(parsed.variant, "direct-boot-v112")
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             policy._parse_args(["prepare-ext4", "--variant", "custom", "--size", "1G"])
         self.assertEqual(caught.exception.code, 2)

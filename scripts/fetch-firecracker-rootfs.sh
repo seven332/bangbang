@@ -20,7 +20,8 @@ Options:
                    guest oracle when requested by boot args. Only valid with
                    --format ext4.
   --direct-boot-variant VARIANT
-                   Select direct-boot-v110 or direct-boot-v111. Defaults to
+                   Select direct-boot-v110, direct-boot-v111, or
+                   direct-boot-v112. Defaults to
                    direct-boot-v110 and is valid only with --direct-boot-init.
   -h, --help       Show this help.
 
@@ -142,7 +143,7 @@ if [[ "$direct_boot_init" != true && "$direct_boot_variant_set" == true ]]; then
   exit 2
 fi
 case "$direct_boot_variant" in
-  direct-boot-v110 | direct-boot-v111)
+  direct-boot-v110 | direct-boot-v111 | direct-boot-v112)
     ;;
   *)
     echo "unsupported direct-boot variant: $direct_boot_variant" >&2
@@ -328,11 +329,18 @@ install_static_arm64_guest_helpers() {
     "${repo_root}/scripts/guest/specification-benchmark.rs" \
     "${extract_dir}/bangbang-specification-benchmark" \
     "arm64 specification benchmark workload"
-  if [[ "$populate_variant" == direct-boot-v111 ]]; then
+  if [[ "$populate_variant" == direct-boot-v111 || "$populate_variant" == direct-boot-v112 ]]; then
     build_static_arm64_guest_helper \
       "${repo_root}/scripts/guest/elevated_vmnet_certification.rs" \
       "${extract_dir}/bangbang-elevated-vmnet-certification" \
       "elevated vmnet certification guest helper"
+  fi
+  if [[ "$populate_variant" == direct-boot-v112 ]]; then
+    install_checked_python_helper \
+      "${repo_root}/scripts/guest/staged_vmnet_certification.py" \
+      "${extract_dir}/bangbang-staged-vmnet-certification" \
+      0555 \
+      "staged vmnet certification guest coordinator"
   fi
 }
 
@@ -382,7 +390,7 @@ install_production_vmnet_certification_helper() {
         0555 \
         "production vmnet certification guest helper"
       ;;
-    direct-boot-v111)
+    direct-boot-v111 | direct-boot-v112)
       ;;
     *)
       echo "checked direct-rootfs variant is missing or invalid" >&2
@@ -5356,6 +5364,12 @@ elif cmdline_has bangbang.vsock-host-connect=1; then
   fetch_host_vsock_marker
 elif cmdline_has bangbang.vsock-host-multistream=1; then
   fetch_multi_host_vsock_marker
+elif cmdline_has bangbang.staged-vmnet-certification=1; then
+  if [ -x /bangbang-staged-vmnet-certification ]; then
+    /bangbang-staged-vmnet-certification || true
+  else
+    emit_line BANGBANG_STAGED_VMNET_FAIL_INTERNAL
+  fi
 elif cmdline_has bangbang.elevated-vmnet-certification=1; then
   if [ -x /bangbang-elevated-vmnet-certification ]; then
     /bangbang-elevated-vmnet-certification || true
@@ -5383,7 +5397,7 @@ EOF
 
 if [[ -n "$internal_populate_dir" ]]; then
   case "$populate_variant" in
-    direct-boot-v110 | direct-boot-v111)
+    direct-boot-v110 | direct-boot-v111 | direct-boot-v112)
       ;;
     *)
       echo "internal rootfs population requires an exact checked variant" >&2

@@ -308,6 +308,63 @@ else:
             self.assertIn("-D", v111_normalized[2])
             self.assertIn("warnings", v111_normalized[2])
 
+            v112_root = temp / "rootfs-v112"
+            v112_root.mkdir()
+            v112_log = temp / "rustc-v112.jsonl"
+            v112_environment = dict(environment)
+            v112_environment["BANGBANG_GUEST_POLICY_VARIANT"] = "direct-boot-v112"
+            v112_environment["FAKE_RUST_LOG"] = os.fspath(v112_log)
+            v112_result = subprocess.run(
+                (
+                    os.fspath(REPOSITORY_ROOT / "scripts/fetch-firecracker-rootfs.sh"),
+                    "--internal-populate-direct",
+                    os.fspath(v112_root),
+                ),
+                env=v112_environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(v112_result.returncode, 0, v112_result.stderr)
+            v112_oracle = v112_root / "bangbang-elevated-vmnet-certification"
+            v112_coordinator = v112_root / "bangbang-staged-vmnet-certification"
+            self.assertTrue(v112_oracle.is_file())
+            self.assertTrue(v112_coordinator.is_file())
+            self.assertEqual(stat.S_IMODE(v112_oracle.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(v112_coordinator.stat().st_mode), 0o555)
+            self.assertEqual(
+                v112_coordinator.read_bytes(),
+                (
+                    REPOSITORY_ROOT
+                    / "scripts/guest/staged_vmnet_certification.py"
+                ).read_bytes(),
+            )
+            v112_init = (v112_root / "bangbang-direct-rootfs-init").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(
+                v112_init.count("cmdline_has bangbang.staged-vmnet-certification=1"),
+                1,
+            )
+            v112_invocations = [
+                json.loads(line)
+                for line in v112_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [Path(arguments[0]).name for arguments in v112_invocations],
+                [
+                    "arm64-id-register-report.rs",
+                    "specification-benchmark.rs",
+                    "elevated_vmnet_certification.rs",
+                ],
+            )
+            v112_normalized: list[list[str]] = []
+            for arguments in v112_invocations:
+                output_index = arguments.index("-o")
+                v112_normalized.append(
+                    ["<source>", *arguments[1:output_index], "-o", "<output>"]
+                )
+            self.assertEqual(v112_normalized, [normalized[0]] * 3)
+
             for mode, expected_error in (
                 ("missing-target", "Rust target aarch64-unknown-linux-musl is required"),
                 ("missing-linker", "does not provide rust-lld"),
@@ -387,6 +444,23 @@ else:
                 "scripts/guest/arm64-id-register-report.rs",
                 "scripts/guest/elevated_vmnet_certification.rs",
                 "scripts/guest/specification-benchmark.rs",
+                "scripts/guest_artifact_policy.py",
+            ],
+        )
+        v112 = next(
+            recipe
+            for recipe in manifest["ext4_recipes"]
+            if recipe["id"] == "rootfs-ext4-direct-boot-v112"
+        )
+        self.assertEqual(
+            v112["tracked_inputs"],
+            [
+                "compat/firecracker/v1.16.0/guest-workflow-audit.json",
+                "scripts/fetch-firecracker-rootfs.sh",
+                "scripts/guest/arm64-id-register-report.rs",
+                "scripts/guest/elevated_vmnet_certification.rs",
+                "scripts/guest/specification-benchmark.rs",
+                "scripts/guest/staged_vmnet_certification.py",
                 "scripts/guest_artifact_policy.py",
             ],
         )

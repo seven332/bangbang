@@ -19,10 +19,11 @@ pub const GUEST_WORKFLOW_AUDIT_PATH: &str = "compat/firecracker/v1.16.0/guest-wo
 /// Exact ordered artifact identities owned by the authority.
 pub const GUEST_ARTIFACT_IDS: [&str; 2] = ["kernel", "rootfs"];
 /// Exact ordered ext4 recipe identities owned by the authority.
-pub const GUEST_EXT4_RECIPE_IDS: [&str; 3] = [
+pub const GUEST_EXT4_RECIPE_IDS: [&str; 4] = [
     "rootfs-ext4",
     "rootfs-ext4-direct-boot-v110",
     "rootfs-ext4-direct-boot-v111",
+    "rootfs-ext4-direct-boot-v112",
 ];
 /// Exact ordered planned workflow identities reserved for the completion slice.
 pub const GUEST_WORKFLOW_PROFILE_IDS: [&str; 2] =
@@ -301,6 +302,20 @@ fn validate_ext4_recipes(audit: &GuestWorkflowAudit, errors: &mut Vec<String>) {
                     "scripts/guest/arm64-id-register-report.rs",
                     "scripts/guest/elevated_vmnet_certification.rs",
                     "scripts/guest/specification-benchmark.rs",
+                    "scripts/guest_artifact_policy.py",
+                ],
+            ),
+            3 => (
+                "direct-boot-v112",
+                "ubuntu-24.04-{size}-direct-boot-v112.ext4",
+                "512M",
+                &[
+                    GUEST_WORKFLOW_AUDIT_PATH,
+                    "scripts/fetch-firecracker-rootfs.sh",
+                    "scripts/guest/arm64-id-register-report.rs",
+                    "scripts/guest/elevated_vmnet_certification.rs",
+                    "scripts/guest/specification-benchmark.rs",
+                    "scripts/guest/staged_vmnet_certification.py",
                     "scripts/guest_artifact_policy.py",
                 ],
             ),
@@ -724,7 +739,9 @@ fn validate_source_tokens(repository_root: &Path, errors: &mut Vec<String>) {
             &[
                 "direct-boot-v110",
                 "direct-boot-v111",
+                "direct-boot-v112",
                 "elevated_vmnet_certification.rs",
+                "staged_vmnet_certification.py",
                 "guest_artifact_policy.py",
             ][..],
         ),

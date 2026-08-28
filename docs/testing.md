@@ -2925,7 +2925,8 @@ scripts/prepare-elevated-vmnet-evidence.sh \
 
 The prepared package includes the exact ad-hoc Hypervisor-signed VMM and its
 test target, the entitlement-free `bangbang-vmnet-provider` and provider test
-target, pinned kernel, sidecar-verified `direct-boot-v111` rootfs, and manifest.
+target, pinned kernel, sidecar-verified `direct-boot-v111` and
+`direct-boot-v112` rootfs images, staged host/guest coordinators, and manifest.
 Preparation proves both ordinary-user denial paths. The provider carries no
 entitlement; the VMM carries only the Hypervisor entitlement. Preparation never
 requests Apple credentials or elevation.
@@ -2953,10 +2954,20 @@ deadline and must leave no harness-owned process, socket, file, listener, or
 interface residue. Output is fixed categorical text and excludes paths,
 identities, PIDs, interface names, addresses, packets, nonces, and raw errors.
 
+The v112 phase then runs three exact root-direct scenarios through the same
+closed package. Startup proves traffic on the initial interface, guest-observed
+PCI removal, public-API deletion/re-addition, a second DHCP/TCP generation, and
+cleanup. Runtime boots without a network and proves public-API insertion,
+traffic, guest removal, API deletion, and cleanup. Restore captures only at the
+guest barrier, terminates the source, loads through an explicit fresh
+`vmnet:shared` override, proves destination traffic, and removes the final
+interface. The nonce-bound barrier records are authoritative; serial output is
+bounded and rejected if it contains a fixed failure marker, but may be empty.
+
 The exact success suffix is:
 
 ```text
-bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed
+bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed startup=passed runtime=passed restore=passed cleanup=passed
 ```
 
 Portable policy and tamper coverage plus the checked audit run unprivileged:
