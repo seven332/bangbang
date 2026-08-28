@@ -1285,7 +1285,10 @@ class StagedBarrier:
                     and record.kind in protocol.FAILURE_CATEGORIES
                     and record.sequence == 0xFFFF_FFFF_FFFF_FFFF
                 ):
-                    _fail(self.vmnet, "guest")
+                    _fail(
+                        self.vmnet,
+                        f"guest-staged-{protocol.FAILURE_CATEGORIES[record.kind]}",
+                    )
                 elif (
                     record.role == protocol.ROLE_STATUS
                     and record.scenario is self.scenario
