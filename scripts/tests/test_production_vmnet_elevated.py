@@ -1223,7 +1223,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         process.wait_output.return_value = (
             11,
             b"",
-            b"bangbang launcher: invalid production launch policy\n",
+            b"bangbang: private launcher session failed\n",
         )
         driver._abort_process.reset_mock()
         driver._run_policy_denial(

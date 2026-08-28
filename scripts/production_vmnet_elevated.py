@@ -2163,7 +2163,7 @@ class ElevatedSystemCertificationDriver:
                     and status == 11
                     and not stdout
                     and stderr
-                    == b"bangbang launcher: invalid production launch policy\n"
+                    == b"bangbang: private launcher session failed\n"
                 ):
                     process.finish_exited()
                     self._retire(process)
