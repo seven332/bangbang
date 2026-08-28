@@ -1310,6 +1310,36 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
                 lambda: elevated._wait_direct_boot(vmnet, process, 1),
             )
 
+    def test_networkless_roles_exclude_every_provider_process(self) -> None:
+        outer = SimpleNamespace(
+            pid=101, parent_pid=90, state="S", command="/fixed/launcher"
+        )
+        worker = SimpleNamespace(
+            pid=102, parent_pid=101, state="S", command="/fixed/worker"
+        )
+        driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
+        driver.vmnet = vmnet
+        driver.layout = SimpleNamespace(
+            launcher=Path("/fixed/launcher"),
+            worker=Path("/fixed/worker"),
+            provider=Path("/fixed/provider"),
+        )
+        driver.handoff = SimpleNamespace(
+            _process_table=mock.Mock(return_value={101: outer, 102: worker})
+        )
+        process = SimpleNamespace(
+            process=SimpleNamespace(pid=101), worker_pid=mock.Mock(return_value=102)
+        )
+        driver._assert_networkless_roles(process)
+
+        provider = SimpleNamespace(
+            pid=103, parent_pid=90, state="S", command="/fixed/provider"
+        )
+        driver.handoff._process_table.return_value[103] = provider
+        self.assert_category(
+            "case", lambda: driver._assert_networkless_roles(process)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

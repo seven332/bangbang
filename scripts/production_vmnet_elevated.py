@@ -2219,6 +2219,31 @@ class ElevatedSystemCertificationDriver:
         self.cleanup_case_files(entry[1])
         self._local_active.remove(entry)
 
+    def _assert_networkless_roles(self, process: Any) -> None:
+        try:
+            records = self.handoff._process_table()
+        except BaseException as error:
+            raise _map_handoff_error(self.vmnet, error) from error
+        outer_pid = process.process.pid
+        worker_pid = process.worker_pid()
+        outer = records.get(outer_pid)
+        worker = records.get(worker_pid)
+        if (
+            outer is None
+            or outer.state.startswith("Z")
+            or outer.command != os.fspath(self.layout.launcher)
+            or worker is None
+            or worker.state.startswith("Z")
+            or worker.parent_pid != outer_pid
+            or worker.command != os.fspath(self.layout.worker)
+            or any(
+                record.command == os.fspath(self.layout.provider)
+                and not record.state.startswith("Z")
+                for record in records.values()
+            )
+        ):
+            _fail(self.vmnet, "case")
+
     def _finish_process(self, process: RemoteProductionProcess) -> None:
         try:
             process.terminate()
@@ -2456,9 +2481,15 @@ class ElevatedSystemCertificationDriver:
             _wait_direct_boot(
                 self.vmnet, process, self.config.timeouts.guest_seconds
             )
-            if self.session_entries() != baseline:
+            active_sessions = self.session_entries()
+            if (
+                len(active_sessions) != len(baseline) + 1
+                or any(entry not in active_sessions for entry in baseline)
+            ):
                 _fail(self.vmnet, "case")
+            self._assert_networkless_roles(process)
             self._retire_networkless(process)
+            self.wait_sessions(baseline)
         except BaseException:
             self._abort_networkless(process)
             raise
