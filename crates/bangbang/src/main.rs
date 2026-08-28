@@ -252,6 +252,13 @@ fn run(
     if contained_shutdown_requested(contained)? {
         return Ok(());
     }
+    if let Some(readiness) = finite_contained_command_readiness(&args.command)
+        && let Some(session) = contained.as_mut()
+    {
+        session
+            .send_ready(readiness)
+            .map_err(|_| ProcessError::ContainedSession)?;
+    }
 
     match args.command {
         Command::Help => {
@@ -660,6 +667,10 @@ fn run(
             }
         }
     }
+}
+
+fn finite_contained_command_readiness(command: &Command) -> Option<bangbang_session::Readiness> {
+    matches!(command, Command::Version).then_some(bangbang_session::Readiness::NoApi)
 }
 
 fn finish_caught_runtime_panic<S>(
@@ -2989,7 +3000,7 @@ mod tests {
         ApiServerError, Args, CONFIG_FILE_MAX_BYTES, Command, DEFAULT_API_SOCK_PATH,
         DEFAULT_INSTANCE_ID, HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError,
         ProcessExitCode, SnapshotInspectionPath, StartupConfig, StartupTimeClock,
-        StartupTimeConfig, parse_process_args,
+        StartupTimeConfig, finite_contained_command_readiness, parse_process_args,
     };
 
     const CAUGHT_RUNTIME_PANIC_CHILD_ENV: &str = "BANGBANG_CAUGHT_RUNTIME_PANIC_CHILD";
@@ -4588,6 +4599,11 @@ mod tests {
         let args = parse(&["--version"]).expect("version arg should parse");
 
         assert_eq!(args.command, Command::Version);
+        assert_eq!(
+            finite_contained_command_readiness(&args.command),
+            Some(bangbang_session::Readiness::NoApi)
+        );
+        assert_eq!(finite_contained_command_readiness(&Command::Help), None);
     }
 
     #[test]

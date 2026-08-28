@@ -3090,6 +3090,104 @@ or execute the final concurrency/death matrix, so the inventory remains exactly
 `383/0/2/33` and global final validation still fails only on the two retained
 network rows.
 
+### Least-privileged elevated certification handoff
+
+#1943 replaces the all-root topology driver as the process-control foundation
+for the later canonical certification. Preparation runs as the ordinary target
+user from a clean source and publishes one absent destination with a fixed
+name:
+
+```sh
+scripts/prepare-elevated-vmnet-handoff.sh \
+  --output /absolute/absent/bangbang-elevated-vmnet-handoff
+```
+
+The package contains the normal ad-hoc-signed networkless `Bangbang.app`, not a
+test-feature product. Its canonical manifest binds the source commit/tree,
+the fixed preparation/run/build implementation hashes, and every relative
+directory/file name, type, mode, size, and SHA-256. The preparer rejects dirty
+source, links, hard links, special or writable nodes, unexpected residue,
+replacement, and a pre-existing destination; it rechecks source and package
+identity before an exclusive `renamex_np(RENAME_EXCL)` publication.
+
+The caller separately authorizes the fixed root entry and supplies only the
+prepared package and its ordinary owner's numeric ids:
+
+```sh
+sudo -- scripts/run-elevated-vmnet-handoff.sh \
+  --prepared /absolute/absent/bangbang-elevated-vmnet-handoff \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+```
+
+The wrapper closes stdin and never invokes an elevation frontend. Root stages
+and revalidates the exact product, then a protocol supervisor forks one
+controller, clears groups, sets gid before uid, and attests real/effective/saved
+ids plus failed root restoration before the controller loader runs. The root
+side can launch only its staged entitlement-free provider with the fixed
+bootstrap prefix, `/` cwd, `LANG/LC_ALL=C`, null stdin, fresh process group,
+and opaque bounded launcher arguments. Provider stdout/stderr arrive as exactly
+two read-only pipe descriptors; no arbitrary root executable or path is
+accepted.
+
+The local protocol uses exact 4096-byte authenticated Unix datagrams. Both
+endpoints first set and read back 8192-byte send/receive buffers because the
+target macOS default is too small for one atomic frame. Each record binds role,
+kind, descriptor count, monotonic sequence, request correlation, random
+session, handle/value, payload length, reserved-zero bytes, SHA-256, and a zero
+tail. The closed graph permits only welcome/ready, spawn, poll/bounded wait,
+TERM, KILL, close, and finish. Wrong, duplicate, excess, truncated, replayed,
+skipped, cross-session, post-terminal, or descriptor-confused traffic is
+terminal.
+
+A root guardian and supervisor hold reciprocal liveness. On normal completion
+the supervisor stays alive after `complete` until the guardian proves the
+controller and exact staged provider/launcher/worker images absent, removes
+the stage, and sends `ack`. Supervisor loss makes the guardian retire captured
+identities and clean; guardian loss makes the supervisor do the same. Any
+forced or uncertain cleanup fails the gate even when absence is recovered.
+Process observation is only `pid/ppid/state/comm`.
+
+TERM targets the exact provider group. KILL sends SIGKILL only to the exact
+root provider leader, keeps that child unreaped while ordinary parent-loss
+cleanup runs, and then uses bounded group TERM/KILL escalation only for live
+subordinates. The former group must be absent after the exact provider reap.
+The kernel may still retain the API socket name; the ordinary controller
+removes only that one expected socket after revalidating its type, target
+uid/gid, and mode. Any TERM residue, unexpected entry, identity/mode mismatch,
+or additional cleanup remains terminal. The test also requires an empty,
+descriptor-anchored production-session namespace before the probe set,
+snapshots it before each signal case, and requires the same empty baseline
+after convergence; it never deletes a durable socket ownership record.
+
+The focused product gate runs two clean version completions and live API-process
+TERM/KILL through the normal bundle. Private API grant material is created only
+after credential drop and is never emitted. After its authenticated contained
+bootstrap and grant acceptance, the finite worker `--version` path publishes
+the existing `NoApi` readiness before output and terminal completion; direct
+version behavior is unchanged. The ordinary controller alone resolves its own
+home after irreversible drop to require an empty production-session root before
+the probes and the same empty root afterward; root actors and public output
+receive no account name or path. Exact success is:
+
+```text
+bangbang elevated vmnet handoff proof: ordinary=passed complete=passed repeat=passed term=passed kill=passed cleanup=passed
+```
+
+Portable manifest, protocol, descriptor, credential, loss, output, and cleanup
+coverage runs without root or Apple authorization:
+
+```sh
+python3 -m unittest scripts.tests.test_elevated_vmnet_handoff
+```
+
+The caller's explicit authorization of the fixed repository entry is the trust
+decision. Manifest implementation hashes prove source/package coherence and
+reject stale packages; they do not authenticate an otherwise modified entry.
+This child publishes neither the canonical private plan/result nor a capability
+claim. #1944 consumes its ordinary process factory, while the inventory remains
+exactly `383/0/2/33` and global final retains the same two network outcomes.
+
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
 absent final paths. Its producer captures the complete non-memory state and

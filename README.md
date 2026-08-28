@@ -54,6 +54,10 @@ Each detailed subject has one primary document:
 - [Entitlement-free vmnet Feasibility Contract](compat/firecracker/v1.16.0/vmnet-feasibility-contract.md)
   owns the no-Apple-authorization root-direct evidence boundary, exact dropped
   owner and repeated guest-connectivity gates, and the `383/0/2/33` handoff.
+- [Elevated Certification Handoff Contract](compat/firecracker/v1.16.0/elevated-certification-handoff-contract.md)
+  owns the immutable normal-bundle package, one-shot root guardian/supervisor,
+  irreversibly ordinary controller, descriptor-only provider lifecycle, and
+  reciprocal cleanup boundary used by the final certification slice.
 - [Private vmnet Provider Protocol](docs/vmnet-provider-protocol.md) freezes the
   bounded session/control/data wire, state, packet, deadline, and descriptor
   ownership contract and documents the minimal root broker plus irreversibly
@@ -243,6 +247,30 @@ stores, forwards, or logs a password, and the runner itself never invokes
 `sudo`. This gate certifies product assembly and supervision without an Apple
 developer identity or vmnet provisioning profile; the full real-guest
 certification remains separate.
+
+The least-privileged successor prepares the normal networkless production
+bundle and gives an irreversibly ordinary controller only fixed provider
+lifecycle operations:
+
+```sh
+scripts/prepare-elevated-vmnet-handoff.sh \
+  --output /absolute/absent/bangbang-elevated-vmnet-handoff
+sudo -- scripts/run-elevated-vmnet-handoff.sh \
+  --prepared /absolute/absent/bangbang-elevated-vmnet-handoff \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+```
+
+The repository entries never obtain elevation themselves. The externally
+authorized root side accepts only the immutable package and numeric target
+ids; it cannot select a product image, environment, working directory,
+fixture, result, account, profile, interface, or socket. This foundation uses
+only ad-hoc signing, publishes no certification result, and leaves the exact
+`383/0/2/33` inventory unchanged. TERM exercises exact group shutdown. KILL
+targets only the root provider first, preserving the ordinary launcher/worker
+long enough for authenticated parent-loss cleanup before bounded group
+escalation; success also requires the descriptor-anchored production-session
+namespace to be empty before and after the probes.
 
 ## Development
 
