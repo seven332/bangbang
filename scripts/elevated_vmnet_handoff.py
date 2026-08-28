@@ -103,6 +103,17 @@ CREDENTIAL_FAILURES = (
     "credentials-restored-observe",
     "credentials-restored-state",
 )
+PROBE_FAILURES = (
+    "probe-completion-status",
+    "probe-completion-stderr",
+    "probe-completion-stdout",
+    "probe-signal-exited",
+    "probe-socket-observe",
+    "probe-socket-shape",
+    "probe-socket-timeout",
+    "probe-path",
+    "probe-private-file",
+)
 CONTROLLER_FAILURES = (
     "internal",
     "credentials",
@@ -115,6 +126,7 @@ CONTROLLER_FAILURES = (
     "timeout",
     "cleanup",
     "probe",
+    *PROBE_FAILURES,
     "controller",
 )
 SUPERVISOR_PHASES = (
@@ -2144,7 +2156,7 @@ def _write_private_file(path: Path, data: bytes) -> None:
     try:
         metadata = os.lstat(path)
     except OSError as error:
-        raise HandoffError("probe") from error
+        raise HandoffError("probe-private-file") from error
     if (
         not stat.S_ISREG(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
@@ -2153,7 +2165,7 @@ def _write_private_file(path: Path, data: bytes) -> None:
         or metadata.st_gid != os.getgid()
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
-        _fail("probe")
+        _fail("probe-private-file")
 
 
 def _launcher_arguments(
@@ -2164,7 +2176,7 @@ def _launcher_arguments(
     worker_arguments: Sequence[str],
 ) -> tuple[str, ...]:
     if re.fullmatch(r"[a-z0-9-]{1,64}", instance) is None:
-        _fail("probe")
+        _fail("probe-path")
     return (
         os.fspath(layout.launcher),
         "--bangbang-jailer-v1",
@@ -2193,28 +2205,32 @@ def _fixed_completion_probe(
     )
     try:
         stdout, stderr = process.communicate()
-        if process.returncode != 0 or stderr or not stdout.startswith(b"bangbang "):
-            _fail("probe")
+        if process.returncode != 0:
+            _fail("probe-completion-status")
+        if stderr:
+            _fail("probe-completion-stderr")
+        if not stdout.startswith(b"bangbang "):
+            _fail("probe-completion-stdout")
     finally:
         process.close()
 
 
 def _probe_socket_present(path: Path, process: RemoteProviderProcess) -> bool:
     if process.poll() is not None:
-        _fail("probe")
+        _fail("probe-signal-exited")
     try:
         metadata = os.lstat(path)
     except FileNotFoundError:
         return False
     except OSError as error:
-        raise HandoffError("probe") from error
+        raise HandoffError("probe-socket-observe") from error
     if (
         not stat.S_ISSOCK(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid != os.getuid()
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
-        _fail("probe")
+        _fail("probe-socket-shape")
     return True
 
 
@@ -2321,7 +2337,7 @@ def _fixed_signal_probe(
         )
         socket_path = api / "api.sock"
         if len(os.fsencode(socket_path)) >= 104:
-            _fail("probe")
+            _fail("probe-path")
         arguments = _launcher_arguments(
             layout,
             uid,
@@ -2337,7 +2353,7 @@ def _fixed_signal_probe(
         )
         process = proxy.spawn(arguments)
         if not _wait_until(lambda: _probe_socket_present(socket_path, process), 20.0):
-            _fail("probe")
+            _fail("probe-socket-timeout")
         if kind == Kind.TERM:
             process.terminate()
         elif kind == Kind.KILL:

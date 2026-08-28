@@ -496,6 +496,9 @@ class FakeProxy:
 
 
 class ProcessTests(unittest.TestCase):
+    def test_probe_failures_are_closed_controller_categories(self) -> None:
+        self.assertTrue(set(handoff.PROBE_FAILURES).issubset(handoff.CONTROLLER_FAILURES))
+
     def test_remote_process_drains_both_descriptors_and_closes_once(self) -> None:
         stdout_read, stdout_write = os.pipe()
         stderr_read, stderr_write = os.pipe()
