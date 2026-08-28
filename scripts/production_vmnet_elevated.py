@@ -1800,6 +1800,16 @@ class ElevatedSystemCertificationDriver:
         created = False
         try:
             self.session.verify()
+            self.vmnet._recheck_artifact(
+                self.artifacts.kernel,
+                self.artifacts.kernel_identity,
+                owner_uid=self.artifacts.owner_uid,
+            )
+            self.vmnet._recheck_artifact(
+                self.artifacts.rootfs,
+                self.artifacts.rootfs_identity,
+                owner_uid=self.artifacts.owner_uid,
+            )
             self.vmnet._create_private_directory(root)
             created = True
             self.vmnet._create_private_directory(api_directory)
@@ -1812,13 +1822,29 @@ class ElevatedSystemCertificationDriver:
                     {
                         "grants": [
                             {
+                                "access": "read-only",
+                                "id": self.vmnet.KERNEL_GRANT_ID,
+                                "role": "kernel-image",
+                                "source": self.vmnet._path_text(
+                                    self.artifacts.kernel, "artifact"
+                                ),
+                            },
+                            {
+                                "access": "read-only",
+                                "id": self.vmnet.ROOTFS_GRANT_ID,
+                                "role": "drive-backing",
+                                "source": self.vmnet._path_text(
+                                    self.artifacts.rootfs, "artifact"
+                                ),
+                            },
+                            {
                                 "access": "create-children",
                                 "id": self.vmnet.API_DIRECTORY_GRANT_ID,
                                 "role": "api-socket-directory",
                                 "source": self.vmnet._path_text(
                                     api_directory, "session"
                                 ),
-                            }
+                            },
                         ],
                         "version": 1,
                     }
@@ -1845,6 +1871,31 @@ class ElevatedSystemCertificationDriver:
                 except (OSError, self.vmnet.CertificationError):
                     pass
             raise
+
+    def _configure_policy(self, process: Any) -> None:
+        process.wait_ready()
+        for path, body in (
+            ("/machine-config", {"mem_size_mib": 256, "vcpu_count": 1}),
+            (
+                "/boot-source",
+                {
+                    "boot_args": self.vmnet.DIRECT_ROOTFS_BOOT_ARGS,
+                    "kernel_image_path": self.vmnet.KERNEL_GRANT_REF,
+                },
+            ),
+            (
+                "/drives/rootfs",
+                {
+                    "drive_id": "rootfs",
+                    "is_read_only": True,
+                    "is_root_device": True,
+                    "path_on_host": self.vmnet.ROOTFS_GRANT_REF,
+                },
+            ),
+        ):
+            self.vmnet._require_no_content(
+                self.vmnet._api_put(process, path, body)
+            )
 
     def _next_attempt(self, case: str) -> int:
         attempt = self._attempts.get(case, 0)
@@ -2246,7 +2297,7 @@ class ElevatedSystemCertificationDriver:
         )
         try:
             try:
-                process.wait_ready()
+                self._configure_policy(process)
             except self.vmnet.CertificationError as error:
                 status, stdout, stderr = process.wait_output()
                 if stdout:

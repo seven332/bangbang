@@ -1171,6 +1171,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver.vmnet = vmnet
         driver._policy_files = mock.Mock(return_value=files)
         driver._spawn_files = mock.Mock(return_value=process)
+        driver._configure_policy = mock.Mock()
         driver._finish_process = mock.Mock()
         driver._retire = mock.Mock()
         driver._abort_process = mock.Mock()
@@ -1192,7 +1193,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
                     ("eth1", "vmnet:shared"),
                 ),
             )
-        process.wait_ready.assert_called_once_with()
+        driver._configure_policy.assert_called_once_with(process)
         self.assertEqual(
             api_put.call_args_list,
             [
@@ -1239,7 +1240,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver._finish_process.assert_not_called()
         driver._abort_process.assert_called_once_with(process)
 
-        process.wait_ready.side_effect = vmnet.CertificationError("process")
+        driver._configure_policy.side_effect = vmnet.CertificationError("process")
         process.wait_output.return_value = (
             11,
             b"",
