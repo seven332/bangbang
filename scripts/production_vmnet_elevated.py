@@ -2222,6 +2222,17 @@ class ElevatedSystemCertificationDriver:
             if stdout:
                 _fail(self.vmnet, "case-stdout")
             if stderr != b"bangbang launcher: invalid production launch policy\n":
+                diagnostic = {
+                    b"": 10,
+                    b"bangbang launcher: private vmnet topology failed\n": 12,
+                    b"bangbang launcher: invalid production bundle layout\n": 13,
+                    (
+                        b"bangbang: private launcher session failed\n"
+                        b"bangbang launcher: private vmnet topology failed\n"
+                    ): 14,
+                }.get(stderr)
+                if diagnostic is not None:
+                    _fail(self.vmnet, f"provider-status-{diagnostic}")
                 _fail(self.vmnet, "case-stderr")
             process.finish_exited()
             self._retire(process)
