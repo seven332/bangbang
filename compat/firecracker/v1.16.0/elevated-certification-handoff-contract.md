@@ -64,8 +64,9 @@ controller loader or future private input is parsed, the child:
 1. redirects stdin/stdout/stderr to `/dev/null` and closes unrelated fds;
 2. clears supplementary groups;
 3. calls `setgid(target)` and then `setuid(target)`;
-4. attests real/effective/saved uid and gid, empty groups, parent, executable,
-   and process birth identity; and
+4. attests real/effective/saved uid and gid, Darwin's exact target-gid-only
+   `effective-only` group-access-list postcondition, parent, executable, and
+   process birth identity; and
 5. proves attempts to restore uid 0, gid 0, and a root group all fail without
    changing that identity.
 

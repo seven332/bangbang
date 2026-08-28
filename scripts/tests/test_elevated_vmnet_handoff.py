@@ -368,6 +368,7 @@ class FakeCredentialBackend(handoff.CredentialBackend):
         self.saved_uid = 0
         self.saved_gid = 0
         self.current_groups = [0, 80]
+        self.final_groups = [gid]
         self.calls = []
 
     def groups(self) -> list[int]:
@@ -375,7 +376,7 @@ class FakeCredentialBackend(handoff.CredentialBackend):
 
     def clear_groups(self) -> None:
         self.calls.append("clear-groups")
-        self.current_groups = []
+        self.current_groups = [self.gid]
 
     def set_gid(self, value: int) -> None:
         self.calls.append(f"set-gid-{value}")
@@ -383,6 +384,7 @@ class FakeCredentialBackend(handoff.CredentialBackend):
             raise PermissionError
         self.gid = value
         self.saved_gid = value
+        self.current_groups = list(self.final_groups)
 
     def set_uid(self, value: int) -> None:
         self.calls.append(f"set-uid-{value}")
@@ -440,6 +442,16 @@ class CredentialTests(unittest.TestCase):
                 handoff.transition_controller_credentials(
                     uid, gid, 42, FakeCredentialBackend(42, 501, 20)
                 )
+
+    def test_transition_requires_exact_effective_only_group_shape(self) -> None:
+        for groups in ([], [20, 80], [80]):
+            with self.subTest(groups=groups):
+                backend = FakeCredentialBackend(42, 501, 20)
+                backend.final_groups = groups
+                with self.assertRaisesRegex(
+                    handoff.HandoffError, "credentials-dropped-groups"
+                ):
+                    handoff.transition_controller_credentials(501, 20, 42, backend)
 
 
 class FakeProxy:

@@ -1432,8 +1432,9 @@ provider is the only product image root may spawn.
 
 One controller child closes unrelated descriptors and stdio, clears
 supplementary groups, sets gid before uid, and attests ordinary real/effective/
-saved ids and empty groups. Attempts to restore uid 0, gid 0, or a root group
-must fail without changing birth identity. The supervisor independently
+saved ids and Darwin's exact target-gid-only `effective-only` group-access-list
+postcondition. Attempts to restore uid 0, gid 0, or a root group must fail
+without changing birth identity. The supervisor independently
 observes the same child identity before sending its session welcome. Only then
 does the child call the controller loader; private plan, API, HVF, fixture, and
 result parsing therefore remain outside root.

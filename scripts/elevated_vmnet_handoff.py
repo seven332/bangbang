@@ -87,6 +87,7 @@ CREDENTIAL_FAILURES = (
     "credentials-initial-process",
     "credentials-initial-root",
     "credentials-clear-groups",
+    "credentials-cleared-groups",
     "credentials-set-gid",
     "credentials-set-uid",
     "credentials-dropped-observe",
@@ -1235,6 +1236,12 @@ def transition_controller_credentials(
     except OSError as error:
         raise HandoffError("credentials-clear-groups") from error
     try:
+        cleared_groups = operations.groups()
+    except OSError as error:
+        raise HandoffError("credentials-cleared-groups") from error
+    if cleared_groups != [0]:
+        _fail("credentials-cleared-groups")
+    try:
         operations.set_gid(target_gid)
     except OSError as error:
         raise HandoffError("credentials-set-gid") from error
@@ -1248,7 +1255,11 @@ def transition_controller_credentials(
         raise HandoffError("credentials-dropped-observe") from error
     if not initial.same_process(dropped) or dropped.parent_pid != supervisor_pid:
         _fail("credentials-dropped-process")
-    if operations.groups():
+    try:
+        dropped_groups = operations.groups()
+    except OSError as error:
+        raise HandoffError("credentials-dropped-groups") from error
+    if dropped_groups != [target_gid]:
         _fail("credentials-dropped-groups")
     if (
         dropped.uid,
@@ -1277,7 +1288,11 @@ def transition_controller_credentials(
             current = operations.identity()
         except HandoffError as error:
             raise HandoffError("credentials-restored-observe") from error
-        if current != dropped or operations.groups():
+        try:
+            current_groups = operations.groups()
+        except OSError as error:
+            raise HandoffError("credentials-restored-state") from error
+        if current != dropped or current_groups != [target_gid]:
             _fail("credentials-restored-state")
     return dropped
 
