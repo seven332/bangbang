@@ -1830,6 +1830,14 @@ class ElevatedSystemCertificationDriver:
                                 ),
                             },
                             {
+                                "access": "read-only",
+                                "id": self.vmnet.ROOTFS_GRANT_ID,
+                                "role": "drive-backing",
+                                "source": self.vmnet._path_text(
+                                    self.artifacts.rootfs, "artifact"
+                                ),
+                            },
+                            {
                                 "access": "create-children",
                                 "id": self.vmnet.API_DIRECTORY_GRANT_ID,
                                 "role": "api-socket-directory",
