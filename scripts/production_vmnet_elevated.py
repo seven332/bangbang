@@ -2153,6 +2153,11 @@ class ElevatedSystemCertificationDriver:
             try:
                 process.wait_ready()
             except self.vmnet.CertificationError as error:
+                status, _stdout, _stderr = process.wait_output()
+                if 10 <= status <= 19:
+                    raise self.vmnet.CertificationError(
+                        f"provider-status-{status}"
+                    ) from error
                 raise self.vmnet.CertificationError("policy-configure") from error
             for index, (iface_id, host_dev_name) in enumerate(networks):
                 try:

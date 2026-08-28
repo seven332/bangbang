@@ -1218,6 +1218,20 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         driver._finish_process.assert_not_called()
         driver._abort_process.assert_called_once_with(process)
 
+        process.wait_ready.side_effect = vmnet.CertificationError("process")
+        process.wait_output.return_value = (16, b"", b"")
+        driver._abort_process.reset_mock()
+        self.assert_category(
+            "provider-status-16",
+            lambda: driver._run_policy_denial(
+                "mismatched-policy-denial",
+                allowed=("host",),
+                maximum=1,
+                networks=(("eth0", "vmnet:shared"),),
+            ),
+        )
+        driver._abort_process.assert_called_once_with(process)
+
 
 if __name__ == "__main__":
     unittest.main()
