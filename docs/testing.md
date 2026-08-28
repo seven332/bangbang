@@ -3148,11 +3148,17 @@ identities and clean; guardian loss makes the supervisor do the same. Any
 forced or uncertain cleanup fails the gate even when absence is recovered.
 Process observation is only `pid/ppid/state/comm`.
 
-The requested KILL case may leave the kernel-owned API socket name after every
-process is reaped. The ordinary controller removes only that one expected
-socket after revalidating its type, target uid/gid, and mode. Any TERM residue,
-unexpected entry, identity/mode mismatch, or additional cleanup remains
-terminal; this exact owned-name removal is not a fallback process cleanup.
+TERM targets the exact provider group. KILL sends SIGKILL only to the exact
+root provider leader, keeps that child unreaped while ordinary parent-loss
+cleanup runs, and then uses bounded group TERM/KILL escalation only for live
+subordinates. The former group must be absent after the exact provider reap.
+The kernel may still retain the API socket name; the ordinary controller
+removes only that one expected socket after revalidating its type, target
+uid/gid, and mode. Any TERM residue, unexpected entry, identity/mode mismatch,
+or additional cleanup remains terminal. The test also snapshots the exact
+production-session namespace before each signal case and requires the same
+name/inode/child baseline after convergence; it never deletes a durable socket
+ownership record.
 
 The focused product gate runs two clean version completions and live API-process
 TERM/KILL through the normal bundle. Private API grant material is created only

@@ -1465,12 +1465,17 @@ A simultaneous administrator/kernel destruction of both cleanup actors is
 outside a one-shot process contract and would require the deliberately rejected
 persistent service.
 
-After the requested KILL case has reaped the complete provider group, the
-kernel may retain the API socket name. The ordinary controller may unlink only
-that one expected name after revalidating socket type, target uid/gid, and
-mode. TERM residue, any extra entry, and every identity or mode mismatch remain
-terminal; this deterministic owned-name cleanup is distinct from a forced
-process cleanup.
+TERM targets the exact owned provider group. KILL instead sends SIGKILL only to
+the exact root provider leader, keeps that child unreaped to pin its PGID, and
+lets the ordinary launcher/worker perform authenticated parent-loss cleanup.
+The root supervisor then applies bounded group TERM and group KILL escalation
+only if live subordinates remain, reaps the provider, and requires the former
+group to be absent. The kernel may still retain the API socket name; the
+ordinary controller may unlink only that one expected name after revalidating
+socket type, target uid/gid, and mode. TERM residue, any extra entry, and every
+identity or mode mismatch remain terminal. The controller also requires the
+exact pre-probe production-session name/inode/child baseline afterward, so the
+handoff never erases or strands a durable product ownership record.
 
 The fixed #1943 probe carries no guest fixture or result. It proves repeat
 completion and live TERM/KILL using ordinary private API-grant material created

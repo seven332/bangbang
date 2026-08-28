@@ -83,6 +83,8 @@ CLEANUP_TIMEOUT = 10.0
 POLL_SECONDS = 0.05
 MAX_CAPTURE_BYTES = 256 * 1024
 MAX_CREDENTIAL_GROUPS = 1024
+PROVIDER_PARENT_LOSS_GRACE = 0.5
+PROVIDER_SIGNAL_GRACE = 2.0
 
 CREDENTIAL_FAILURES = (
     "credentials-initial-observe",
@@ -128,6 +130,7 @@ PROBE_FAILURES = (
     "probe-path",
     "probe-private-root",
     "probe-private-file",
+    "probe-session-root",
     "probe-term-cleanup",
     "probe-kill-cleanup",
 )
@@ -1593,33 +1596,138 @@ class OwnedProvider:
     handle: int
 
 
+def _provider_group_has_live_members(process_group: int) -> bool:
+    if process_group <= 1 or os.geteuid() != 0:
+        _fail("cleanup")
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # On Darwin an unreaped session leader with no other live members
+        # yields EPERM even to root. Keeping that exact child unreaped pins the
+        # PGID while this probe distinguishes live descendants from the
+        # provider zombie.
+        return False
+    except OSError as error:
+        raise HandoffError("cleanup") from error
+    return True
+
+
+def _wait_provider_group_quiescent(
+    process_group: int, timeout: float = PROVIDER_SIGNAL_GRACE
+) -> bool:
+    return _wait_until(
+        lambda: not _provider_group_has_live_members(process_group), timeout
+    )
+
+
+def _provider_group_absent(process_group: int) -> bool:
+    if process_group <= 1 or os.geteuid() != 0:
+        _fail("cleanup")
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return True
+    except OSError as error:
+        raise HandoffError("cleanup") from error
+    return False
+
+
+def _send_group_cleanup_signal(process_group: int, value: signal.Signals) -> None:
+    if not _provider_group_has_live_members(process_group):
+        return
+    try:
+        os.killpg(process_group, value)
+    except (ProcessLookupError, PermissionError):
+        if _provider_group_has_live_members(process_group):
+            _fail("cleanup")
+    except OSError as error:
+        raise HandoffError("cleanup") from error
+
+
+def _signal_provider(provider: OwnedProvider, kind: Kind) -> int:
+    process = provider.process
+    if process.returncode is not None or kind not in (Kind.TERM, Kind.KILL):
+        _fail("signal")
+    try:
+        if os.getpgid(process.pid) != process.pid:
+            _fail("signal")
+        if kind == Kind.TERM:
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            os.kill(process.pid, signal.SIGKILL)
+    except HandoffError:
+        raise
+    except OSError as error:
+        raise HandoffError("signal") from error
+
+    quiescent = _wait_provider_group_quiescent(
+        process.pid,
+        PROVIDER_SIGNAL_GRACE
+        if kind == Kind.TERM
+        else PROVIDER_PARENT_LOSS_GRACE,
+    )
+    if not quiescent and kind == Kind.KILL:
+        _send_group_cleanup_signal(process.pid, signal.SIGTERM)
+        quiescent = _wait_provider_group_quiescent(process.pid)
+    if not quiescent:
+        _send_group_cleanup_signal(process.pid, signal.SIGKILL)
+        quiescent = _wait_provider_group_quiescent(process.pid)
+    if not quiescent:
+        _fail("cleanup")
+
+    try:
+        status = process.wait(timeout=PROVIDER_SIGNAL_GRACE)
+    except subprocess.TimeoutExpired as error:
+        raise HandoffError("cleanup") from error
+    if kind == Kind.KILL and status != -signal.SIGKILL:
+        _fail("signal")
+    if not _wait_until(
+        lambda: _provider_group_absent(process.pid), PROVIDER_SIGNAL_GRACE
+    ):
+        _fail("cleanup")
+    return status
+
+
 def _terminate_provider(provider: OwnedProvider) -> bool:
     process = provider.process
-    forced = False
-    if process.poll() is not None:
-        return forced
+    if process.returncode is not None:
+        if not _wait_until(
+            lambda: _provider_group_absent(process.pid), PROVIDER_SIGNAL_GRACE
+        ):
+            _fail("cleanup")
+        return False
     try:
         if os.getpgid(process.pid) != process.pid:
             _fail("cleanup")
     except ProcessLookupError:
-        process.poll()
-        return forced
+        status = process.poll()
+        if status is None or not _provider_group_absent(process.pid):
+            _fail("cleanup")
+        return False
     except OSError as error:
         raise HandoffError("cleanup") from error
-    for value in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(process.pid, value)
-            forced = True
-        except ProcessLookupError:
-            pass
-        except OSError as error:
-            raise HandoffError("cleanup") from error
-        try:
-            process.wait(timeout=2.0)
-            return forced
-        except subprocess.TimeoutExpired:
-            continue
-    _fail("cleanup")
+    forced = False
+    if _provider_group_has_live_members(process.pid):
+        _send_group_cleanup_signal(process.pid, signal.SIGTERM)
+        forced = True
+    quiescent = _wait_provider_group_quiescent(process.pid)
+    if not quiescent:
+        _send_group_cleanup_signal(process.pid, signal.SIGKILL)
+        forced = True
+        quiescent = _wait_provider_group_quiescent(process.pid)
+    if not quiescent:
+        _fail("cleanup")
+    try:
+        process.wait(timeout=PROVIDER_SIGNAL_GRACE)
+    except subprocess.TimeoutExpired as error:
+        raise HandoffError("cleanup") from error
+    if not _wait_until(
+        lambda: _provider_group_absent(process.pid), PROVIDER_SIGNAL_GRACE
+    ):
+        _fail("cleanup")
+    return forced
 
 
 class ProviderSupervisor:
@@ -1742,7 +1850,13 @@ class ProviderSupervisor:
                 )
 
     def _status(self, owned: OwnedProvider) -> Optional[int]:
-        return owned.process.poll()
+        status = owned.process.poll()
+        if status is not None and not _wait_until(
+            lambda: _provider_group_absent(owned.process.pid),
+            PROVIDER_SIGNAL_GRACE,
+        ):
+            _fail("cleanup")
+        return status
 
     def _wait_status(self, owned: OwnedProvider, milliseconds: int) -> Optional[int]:
         if not 1 <= milliseconds <= 1000:
@@ -1838,17 +1952,8 @@ class ProviderSupervisor:
                     owned = self._require_handle(request)
                     if request.value != 0:
                         _fail("protocol")
-                    if owned.process.poll() is None:
-                        try:
-                            os.killpg(
-                                owned.process.pid,
-                                signal.SIGTERM if request.kind == Kind.TERM else signal.SIGKILL,
-                            )
-                        except ProcessLookupError:
-                            pass
-                        except OSError as error:
-                            raise HandoffError("signal") from error
-                    self._reply_status(request, owned, owned.process.poll())
+                    status = _signal_provider(owned, request.kind)
+                    self._reply_status(request, owned, status)
                 elif request.kind == Kind.CLOSE:
                     owned = self._require_handle(request)
                     if request.value != 0:
@@ -2185,6 +2290,101 @@ def _write_private_file(path: Path, data: bytes) -> None:
         _fail("probe-private-file")
 
 
+def _probe_session_root() -> Path:
+    # This lookup runs only in the irreversibly ordinary controller. The root
+    # guardian and protocol supervisor never receive or discover the account
+    # name or home path.
+    try:
+        import pwd
+
+        account = pwd.getpwuid(os.getuid())
+        home = Path(account.pw_dir)
+    except (ImportError, KeyError, OSError) as error:
+        raise HandoffError("probe-session-root") from error
+    if account.pw_uid != os.getuid() or not home.is_absolute() or "\x00" in os.fspath(home):
+        _fail("probe-session-root")
+    return home / "Library/Containers" / WORKER_IDENTIFIER / "Data/tmp/bangbang-sessions-v1"
+
+
+def _probe_session_entries(
+    root: Optional[Path] = None,
+) -> tuple[
+    tuple[str, int, int, tuple[tuple[str, int, int, int, int, int], ...]], ...
+]:
+    root = _probe_session_root() if root is None else root
+    try:
+        metadata = os.lstat(root)
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise HandoffError("probe-session-root") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        _fail("probe-session-root")
+    try:
+        entries = sorted(os.scandir(root), key=lambda entry: entry.name)
+        if len(entries) > 128:
+            _fail("probe-session-root")
+        result = []
+        for entry in entries:
+            if re.fullmatch(r"session-[0-9a-f]{64}", entry.name) is None:
+                _fail("probe-session-root")
+            session = entry.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(session.st_mode)
+                or stat.S_ISLNK(session.st_mode)
+                or session.st_uid != os.getuid()
+                or session.st_gid != os.getgid()
+                or stat.S_IMODE(session.st_mode) != 0o700
+            ):
+                _fail("probe-session-root")
+            children = sorted(os.scandir(entry.path), key=lambda child: child.name)
+            if len(children) > 8:
+                _fail("probe-session-root")
+            child_rows = []
+            for child in children:
+                child_metadata = child.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISLNK(child_metadata.st_mode)
+                    or child_metadata.st_uid != os.getuid()
+                    or child_metadata.st_gid != os.getgid()
+                    or not (
+                        stat.S_ISREG(child_metadata.st_mode)
+                        or stat.S_ISSOCK(child_metadata.st_mode)
+                    )
+                ):
+                    _fail("probe-session-root")
+                child_rows.append(
+                    (
+                        child.name,
+                        stat.S_IFMT(child_metadata.st_mode)
+                        | stat.S_IMODE(child_metadata.st_mode),
+                        child_metadata.st_dev,
+                        child_metadata.st_ino,
+                        child_metadata.st_size,
+                        child_metadata.st_mtime_ns,
+                    )
+                )
+            result.append(
+                (
+                    entry.name,
+                    session.st_dev,
+                    session.st_ino,
+                    tuple(child_rows),
+                )
+            )
+        return tuple(result)
+    except HandoffError:
+        raise
+    except OSError as error:
+        raise HandoffError("probe-session-root") from error
+
+
 def _create_private_probe_root(
     parent: Path = Path("/private/var/tmp"),
 ) -> Path:
@@ -2309,7 +2509,7 @@ def _remove_killed_probe_socket(path: Path) -> None:
         raise HandoffError("cleanup") from error
 
 
-def _cleanup_probe_root(root: Path) -> bool:
+def _cleanup_probe_root(root: Path, *, require_material: bool = True) -> bool:
     forced = False
     try:
         metadata = os.lstat(root)
@@ -2364,7 +2564,10 @@ def _cleanup_probe_root(root: Path) -> bool:
                     _fail("cleanup")
                 actual[relative] = kind
         if (
-            not {"api", "grants.json"}.issubset(actual)
+            (
+                require_material
+                and not {"api", "grants.json"}.issubset(actual)
+            )
             or set(actual) - set(expected)
             or any(
                 expected[name] != kind for name, kind in actual.items()
@@ -2393,8 +2596,11 @@ def _fixed_signal_probe(
     instance: str,
     kind: Kind,
 ) -> None:
+    session_root = _probe_session_root()
+    session_baseline = _probe_session_entries(session_root)
     root = _create_private_probe_root()
     process: Optional[RemoteProviderProcess] = None
+    material_complete = False
     try:
         api = root / "api"
         api.mkdir(mode=0o700)
@@ -2415,6 +2621,7 @@ def _fixed_signal_probe(
                 }
             ),
         )
+        material_complete = True
         socket_path = api / "api.sock"
         if len(os.fsencode(socket_path)) >= 104:
             _fail("probe-path")
@@ -2449,10 +2656,29 @@ def _fixed_signal_probe(
                 _fail("cleanup")
             _remove_killed_probe_socket(socket_path)
     finally:
+        cleanup_failure: Optional[HandoffError] = None
         if process is not None:
-            process.close()
-        if _cleanup_probe_root(root):
-            _fail("cleanup")
+            try:
+                process.close()
+            except HandoffError as error:
+                cleanup_failure = error
+        try:
+            if _cleanup_probe_root(root, require_material=material_complete):
+                _fail("cleanup")
+        except HandoffError as error:
+            if cleanup_failure is None:
+                cleanup_failure = error
+        try:
+            if not _wait_until(
+                lambda: _probe_session_entries(session_root) == session_baseline,
+                CLEANUP_TIMEOUT,
+            ):
+                _fail("cleanup")
+        except HandoffError as error:
+            if cleanup_failure is None:
+                cleanup_failure = error
+        if cleanup_failure is not None:
+            raise cleanup_failure
 
 
 def run_fixed_probes(proxy: ControllerProxy, layout: ProductLayout, uid: int, gid: int) -> None:

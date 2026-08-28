@@ -266,7 +266,11 @@ authorized root side accepts only the immutable package and numeric target
 ids; it cannot select a product image, environment, working directory,
 fixture, result, account, profile, interface, or socket. This foundation uses
 only ad-hoc signing, publishes no certification result, and leaves the exact
-`383/0/2/33` inventory unchanged.
+`383/0/2/33` inventory unchanged. TERM exercises exact group shutdown. KILL
+targets only the root provider first, preserving the ordinary launcher/worker
+long enough for authenticated parent-loss cleanup before bounded group
+escalation; success also requires the production-session baseline to be
+unchanged.
 
 ## Development
 

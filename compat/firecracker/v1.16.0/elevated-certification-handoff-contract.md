@@ -112,11 +112,16 @@ drop-before-broad-parse contract.
 
 ## Lifecycle and cleanup
 
-Each process handle supports poll, bounded wait, exact process-group TERM/KILL,
-and close. Output pumps start immediately, retain only a bounded prefix, and
-make overflow, reader failure, or stuck EOF terminal. Partial pipe creation,
-partial spawn, response-transfer failure, timeout, protocol failure, controller
-loss, and normal close retire and reap every owned group.
+Each process handle supports poll, bounded wait, exact TERM/KILL, and close.
+TERM is directed to the exact owned process group. KILL first sends SIGKILL to
+the exact root provider leader; the still-live root supervisor keeps that child
+unreaped to pin its PGID while it permits authenticated parent-loss cleanup,
+then sends group TERM and finally group KILL only as bounded escalation. The
+provider is reaped only after no live subordinate remains, and the former group
+must then be absent. Output pumps start immediately, retain only a bounded
+prefix, and make overflow, reader failure, or stuck EOF terminal. Partial pipe
+creation, partial spawn, response-transfer failure, timeout, protocol failure,
+controller loss, and normal close retire and reap every owned group.
 
 On success the supervisor sends `complete` but stays alive. The guardian then
 proves the controller and every exact staged provider/launcher/worker image
@@ -129,10 +134,14 @@ administrator/kernel event and would require a persistent service, which this
 contract deliberately excludes.
 
 The requested KILL case may leave the ordinary private API socket name after
-the complete provider group is reaped. The controller may unlink only that
-exact expected socket after revalidating its type, target uid/gid, and mode.
-TERM residue, any extra entry, and every ownership/mode mismatch are terminal;
-this deterministic owned-name step is not fallback process cleanup.
+the provider leader and subordinate group converge. The controller may unlink
+only that exact expected socket after revalidating its type, target uid/gid,
+and mode. TERM residue, any extra entry, and every ownership/mode mismatch are
+terminal; this deterministic owned-name step is not fallback process cleanup.
+The ordinary controller snapshots the exact private production-session
+namespace before each signal case and requires that same name/inode/child
+baseline after convergence. Durable socket ownership records are never erased
+by the handoff.
 
 ## Fixed probes and handoff
 

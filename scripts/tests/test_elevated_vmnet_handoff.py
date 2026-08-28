@@ -498,6 +498,8 @@ class FakeProxy:
 class ProcessTests(unittest.TestCase):
     def test_probe_failures_are_closed_controller_categories(self) -> None:
         self.assertTrue(set(handoff.PROBE_FAILURES).issubset(handoff.CONTROLLER_FAILURES))
+        self.assertLessEqual(len(handoff.CONTROLLER_FAILURES), 255)
+        self.assertLessEqual(len(handoff.SUPERVISOR_FAILURES), 255)
         self.assertEqual(
             set(handoff.PROVIDER_STATUS_FAILURES), set(range(10, 20))
         )
@@ -516,6 +518,85 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o700)
             finally:
                 handoff._remove_tree(root)
+
+    def test_probe_session_baseline_binds_exact_owned_namespace_and_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "bangbang-sessions-v1"
+            root.mkdir(mode=0o700)
+            self.assertEqual(handoff._probe_session_entries(root), ())
+            session = root / ("session-" + "a" * 64)
+            session.mkdir(mode=0o700)
+            record = session / ".api-socket-owner"
+            record.write_bytes(bytes(96))
+            record.chmod(0o600)
+            baseline = handoff._probe_session_entries(root)
+            self.assertEqual(len(baseline), 1)
+            self.assertEqual(baseline[0][0], session.name)
+            record.write_bytes(b"x" * 96)
+            changed = record.stat().st_mtime_ns + 1_000_000_000
+            os.utime(record, ns=(changed, changed))
+            self.assertNotEqual(handoff._probe_session_entries(root), baseline)
+
+    def test_probe_session_baseline_rejects_unowned_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "bangbang-sessions-v1"
+            root.mkdir(mode=0o700)
+            (root / "unexpected").mkdir(mode=0o700)
+            with self.assertRaisesRegex(handoff.HandoffError, "probe-session-root"):
+                handoff._probe_session_entries(root)
+
+    def test_provider_kill_targets_leader_then_gracefully_converges_group(self) -> None:
+        process = mock.Mock(pid=42, returncode=None)
+        process.wait.return_value = -int(handoff.signal.SIGKILL)
+        provider = handoff.OwnedProvider(process, 1)
+        with mock.patch.object(handoff.os, "getpgid", return_value=42), mock.patch.object(
+            handoff.os, "kill"
+        ) as kill, mock.patch.object(handoff.os, "killpg") as killpg, mock.patch.object(
+            handoff, "_provider_group_has_live_members", return_value=True
+        ), mock.patch.object(
+            handoff,
+            "_wait_provider_group_quiescent",
+            side_effect=(False, True),
+        ), mock.patch.object(
+            handoff, "_provider_group_absent", return_value=True
+        ):
+            self.assertEqual(handoff._signal_provider(provider, handoff.Kind.KILL), -9)
+        kill.assert_called_once_with(42, handoff.signal.SIGKILL)
+        killpg.assert_called_once_with(42, handoff.signal.SIGTERM)
+
+    def test_provider_kill_escalates_only_after_bounded_parent_and_term_windows(self) -> None:
+        process = mock.Mock(pid=42, returncode=None)
+        process.wait.return_value = -int(handoff.signal.SIGKILL)
+        provider = handoff.OwnedProvider(process, 1)
+        with mock.patch.object(handoff.os, "getpgid", return_value=42), mock.patch.object(
+            handoff.os, "kill"
+        ), mock.patch.object(handoff.os, "killpg") as killpg, mock.patch.object(
+            handoff, "_provider_group_has_live_members", return_value=True
+        ), mock.patch.object(
+            handoff,
+            "_wait_provider_group_quiescent",
+            side_effect=(False, False, True),
+        ), mock.patch.object(
+            handoff, "_provider_group_absent", return_value=True
+        ):
+            self.assertEqual(handoff._signal_provider(provider, handoff.Kind.KILL), -9)
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(42, handoff.signal.SIGTERM), mock.call(42, handoff.signal.SIGKILL)],
+        )
+
+    def test_provider_signal_requires_group_absence_after_exact_reap(self) -> None:
+        process = mock.Mock(pid=42, returncode=None)
+        process.wait.return_value = -int(handoff.signal.SIGTERM)
+        provider = handoff.OwnedProvider(process, 1)
+        with mock.patch.object(handoff.os, "getpgid", return_value=42), mock.patch.object(
+            handoff.os, "killpg"
+        ), mock.patch.object(
+            handoff, "_wait_provider_group_quiescent", return_value=True
+        ), mock.patch.object(
+            handoff, "_wait_until", return_value=False
+        ), self.assertRaisesRegex(handoff.HandoffError, "cleanup"):
+            handoff._signal_provider(provider, handoff.Kind.TERM)
 
     def test_remote_process_drains_both_descriptors_and_closes_once(self) -> None:
         stdout_read, stdout_write = os.pipe()
@@ -753,6 +834,19 @@ class ProcessTests(unittest.TestCase):
                 self.assertFalse(os.path.lexists(root))
             finally:
                 listener.close()
+
+    def test_private_probe_cleanup_removes_valid_partial_material_after_early_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "probe"
+            root.mkdir(mode=0o700)
+            root.chmod(0o700)
+            api = root / "api"
+            api.mkdir(mode=0o700)
+            api.chmod(0o700)
+            self.assertFalse(
+                handoff._cleanup_probe_root(root, require_material=False)
+            )
+            self.assertFalse(os.path.lexists(root))
 
     def test_killed_probe_socket_has_exact_validated_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

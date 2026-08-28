@@ -196,8 +196,11 @@ bound to clean source in an immutable package. Exact root stages only that
 package and retains a closed descriptor protocol, while all future private
 certification work runs only after the controller has irreversibly dropped to
 the ordinary package owner. Reciprocal guardian/supervisor cleanup covers
-either single root-actor loss, and fixed completion/TERM/KILL product probes
-require no Apple authorization. The canonical matrix and verdict remain #1944.
+either single root-actor loss. TERM targets the exact owned group; KILL first
+targets only the root provider and preserves ordinary parent-loss cleanup
+before bounded group escalation. Both require exact group absence and
+restoration of the production-session baseline. The fixed probes require no
+Apple authorization. The canonical matrix and verdict remain #1944.
 
 ## Guest workflow artifact authority
 
