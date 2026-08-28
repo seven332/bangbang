@@ -104,6 +104,14 @@ SUPERVISOR_PHASES = (
     "controller-exit",
     "cleanup-ack",
 )
+SUPERVISOR_FAILURES = (
+    *SUPERVISOR_PHASES,
+    "identity-capture",
+    "identity-parent",
+    "identity-uid",
+    "identity-gid",
+    *(f"controller-{category}" for category in CONTROLLER_FAILURES),
+)
 
 PROC_PIDTBSDINFO = 3
 PROC_PIDPATHINFO_MAXSIZE = 4096
@@ -2505,9 +2513,9 @@ def _wait_supervisor_complete(connection: socket.socket) -> None:
         if (
             len(message) == 2
             and message[0] == ord("F")
-            and 1 <= message[1] <= len(SUPERVISOR_PHASES)
+            and 1 <= message[1] <= len(SUPERVISOR_FAILURES)
         ):
-            _fail(f"supervisor-{SUPERVISOR_PHASES[message[1] - 1]}")
+            _fail(f"supervisor-{SUPERVISOR_FAILURES[message[1] - 1]}")
         _fail("supervisor")
     except HandoffError:
         raise
@@ -2580,23 +2588,24 @@ def _supervisor_entry(
             _fail("credentials")
         os.close(ready_read)
         ready_read = -1
-        controller_identity = capture_process(controller_pid)
+        try:
+            controller_identity = capture_process(controller_pid)
+        except HandoffError as error:
+            raise HandoffError("identity-capture") from error
+        if controller_identity.parent_pid != os.getpid():
+            _fail("identity-parent")
         if (
-            controller_identity.parent_pid != os.getpid()
-            or (
-                controller_identity.uid,
-                controller_identity.real_uid,
-                controller_identity.saved_uid,
-            )
-            != (uid, uid, uid)
-            or (
-                controller_identity.gid,
-                controller_identity.real_gid,
-                controller_identity.saved_gid,
-            )
-            != (gid, gid, gid)
-        ):
-            _fail("credentials")
+            controller_identity.uid,
+            controller_identity.real_uid,
+            controller_identity.saved_uid,
+        ) != (uid, uid, uid):
+            _fail("identity-uid")
+        if (
+            controller_identity.gid,
+            controller_identity.real_gid,
+            controller_identity.saved_gid,
+        ) != (gid, gid, gid):
+            _fail("identity-gid")
         session_id = secrets.token_bytes(32)
         phase = 4
         session = SessionSocket(
@@ -2637,9 +2646,17 @@ def _supervisor_entry(
         if os.path.lexists(stage.root):
             _fail("cleanup")
         return 0
-    except BaseException:
+    except BaseException as error:
         try:
-            completion.send(bytes((ord("F"), phase)))
+            category = (
+                error.category
+                if isinstance(error, HandoffError)
+                and error.category in SUPERVISOR_FAILURES
+                else SUPERVISOR_PHASES[phase - 1]
+            )
+            completion.send(
+                bytes((ord("F"), SUPERVISOR_FAILURES.index(category) + 1))
+            )
         except OSError:
             pass
         guardian_lost = not _guardian_lease_alive(guardian_lease)
