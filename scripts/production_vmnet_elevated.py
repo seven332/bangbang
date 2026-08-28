@@ -1053,6 +1053,30 @@ def _wait_router_oracle(
         time.sleep(vmnet.POLL_SECONDS)
 
 
+def _wait_direct_boot(
+    vmnet: ModuleType,
+    process: Any,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        data = vmnet._read_identity_bounded(
+            process.files.serial,
+            process.files.serial_identity,
+            maximum=vmnet.MAX_SERIAL_BYTES,
+            category="guest",
+        )
+        lines = data.splitlines(keepends=True)
+        if any(line.startswith(vmnet.GUEST_FAILURE_PREFIX) for line in lines):
+            _fail(vmnet, "guest")
+        if vmnet.DIRECT_ROOTFS_BOOT_MARKER in lines:
+            return
+        process.raise_if_failed()
+        if time.monotonic() >= deadline:
+            _fail(vmnet, "guest-timeout")
+        time.sleep(vmnet.POLL_SECONDS)
+
+
 @dataclasses.dataclass(frozen=True)
 class StagedCaseFiles:
     root: Path
@@ -2423,10 +2447,8 @@ class ElevatedSystemCertificationDriver:
                 mmds_interfaces=("eth0",),
             )
             self.vmnet._require_no_content(self._start(process))
-            self.vmnet._wait_serial(
-                process.files,
-                self.vmnet.DIRECT_ROOTFS_BOOT_MARKER,
-                self.config.timeouts.guest_seconds,
+            _wait_direct_boot(
+                self.vmnet, process, self.config.timeouts.guest_seconds
             )
             if self.session_entries() != baseline:
                 _fail(self.vmnet, "case")
@@ -2500,10 +2522,8 @@ class ElevatedSystemCertificationDriver:
             self._configure(process, networks=(("eth0", "vmnet:shared"),))
             self.vmnet._require_no_content(self._start(process))
             process.owner_pid()
-            self.vmnet._wait_serial(
-                process.files,
-                self.vmnet.DIRECT_ROOTFS_BOOT_MARKER,
-                self.config.timeouts.guest_seconds,
+            _wait_direct_boot(
+                self.vmnet, process, self.config.timeouts.guest_seconds
             )
             return process
         except BaseException:

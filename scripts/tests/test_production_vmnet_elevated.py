@@ -1285,6 +1285,26 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         self.assertEqual(minimal[-1], "--version")
         self.assertNotIn(vmnet.GRANT_MANIFEST_OPTION, minimal)
 
+    def test_direct_boot_wait_observes_process_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            serial = Path(raw_temp) / "serial"
+            identity = vmnet._write_private_file(
+                serial, vmnet.DIRECT_ROOTFS_BOOT_MARKER
+            )
+            process = SimpleNamespace(
+                files=SimpleNamespace(serial=serial, serial_identity=identity),
+                raise_if_failed=mock.Mock(),
+            )
+            elevated._wait_direct_boot(vmnet, process, 1)
+            process.raise_if_failed.assert_not_called()
+
+            serial.write_bytes(b"")
+            process.raise_if_failed.side_effect = vmnet.CertificationError("process")
+            self.assert_category(
+                "process",
+                lambda: elevated._wait_direct_boot(vmnet, process, 1),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
