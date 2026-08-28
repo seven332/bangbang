@@ -103,8 +103,22 @@ CREDENTIAL_FAILURES = (
     "credentials-restored-observe",
     "credentials-restored-state",
 )
+PROVIDER_STATUS_FAILURES = {
+    10: "probe-completion-configuration",
+    11: "probe-completion-provider-protocol",
+    12: "probe-completion-provider-process",
+    13: "probe-completion-provider-timeout",
+    14: "probe-completion-provider-cleanup",
+    15: "probe-completion-provider-io",
+    16: "probe-completion-provider-authority",
+    17: "probe-completion-provider-descriptor",
+    18: "probe-completion-provider-bootstrap-descriptor",
+    19: "probe-completion-provider-stream",
+}
 PROBE_FAILURES = (
-    "probe-completion-status",
+    *PROVIDER_STATUS_FAILURES.values(),
+    "probe-completion-child-status",
+    "probe-completion-signal",
     "probe-completion-stderr",
     "probe-completion-stdout",
     "probe-signal-exited",
@@ -2206,7 +2220,13 @@ def _fixed_completion_probe(
     try:
         stdout, stderr = process.communicate()
         if process.returncode != 0:
-            _fail("probe-completion-status")
+            category = PROVIDER_STATUS_FAILURES.get(
+                process.returncode,
+                "probe-completion-signal"
+                if process.returncode is not None and process.returncode < 0
+                else "probe-completion-child-status",
+            )
+            _fail(category)
         if stderr:
             _fail("probe-completion-stderr")
         if not stdout.startswith(b"bangbang "):
