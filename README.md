@@ -269,8 +269,8 @@ only ad-hoc signing, publishes no certification result, and leaves the exact
 `383/0/2/33` inventory unchanged. TERM exercises exact group shutdown. KILL
 targets only the root provider first, preserving the ordinary launcher/worker
 long enough for authenticated parent-loss cleanup before bounded group
-escalation; success also requires the production-session baseline to be
-unchanged.
+escalation; success also requires the descriptor-anchored production-session
+namespace to be empty before and after the probes.
 
 ## Development
 

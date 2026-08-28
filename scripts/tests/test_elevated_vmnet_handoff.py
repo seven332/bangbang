@@ -545,6 +545,22 @@ class ProcessTests(unittest.TestCase):
             with self.assertRaisesRegex(handoff.HandoffError, "probe-session-root"):
                 handoff._probe_session_entries(root)
 
+    def test_fixed_probes_reject_preexisting_production_session_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "bangbang-sessions-v1"
+            root.mkdir(mode=0o700)
+            session = root / ("session-" + "a" * 64)
+            session.mkdir(mode=0o700)
+            with mock.patch.object(
+                handoff, "_probe_session_root", return_value=root
+            ), self.assertRaisesRegex(handoff.HandoffError, "probe-session-root"):
+                handoff.run_fixed_probes(
+                    object(),
+                    handoff.ProductLayout.from_package(Path("/absolute/package")),
+                    os.getuid(),
+                    os.getgid(),
+                )
+
     def test_provider_kill_targets_leader_then_gracefully_converges_group(self) -> None:
         process = mock.Mock(pid=42, returncode=None)
         process.wait.return_value = -int(handoff.signal.SIGKILL)

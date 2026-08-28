@@ -3155,17 +3155,20 @@ subordinates. The former group must be absent after the exact provider reap.
 The kernel may still retain the API socket name; the ordinary controller
 removes only that one expected socket after revalidating its type, target
 uid/gid, and mode. Any TERM residue, unexpected entry, identity/mode mismatch,
-or additional cleanup remains terminal. The test also snapshots the exact
-production-session namespace before each signal case and requires the same
-name/inode/child baseline after convergence; it never deletes a durable socket
-ownership record.
+or additional cleanup remains terminal. The test also requires an empty,
+descriptor-anchored production-session namespace before the probe set,
+snapshots it before each signal case, and requires the same empty baseline
+after convergence; it never deletes a durable socket ownership record.
 
 The focused product gate runs two clean version completions and live API-process
 TERM/KILL through the normal bundle. Private API grant material is created only
 after credential drop and is never emitted. After its authenticated contained
 bootstrap and grant acceptance, the finite worker `--version` path publishes
 the existing `NoApi` readiness before output and terminal completion; direct
-version behavior is unchanged. Exact success is:
+version behavior is unchanged. The ordinary controller alone resolves its own
+home after irreversible drop to require an empty production-session root before
+the probes and the same empty root afterward; root actors and public output
+receive no account name or path. Exact success is:
 
 ```text
 bangbang elevated vmnet handoff proof: ordinary=passed complete=passed repeat=passed term=passed kill=passed cleanup=passed

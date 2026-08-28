@@ -199,8 +199,9 @@ the ordinary package owner. Reciprocal guardian/supervisor cleanup covers
 either single root-actor loss. TERM targets the exact owned group; KILL first
 targets only the root provider and preserves ordinary parent-loss cleanup
 before bounded group escalation. Both require exact group absence and
-restoration of the production-session baseline. The fixed probes require no
-Apple authorization. The canonical matrix and verdict remain #1944.
+an empty descriptor-anchored production-session namespace before and after the
+probe set. The fixed probes require no Apple authorization. The canonical
+matrix and verdict remain #1944.
 
 ## Guest workflow artifact authority
 

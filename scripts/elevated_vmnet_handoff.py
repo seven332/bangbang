@@ -2312,6 +2312,7 @@ def _probe_session_entries(
     tuple[str, int, int, tuple[tuple[str, int, int, int, int, int], ...]], ...
 ]:
     root = _probe_session_root() if root is None else root
+    root_descriptor = -1
     try:
         metadata = os.lstat(root)
     except FileNotFoundError:
@@ -2327,62 +2328,117 @@ def _probe_session_entries(
     ):
         _fail("probe-session-root")
     try:
-        entries = sorted(os.scandir(root), key=lambda entry: entry.name)
-        if len(entries) > 128:
+        root_descriptor = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_root = os.fstat(root_descriptor)
+        if (
+            opened_root.st_dev,
+            opened_root.st_ino,
+            opened_root.st_uid,
+            opened_root.st_gid,
+            stat.S_IMODE(opened_root.st_mode),
+        ) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            os.getuid(),
+            os.getgid(),
+            0o700,
+        ):
+            _fail("probe-session-root")
+        names = sorted(os.listdir(root_descriptor))
+        if len(names) > 128:
             _fail("probe-session-root")
         result = []
-        for entry in entries:
-            if re.fullmatch(r"session-[0-9a-f]{64}", entry.name) is None:
+        for name in names:
+            if re.fullmatch(r"session-[0-9a-f]{64}", name) is None:
                 _fail("probe-session-root")
-            session = entry.stat(follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(session.st_mode)
-                or stat.S_ISLNK(session.st_mode)
-                or session.st_uid != os.getuid()
-                or session.st_gid != os.getgid()
-                or stat.S_IMODE(session.st_mode) != 0o700
-            ):
-                _fail("probe-session-root")
-            children = sorted(os.scandir(entry.path), key=lambda child: child.name)
-            if len(children) > 8:
-                _fail("probe-session-root")
-            child_rows = []
-            for child in children:
-                child_metadata = child.stat(follow_symlinks=False)
+            session_descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_descriptor,
+            )
+            try:
+                session = os.fstat(session_descriptor)
                 if (
-                    stat.S_ISLNK(child_metadata.st_mode)
-                    or child_metadata.st_uid != os.getuid()
-                    or child_metadata.st_gid != os.getgid()
-                    or not (
-                        stat.S_ISREG(child_metadata.st_mode)
-                        or stat.S_ISSOCK(child_metadata.st_mode)
-                    )
+                    not stat.S_ISDIR(session.st_mode)
+                    or session.st_uid != os.getuid()
+                    or session.st_gid != os.getgid()
+                    or stat.S_IMODE(session.st_mode) != 0o700
                 ):
                     _fail("probe-session-root")
-                child_rows.append(
+                children = sorted(os.listdir(session_descriptor))
+                if len(children) > 8:
+                    _fail("probe-session-root")
+                child_rows = []
+                for child in children:
+                    child_metadata = os.stat(
+                        child,
+                        dir_fd=session_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        stat.S_ISLNK(child_metadata.st_mode)
+                        or child_metadata.st_uid != os.getuid()
+                        or child_metadata.st_gid != os.getgid()
+                        or not (
+                            stat.S_ISREG(child_metadata.st_mode)
+                            or stat.S_ISSOCK(child_metadata.st_mode)
+                        )
+                    ):
+                        _fail("probe-session-root")
+                    child_rows.append(
+                        (
+                            child,
+                            stat.S_IFMT(child_metadata.st_mode)
+                            | stat.S_IMODE(child_metadata.st_mode),
+                            child_metadata.st_dev,
+                            child_metadata.st_ino,
+                            child_metadata.st_size,
+                            child_metadata.st_mtime_ns,
+                        )
+                    )
+                linked_session = os.stat(
+                    name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    linked_session.st_dev,
+                    linked_session.st_ino,
+                ) != (session.st_dev, session.st_ino):
+                    _fail("probe-session-root")
+                result.append(
                     (
-                        child.name,
-                        stat.S_IFMT(child_metadata.st_mode)
-                        | stat.S_IMODE(child_metadata.st_mode),
-                        child_metadata.st_dev,
-                        child_metadata.st_ino,
-                        child_metadata.st_size,
-                        child_metadata.st_mtime_ns,
+                        name,
+                        session.st_dev,
+                        session.st_ino,
+                        tuple(child_rows),
                     )
                 )
-            result.append(
-                (
-                    entry.name,
-                    session.st_dev,
-                    session.st_ino,
-                    tuple(child_rows),
-                )
-            )
+            finally:
+                os.close(session_descriptor)
+        visible_root = os.lstat(root)
+        if (
+            visible_root.st_dev,
+            visible_root.st_ino,
+        ) != (opened_root.st_dev, opened_root.st_ino):
+            _fail("probe-session-root")
         return tuple(result)
     except HandoffError:
         raise
     except OSError as error:
         raise HandoffError("probe-session-root") from error
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
 
 
 def _create_private_probe_root(
@@ -2682,18 +2738,27 @@ def _fixed_signal_probe(
 
 
 def run_fixed_probes(proxy: ControllerProxy, layout: ProductLayout, uid: int, gid: int) -> None:
-    _fixed_completion_probe(proxy, layout, uid, gid, "handoff-complete-1")
-    _fixed_completion_probe(proxy, layout, uid, gid, "handoff-complete-2")
-    for instance, kind, category in (
-        ("handoff-term", Kind.TERM, "probe-term-cleanup"),
-        ("handoff-kill", Kind.KILL, "probe-kill-cleanup"),
-    ):
-        try:
-            _fixed_signal_probe(proxy, layout, uid, gid, instance, kind)
-        except HandoffError as error:
-            if error.category == "cleanup":
-                raise HandoffError(category) from error
-            raise
+    session_root = _probe_session_root()
+    if _probe_session_entries(session_root):
+        _fail("probe-session-root")
+    try:
+        _fixed_completion_probe(proxy, layout, uid, gid, "handoff-complete-1")
+        _fixed_completion_probe(proxy, layout, uid, gid, "handoff-complete-2")
+        for instance, kind, category in (
+            ("handoff-term", Kind.TERM, "probe-term-cleanup"),
+            ("handoff-kill", Kind.KILL, "probe-kill-cleanup"),
+        ):
+            try:
+                _fixed_signal_probe(proxy, layout, uid, gid, instance, kind)
+            except HandoffError as error:
+                if error.category == "cleanup":
+                    raise HandoffError(category) from error
+                raise
+    finally:
+        if not _wait_until(
+            lambda: _probe_session_entries(session_root) == (), CLEANUP_TIMEOUT
+        ):
+            _fail("cleanup")
 
 
 ControllerEntry = Callable[[ControllerProxy, ProductLayout, int, int], None]

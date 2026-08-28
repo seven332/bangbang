@@ -1422,9 +1422,12 @@ caller's explicit authorization of the fixed repository entry; code cannot
 authenticate itself against an already modified authorized checkout.
 
 The exact-root entry accepts only the package plus nonzero numeric target uid
-and gid. It never obtains authorization, discovers accounts or credentials, or
-accepts an executable, bundle override, environment, cwd, fixture, result,
-profile, interface, or socket. It validates the target-owned source package,
+and gid. Its root actors never obtain authorization, discover accounts or
+credentials, or accept an executable, bundle override, environment, cwd,
+fixture, result, profile, interface, or socket. After irreversible drop, the
+ordinary controller resolves only its own home for the fixed production-session
+residue check; no account name or path is returned to root or public output. It
+validates the target-owned source package,
 copies into a fresh private root stage, root-owns and freezes the copy, repeats
 the manifest/layout/signature/entitlement checks, and opens traversal only
 after the normal networkless product is coherent. The entitlement-free staged
@@ -1473,9 +1476,10 @@ only if live subordinates remain, reaps the provider, and requires the former
 group to be absent. The kernel may still retain the API socket name; the
 ordinary controller may unlink only that one expected name after revalidating
 socket type, target uid/gid, and mode. TERM residue, any extra entry, and every
-identity or mode mismatch remain terminal. The controller also requires the
-exact pre-probe production-session name/inode/child baseline afterward, so the
-handoff never erases or strands a durable product ownership record.
+identity or mode mismatch remain terminal. The controller also requires an
+empty descriptor-anchored production-session namespace before the probe set and
+the same empty baseline afterward, so the handoff never accepts, erases, or
+strands a durable product ownership record.
 
 The fixed #1943 probe carries no guest fixture or result. It proves repeat
 completion and live TERM/KILL using ordinary private API-grant material created

@@ -39,9 +39,12 @@ source drift, replacement, and a pre-existing output fail. Publication uses
 ## Root invocation authority
 
 The public root entry accepts only the prepared absolute package and canonical
-nonzero u32 target uid/gid. It closes stdin. It does not invoke an authorization
-frontend or accept/discover an executable, alternate bundle, environment, cwd,
-fixture, result, account, credential, profile, interface, or socket.
+nonzero u32 target uid/gid. It closes stdin. Root does not invoke an
+authorization frontend or accept/discover an executable, alternate bundle,
+environment, cwd, fixture, result, account, credential, profile, interface, or
+socket. Only after irreversible drop does the ordinary controller resolve its
+own home to inspect the fixed production-session root; that value is never
+returned to root or public output.
 
 Caller authorization of the fixed repository entry is the trust decision.
 Implementation hashes prove that package/source and the authorized entry are
@@ -138,10 +141,10 @@ the provider leader and subordinate group converge. The controller may unlink
 only that exact expected socket after revalidating its type, target uid/gid,
 and mode. TERM residue, any extra entry, and every ownership/mode mismatch are
 terminal; this deterministic owned-name step is not fallback process cleanup.
-The ordinary controller snapshots the exact private production-session
-namespace before each signal case and requires that same name/inode/child
-baseline after convergence. Durable socket ownership records are never erased
-by the handoff.
+The ordinary controller requires an empty, descriptor-anchored private
+production-session namespace before the probe set, snapshots it before each
+signal case, and requires the same empty baseline after convergence. Durable
+socket ownership records are never erased by the handoff.
 
 ## Fixed probes and handoff
 

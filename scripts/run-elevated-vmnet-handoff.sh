@@ -11,8 +11,10 @@ Usage: scripts/run-elevated-vmnet-handoff.sh --prepared ABSOLUTE_PATH
 
 Run the fixed one-shot elevated vmnet handoff against one immutable prepared
 package. The caller must arrange exact-root execution externally. This entry
-does not discover identities or accept executable, environment, fixture,
-result, profile, account, credential, interface, or socket parameters.
+does not accept executable, environment, fixture, result, profile, account,
+credential, interface, or socket parameters. Root actors receive only the
+numeric target identity; the dropped controller resolves only its own fixed
+production-session root for residue validation.
 EOF
 }
 

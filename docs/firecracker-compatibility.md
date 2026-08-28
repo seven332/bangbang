@@ -5484,7 +5484,8 @@ complete/cleanup/ack boundary cover either single root-actor loss without a
 persistent service. TERM targets the exact owned group; KILL targets the exact
 root provider first and preserves the ordinary cleanup actors through bounded
 parent-loss/TERM convergence before any group-KILL escalation. The former group
-must be absent and the exact production-session baseline restored. Fixed
+must be absent and the descriptor-anchored production-session namespace must be
+empty before and after the probe set. Fixed
 normal-product completion and live-signal probes use no Apple authorization and
 publish no canonical result. The inventory stays `383/0/2/33`; #1944 remains
 responsible for the private concurrent matrix and both retained network
