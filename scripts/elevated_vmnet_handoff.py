@@ -128,6 +128,8 @@ PROBE_FAILURES = (
     "probe-path",
     "probe-private-root",
     "probe-private-file",
+    "probe-term-cleanup",
+    "probe-kill-cleanup",
 )
 CONTROLLER_FAILURES = (
     "internal",
@@ -2434,8 +2436,16 @@ def _fixed_signal_probe(
 def run_fixed_probes(proxy: ControllerProxy, layout: ProductLayout, uid: int, gid: int) -> None:
     _fixed_completion_probe(proxy, layout, uid, gid, "handoff-complete-1")
     _fixed_completion_probe(proxy, layout, uid, gid, "handoff-complete-2")
-    _fixed_signal_probe(proxy, layout, uid, gid, "handoff-term", Kind.TERM)
-    _fixed_signal_probe(proxy, layout, uid, gid, "handoff-kill", Kind.KILL)
+    for instance, kind, category in (
+        ("handoff-term", Kind.TERM, "probe-term-cleanup"),
+        ("handoff-kill", Kind.KILL, "probe-kill-cleanup"),
+    ):
+        try:
+            _fixed_signal_probe(proxy, layout, uid, gid, instance, kind)
+        except HandoffError as error:
+            if error.category == "cleanup":
+                raise HandoffError(category) from error
+            raise
 
 
 ControllerEntry = Callable[[ControllerProxy, ProductLayout, int, int], None]
