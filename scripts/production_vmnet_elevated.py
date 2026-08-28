@@ -2174,7 +2174,12 @@ class ElevatedSystemCertificationDriver:
                 if stdout:
                     raise self.vmnet.CertificationError("case-stdout") from error
                 if stderr:
-                    raise self.vmnet.CertificationError("case-stderr") from error
+                    category = (
+                        f"case-stderr-length-{len(stderr)}"
+                        if len(stderr) <= 118
+                        else "case-stderr"
+                    )
+                    raise self.vmnet.CertificationError(category) from error
                 if 10 <= status <= 19:
                     raise self.vmnet.CertificationError(
                         f"provider-status-{status}"
