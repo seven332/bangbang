@@ -493,7 +493,7 @@ def prepare_elevated(
 
 
 def _handoff_category(category: str) -> str:
-    return {
+    direct = {
         "build": "bundle",
         "implementation": "source",
         "invocation": "invocation",
@@ -502,7 +502,15 @@ def _handoff_category(category: str) -> str:
         "platform": "platform",
         "publication": "output",
         "source": "source",
-    }.get(category, "handoff")
+    }.get(category)
+    if direct is not None:
+        return direct
+    prefix = "supervisor-controller-certification-"
+    if category.startswith(prefix):
+        certification = category[len(prefix) :]
+        if certification in load_handoff().CERTIFICATION_FAILURES:
+            return certification
+    return "handoff"
 
 
 def _platform_identity(vmnet: ModuleType) -> Any:
@@ -2772,32 +2780,40 @@ def _controller_entry(
     gid: int,
 ) -> None:
     handoff = load_handoff()
-    package = layout.bundle.parent
-    loaded = load_package(vmnet, package, uid, gid)
+    try:
+        package = layout.bundle.parent
+        loaded = load_package(vmnet, package, uid, gid)
 
-    def recheck() -> None:
-        recheck_loaded_package(vmnet, package, loaded)
+        def recheck() -> None:
+            recheck_loaded_package(vmnet, package, loaded)
 
-    assertions = vmnet.ElevatedEntitlementAssertions(True, True, True, False)
-    vmnet.run_elevated_certification(
-        loaded.config,
-        loaded.result,
-        loaded.source,
-        loaded.host,
-        assertions,
-        lambda config, session: ElevatedSystemCertificationDriver(
-            vmnet,
-            handoff,
-            proxy,
-            layout,
-            uid,
-            gid,
-            config,
-            session,
-            loaded.artifacts,
-        ),
-        recheck=recheck,
-    )
+        assertions = vmnet.ElevatedEntitlementAssertions(True, True, True, False)
+        vmnet.run_elevated_certification(
+            loaded.config,
+            loaded.result,
+            loaded.source,
+            loaded.host,
+            assertions,
+            lambda config, session: ElevatedSystemCertificationDriver(
+                vmnet,
+                handoff,
+                proxy,
+                layout,
+                uid,
+                gid,
+                config,
+                session,
+                loaded.artifacts,
+            ),
+            recheck=recheck,
+        )
+    except vmnet.CertificationError as error:
+        category = (
+            error.category
+            if error.category in handoff.CERTIFICATION_FAILURES
+            else "internal"
+        )
+        raise handoff.HandoffError(f"certification-{category}") from error
 
 
 def run_elevated(

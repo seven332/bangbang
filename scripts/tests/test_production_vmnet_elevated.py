@@ -880,6 +880,28 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
                     ),
                 )
 
+    def test_certification_failures_cross_handoff_as_closed_categories(self) -> None:
+        handoff = elevated.load_handoff()
+        self.assertLessEqual(len(handoff.SUPERVISOR_FAILURES), 255)
+        self.assertEqual(
+            len(handoff.CONTROLLER_FAILURES),
+            len(set(handoff.CONTROLLER_FAILURES)),
+        )
+        for category in handoff.CERTIFICATION_FAILURES:
+            with self.subTest(category=category):
+                wire = f"supervisor-controller-certification-{category}"
+                self.assertIn(
+                    f"controller-certification-{category}",
+                    handoff.SUPERVISOR_FAILURES,
+                )
+                self.assertEqual(elevated._handoff_category(wire), category)
+        self.assertEqual(
+            elevated._handoff_category(
+                "supervisor-controller-certification-private-sentinel"
+            ),
+            "handoff",
+        )
+
     def test_restore_orchestration_requires_fresh_owner_and_exact_barrier(self) -> None:
         protocol = elevated.load_staged_protocol()
         nonce = bytes(range(1, 33))
