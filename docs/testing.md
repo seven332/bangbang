@@ -3150,7 +3150,10 @@ Process observation is only `pid/ppid/state/comm`.
 
 The focused product gate runs two clean version completions and live API-process
 TERM/KILL through the normal bundle. Private API grant material is created only
-after credential drop and is never emitted. Exact success is:
+after credential drop and is never emitted. After its authenticated contained
+bootstrap and grant acceptance, the finite worker `--version` path publishes
+the existing `NoApi` readiness before output and terminal completion; direct
+version behavior is unchanged. Exact success is:
 
 ```text
 bangbang elevated vmnet handoff proof: ordinary=passed complete=passed repeat=passed term=passed kill=passed cleanup=passed

@@ -133,7 +133,10 @@ contract deliberately excludes.
 The #1943 real gate uses the normal bundle for two clean version completions and
 two live ordinary API-process cases, one terminated and one killed. Fixed
 private API-grant material is created only inside the dropped controller and is
-removed before finish. Public output is categorical and contains no private
+removed before finish. The contained worker `--version` path emits the existing
+`NoApi` readiness after its authenticated bootstrap and grant acceptance so the
+launcher/provider observe ready before its successful terminal; direct version
+behavior is unchanged. Public output is categorical and contains no private
 path, id, PID, session, arguments, interface, address, packet, nonce, or raw
 tool/process value.
 

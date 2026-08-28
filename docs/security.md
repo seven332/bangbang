@@ -1467,10 +1467,14 @@ persistent service.
 
 The fixed #1943 probe carries no guest fixture or result. It proves repeat
 completion and live TERM/KILL using ordinary private API-grant material created
-only after drop. Public output is categorical and contains no path, id, PID,
-session, argument, interface, address, packet, nonce, raw process output, or
-private value. This foundation changes no capability disposition; #1944 alone
-may import it from the ordinary controller and publish the canonical verdict.
+only after drop. The contained worker's finite `--version` command publishes
+the existing `NoApi` readiness only after authenticated bootstrap and grant
+acceptance, allowing the existing topology to acknowledge a clean terminal;
+direct version behavior is unchanged. Public output is categorical and
+contains no path, id, PID, session, argument, interface, address, packet,
+nonce, raw process output, or private value. This foundation changes no
+capability disposition; #1944 alone may import it from the ordinary controller
+and publish the canonical verdict.
 
 The local vmnet worker path requires the host to satisfy macOS vmnet
 authorization, entitlement, and code-signing requirements. The split provider
