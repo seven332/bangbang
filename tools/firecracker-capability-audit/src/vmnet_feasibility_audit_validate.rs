@@ -132,7 +132,7 @@ const EVIDENCE: [EvidenceSpec; 3] = [
         validation: &[
             (
                 "scripts/run-elevated-vmnet-evidence.sh",
-                "guest=passed repeat=passed cleanup=passed",
+                "guest=passed repeat=passed startup=passed runtime=passed restore=passed cleanup=passed",
             ),
             (
                 "compat/firecracker/v1.16.0/vmnet-feasibility-contract.md",

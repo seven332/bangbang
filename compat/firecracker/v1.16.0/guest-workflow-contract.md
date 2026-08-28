@@ -82,6 +82,13 @@ oracle instead and has its own exact sidecar identity. Both selectors are inert
 in the public networkless workflow profiles; v111 is owned by #1930's separate
 root-direct feasibility gate, not by this terminal public workflow.
 
+The further distinct `direct-boot-v112` identity retains the v111 static
+one-shot oracle and adds the staged Python coordinator used by #1942. Its
+authenticated fixed-sector barrier separates startup removal/re-addition,
+networkless runtime insertion/removal, and source-to-destination snapshot
+continuation. It remains nonfinal root-direct evidence and changes neither
+public guest-workflow profile nor capability disposition.
+
 ## API and no-API evidence
 
 API mode starts an unconfigured signed process on an owner-only Unix socket,

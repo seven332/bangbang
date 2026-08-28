@@ -96,7 +96,7 @@ kernel="$(scripts/fetch-firecracker-kernel.sh 2>>"$log")" || {
   echo "bangbang elevated vmnet prepare: kernel failed" >&2
   exit 1
 }
-rootfs="$(scripts/fetch-firecracker-rootfs.sh \
+rootfs_v111="$(scripts/fetch-firecracker-rootfs.sh \
   --format ext4 \
   --ext4-size 512M \
   --direct-boot-init \
@@ -105,11 +105,24 @@ rootfs="$(scripts/fetch-firecracker-rootfs.sh \
   echo "bangbang elevated vmnet prepare: rootfs failed" >&2
   exit 1
 }
-sidecar="${rootfs}.bangbang.json"
+rootfs_v112="$(scripts/fetch-firecracker-rootfs.sh \
+  --format ext4 \
+  --ext4-size 512M \
+  --direct-boot-init \
+  --direct-boot-variant direct-boot-v112 \
+  2>>"$log")" || {
+  echo "bangbang elevated vmnet prepare: staged rootfs failed" >&2
+  exit 1
+}
+sidecar_v111="${rootfs_v111}.bangbang.json"
+sidecar_v112="${rootfs_v112}.bangbang.json"
 if [[ ! -f "$kernel" || -L "$kernel" \
-  || ! -f "$rootfs" || -L "$rootfs" \
-  || ! -f "$sidecar" || -L "$sidecar" \
-  || "$(/usr/bin/basename "$rootfs")" != "ubuntu-24.04-512M-direct-boot-v111.ext4" ]]; then
+  || ! -f "$rootfs_v111" || -L "$rootfs_v111" \
+  || ! -f "$sidecar_v111" || -L "$sidecar_v111" \
+  || ! -f "$rootfs_v112" || -L "$rootfs_v112" \
+  || ! -f "$sidecar_v112" || -L "$sidecar_v112" \
+  || "$(/usr/bin/basename "$rootfs_v111")" != "ubuntu-24.04-512M-direct-boot-v111.ext4" \
+  || "$(/usr/bin/basename "$rootfs_v112")" != "ubuntu-24.04-512M-direct-boot-v112.ext4" ]]; then
   echo "bangbang elevated vmnet prepare: artifact failed" >&2
   exit 1
 fi
@@ -255,9 +268,13 @@ fi
 /usr/bin/codesign --verify --strict "$stage/elevated-vmnet-provider-e2e" >>"$log" 2>&1
 
 /bin/cp -p -- "$kernel" "$stage/vmlinux-6.1.155"
-/bin/cp -p -- "$rootfs" "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4"
-/bin/cp -p -- "$sidecar" "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json"
+/bin/cp -p -- "$rootfs_v111" "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4"
+/bin/cp -p -- "$sidecar_v111" "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json"
+/bin/cp -p -- "$rootfs_v112" "$stage/ubuntu-24.04-512M-direct-boot-v112.ext4"
+/bin/cp -p -- "$sidecar_v112" "$stage/ubuntu-24.04-512M-direct-boot-v112.ext4.bangbang.json"
 /bin/cp -p -- scripts/elevated_vmnet_evidence.py "$stage/elevated-vmnet-evidence.py"
+/bin/cp -p -- scripts/staged_vmnet_evidence.py "$stage/staged-vmnet-evidence.py"
+/bin/cp -p -- scripts/guest/staged_vmnet_certification.py "$stage/staged-vmnet-certification.py"
 /bin/chmod 0555 \
   "$stage/bangbang" \
   "$stage/elevated-vmnet-e2e" \
@@ -267,7 +284,11 @@ fi
   "$stage/vmlinux-6.1.155" \
   "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4" \
   "$stage/ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json" \
-  "$stage/elevated-vmnet-evidence.py"
+  "$stage/ubuntu-24.04-512M-direct-boot-v112.ext4" \
+  "$stage/ubuntu-24.04-512M-direct-boot-v112.ext4.bangbang.json" \
+  "$stage/elevated-vmnet-evidence.py" \
+  "$stage/staged-vmnet-evidence.py" \
+  "$stage/staged-vmnet-certification.py"
 
 entitlements="$stage/entitlements.plist"
 /usr/bin/codesign --display --entitlements - --xml "$stage/bangbang" >"$entitlements" 2>>"$log" || {

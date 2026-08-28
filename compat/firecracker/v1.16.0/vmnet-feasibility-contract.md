@@ -47,9 +47,9 @@ It fetches and verifies the pinned kernel/rootfs, builds the static aarch64
 guest oracle and exact Rust harnesses, builds and ad-hoc signs the direct
 Hypervisor-entitled Bangbang executable, and builds the separately ad-hoc-signed
 entitlement-free `bangbang-vmnet-provider`. It validates the closed artifact
-shape and runs both ordinary-user negative controls. The v111 rootfs recipe is
-a distinct identity; v110 and the optional Apple-authorized production
-certifier retain their existing meaning and digest.
+shape and runs both ordinary-user negative controls. The v111 and staged v112
+rootfs recipes are distinct identities; v110 and the optional Apple-authorized
+production certifier retain their existing meaning and digest.
 
 The run wrapper requires that its caller already holds exact root authority:
 
@@ -71,6 +71,10 @@ runner copies that immutable shape into one private root-owned stage. Under a
 closed environment it invokes only four distinct positive prebuilt test names:
 provider data lifecycle, provider cancellation, direct dropped owner, and direct
 guest. The provider data and guest names each run twice for clean-repeat proof.
+It then runs the closed v112 staged host driver for startup, runtime, and
+restore. These successor scenarios remain root-direct foundation evidence; they
+do not change the historical #1930 transition or make root execution a product
+topology.
 
 ## Exact evidence result
 
@@ -83,13 +87,14 @@ checked workflow requires all of the following categorical outcomes:
 | Minimal provider broker/owner | A root-owned, single-link, non-writable provider image starts one suspended exact-image owner through default-close descriptors. The owner starts shared vmnet while root, irreversibly drops and re-attests the configured ordinary uid/gid, then completes provider-v1 Hello/readiness/read/write/stop/shutdown, correlated control Stop/reap, control cancellation, and clean repeat without residue. The provider carries no entitlement. |
 | Dropped owner | A separate exact-root process starts the real Rust `SystemVmnetInterfaceBackend`, validates bounded realized parameters, clears supplementary groups, irreversibly changes real/effective uid and gid, proves it cannot regain root, then completes callback enable, fixed 60-byte experimental-frame write, bounded read, stop, and residue checks. |
 | Direct guest | The public Unix HTTP API configures the exact kernel, read-only v111 rootfs, read-only schema-v2 control sector, serial sink, and one `vmnet:shared` interface. A real HVF guest validates DHCP offer/request/ack, derives the host endpoint only from the accepted DHCP router, and completes an exact nonce-bound request and response. |
+| Staged direct guest | The v112 guest and fixed 4096-byte authenticated barrier separately prove startup removal/re-addition with two TCP generations, networkless runtime insertion/removal with live traffic, and Full snapshot source termination plus fresh destination `vmnet:shared` override and post-restore traffic. Guest PCI rescan/removal precedes host API cleanup. |
 | Repeat and cleanup | The guest gate succeeds twice in separate VMM processes. Each process stops normally, and every harness-owned API socket, process group, temporary file, listener, and interface owner is gone. |
 
 The successful fixed output is:
 
 ```text
 platform: macos=<version> sdk=<version> arch=arm64 hvf=supported root=exact apple-vmnet=absent
-bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed cleanup=passed
+bangbang elevated vmnet proof: denial=passed provider=passed provider-cancel=passed provider-repeat=passed dropped-owner=passed guest=passed repeat=passed startup=passed runtime=passed restore=passed cleanup=passed
 ```
 
 Tracked evidence and normal output never contain artifact paths, account names,
@@ -119,6 +124,19 @@ The v111 oracle does not accept a host address from the control sector. The TCP
 address is the router from the accepted DHCP lease, so the host cannot substitute
 an unrelated endpoint after lease validation.
 
+`direct-boot-v112` retains that exact one-shot helper and adds
+`/bangbang-staged-vmnet-certification`. The coordinator accepts only one
+4096-byte `/dev/vdc` barrier with a versioned header and fixed command/status
+sectors. Every record binds role, scenario, sequence, nonce, digest, and zeroed
+reserved bytes. It permits exactly the startup, runtime, or restore transition
+graph selected before boot, performs the manual PCI rescan/removal required by
+the product contract, invokes the v111 helper once per required interface
+generation, and reports fixed failure kinds through the authenticated status
+sector. The host-side driver uses only bounded Unix HTTP and a modern File
+snapshot memory backend; restore supplies an explicit network override so the
+destination must acquire fresh backend authority. Serial remains a bounded
+failure-only auxiliary channel and may be empty.
+
 ## Inventory handoff and nonclaims
 
 The checked `vmnet-feasibility-audit.json` pins the source identity, two public
@@ -139,7 +157,9 @@ outer, transfers the inherited provider authority, and proves the foreground
 and provider-owned daemon topology with repeated real provider I/O, signals,
 and cleanup. Neither successor changes a disposition. A real guest through the
 production provider and the complete lifecycle/concurrency certification remain
-separate work.
+separate work. #1942 subsequently adds the three staged root-direct oracle
+scenarios described above, still without capability promotion or parent
+closure.
 
 At its delivery boundary, #1930 itself did not claim any of the following;
 later provider and topology slices do not retroactively change that evidence

@@ -29,7 +29,15 @@ FILES = (
         0o444,
         64 * 1024,
     ),
+    ("ubuntu-24.04-512M-direct-boot-v112.ext4", 0o444, 2 * 1024 * 1024 * 1024),
+    (
+        "ubuntu-24.04-512M-direct-boot-v112.ext4.bangbang.json",
+        0o444,
+        64 * 1024,
+    ),
     ("elevated-vmnet-evidence.py", 0o444, 256 * 1024),
+    ("staged-vmnet-evidence.py", 0o444, 256 * 1024),
+    ("staged-vmnet-certification.py", 0o444, 256 * 1024),
 )
 
 
@@ -168,27 +176,22 @@ def _record(root: Path, owner: int, name: str, mode: int, maximum: int) -> dict[
     }
 
 
-def _validate_sidecar(root: Path, records: list[dict[str, object]]) -> None:
-    sidecar, _raw = _load_json(
-        root / "ubuntu-24.04-512M-direct-boot-v111.ext4.bangbang.json",
-        64 * 1024,
-    )
-    rootfs = next(
-        (
-            record
-            for record in records
-            if record.get("name") == "ubuntu-24.04-512M-direct-boot-v111.ext4"
-        ),
-        None,
-    )
-    if (
-        rootfs is None
-        or sidecar.get("schema_version") != 1
-        or sidecar.get("variant") != "direct-boot-v111"
-        or sidecar.get("output_sha256") != rootfs["sha256"]
-        or sidecar.get("output_size_bytes") != rootfs["size_bytes"]
-    ):
-        _fail("sidecar")
+def _validate_sidecars(root: Path, records: list[dict[str, object]]) -> None:
+    for variant in ("direct-boot-v111", "direct-boot-v112"):
+        filename = f"ubuntu-24.04-512M-{variant}.ext4"
+        sidecar, _raw = _load_json(root / f"{filename}.bangbang.json", 64 * 1024)
+        rootfs = next(
+            (record for record in records if record.get("name") == filename),
+            None,
+        )
+        if (
+            rootfs is None
+            or sidecar.get("schema_version") != 1
+            or sidecar.get("variant") != variant
+            or sidecar.get("output_sha256") != rootfs["sha256"]
+            or sidecar.get("output_size_bytes") != rootfs["size_bytes"]
+        ):
+            _fail("sidecar")
 
 
 def create_manifest(root: Path, owner: int) -> None:
@@ -197,7 +200,7 @@ def create_manifest(root: Path, owner: int) -> None:
         _fail("collision")
     _file(root / LOG_NAME, owner, 0o600, 1024 * 1024, allow_empty=True)
     records = [_record(root, owner, *specification) for specification in FILES]
-    _validate_sidecar(root, records)
+    _validate_sidecars(root, records)
     document = {
         "files": records,
         "kind": KIND,
@@ -264,7 +267,7 @@ def verify_manifest(root: Path, owner: int) -> None:
         if record != actual:
             _fail("artifact")
         actual_records.append(actual)
-    _validate_sidecar(root, actual_records)
+    _validate_sidecars(root, actual_records)
 
 
 def _owner(value: str) -> int:

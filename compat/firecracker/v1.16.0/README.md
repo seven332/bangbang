@@ -211,6 +211,12 @@ static no-std entitlement-free guest oracle used only by #1930. Neither recipe
 aliases historical sidecars; v111 is feasibility evidence and does not itself
 implement either #1378 capability.
 
+`rootfs-ext4-direct-boot-v112` retains the v111 one-shot oracle and adds
+#1942's staged coordinator and authenticated 4096-byte barrier protocol. It is
+used only for exact-root startup/runtime/restore foundation evidence, does not
+replace either public workflow profile, and leaves the inventory at
+`383/0/2/33`.
+
 Runtime sidecars stay under the ignored cache root and never count as checked
 inventory or terminal workflow evidence.
 
