@@ -2152,7 +2152,20 @@ class ElevatedSystemCertificationDriver:
         try:
             self._configure(process, networks=networks)
             self.vmnet._require_policy_denial(self._start(process))
-            self._finish_process(process)
+            status, stdout, stderr = process.wait_output()
+            if status != 0:
+                category = (
+                    f"provider-status-{status}"
+                    if 10 <= status <= 19
+                    else "case-status"
+                )
+                _fail(self.vmnet, category)
+            if stdout != self.vmnet.API_READY_MARKER:
+                _fail(self.vmnet, "case-stdout")
+            if stderr:
+                _fail(self.vmnet, "case-stderr")
+            process.finish_exited()
+            self._retire(process)
         except BaseException:
             self._abort_process(process)
             raise

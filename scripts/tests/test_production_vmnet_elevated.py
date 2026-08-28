@@ -1152,6 +1152,42 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             lambda: driver._run_missing_policy_denial("missing-policy-denial"),
         )
 
+    def test_api_policy_denial_requires_exact_provider_terminal(self) -> None:
+        process = mock.Mock()
+        process.wait_output.return_value = (0, vmnet.API_READY_MARKER, b"")
+        driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
+        driver.vmnet = vmnet
+        driver._spawn = mock.Mock(return_value=process)
+        driver._configure = mock.Mock()
+        driver._start = mock.Mock(return_value=object())
+        driver._retire = mock.Mock()
+        driver._abort_process = mock.Mock()
+        with mock.patch.object(vmnet, "_require_policy_denial"):
+            driver._run_policy_denial(
+                "mismatched-policy-denial",
+                allowed=("host",),
+                maximum=1,
+                networks=(("eth0", "vmnet:shared"),),
+            )
+        process.finish_exited.assert_called_once_with()
+        driver._retire.assert_called_once_with(process)
+        driver._abort_process.assert_not_called()
+
+        process.wait_output.return_value = (13, vmnet.API_READY_MARKER, b"")
+        driver._retire.reset_mock()
+        with mock.patch.object(vmnet, "_require_policy_denial"):
+            self.assert_category(
+                "provider-status-13",
+                lambda: driver._run_policy_denial(
+                    "mismatched-policy-denial",
+                    allowed=("host",),
+                    maximum=1,
+                    networks=(("eth0", "vmnet:shared"),),
+                ),
+            )
+        driver._retire.assert_not_called()
+        driver._abort_process.assert_called_once_with(process)
+
 
 if __name__ == "__main__":
     unittest.main()
