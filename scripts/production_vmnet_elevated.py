@@ -2163,7 +2163,10 @@ class ElevatedSystemCertificationDriver:
                     and status == 11
                     and not stdout
                     and stderr
-                    == b"bangbang launcher: private vmnet topology failed\n"
+                    == (
+                        b"bangbang: private launcher session failed\n"
+                        b"bangbang launcher: private vmnet topology failed\n"
+                    )
                 ):
                     process.finish_exited()
                     self._retire(process)
