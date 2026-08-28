@@ -259,6 +259,7 @@ run_staged_case() {
   /usr/bin/env -i \
     LANG=C \
     LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 \
     TMPDIR="$stage/runs" \
     BANGBANG_ELEVATED_VMNET_BANGBANG="$stage/bangbang" \
     BANGBANG_ELEVATED_VMNET_KERNEL="$stage/vmlinux-6.1.155" \
@@ -329,6 +330,12 @@ for scenario in startup runtime restore; do
     exit 1
   fi
 done
+
+final_count="$(/usr/bin/find -x "$stage" -mindepth 1 -maxdepth 1 -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+if [[ "$final_count" != "$((${#names[@]} + 1))" ]]; then
+  echo "bangbang elevated vmnet proof: final package residue" >&2
+  exit 1
+fi
 
 os_version="$(/usr/bin/sw_vers -productVersion)"
 sdk_version="$(/usr/bin/xcrun --sdk macosx --show-sdk-version)"

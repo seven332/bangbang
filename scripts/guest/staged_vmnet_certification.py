@@ -77,7 +77,6 @@ class Status(IntEnum):
     TRAFFIC_TWO = 6
     CAPTURE_READY = 7
     COMPLETE = 8
-    FAILED = 9
 
     @property
     def label(self) -> str:
@@ -267,7 +266,7 @@ class BlockBarrier:
         self.device = device
         self.header = header
         self._previous_command: Optional[Record] = None
-        self._previous_status_sequence = 0
+        self._previous_status: Optional[Record] = None
         self._terminal = False
         self._closed = False
 
@@ -329,10 +328,13 @@ class BlockBarrier:
 
     def status(self, sequence: int, kind: Status) -> None:
         graph = STATUS_GRAPHS[self.header.scenario]
+        expected_sequence = (
+            1 if self._previous_status is None else self._previous_status.sequence + 1
+        )
         if (
             self._terminal
             or not isinstance(kind, Status)
-            or sequence != self._previous_status_sequence + 1
+            or sequence != expected_sequence
             or sequence > len(graph)
             or kind is not graph[sequence - 1]
             or (
@@ -354,6 +356,12 @@ class BlockBarrier:
         )
         descriptor = self._open()
         try:
+            current = decode_record(
+                os.pread(descriptor, SECTOR_BYTES, STATUS_OFFSET),
+                allow_empty=True,
+            )
+            if current != self._previous_status:
+                raise CoordinatorError("control")
             written = os.pwrite(descriptor, value, STATUS_OFFSET)
             os.fsync(descriptor)
         except OSError as error:
@@ -362,7 +370,13 @@ class BlockBarrier:
             os.close(descriptor)
         if written != len(value):
             raise CoordinatorError("io")
-        self._previous_status_sequence = sequence
+        self._previous_status = Record(
+            ROLE_STATUS,
+            self.header.scenario,
+            int(kind),
+            sequence,
+            self.header.nonce,
+        )
         self._terminal = kind is Status.COMPLETE
         _emit(f"BANGBANG_STAGED_VMNET_STATUS_{kind.name}")
 

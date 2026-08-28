@@ -335,13 +335,26 @@ def _http(
         raise EvidenceError("api")
     response = bytearray()
     client: Optional[socket.socket] = None
+    deadline = time.monotonic() + REQUEST_SECONDS
+
+    def set_remaining_timeout() -> None:
+        if client is None:
+            raise EvidenceError("api")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EvidenceError("api")
+        client.settimeout(remaining)
+
     try:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(REQUEST_SECONDS)
+        set_remaining_timeout()
         client.connect(os.fspath(product.socket_path))
+        set_remaining_timeout()
         client.sendall(request)
+        set_remaining_timeout()
         client.shutdown(socket.SHUT_WR)
         while True:
+            set_remaining_timeout()
             chunk = client.recv(4096)
             if not chunk:
                 break
@@ -369,6 +382,15 @@ def _parse_http_response(response: bytes) -> tuple[int, bytes]:
         status = int(parts[1])
     except (IndexError, UnicodeDecodeError, ValueError) as error:
         raise EvidenceError("api") from error
+    if (
+        len(parts) != 3
+        or parts[0] != "HTTP/1.1"
+        or len(parts[1]) != 3
+        or not 100 <= status <= 599
+        or any(b":" not in line for line in lines[1:])
+        or any(line.lower().startswith(b"transfer-encoding:") for line in lines[1:])
+    ):
+        raise EvidenceError("api")
     lengths = [line[16:] for line in lines[1:] if line.lower().startswith(b"content-length: ")]
     if len(lengths) != 1 or not lengths[0].isdigit() or int(lengths[0]) != len(payload):
         raise EvidenceError("api")
@@ -446,24 +468,52 @@ class Barrier:
             sequence,
             self.nonce,
         )
+        descriptor = -1
         try:
-            descriptor = os.open(self.path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+            descriptor = os.open(
+                self.path,
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            current = protocol.decode_record(
+                os.pread(descriptor, protocol.SECTOR_BYTES, protocol.COMMAND_OFFSET),
+                allow_empty=True,
+            )
+            expected = None
+            if self.previous_command_sequence != 0:
+                expected = protocol.Record(
+                    protocol.ROLE_COMMAND,
+                    self.scenario,
+                    protocol.COMMAND_PROCEED,
+                    self.previous_command_sequence,
+                    self.nonce,
+                )
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != protocol.CONTROL_BYTES
+                or current != expected
+            ):
+                raise EvidenceError("control")
             if os.pwrite(descriptor, value, protocol.COMMAND_OFFSET) != len(value):
                 raise EvidenceError("control")
             os.fsync(descriptor)
-            os.close(descriptor)
+        except protocol.CoordinatorError as error:
+            raise EvidenceError("control") from error
         except EvidenceError:
-            try:
-                os.close(descriptor)
-            except (OSError, UnboundLocalError):
-                pass
             raise
         except OSError as error:
-            try:
-                os.close(descriptor)
-            except (OSError, UnboundLocalError):
-                pass
             raise EvidenceError("control") from error
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    raise EvidenceError("control") from error
         self.previous_command_sequence = sequence
 
     def wait(self, product: Product, sequence: int, kind: Any) -> None:
@@ -509,16 +559,10 @@ class Barrier:
                     and record.scenario is self.scenario
                     and record.nonce == self.nonce
                     and record.kind in protocol.FAILURE_CATEGORIES
+                    and record.sequence == 0xFFFF_FFFF_FFFF_FFFF
                 ):
                     category = protocol.FAILURE_CATEGORIES[record.kind]
                     raise EvidenceError(f"guest-staged-{category}")
-                elif (
-                    record.role == protocol.ROLE_STATUS
-                    and record.scenario is self.scenario
-                    and record.kind == int(protocol.Status.FAILED)
-                    and record.nonce == self.nonce
-                ):
-                    raise EvidenceError("guest")
                 elif (
                     record.role == protocol.ROLE_STATUS
                     and record.scenario is self.scenario
@@ -618,11 +662,11 @@ class Fixture:
         self.expected = expected
         self.cancelled = threading.Event()
         self.result: Optional[EvidenceError] = None
+        self.deadline = time.monotonic() + FIXTURE_SECONDS
         self.thread = threading.Thread(target=self._run, name="staged-vmnet-fixture", daemon=True)
         self.thread.start()
 
     def _run(self) -> None:
-        deadline = time.monotonic() + FIXTURE_SECONDS
         valid = 0
         attempts = 0
         try:
@@ -632,7 +676,7 @@ class Fixture:
                 try:
                     connection, _address = self.listener.accept()
                 except socket.timeout:
-                    if time.monotonic() >= deadline:
+                    if time.monotonic() >= self.deadline:
                         raise EvidenceError("fixture-timeout")
                     continue
                 attempts += 1
@@ -640,13 +684,20 @@ class Fixture:
                     connection.close()
                     raise EvidenceError("fixture")
                 with connection:
-                    connection.settimeout(5)
                     request = bytearray()
                     while len(request) < TCP_RECORD_BYTES:
+                        remaining = self.deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise EvidenceError("fixture-timeout")
+                        connection.settimeout(min(5.0, remaining))
                         chunk = connection.recv(TCP_RECORD_BYTES - len(request))
                         if not chunk:
                             break
                         request.extend(chunk)
+                    remaining = self.deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EvidenceError("fixture-timeout")
+                    connection.settimeout(min(5.0, remaining))
                     trailing = connection.recv(1)
                     if (
                         len(request) != TCP_RECORD_BYTES
@@ -656,6 +707,10 @@ class Fixture:
                     ):
                         continue
                     response = TCP_RESPONSE_MAGIC + self.nonce
+                    remaining = self.deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EvidenceError("fixture-timeout")
+                    connection.settimeout(min(5.0, remaining))
                     connection.sendall(response)
                     connection.shutdown(socket.SHUT_WR)
                     valid += 1
@@ -665,7 +720,7 @@ class Fixture:
             self.listener.close()
 
     def finish(self) -> None:
-        self.thread.join(timeout=FIXTURE_SECONDS)
+        self.thread.join(timeout=max(0.0, self.deadline - time.monotonic()))
         if self.thread.is_alive():
             raise EvidenceError("fixture-timeout")
         if self.result is not None:

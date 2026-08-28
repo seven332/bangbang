@@ -63,6 +63,9 @@ class StagedVmnetEvidenceTests(unittest.TestCase):
         for response in (
             b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\n",
             b"HTTP/1.1 204 No Content\r\n\r\n",
+            b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 999 Unknown\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
         ):
             with self.assertRaisesRegex(evidence.EvidenceError, "api"):
                 evidence._parse_http_response(response)
@@ -144,6 +147,25 @@ class StagedVmnetEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(evidence.EvidenceError, "control"):
                 barrier.assert_terminal()
 
+        with tempfile.TemporaryDirectory() as raw_temp:
+            barrier = evidence.Barrier(
+                Path(raw_temp) / "barrier.bin",
+                evidence.protocol.Scenario.RUNTIME,
+                nonce,
+            )
+            tampered = evidence.protocol.encode_record(
+                evidence.protocol.ROLE_COMMAND,
+                evidence.protocol.Scenario.RUNTIME,
+                evidence.protocol.COMMAND_PROCEED,
+                2,
+                nonce,
+            )
+            with barrier.path.open("r+b", buffering=0) as destination:
+                destination.seek(evidence.protocol.COMMAND_OFFSET)
+                destination.write(tampered)
+            with self.assertRaisesRegex(evidence.EvidenceError, "control"):
+                barrier.command(1)
+
     def test_host_barrier_surfaces_authenticated_guest_failure(self) -> None:
         nonce = bytes(range(1, 33))
         with tempfile.TemporaryDirectory() as raw_temp:
@@ -163,6 +185,32 @@ class StagedVmnetEvidenceTests(unittest.TestCase):
                 destination.seek(evidence.protocol.STATUS_OFFSET)
                 destination.write(failure)
             with self.assertRaisesRegex(evidence.EvidenceError, "guest-staged-traffic"):
+                barrier.wait(FakeProduct(), 1, evidence.protocol.Status.INITIAL_PRESENT)
+
+            uncategorized = evidence.protocol.encode_record(
+                evidence.protocol.ROLE_STATUS,
+                evidence.protocol.Scenario.STARTUP,
+                9,
+                1,
+                nonce,
+            )
+            with barrier.path.open("r+b", buffering=0) as destination:
+                destination.seek(evidence.protocol.STATUS_OFFSET)
+                destination.write(uncategorized)
+            with self.assertRaisesRegex(evidence.EvidenceError, "protocol"):
+                barrier.wait(FakeProduct(), 1, evidence.protocol.Status.INITIAL_PRESENT)
+
+            wrong_sequence = evidence.protocol.encode_record(
+                evidence.protocol.ROLE_STATUS,
+                evidence.protocol.Scenario.STARTUP,
+                evidence.protocol.FAILURE_KINDS["traffic"],
+                1,
+                nonce,
+            )
+            with barrier.path.open("r+b", buffering=0) as destination:
+                destination.seek(evidence.protocol.STATUS_OFFSET)
+                destination.write(wrong_sequence)
+            with self.assertRaisesRegex(evidence.EvidenceError, "protocol"):
                 barrier.wait(FakeProduct(), 1, evidence.protocol.Status.INITIAL_PRESENT)
 
     def test_startup_dispatch_orders_two_network_generations(self) -> None:

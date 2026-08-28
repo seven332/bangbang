@@ -182,6 +182,8 @@ class ElevatedVmnetEvidenceTests(unittest.TestCase):
         self.assertEqual(runner.count("elevated_direct_guest_uses_shared_vmnet"), 2)
         self.assertIn('for scenario in startup runtime restore', runner)
         self.assertIn('run_staged_case "$scenario"', runner)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", runner)
+        self.assertIn('final_count="$(/usr/bin/find -x "$stage"', runner)
         self.assertNotIn("sudo", runner.lower())
         self.assertNotIn("SUDO_", runner)
         self.assertNotIn("dscacheutil", runner)
