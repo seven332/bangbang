@@ -1704,6 +1704,7 @@ class ElevatedSystemCertificationDriver:
         self.artifacts = artifacts
         self._attempts: dict[str, int] = {}
         self._active: list[RemoteProductionProcess] = []
+        self._local_active: list[tuple[Any, Any]] = []
         self._closed = False
         self._session_root = handoff._probe_session_root()
         if self.session_entries():
@@ -2141,6 +2142,53 @@ class ElevatedSystemCertificationDriver:
         except ValueError as error:
             raise self.vmnet.CertificationError("internal") from error
 
+    def _spawn_networkless(self, case: str) -> Any:
+        files = self._files(case)
+        instance = (
+            f"elevated-{self.vmnet.V2_CASE_NAMES.index(case):02d}-"
+            f"{self._attempts[case]:02d}"
+        )
+        try:
+            process = self.vmnet.ProductionProcess(
+                _elevated_launcher_arguments(
+                    self.vmnet,
+                    self.layout.bundle,
+                    files,
+                    instance,
+                    (),
+                    None,
+                ),
+                files,
+                self.config,
+            )
+        except BaseException:
+            self.cleanup_case_files(files)
+            raise
+        self._local_active.append((process, files))
+        return process
+
+    def _retire_networkless(self, process: Any) -> None:
+        entry = next(
+            (entry for entry in self._local_active if entry[0] is process),
+            None,
+        )
+        if entry is None:
+            _fail(self.vmnet, "internal")
+        process.terminate()
+        self.cleanup_case_files(entry[1])
+        self._local_active.remove(entry)
+
+    def _abort_networkless(self, process: Any) -> None:
+        entry = next(
+            (entry for entry in self._local_active if entry[0] is process),
+            None,
+        )
+        if entry is None:
+            return
+        process.close()
+        self.cleanup_case_files(entry[1])
+        self._local_active.remove(entry)
+
     def _finish_process(self, process: RemoteProductionProcess) -> None:
         try:
             process.terminate()
@@ -2366,7 +2414,8 @@ class ElevatedSystemCertificationDriver:
             raise
 
     def _run_mmds_only(self, case: str) -> None:
-        process = self._spawn(case, allowed=(), maximum=None)
+        baseline = self.session_entries()
+        process = self._spawn_networkless(case)
         try:
             self._configure(
                 process,
@@ -2375,14 +2424,15 @@ class ElevatedSystemCertificationDriver:
             )
             self.vmnet._require_no_content(self._start(process))
             self.vmnet._wait_serial(
-                files,
+                process.files,
                 self.vmnet.DIRECT_ROOTFS_BOOT_MARKER,
                 self.config.timeouts.guest_seconds,
             )
-            process.roles(require_owner=False, forbid_owner=True)
-            self._finish_process(process)
+            if self.session_entries() != baseline:
+                _fail(self.vmnet, "case")
+            self._retire_networkless(process)
         except BaseException:
-            self._abort_process(process)
+            self._abort_networkless(process)
             raise
 
     def _run_connectivity(
@@ -3008,6 +3058,13 @@ class ElevatedSystemCertificationDriver:
 
     def close(self) -> None:
         cleanup_error: Optional[Any] = None
+        for process, files in reversed(self._local_active):
+            try:
+                process.close()
+                self.cleanup_case_files(files)
+            except self.vmnet.CertificationError as error:
+                cleanup_error = cleanup_error or error
+        self._local_active.clear()
         for process in reversed(self._active):
             try:
                 process.close()
