@@ -2150,9 +2150,22 @@ class ElevatedSystemCertificationDriver:
     ) -> None:
         process = self._spawn(case, allowed=allowed, maximum=maximum)
         try:
-            self._configure(process, networks=networks)
-            self.vmnet._require_policy_denial(self._start(process))
-            status, stdout, stderr = process.wait_output()
+            try:
+                self._configure(process, networks=networks)
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("policy-configure") from error
+            try:
+                response = self._start(process)
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("policy-request") from error
+            try:
+                self.vmnet._require_policy_denial(response)
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("policy-response") from error
+            try:
+                status, stdout, stderr = process.wait_output()
+            except self.vmnet.CertificationError as error:
+                raise self.vmnet.CertificationError("policy-terminal") from error
             if status != 0:
                 category = (
                     f"provider-status-{status}"
