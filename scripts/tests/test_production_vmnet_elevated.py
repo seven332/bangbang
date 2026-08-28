@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -901,6 +902,35 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             ),
             "handoff",
         )
+
+    def test_remote_process_removes_only_the_pinned_stale_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            path = Path(raw_temp) / "api.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(os.fspath(path))
+            path.chmod(0o600)
+            identity = vmnet._api_socket_identity(path)
+            process = object.__new__(elevated.RemoteProductionProcess)
+            process.vmnet = vmnet
+            process.files = SimpleNamespace(api_socket=path)
+            process._api_identity = identity
+            process._remove_stale_socket()
+            self.assertFalse(os.path.lexists(path))
+            listener.close()
+
+            original = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            original.bind(os.fspath(path))
+            path.chmod(0o600)
+            process._api_identity = vmnet._api_socket_identity(path)
+            original.close()
+            path.unlink()
+            replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            replacement.bind(os.fspath(path))
+            path.chmod(0o600)
+            self.assert_category("process-cleanup", process._remove_stale_socket)
+            self.assertTrue(os.path.lexists(path))
+            replacement.close()
+            path.unlink()
 
     def test_restore_orchestration_requires_fresh_owner_and_exact_barrier(self) -> None:
         protocol = elevated.load_staged_protocol()

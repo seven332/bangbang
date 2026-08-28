@@ -1353,7 +1353,6 @@ class RemoteProductionProcess:
         self._api_identity: Optional[Any] = None
         self._roles: Optional[ProductRoles] = None
         self._closed = False
-        self._killed = False
         self._retain_files = False
         try:
             self.process = driver.proxy.spawn(arguments)
@@ -1495,7 +1494,6 @@ class RemoteProductionProcess:
                 if number == signal.SIGTERM:
                     self.process.terminate()
                 else:
-                    self._killed = True
                     self.process.kill()
             except BaseException as error:
                 raise _map_handoff_error(self.vmnet, error) from error
@@ -1508,8 +1506,6 @@ class RemoteProductionProcess:
         }.get(role, 0)
         if pid <= 1:
             raise self.vmnet.CertificationError("internal")
-        if number == signal.SIGKILL:
-            self._killed = True
         self._signal_ordinary(pid, number)
         return pid
 
@@ -1521,7 +1517,7 @@ class RemoteProductionProcess:
         except BaseException as error:
             raise _map_handoff_error(self.vmnet, error) from error
 
-    def _remove_killed_socket(self) -> None:
+    def _remove_stale_socket(self) -> None:
         path = self.files.api_socket
         try:
             metadata = os.lstat(path)
@@ -1529,13 +1525,16 @@ class RemoteProductionProcess:
             return
         except OSError as error:
             raise self.vmnet.CertificationError("process-cleanup") from error
+        identity = self._api_identity
         if (
-            not self._killed
+            identity is None
             or not stat.S_ISSOCK(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_uid != os.getuid()
             or metadata.st_gid != os.getgid()
             or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_dev != identity.device
+            or metadata.st_ino != identity.inode
         ):
             raise self.vmnet.CertificationError("process-cleanup")
         try:
@@ -1550,7 +1549,7 @@ class RemoteProductionProcess:
             self.process.close()
         except BaseException as error:
             raise _map_handoff_error(self.vmnet, error) from error
-        self._remove_killed_socket()
+        self._remove_stale_socket()
         self.vmnet._wait_socket_absent(
             self.files.api_socket, self.config.timeouts.request_seconds
         )
@@ -1586,7 +1585,7 @@ class RemoteProductionProcess:
             self.process.close()
         except BaseException as error:
             raise _map_handoff_error(self.vmnet, error) from error
-        self._remove_killed_socket()
+        self._remove_stale_socket()
         self.vmnet._wait_socket_absent(
             self.files.api_socket, self.config.timeouts.request_seconds
         )
