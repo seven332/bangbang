@@ -416,6 +416,28 @@ class FakeCredentialBackend(handoff.CredentialBackend):
 
 
 class CredentialTests(unittest.TestCase):
+    def test_process_group_reader_is_exact_bounded_and_two_phase(self) -> None:
+        expected = [20, 80]
+        calls = []
+
+        def getgroups(size, groups):
+            calls.append(size)
+            if size == 0:
+                return len(expected)
+            for index, value in enumerate(expected):
+                groups[index] = value
+            return len(expected)
+
+        self.assertEqual(handoff._read_process_groups(getgroups), expected)
+        self.assertEqual(calls, [0, len(expected)])
+
+        with self.assertRaises(OSError):
+            handoff._read_process_groups(
+                lambda size, _groups: handoff.MAX_CREDENTIAL_GROUPS + 1
+                if size == 0
+                else 0
+            )
+
     def test_transition_orders_drop_and_rejects_all_root_restoration(self) -> None:
         backend = FakeCredentialBackend(42, 501, 20)
         identity = handoff.transition_controller_credentials(501, 20, 42, backend)

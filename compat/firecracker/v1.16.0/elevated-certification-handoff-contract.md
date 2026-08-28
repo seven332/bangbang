@@ -74,6 +74,10 @@ The supervisor independently attests the same dropped child before sending a
 welcome. Only the controller may later load private config, fixture, API/HVF,
 guest-matrix, or result code.
 
+Group attestation uses Darwin's bounded live-process `getgroups` ABI directly,
+not the system Python deployment-target account-directory variant that ignores
+`setgroups` changes.
+
 ## Fixed descriptor protocol
 
 The controller and supervisor use a connected `AF_UNIX/SOCK_DGRAM` socketpair.

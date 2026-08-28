@@ -8,6 +8,7 @@ import array
 import ctypes
 import dataclasses
 import enum
+import errno
 import fcntl
 import hashlib
 import json
@@ -81,6 +82,7 @@ SESSION_TIMEOUT = 30.0 * 60.0
 CLEANUP_TIMEOUT = 10.0
 POLL_SECONDS = 0.05
 MAX_CAPTURE_BYTES = 256 * 1024
+MAX_CREDENTIAL_GROUPS = 1024
 
 CREDENTIAL_FAILURES = (
     "credentials-initial-observe",
@@ -1186,7 +1188,7 @@ class CredentialBackend:
     """Injectable credential operations for the post-fork controller transition."""
 
     def groups(self) -> list[int]:
-        return list(os.getgroups())
+        return _process_groups()
 
     def clear_groups(self) -> None:
         os.setgroups([])
@@ -1202,6 +1204,34 @@ class CredentialBackend:
 
     def identity(self) -> ProcessIdentity:
         return capture_process(os.getpid())
+
+
+def _read_process_groups(getgroups: Any) -> list[int]:
+    count = getgroups(0, None)
+    if count < 0:
+        raise OSError(ctypes.get_errno(), "getgroups")
+    if count > MAX_CREDENTIAL_GROUPS:
+        raise OSError(errno.EOVERFLOW, "getgroups")
+    if count == 0:
+        return []
+    groups = (ctypes.c_uint32 * count)()
+    actual = getgroups(count, groups)
+    if actual < 0:
+        raise OSError(ctypes.get_errno(), "getgroups")
+    if actual != count:
+        raise OSError(errno.EIO, "getgroups")
+    return [int(groups[index]) for index in range(actual)]
+
+
+def _process_groups() -> list[int]:
+    # Xcode's system Python is linked to getgroups$DARWIN_EXTSN, which reports
+    # the account-directory access list and ignores setgroups(2). Resolving the
+    # unversioned ABI explicitly observes the bounded live process group list.
+    library = ctypes.CDLL(None, use_errno=True)
+    getgroups = library.getgroups
+    getgroups.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_uint32))
+    getgroups.restype = ctypes.c_int
+    return _read_process_groups(getgroups)
 
 
 def transition_controller_credentials(

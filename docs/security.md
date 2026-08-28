@@ -1439,6 +1439,10 @@ observes the same child identity before sending its session welcome. Only then
 does the child call the controller loader; private plan, API, HVF, fixture, and
 result parsing therefore remain outside root.
 
+The group attestation resolves Darwin's bounded live-process `getgroups` ABI
+directly. It does not use the system Python deployment-target variant, which
+reports the account-directory access list and does not reflect `setgroups`.
+
 Root retains a closed local lifecycle protocol, not general execution. Exact
 4096-byte Unix datagrams use explicitly attested 8192-byte socket buffers,
 monotonic per-role sequences, request correlation, a random 32-byte session,
