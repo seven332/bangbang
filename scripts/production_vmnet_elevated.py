@@ -2161,7 +2161,7 @@ class ElevatedSystemCertificationDriver:
         process = self._spawn(case)
         try:
             status, stdout, stderr = process.wait_output()
-            if status != 12:
+            if status != 11:
                 category = (
                     f"provider-status-{status}"
                     if 10 <= status <= 19
