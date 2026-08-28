@@ -1298,6 +1298,11 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             elevated._wait_direct_boot(vmnet, process, 1)
             process.raise_if_failed.assert_not_called()
 
+            serial.write_bytes(
+                vmnet.DIRECT_ROOTFS_BOOT_MARKER.rstrip(b"\n") + b"\r\n"
+            )
+            elevated._wait_direct_boot(vmnet, process, 1)
+
             serial.write_bytes(b"")
             process.raise_if_failed.side_effect = vmnet.CertificationError("process")
             self.assert_category(

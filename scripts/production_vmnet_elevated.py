@@ -1040,12 +1040,15 @@ def _wait_router_oracle(
             maximum=vmnet.MAX_SERIAL_BYTES,
             category="guest",
         )
-        lines = data.splitlines(keepends=True)
-        if any(line.startswith(ELEVATED_GUEST_FAILURE_PREFIX) for line in lines):
+        lines = data.splitlines()
+        if any(
+            line.startswith(ELEVATED_GUEST_FAILURE_PREFIX.rstrip(b"\n"))
+            for line in lines
+        ):
             _fail(vmnet, "guest")
         if (
-            ELEVATED_GUEST_BEGIN_MARKER in lines
-            and ELEVATED_GUEST_SUCCESS_MARKER in lines
+            ELEVATED_GUEST_BEGIN_MARKER.rstrip(b"\n") in lines
+            and ELEVATED_GUEST_SUCCESS_MARKER.rstrip(b"\n") in lines
         ):
             return
         if time.monotonic() >= deadline:
@@ -1066,10 +1069,13 @@ def _wait_direct_boot(
             maximum=vmnet.MAX_SERIAL_BYTES,
             category="guest",
         )
-        lines = data.splitlines(keepends=True)
-        if any(line.startswith(vmnet.GUEST_FAILURE_PREFIX) for line in lines):
+        lines = data.splitlines()
+        if any(
+            line.startswith(vmnet.GUEST_FAILURE_PREFIX.rstrip(b"\n"))
+            for line in lines
+        ):
             _fail(vmnet, "guest")
-        if vmnet.DIRECT_ROOTFS_BOOT_MARKER in lines:
+        if vmnet.DIRECT_ROOTFS_BOOT_MARKER.rstrip(b"\n") in lines:
             return
         process.raise_if_failed()
         if time.monotonic() >= deadline:
