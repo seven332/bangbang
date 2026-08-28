@@ -42,6 +42,11 @@ IMPLEMENTATION_PATHS = (
     Path("scripts/prepare-elevated-vmnet-handoff.sh"),
     Path("scripts/run-elevated-vmnet-handoff.sh"),
     Path("scripts/build-production-bundle.sh"),
+    Path("scripts/production_vmnet_certification.py"),
+    Path("scripts/production_vmnet_elevated.py"),
+    Path("scripts/prepare-production-vmnet-certification.sh"),
+    Path("scripts/run-production-vmnet-certification.sh"),
+    Path("scripts/guest/staged_vmnet_certification.py"),
 )
 
 SCHEMA_VERSION = 1
@@ -79,6 +84,7 @@ PROTOCOL_TIMEOUT = 5.0
 WAIT_SLICE_MILLISECONDS = 250
 PROCESS_TIMEOUT = 90.0
 SESSION_TIMEOUT = 30.0 * 60.0
+MAX_SESSION_TIMEOUT = 3.0 * 60.0 * 60.0
 CLEANUP_TIMEOUT = 10.0
 POLL_SECONDS = 0.05
 MAX_CAPTURE_BYTES = 256 * 1024
@@ -749,7 +755,14 @@ def _remove_tree(path: Path) -> None:
         raise HandoffError("cleanup") from error
 
 
-def prepare_package(output: Path) -> None:
+PackagePopulator = Callable[[Path, SourceIdentity], None]
+
+
+def prepare_package(
+    output: Path,
+    *,
+    populate: Optional[PackagePopulator] = None,
+) -> None:
     if (
         not output.is_absolute()
         or output.name != PACKAGE_KIND
@@ -780,6 +793,17 @@ def prepare_package(output: Path) -> None:
         )
         if outcome.returncode != 0:
             _fail("build")
+        if read_clean_source_identity() != source:
+            _fail("source")
+        if populate is not None:
+            if not callable(populate):
+                _fail("invocation")
+            try:
+                populate(stage, source)
+            except HandoffError:
+                raise
+            except BaseException as error:
+                raise HandoffError("package") from error
         if read_clean_source_identity() != source:
             _fail("source")
         create_manifest(stage, source, os.getuid(), os.getgid())
@@ -1740,7 +1764,14 @@ class ProviderSupervisor:
         controller_pid: int,
         controller_identity: ProcessIdentity,
         guardian_lease: int,
+        session_timeout: float = SESSION_TIMEOUT,
     ) -> None:
+        if (
+            isinstance(session_timeout, bool)
+            or not isinstance(session_timeout, (int, float))
+            or not SESSION_TIMEOUT <= session_timeout <= MAX_SESSION_TIMEOUT
+        ):
+            _fail("session-timeout")
         self.session = session
         self.layout = layout
         self.uid = uid
@@ -1748,6 +1779,7 @@ class ProviderSupervisor:
         self.controller_pid = controller_pid
         self.controller_identity = controller_identity
         self.guardian_lease = guardian_lease
+        self.session_timeout = float(session_timeout)
         self.providers: dict[int, OwnedProvider] = {}
         self.next_handle = 1
         self.controller_status: Optional[int] = None
@@ -1895,7 +1927,7 @@ class ProviderSupervisor:
         return forced
 
     def serve(self) -> None:
-        deadline = time.monotonic() + SESSION_TIMEOUT
+        deadline = time.monotonic() + self.session_timeout
         try:
             while True:
                 if not self._guardian_alive() or not self._controller_alive():
@@ -2182,6 +2214,15 @@ class RemoteProviderProcess:
     def _output_failed(self) -> bool:
         return any(capture.result()[1] or capture.result()[2] for capture in (self.stdout_capture, self.stderr_capture))
 
+    def snapshot_output(self) -> tuple[bytes, bytes]:
+        """Return bounded output observed so far without consuming the streams."""
+
+        stdout, stdout_overflow, stdout_failure = self.stdout_capture.result()
+        stderr, stderr_overflow, stderr_failure = self.stderr_capture.result()
+        if stdout_overflow or stderr_overflow or stdout_failure or stderr_failure:
+            _fail("output")
+        return stdout, stderr
+
     def poll(self) -> Optional[int]:
         if self.closed:
             return self.returncode
@@ -2235,6 +2276,11 @@ class RemoteProviderProcess:
 
     def communicate(self, timeout: float = PROCESS_TIMEOUT) -> tuple[bytes, bytes]:
         self.wait(timeout)
+        return self._finish_readers()
+
+    def finish_output(self) -> tuple[bytes, bytes]:
+        if self.poll() is None:
+            _fail("protocol")
         return self._finish_readers()
 
     def close(self) -> None:
@@ -3039,6 +3085,7 @@ def _supervisor_entry(
     identity_descriptor: int,
     completion: socket.socket,
     loader: ControllerLoader,
+    session_timeout: float,
 ) -> int:
     controller_pid = -1
     controller_identity: Optional[ProcessIdentity] = None
@@ -3130,6 +3177,7 @@ def _supervisor_entry(
             controller_pid,
             controller_identity,
             guardian_lease,
+            session_timeout,
         )
         phase = 5
         server.serve()
@@ -3226,7 +3274,15 @@ def run_root(
     uid: int,
     gid: int,
     loader: ControllerLoader = default_controller_loader,
+    *,
+    session_timeout: float = SESSION_TIMEOUT,
 ) -> None:
+    if (
+        isinstance(session_timeout, bool)
+        or not isinstance(session_timeout, (int, float))
+        or not SESSION_TIMEOUT <= session_timeout <= MAX_SESSION_TIMEOUT
+    ):
+        _fail("invocation")
     _require_root_platform(uid, gid)
     if not prepared.is_absolute() or prepared.name != PACKAGE_KIND:
         _fail("invocation")
@@ -3257,6 +3313,7 @@ def run_root(
                 identity_write,
                 supervisor_completion,
                 loader,
+                float(session_timeout),
             )
             os._exit(status)
         supervisor_completion.close()

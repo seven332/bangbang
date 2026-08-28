@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -32,6 +33,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, BinaryIO, Callable, Iterator, Mapping, Optional, Protocol, Sequence
 
 
@@ -192,15 +194,25 @@ V2_ENVIRONMENT_GATED_CASES = frozenset(
 )
 FIXTURE_CASES = frozenset(
     {
+        "capture-restore-fresh-ownership",
         "shared-connectivity",
         "host-connectivity",
         "bridged-connectivity",
         "not-authorized",
+        "runtime-hotplug-remove",
         "sharing-service-busy",
+        "startup-interface-remove",
     }
 )
 CONNECTIVITY_CASES = frozenset(
-    {"shared-connectivity", "host-connectivity", "bridged-connectivity"}
+    {
+        "bridged-connectivity",
+        "capture-restore-fresh-ownership",
+        "host-connectivity",
+        "runtime-hotplug-remove",
+        "shared-connectivity",
+        "startup-interface-remove",
+    }
 )
 CASE_OUTCOMES = frozenset({"passed", "environment-gated", "blocked", "failed"})
 
@@ -255,6 +267,7 @@ class FixtureConfig:
     executable: Path
     expected_sha256: str
     identity: FileIdentity
+    owner_uid: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -328,6 +341,7 @@ class PreparedArtifacts:
     rootfs: Path
     kernel_identity: FileIdentity
     rootfs_identity: FileIdentity
+    owner_uid: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -339,6 +353,14 @@ class ProductionBundles:
 @dataclass(frozen=True)
 class EntitlementAssertions:
     outer_empty: bool
+    worker_app_sandbox_hvf: bool
+    worker_vmnet: bool
+
+
+@dataclass(frozen=True)
+class ElevatedEntitlementAssertions:
+    outer_empty: bool
+    provider_empty: bool
     worker_app_sandbox_hvf: bool
     worker_vmnet: bool
 
@@ -520,6 +542,7 @@ def _open_regular(
     private: bool,
     executable: bool = False,
     digest: bool = False,
+    owner_uid: Optional[int] = None,
 ) -> tuple[int, FileIdentity]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -536,7 +559,8 @@ def _open_regular(
             or before.st_dev != current.st_dev
             or before.st_ino != current.st_ino
             or current.st_nlink != 1
-            or current.st_uid != os.getuid()
+            or current.st_uid
+            != (os.getuid() if owner_uid is None else owner_uid)
             or current.st_size < 0
             or current.st_size > maximum
         ):
@@ -701,6 +725,78 @@ def _parse_elevated_config_document(document: object) -> ElevatedCertificationCo
         optional_cases=_parse_optional_cases(root["optional_cases"]),
         timeouts=_parse_timeouts(root["timeouts"]),
     )
+
+
+def _parse_elevated_config_document_staged(
+    document: object, fixture_identity: FileIdentity
+) -> ElevatedCertificationConfig:
+    root = _object(
+        document,
+        ("authority", "fixture", "optional_cases", "schema_version", "timeouts"),
+        "config",
+    )
+    if (
+        _integer(
+            root["schema_version"],
+            ELEVATED_SCHEMA_VERSION,
+            ELEVATED_SCHEMA_VERSION,
+            "config",
+        )
+        != ELEVATED_SCHEMA_VERSION
+    ):
+        raise CertificationError("config")
+    authority = _object(root["authority"], ("kind",), "authority")
+    if authority["kind"] != "elevated-provider":
+        raise CertificationError("authority")
+    fixture_value = _object(root["fixture"], ("executable", "sha256"), "fixture")
+    fixture_path = _absolute_path(fixture_value["executable"], "fixture")
+    expected_sha256 = _string(fixture_value["sha256"], "fixture", maximum=64)
+    if (
+        not isinstance(fixture_identity, FileIdentity)
+        or fixture_identity.size <= 0
+        or fixture_identity.sha256 != expected_sha256
+        or SHA256_RE.fullmatch(expected_sha256) is None
+    ):
+        raise CertificationError("fixture")
+    config = ElevatedCertificationConfig(
+        fixture=FixtureConfig(
+            fixture_path,
+            expected_sha256,
+            fixture_identity,
+            owner_uid=0,
+        ),
+        optional_cases=_parse_optional_cases(root["optional_cases"]),
+        timeouts=_parse_timeouts(root["timeouts"]),
+    )
+    _recheck_config_inputs_elevated(config)
+    return config
+
+
+def _recheck_config_inputs_elevated(config: ElevatedCertificationConfig) -> None:
+    if not isinstance(config, ElevatedCertificationConfig):
+        raise CertificationError("internal")
+    fixture = config.fixture
+    fd, current = _open_regular(
+        fixture.executable,
+        category="fixture",
+        maximum=MAX_FIXTURE_BYTES,
+        private=False,
+        executable=True,
+        digest=True,
+        owner_uid=fixture.owner_uid,
+    )
+    os.close(fd)
+    expected = fixture.identity
+    if (
+        current.device != expected.device
+        or current.inode != expected.inode
+        or current.size != expected.size
+        or current.mtime_ns != expected.mtime_ns
+        or current.ctime_ns != expected.ctime_ns
+        or current.sha256 != expected.sha256
+        or current.sha256 != fixture.expected_sha256
+    ):
+        raise CertificationError("fixture")
 
 
 def parse_config_document(
@@ -1520,6 +1616,7 @@ class FixtureSession:
             private=False,
             executable=True,
             digest=True,
+            owner_uid=self._fixture.owner_uid,
         )
         os.close(fd)
         expected = self._fixture.identity
@@ -2258,7 +2355,9 @@ def _write_private_file(path: Path, contents: bytes, *, executable: bool = False
     return FileIdentity(metadata.st_dev, metadata.st_ino, metadata.st_size)
 
 
-def _verify_regular_artifact(path: Path, label: str) -> FileIdentity:
+def _verify_regular_artifact(
+    path: Path, label: str, *, owner_uid: Optional[int] = None
+) -> FileIdentity:
     try:
         metadata = os.lstat(path)
     except OSError as error:
@@ -2269,7 +2368,7 @@ def _verify_regular_artifact(path: Path, label: str) -> FileIdentity:
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_size <= 0
         or metadata.st_nlink != 1
-        or metadata.st_uid != os.getuid()
+        or metadata.st_uid != (os.getuid() if owner_uid is None else owner_uid)
         or len(label) == 0
     ):
         raise CertificationError("artifact")
@@ -2282,8 +2381,10 @@ def _verify_regular_artifact(path: Path, label: str) -> FileIdentity:
     )
 
 
-def _recheck_artifact(path: Path, expected: FileIdentity) -> None:
-    current = _verify_regular_artifact(path, "retained")
+def _recheck_artifact(
+    path: Path, expected: FileIdentity, *, owner_uid: Optional[int] = None
+) -> None:
+    current = _verify_regular_artifact(path, "retained", owner_uid=owner_uid)
     if (
         current.device != expected.device
         or current.inode != expected.inode
@@ -2710,16 +2811,23 @@ def _create_case_files(
     endpoint: Optional[FixtureEndpoint] = None,
     nonce: bytes = b"",
     attempt: int = 0,
+    case_names: Sequence[str] = CASE_NAMES,
+    control_data: Optional[bytes] = None,
 ) -> CaseFiles:
     if (
-        case not in CASE_NAMES
-        or not 0 <= index < len(CASE_NAMES)
+        case not in case_names
+        or not 0 <= index < len(case_names)
+        or case_names[index] != case
         or not 0 <= attempt <= 99
     ):
         raise CertificationError("internal")
     session.verify()
-    _recheck_artifact(artifacts.kernel, artifacts.kernel_identity)
-    _recheck_artifact(artifacts.rootfs, artifacts.rootfs_identity)
+    _recheck_artifact(
+        artifacts.kernel, artifacts.kernel_identity, owner_uid=artifacts.owner_uid
+    )
+    _recheck_artifact(
+        artifacts.rootfs, artifacts.rootfs_identity, owner_uid=artifacts.owner_uid
+    )
     root = session.path / f"case-{index:02d}-{attempt:02d}-{case}"
     api_directory = root / "api"
     _create_private_directory(root)
@@ -2728,7 +2836,18 @@ def _create_case_files(
     serial_identity = _write_private_file(serial, b"")
     control: Optional[Path] = None
     control_identity: Optional[FileIdentity] = None
-    if mode is not None or endpoint is not None or nonce:
+    if control_data is not None:
+        if (
+            not isinstance(control_data, bytes)
+            or len(control_data) != CONTROL_BYTES
+            or mode is not None
+            or endpoint is not None
+            or nonce
+        ):
+            raise CertificationError("control")
+        control = root / "control.bin"
+        control_identity = _write_private_file(control, control_data)
+    elif mode is not None or endpoint is not None or nonce:
         if mode is None or endpoint is None:
             raise CertificationError("control")
         control = root / "control.bin"
@@ -4089,7 +4208,9 @@ class SystemCertificationDriver:
             raise cleanup_error
 
 
-def _optional_case_enabled(config: CertificationConfig, case: str) -> bool:
+def _optional_case_enabled(
+    config: CertificationConfig | ElevatedCertificationConfig, case: str
+) -> bool:
     if case == "host-connectivity":
         return config.optional_cases.host_connectivity
     if case == "bridged-connectivity":
@@ -4175,6 +4296,55 @@ def _result_document(
     return validate_result_document(document)
 
 
+def _elevated_result_document(
+    source: SourceIdentity,
+    host: PlatformIdentity,
+    entitlements: ElevatedEntitlementAssertions,
+    outcomes: Sequence[str],
+    cleanup: str,
+) -> dict[str, object]:
+    if len(outcomes) != len(V2_CASE_NAMES):
+        raise CertificationError("internal")
+    verdict = (
+        "failed"
+        if cleanup == "incomplete" or "failed" in outcomes
+        else "blocked"
+        if "blocked" in outcomes
+        else "passed"
+    )
+    document: dict[str, object] = {
+        "authority": {
+            "controller": "ordinary",
+            "kind": "elevated-provider",
+            "outer": "ordinary",
+            "owner": "irreversibly-ordinary",
+            "provider": "bounded-root",
+            "route": "remote-only",
+        },
+        "cases": [
+            {"name": name, "outcome": outcome}
+            for name, outcome in zip(V2_CASE_NAMES, outcomes)
+        ],
+        "cleanup": cleanup,
+        "entitlements": {
+            "outer_empty": entitlements.outer_empty,
+            "provider_empty": entitlements.provider_empty,
+            "worker_app_sandbox_hvf": entitlements.worker_app_sandbox_hvf,
+            "worker_vmnet": entitlements.worker_vmnet,
+        },
+        "platform": {
+            "architecture": host.architecture,
+            "hvf": host.hvf,
+            "macos": host.macos,
+            "sdk": host.sdk,
+        },
+        "schema_version": ELEVATED_SCHEMA_VERSION,
+        "source": {"commit": source.commit, "tree": source.tree},
+        "verdict": verdict,
+    }
+    return validate_result_document(document)
+
+
 @contextmanager
 def _interruption_boundary() -> Iterator[None]:
     previous: dict[int, Any] = {}
@@ -4215,6 +4385,8 @@ def run_certification(
 
     _validate_output_target(result_path)
     config = read_config(config_path)
+    if not isinstance(config, CertificationConfig):
+        raise CertificationError("config")
     runtime = dependencies if dependencies is not None else default_dependencies()
     source, host = runtime.preflight()
     if not isinstance(source, SourceIdentity) or not isinstance(host, PlatformIdentity):
@@ -4356,6 +4528,190 @@ def run_certification(
     return document
 
 
+_ELEVATED_MODULE: Optional[ModuleType] = None
+
+
+def _elevated_module() -> ModuleType:
+    global _ELEVATED_MODULE
+    if _ELEVATED_MODULE is None:
+        path = REPOSITORY_ROOT / "scripts/production_vmnet_elevated.py"
+        spec = importlib.util.spec_from_file_location(
+            "bangbang_production_vmnet_elevated", path
+        )
+        if spec is None or spec.loader is None:
+            raise CertificationError("internal")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException as error:
+            raise CertificationError("internal") from error
+        _ELEVATED_MODULE = module
+    return _ELEVATED_MODULE
+
+
+def run_elevated_certification(
+    config: ElevatedCertificationConfig,
+    result_path: Path,
+    source: SourceIdentity,
+    host: PlatformIdentity,
+    entitlements: ElevatedEntitlementAssertions,
+    driver_factory: Callable[
+        [ElevatedCertificationConfig, PrivateSession], CertificationCaseDriver
+    ],
+    *,
+    session_parent: Optional[Path] = PRODUCTION_SESSION_PARENT,
+    recheck: Optional[Callable[[], None]] = None,
+    fixture_popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    clock: Callable[[], float] = time.monotonic,
+    nonce_factory: Callable[[int], bytes] = secrets.token_bytes,
+) -> dict[str, Any]:
+    """Run the exact elevated v2 matrix from an already verified package."""
+
+    _validate_output_target(result_path)
+    if (
+        not isinstance(config, ElevatedCertificationConfig)
+        or not isinstance(source, SourceIdentity)
+        or not isinstance(host, PlatformIdentity)
+        or not isinstance(entitlements, ElevatedEntitlementAssertions)
+        or not callable(driver_factory)
+        or recheck is not None
+        and not callable(recheck)
+    ):
+        raise CertificationError("internal")
+    if (
+        not entitlements.outer_empty
+        or not entitlements.provider_empty
+        or not entitlements.worker_app_sandbox_hvf
+        or entitlements.worker_vmnet
+    ):
+        raise CertificationError("bundle")
+
+    outcomes = ["blocked"] * len(V2_CASE_NAMES)
+    session: Optional[PrivateSession] = None
+    driver: Optional[CertificationCaseDriver] = None
+    setup_complete = False
+    active_index: Optional[int] = None
+    first_error: Optional[CertificationError] = None
+    cleanup_error: Optional[CertificationError] = None
+
+    def recheck_package() -> None:
+        if recheck is not None:
+            recheck()
+
+    with _interruption_boundary():
+        try:
+            recheck_package()
+            session = PrivateSession.create(session_parent)
+            driver = driver_factory(config, session)
+            if not callable(getattr(driver, "execute", None)) or not callable(
+                getattr(driver, "close", None)
+            ):
+                raise CertificationError("internal")
+            setup_complete = True
+            for index, case in enumerate(V2_CASE_NAMES):
+                active_index = index
+                if case in V2_ENVIRONMENT_GATED_CASES and not _optional_case_enabled(
+                    config, case
+                ):
+                    outcomes[index] = "environment-gated"
+                    active_index = None
+                    continue
+                nonce = _next_nonce(nonce_factory)
+                if case in FIXTURE_CASES:
+                    bridge = (
+                        config.optional_cases.bridged_interface
+                        if case == "bridged-connectivity"
+                        else None
+                    )
+                    with FixtureSession(
+                        config.fixture,
+                        case,
+                        nonce,
+                        config.timeouts.fixture_seconds,
+                        bridge_interface=bridge,
+                        session_parent=session.path,
+                        terminate_seconds=config.timeouts.terminate_seconds,
+                        clock=clock,
+                        popen_factory=fixture_popen_factory,
+                    ) as fixture:
+                        endpoint = fixture.prepare()
+                        if case in CONNECTIVITY_CASES and endpoint is None:
+                            raise CertificationError("fixture-protocol")
+                        if case not in CONNECTIVITY_CASES and endpoint is not None:
+                            raise CertificationError("fixture-protocol")
+                        driver.execute(case, endpoint=endpoint, nonce=nonce)
+                        fixture.wait_observed()
+                        fixture.complete()
+                else:
+                    driver.execute(case, endpoint=None, nonce=nonce)
+                recheck_package()
+                outcomes[index] = "passed"
+                active_index = None
+        except CertificationError as error:
+            first_error = error
+            if setup_complete and active_index is not None:
+                outcomes[active_index] = "failed"
+        except KeyboardInterrupt as error:  # pragma: no cover - signals own CLI
+            first_error = CertificationError("interrupted")
+            first_error.__cause__ = error
+            if setup_complete and active_index is not None:
+                outcomes[active_index] = "failed"
+        except BaseException as error:
+            first_error = CertificationError("internal")
+            first_error.__cause__ = error
+            if setup_complete and active_index is not None:
+                outcomes[active_index] = "failed"
+        finally:
+            if driver is not None:
+                try:
+                    driver.close()
+                except CertificationError as error:
+                    cleanup_error = error
+                except BaseException as error:
+                    cleanup_error = CertificationError("cleanup")
+                    cleanup_error.__cause__ = error
+            if session is not None:
+                try:
+                    session.cleanup()
+                except CertificationError as error:
+                    cleanup_error = cleanup_error or error
+                except BaseException as error:
+                    cleanup_error = cleanup_error or CertificationError("cleanup")
+                    cleanup_error.__cause__ = error
+
+    if setup_complete:
+        try:
+            recheck_package()
+        except CertificationError as error:
+            if first_error is None:
+                first_error = error
+                if "failed" not in outcomes:
+                    outcomes[-1] = "failed"
+        except BaseException as error:
+            if first_error is None:
+                first_error = CertificationError("internal")
+                first_error.__cause__ = error
+                if "failed" not in outcomes:
+                    outcomes[-1] = "failed"
+
+    if not setup_complete:
+        raise cleanup_error or first_error or CertificationError("internal")
+    document = _elevated_result_document(
+        source,
+        host,
+        entitlements,
+        outcomes,
+        "incomplete" if cleanup_error is not None else "complete",
+    )
+    publish_result(result_path, document)
+    if cleanup_error is not None:
+        raise cleanup_error
+    if first_error is not None:
+        raise first_error
+    return document
+
+
 def _parser() -> RedactedArgumentParser:
     parser = RedactedArgumentParser(
         description="Validate or run production-vmnet certification."
@@ -4368,7 +4724,30 @@ def _parser() -> RedactedArgumentParser:
     run = subparsers.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--result", type=Path, required=True)
+    prepare_elevated = subparsers.add_parser("prepare-elevated")
+    prepare_elevated.add_argument("--config", type=Path, required=True)
+    prepare_elevated.add_argument("--result", type=Path, required=True)
+    prepare_elevated.add_argument("--output", type=Path, required=True)
+    run_elevated = subparsers.add_parser("run-elevated")
+    run_elevated.add_argument("--prepared", type=Path, required=True)
+    run_elevated.add_argument("--target-uid", type=_nonzero_u32, required=True)
+    run_elevated.add_argument("--target-gid", type=_nonzero_u32, required=True)
     return parser
+
+
+def _nonzero_u32(value: str) -> int:
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isascii()
+        or not value.isdecimal()
+        or value.startswith("0")
+    ):
+        raise argparse.ArgumentTypeError("invalid identity")
+    parsed = int(value)
+    if not 0 < parsed <= 0xFFFF_FFFF:
+        raise argparse.ArgumentTypeError("invalid identity")
+    return parsed
 
 
 def _has_duplicate_path_option(arguments: Sequence[str], option: str) -> bool:
@@ -4383,8 +4762,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     failure: Optional[CertificationError] = None
     try:
-        if _has_duplicate_path_option(arguments, "--config") or _has_duplicate_path_option(
-            arguments, "--result"
+        if any(
+            _has_duplicate_path_option(arguments, option)
+            for option in (
+                "--config",
+                "--output",
+                "--prepared",
+                "--result",
+                "--target-gid",
+                "--target-uid",
+            )
         ):
             raise CertificationError("invocation")
         args = _parser().parse_args(arguments)
@@ -4397,6 +4784,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.operation == "run":
             run_certification(args.config, args.result)
             print("bangbang production vmnet run: passed")
+        elif args.operation == "prepare-elevated":
+            _elevated_module().prepare_elevated(
+                sys.modules[__name__], args.config, args.result, args.output
+            )
+            print("bangbang production vmnet elevated prepare: ready")
+        elif args.operation == "run-elevated":
+            _elevated_module().run_elevated(
+                sys.modules[__name__],
+                args.prepared,
+                args.target_uid,
+                args.target_gid,
+            )
+            print("bangbang production vmnet elevated run: passed")
         else:  # pragma: no cover - argparse owns the closed operation set.
             raise CertificationError("invocation")
     except CertificationError as error:
@@ -4414,11 +4814,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if failure.category != "invocation" and operation == "validate-result"
             else "run"
             if failure.category != "invocation" and operation == "run"
+            else "elevated prepare"
+            if failure.category != "invocation" and operation == "prepare-elevated"
+            else "elevated run"
+            if failure.category != "invocation" and operation == "run-elevated"
             else "invocation"
         )
-        if label == "run":
+        if label in ("run", "elevated prepare", "elevated run"):
             print(
-                f"bangbang production vmnet run: blocked category={failure.category}",
+                f"bangbang production vmnet {label}: blocked category={failure.category}",
                 file=sys.stderr,
             )
         else:
