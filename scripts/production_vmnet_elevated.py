@@ -2233,6 +2233,8 @@ class ElevatedSystemCertificationDriver:
                 }.get(stderr)
                 if diagnostic is not None:
                     _fail(self.vmnet, f"provider-status-{diagnostic}")
+                if len(stderr) <= 118:
+                    _fail(self.vmnet, f"case-stderr-length-{len(stderr)}")
                 _fail(self.vmnet, "case-stderr")
             process.finish_exited()
             self._retire(process)
