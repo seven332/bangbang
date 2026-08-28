@@ -82,9 +82,28 @@ CLEANUP_TIMEOUT = 10.0
 POLL_SECONDS = 0.05
 MAX_CAPTURE_BYTES = 256 * 1024
 
+CREDENTIAL_FAILURES = (
+    "credentials-initial-observe",
+    "credentials-initial-process",
+    "credentials-initial-root",
+    "credentials-clear-groups",
+    "credentials-set-gid",
+    "credentials-set-uid",
+    "credentials-dropped-observe",
+    "credentials-dropped-process",
+    "credentials-dropped-groups",
+    "credentials-dropped-uid",
+    "credentials-dropped-gid",
+    "credentials-restore-uid",
+    "credentials-restore-gid",
+    "credentials-restore-groups",
+    "credentials-restored-observe",
+    "credentials-restored-state",
+)
 CONTROLLER_FAILURES = (
     "internal",
     "credentials",
+    *CREDENTIAL_FAILURES,
     "protocol",
     "protocol-timeout",
     "descriptor",
@@ -1193,11 +1212,13 @@ def transition_controller_credentials(
     if target_uid == 0 or target_gid == 0 or supervisor_pid <= 1:
         _fail("credentials")
     operations = backend if backend is not None else CredentialBackend()
-    initial = operations.identity()
-    if (
-        initial.pid != os.getpid()
-        or initial.parent_pid != supervisor_pid
-        or any(
+    try:
+        initial = operations.identity()
+    except HandoffError as error:
+        raise HandoffError("credentials-initial-observe") from error
+    if initial.pid != os.getpid() or initial.parent_pid != supervisor_pid:
+        _fail("credentials-initial-process")
+    if any(
             value != 0
             for value in (
                 initial.uid,
@@ -1207,48 +1228,57 @@ def transition_controller_credentials(
                 initial.saved_uid,
                 initial.saved_gid,
             )
-        )
-    ):
-        _fail("credentials")
+        ):
+        _fail("credentials-initial-root")
     try:
         operations.clear_groups()
+    except OSError as error:
+        raise HandoffError("credentials-clear-groups") from error
+    try:
         operations.set_gid(target_gid)
+    except OSError as error:
+        raise HandoffError("credentials-set-gid") from error
+    try:
         operations.set_uid(target_uid)
     except OSError as error:
-        raise HandoffError("credentials") from error
-    dropped = operations.identity()
+        raise HandoffError("credentials-set-uid") from error
+    try:
+        dropped = operations.identity()
+    except HandoffError as error:
+        raise HandoffError("credentials-dropped-observe") from error
+    if not initial.same_process(dropped) or dropped.parent_pid != supervisor_pid:
+        _fail("credentials-dropped-process")
+    if operations.groups():
+        _fail("credentials-dropped-groups")
     if (
-        not initial.same_process(dropped)
-        or dropped.parent_pid != supervisor_pid
-        or operations.groups()
-        or (
-            dropped.uid,
-            dropped.real_uid,
-            dropped.saved_uid,
-        )
-        != (target_uid, target_uid, target_uid)
-        or (
-            dropped.gid,
-            dropped.real_gid,
-            dropped.saved_gid,
-        )
-        != (target_gid, target_gid, target_gid)
-    ):
-        _fail("credentials")
-    for restore in (
-        lambda: operations.set_uid(0),
-        lambda: operations.set_gid(0),
-        operations.restore_groups,
+        dropped.uid,
+        dropped.real_uid,
+        dropped.saved_uid,
+    ) != (target_uid, target_uid, target_uid):
+        _fail("credentials-dropped-uid")
+    if (
+        dropped.gid,
+        dropped.real_gid,
+        dropped.saved_gid,
+    ) != (target_gid, target_gid, target_gid):
+        _fail("credentials-dropped-gid")
+    for label, restore in (
+        ("uid", lambda: operations.set_uid(0)),
+        ("gid", lambda: operations.set_gid(0)),
+        ("groups", operations.restore_groups),
     ):
         try:
             restore()
         except OSError:
             pass
         else:
-            _fail("credentials")
-        current = operations.identity()
+            _fail(f"credentials-restore-{label}")
+        try:
+            current = operations.identity()
+        except HandoffError as error:
+            raise HandoffError("credentials-restored-observe") from error
         if current != dropped or operations.groups():
-            _fail("credentials")
+            _fail("credentials-restored-state")
     return dropped
 
 
