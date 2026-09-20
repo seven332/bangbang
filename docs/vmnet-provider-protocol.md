@@ -313,7 +313,11 @@ checked inventory remains `383 implemented / 0 audit-required / 2
 missing-platform-feasible / 33 proven-platform-impossible`; the two retained
 rows are `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity`. The packaged
-elevated bootstrap and foreground/daemon supervision are now implemented. A
-real guest through this production provider, the complete concurrent
-lifecycle/death matrix, optional Apple-authorized evidence, and final capability
-certification remain successor work.
+elevated bootstrap and foreground/daemon supervision are now implemented. The
+canonical no-Apple version-2 certification consumer also boots real guests
+through this provider and covers startup/runtime removal, fresh-owner restore,
+provider/broker/owner/launcher/worker TERM and SIGKILL, clean repeat, and two
+noninterchangeable live policies. Its ordinary controller uses only the closed
+provider process handles after irreversible drop; root never receives guest,
+fixture, API, or result values. Optional Apple-authorized evidence and the
+merged-clean-main capability promotion remain successor work.

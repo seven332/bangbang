@@ -3084,11 +3084,12 @@ Portable runner policy coverage requires neither root nor Apple credentials:
 python3 -m unittest scripts.tests.test_production_vmnet_topology
 ```
 
-This certifies packaging, transition, inherited authority, foreground/daemon
-supervision, signals, and cleanup. It does not boot a guest through the provider
-or execute the final concurrency/death matrix, so the inventory remains exactly
-`383/0/2/33` and global final validation still fails only on the two retained
-network rows.
+This command certifies packaging, transition, inherited authority,
+foreground/daemon supervision, signals, and cleanup; by itself it does not boot
+a guest through the provider. The canonical version-2 consumer below now adds
+the guest and concurrency/death matrix, but inventory remains exactly
+`383/0/2/33` until merged-main promotion, and global final validation still
+fails only on the two retained network rows.
 
 ### Least-privileged elevated certification handoff
 
@@ -3184,9 +3185,104 @@ python3 -m unittest scripts.tests.test_elevated_vmnet_handoff
 The caller's explicit authorization of the fixed repository entry is the trust
 decision. Manifest implementation hashes prove source/package coherence and
 reject stale packages; they do not authenticate an otherwise modified entry.
-This child publishes neither the canonical private plan/result nor a capability
-claim. #1944 consumes its ordinary process factory, while the inventory remains
-exactly `383/0/2/33` and global final retains the same two network outcomes.
+The handoff-only command publishes neither the canonical private plan/result nor
+a capability claim. The canonical version-2 consumer below imports its ordinary
+process factory, while the inventory remains exactly `383/0/2/33` and global
+final retains the same two network outcomes.
+
+### No-Apple production vmnet certification matrix
+
+The canonical production-vmnet CLI has two disjoint contracts. Schema version
+1 retains the optional Apple identity/profile path and its exact 21-row result.
+Schema version 2 accepts only `authority = {"kind":"elevated-provider"}`, one
+digest-pinned fixture, the four closed optional-case selectors, and the seven
+bounded timeouts shown in
+[`scripts/production-vmnet-certification-elevated-config.example.json`](../scripts/production-vmnet-certification-elevated-config.example.json).
+Apple signing/profile fields, partial authority, unknown keys, duplicates, and
+cross-version fields are rejected.
+
+Preparation runs as the ordinary target user from clean source. The result and
+fixed-name package destinations must both be absent:
+
+```sh
+scripts/prepare-production-vmnet-certification.sh \
+  --config /absolute/private/elevated-config.json \
+  --result /absolute/private/elevated-result.json \
+  --output /absolute/absent/bangbang-elevated-vmnet-handoff
+```
+
+It prepares and rechecks the pinned kernel plus `direct-boot-v112` rootfs and
+sidecar, the exact fixture, and one normal ad-hoc/networkless production bundle.
+The immutable handoff package adds fixed-name kernel, rootfs, sidecar, fixture,
+private plan, and public payload-manifest entries before the outer manifest is
+sealed. The private result path and optional fixture choices are parsed only by
+the controller after irreversible credential drop; root treats those payloads
+as opaque manifest-bound bytes.
+
+The caller then supplies external exact-root authorization. The wrapper itself
+never invokes `sudo`, accepts no private inputs, and closes stdin:
+
+```sh
+sudo -- scripts/run-production-vmnet-certification.sh \
+  --prepared /absolute/absent/bangbang-elevated-vmnet-handoff \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+python3 scripts/production_vmnet_certification.py validate-result \
+  --result /absolute/private/elevated-result.json
+```
+
+The exact ordered version-2 ledger is:
+
+```text
+authority-split, networkless-denial, missing-policy-denial,
+mismatched-policy-denial, bridge-allowlist-denial,
+active-interface-count-exhaustion, mmds-only-no-consumption,
+shared-connectivity, host-connectivity, bridged-connectivity, not-authorized,
+sharing-service-busy, startup-interface-remove, runtime-hotplug-remove,
+normal-teardown, partial-start-cleanup, pre-ready-cancellation,
+post-ready-cancellation, provider-startup-death, broker-runtime-death,
+owner-runtime-death, launcher-first-death, worker-first-death,
+provider-sigkill-reclamation, broker-sigkill-reclamation,
+owner-sigkill-reclamation, launcher-sigkill-reclamation,
+worker-sigkill-reclamation, clean-repeat,
+capture-restore-fresh-ownership, concurrent-noninterchangeability
+```
+
+Only `host-connectivity`, `bridged-connectivity`, `not-authorized`, and
+`sharing-service-busy` may be `environment-gated`; every other row is
+mandatory. Networkless denial and MMDS-only run without a provider. Positive
+rows use the fixed remote-only provider, and staged rows bind startup,
+runtime-inserted, and restored DHCP/TCP observations to distinct barrier
+generations. Death rows distinguish provider/bootstrap, live broker,
+per-interface owner, outer, and worker TERM/SIGKILL. The concurrent row starts
+independent shared and host-policy sessions, rejects a shared request against
+the host authority before backend acquisition, and proves the shared peer stays
+running.
+
+The exact public result asserts an ordinary controller and outer, bounded-root
+provider, irreversibly ordinary owner, remote-only route, empty provider/outer
+entitlements, App Sandbox plus Hypervisor worker, absent worker vmnet
+entitlement, ordered outcomes, cleanup, and verdict. Fixture output can prepare
+and observe but cannot choose an outcome. First failure is retained; cleanup
+uncertainty forces `cleanup=incomplete`; publication is same-directory,
+mode-`0600`, and no-clobber. Process observation remains limited to
+`pid/ppid/state/comm`.
+
+Portable coverage requires no elevation or Apple credentials:
+
+```sh
+python3 -m unittest \
+  scripts.tests.test_production_vmnet_elevated \
+  scripts.tests.test_elevated_vmnet_handoff
+```
+
+The focused real gate must run from a freshly prepared package/result and be
+repeated from a second fresh destination. Both runs require all 27 mandatory
+rows passed, exactly four permitted environment gates when they are disabled,
+`cleanup=complete`, `verdict=passed`, and no stage, session, socket, or process
+residue. This is feature-head evidence only. It deliberately retains
+`383/0/2/33`; the two network rows may change only after the separate
+merged-clean-main evidence, review, and promotion slice.
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
