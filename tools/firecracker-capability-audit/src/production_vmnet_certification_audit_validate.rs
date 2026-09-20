@@ -72,6 +72,8 @@ const CHALLENGE_COMMENT: &str =
     "https://github.com/seven332/bangbang/issues/1948#issuecomment-5747683837";
 const UNRELATED_INVENTORY_SHA256: &str =
     "eb54c4cf9cadaaf7a2ddb7a86b5642a93af1cc913bdd3edaedff5cc53472dc00";
+const NETWORK_SETUP_SUMMARY: &str = "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented and verified. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. The no-Apple schema-v2 production topology uses an ordinary launcher/controller, bounded-root provider acquisition, irreversibly ordinary packet owners, and a remote-only sandbox-worker route. Two byte-identical clean merged-main executions verify real shared guest DHCP plus nonce-bound bidirectional TCP, policy denial and MMDS nonconsumption, startup/runtime removal, fresh-owner restore, role-specific TERM/SIGKILL reclamation, repeat, concurrency, and complete cleanup. Positive host/bridged traffic and two externally induced service conditions remain visible optional environment gates; root-direct execution remains historical feasibility evidence rather than a supported topology.";
+const NETWORK_SEMANTIC_SUMMARY: &str = "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented and verified. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. The no-Apple contained product authenticates one remote provider route, keeps the launcher/controller ordinary, confines root to bounded provider acquisition, drops sustained owners irreversibly, and never falls back to local vmnet. Two byte-identical clean merged-main schema-v2 results verify real shared guest DHCP and bidirectional nonce-bound TCP, provider-free MMDS, startup/hotplug/remove/restore generations, role-specific death and SIGKILL reclamation, repeat, noninterchangeable concurrent policies, and complete cleanup. Optional host/bridged traffic and externally induced service conditions remain explicit nondependencies. Wave 7 https://github.com/seven332/bangbang/issues/1491 retains terminal performance and observability ownership.";
 
 const EXPECTED_CASES: [(&str, &str); 31] = [
     ("authority-split", "passed"),
@@ -346,6 +348,7 @@ fn expected_claims() -> Vec<ProductionVmnetCapabilityClaim> {
     vec![
         ProductionVmnetCapabilityClaim {
             capability_id: "corpus:network-setup".to_string(),
+            summary: NETWORK_SETUP_SUMMARY.to_string(),
             required_cases: mandatory(),
             implementation: local_references(&[
                 (
@@ -382,6 +385,7 @@ fn expected_claims() -> Vec<ProductionVmnetCapabilityClaim> {
         },
         ProductionVmnetCapabilityClaim {
             capability_id: "semantic.network:virtio-net-vmnet-policy-and-connectivity".to_string(),
+            summary: NETWORK_SEMANTIC_SUMMARY.to_string(),
             required_cases: mandatory(),
             implementation: local_references(&[
                 (
@@ -470,6 +474,7 @@ fn capability_is_exact_terminal(
         ][..]
     };
     capability.family == "network-and-mmds"
+        && capability.summary == claim.summary
         && capability
             .source_refs
             .iter()

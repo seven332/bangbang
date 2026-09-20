@@ -93,6 +93,7 @@ pub struct ProductionVmnetEvidence {
 #[serde(deny_unknown_fields)]
 pub struct ProductionVmnetCapabilityClaim {
     pub capability_id: String,
+    pub summary: String,
     pub required_cases: Vec<String>,
     pub implementation: Vec<Reference>,
     pub validation: Vec<Reference>,

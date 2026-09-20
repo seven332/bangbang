@@ -243,6 +243,21 @@ fn checked_production_vmnet_certification_is_canonical_and_fail_closed() {
             .contains("unrelated inventory changed")
     );
 
+    let mut summary_drift = inventory.clone();
+    summary_drift
+        .capabilities
+        .iter_mut()
+        .find(|capability| capability.id == PRODUCTION_VMNET_CERTIFICATION_CAPABILITY_IDS[0])
+        .expect("promoted capability must exist")
+        .summary
+        .push_str(" drift");
+    assert!(
+        validate_production_vmnet_certification_audit(&audit, &summary_drift, &root)
+            .expect_err("terminal capability summary drift must fail")
+            .to_string()
+            .contains("not exact terminal evidence")
+    );
+
     let mut unknown = serde_json::to_value(&audit).expect("audit must serialize");
     unknown
         .as_object_mut()
@@ -253,5 +268,19 @@ fn checked_production_vmnet_certification_is_canonical_and_fail_closed() {
             .expect_err("unknown audit field must fail")
             .to_string()
             .contains("unknown field")
+    );
+
+    let mut unknown_result = serde_json::to_value(&result).expect("result must serialize");
+    unknown_result
+        .as_object_mut()
+        .expect("result must be an object")
+        .insert("unknown".to_string(), serde_json::Value::Bool(true));
+    assert!(
+        serde_json::from_value::<
+            bangbang_firecracker_capability_audit::ProductionVmnetCertificationResult,
+        >(unknown_result)
+        .expect_err("unknown result field must fail")
+        .to_string()
+        .contains("unknown field")
     );
 }

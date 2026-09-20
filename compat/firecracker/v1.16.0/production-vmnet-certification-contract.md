@@ -110,15 +110,15 @@ path described here.
 
 `production-vmnet-certification-audit.json` binds the evidence path/digest,
 two byte-identical executions, source/platform identity, result and challenge
-comments, exact optional set, closed claim mappings, counts, transitions, and
-unrelated inventory.
+comments, exact optional set, final capability summaries, closed claim
+mappings, counts, transitions, and unrelated inventory.
 
 The capability audit rejects unknown fields, noncanonical bytes, changed
 evidence, wrong source/platform/authority/entitlements, missing/reordered or
 changed cases, optional cases used as required evidence, incomplete cleanup or
-verdict, repetition/challenge drift, stale local references, an incomplete
-capability record, wrong terminal identities/counts, and unrelated inventory
-drift. The scoped gate is:
+verdict, repetition/challenge drift, stale local references, a changed summary
+or incomplete capability record, wrong terminal identities/counts, and
+unrelated inventory drift. The scoped gate is:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- \
