@@ -3214,10 +3214,10 @@ scripts/prepare-production-vmnet-certification.sh \
 It prepares and rechecks the pinned kernel plus `direct-boot-v112` rootfs and
 sidecar, the exact fixture, and one normal ad-hoc/networkless production bundle.
 The immutable handoff package adds fixed-name kernel, rootfs, sidecar, fixture,
-private plan, and public payload-manifest entries before the outer manifest is
-sealed. The private result path and optional fixture choices are parsed only by
-the controller after irreversible credential drop; root treats those payloads
-as opaque manifest-bound bytes.
+staged guest-coordination module, private plan, and public payload-manifest
+entries before the outer manifest is sealed. The private result path and
+optional fixture choices are parsed only by the controller after irreversible
+credential drop; root treats those payloads as opaque manifest-bound bytes.
 
 The caller then supplies external exact-root authorization. The wrapper itself
 never invokes `sudo`, accepts no private inputs, and closes stdin:

@@ -771,6 +771,25 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
                 destination.write(b"\1")
             self.assert_category("control", barrier.assert_terminal)
 
+    def test_staged_barrier_rejects_path_identity_replacement(self) -> None:
+        protocol = elevated.load_staged_protocol()
+        nonce = bytes(range(1, 33))
+        with tempfile.TemporaryDirectory() as raw_temp:
+            path = Path(raw_temp) / "barrier.bin"
+            barrier = elevated.StagedBarrier(
+                vmnet,
+                path,
+                protocol.Scenario.RUNTIME,
+                nonce,
+                create=True,
+            )
+            original = path.with_name("original.bin")
+            path.rename(original)
+            path.write_bytes(original.read_bytes())
+            path.chmod(0o600)
+
+            self.assert_category("control", lambda: barrier.command(1))
+
     def test_staged_barrier_preserves_closed_guest_failure_category(self) -> None:
         protocol = elevated.load_staged_protocol()
         nonce = bytes(range(1, 33))
@@ -859,6 +878,35 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
                         vmnet, port, bad_nonce
                     ),
                 )
+
+    def test_staged_protocol_loader_is_bound_to_first_verified_path(self) -> None:
+        prior_module = elevated._STAGED_PROTOCOL
+        prior_source = elevated._STAGED_PROTOCOL_SOURCE
+        module_name = "bangbang_production_vmnet_staged_protocol"
+        prior_registered = sys.modules.get(module_name)
+        try:
+            elevated._STAGED_PROTOCOL = None
+            elevated._STAGED_PROTOCOL_SOURCE = None
+            with tempfile.TemporaryDirectory() as raw_temp:
+                root = Path(raw_temp)
+                first = root / "first.py"
+                second = root / "second.py"
+                contents = elevated.STAGED_PROTOCOL_PATH.read_bytes()
+                first.write_bytes(contents)
+                second.write_bytes(contents)
+
+                loaded = elevated.load_staged_protocol(first)
+                self.assertEqual(Path(loaded.__file__), first)
+                self.assertIs(elevated.load_staged_protocol(), loaded)
+                with self.assertRaisesRegex(RuntimeError, "module path changed"):
+                    elevated.load_staged_protocol(second)
+        finally:
+            elevated._STAGED_PROTOCOL = prior_module
+            elevated._STAGED_PROTOCOL_SOURCE = prior_source
+            if prior_registered is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = prior_registered
 
     def test_result_target_seal_rejects_hostile_values_and_creation(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
@@ -1221,6 +1269,36 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             driver._abort_process.call_args_list,
             [mock.call(second), mock.call(first)],
         )
+
+    def test_finish_process_retains_cleanup_ownership_until_success(self) -> None:
+        process = mock.Mock()
+        process.terminate.side_effect = vmnet.CertificationError("process-cleanup")
+        driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
+        driver._active = [process]
+
+        self.assert_category(
+            "process-cleanup", lambda: driver._finish_process(process)
+        )
+        self.assertEqual(driver._active, [process])
+
+        process.terminate.side_effect = None
+        driver._finish_process(process)
+        self.assertEqual(driver._active, [])
+
+    def test_abort_process_retains_cleanup_ownership_until_success(self) -> None:
+        process = mock.Mock()
+        process.close.side_effect = vmnet.CertificationError("process-cleanup")
+        driver = object.__new__(elevated.ElevatedSystemCertificationDriver)
+        driver._active = [process]
+
+        self.assert_category(
+            "process-cleanup", lambda: driver._abort_process(process)
+        )
+        self.assertEqual(driver._active, [process])
+
+        process.close.side_effect = None
+        driver._abort_process(process)
+        self.assertEqual(driver._active, [])
 
     def test_missing_policy_requires_exact_provider_side_denial(self) -> None:
         process = mock.Mock()

@@ -1366,8 +1366,9 @@ mode-`0600` config, absent result and package destinations, and the exact
 `elevated-provider` discriminator. It reuses the pinned fixture and source
 checks, prepares `direct-boot-v112`, builds the normal ad-hoc/networkless
 product, and seals all certification inputs plus a private plan into the
-immutable handoff package. It accepts no Apple identity or provisioning
-profile, and cross-mode fields fail validation.
+immutable handoff package, including the fixed staged guest-coordination
+module used after credential drop. It accepts no Apple identity or
+provisioning profile, and cross-mode fields fail validation.
 
 The externally authorized root command accepts only the prepared package and
 numeric nonroot uid/gid. Root verifies and stages opaque bytes, starts only the

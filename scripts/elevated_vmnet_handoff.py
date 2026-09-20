@@ -3110,9 +3110,12 @@ def _supervisor_complete(connection: socket.socket) -> None:
         raise HandoffError("guardian") from error
 
 
-def _wait_supervisor_complete(connection: socket.socket) -> None:
+def _wait_supervisor_complete(
+    connection: socket.socket,
+    session_timeout: float = SESSION_TIMEOUT,
+) -> None:
     try:
-        connection.settimeout(SESSION_TIMEOUT + CLEANUP_TIMEOUT)
+        connection.settimeout(session_timeout + CLEANUP_TIMEOUT)
         message = _receive_completion(connection)
         if message == b"C\x00":
             return
@@ -3404,7 +3407,7 @@ def run_root(
             os.close(identity_read)
             identity_read = -1
         try:
-            _wait_supervisor_complete(guardian_completion)
+            _wait_supervisor_complete(guardian_completion, float(session_timeout))
         except HandoffError as error:
             guardian_completion.close()
             guardian_completion = None

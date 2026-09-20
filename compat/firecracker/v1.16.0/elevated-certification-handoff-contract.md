@@ -169,9 +169,10 @@ fallback.
 
 #1944 imports the ordinary `ControllerProxy`/`RemoteProviderProcess` seam only
 after drop. Its ordinary preparer extends the immutable package with fixed-name
-kernel, `direct-boot-v112` rootfs/sidecar, fixture, private-plan, and public
-payload-manifest entries before the outer manifest is sealed. Root still sees
-only opaque manifest-bound bytes and the closed provider lifecycle protocol.
+kernel, `direct-boot-v112` rootfs/sidecar, fixture, staged guest-coordination
+module, private-plan, and public payload-manifest entries before the outer
+manifest is sealed. Root still sees only opaque manifest-bound bytes and the
+closed provider lifecycle protocol.
 
 The dropped controller alone parses the private plan, drives the canonical
 31-row guest/API/provider matrix, and publishes the exact version-2 result. It

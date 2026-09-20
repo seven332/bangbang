@@ -275,8 +275,9 @@ escalation; success also requires the descriptor-anchored production-session
 namespace to be empty before and after the probes.
 
 The canonical no-Apple certification consumer extends that same handoff with
-the pinned guest artifacts, private fixture, exact run plan, and public result.
-Preparation remains ordinary and the repository still never invokes `sudo`:
+the pinned guest artifacts, private fixture, sealed staged guest-coordination
+module, exact run plan, and public result. Preparation remains ordinary and the
+repository still never invokes `sudo`:
 
 ```sh
 scripts/prepare-production-vmnet-certification.sh \

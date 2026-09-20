@@ -32,6 +32,7 @@ PAYLOAD_MANIFEST_NAME = "payload-manifest.json"
 KERNEL_NAME = "vmlinux-6.1.155"
 ROOTFS_NAME = "ubuntu-24.04-512M-direct-boot-v112.ext4"
 SIDECAR_NAME = ROOTFS_NAME + ".bangbang.json"
+STAGED_PROTOCOL_NAME = "staged_vmnet_certification.py"
 FIXTURE_NAME = "fixture"
 PAYLOAD_SCHEMA_VERSION = 1
 PLAN_SCHEMA_VERSION = 1
@@ -41,6 +42,7 @@ MAX_PRIVATE_PLAN_BYTES = 64 * 1024
 MAX_KERNEL_BYTES = 512 * 1024 * 1024
 MAX_ROOTFS_BYTES = 1024 * 1024 * 1024
 MAX_SIDECAR_BYTES = 1024 * 1024
+MAX_STAGED_PROTOCOL_BYTES = 256 * 1024
 FIXED_ENVIRONMENT = {"LANG": "C", "LC_ALL": "C"}
 CASE_FILE_CLEANUP_CATEGORIES = frozenset(
     {"case-remove-cleanup", "case-root-cleanup", "case-tree-cleanup"}
@@ -51,10 +53,12 @@ PAYLOAD_ROLES = {
     PRIVATE_PLAN_NAME: ("private-plan", 0o444),
     ROOTFS_NAME: ("rootfs", 0o444),
     SIDECAR_NAME: ("rootfs-sidecar", 0o444),
+    STAGED_PROTOCOL_NAME: ("staged-protocol", 0o444),
 }
 
 _HANDOFF: Optional[ModuleType] = None
 _STAGED_PROTOCOL: Optional[ModuleType] = None
+_STAGED_PROTOCOL_SOURCE: Optional[Path] = None
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -76,12 +80,18 @@ def load_handoff() -> ModuleType:
     return _HANDOFF
 
 
-def load_staged_protocol() -> ModuleType:
-    global _STAGED_PROTOCOL
+def load_staged_protocol(path: Optional[Path] = None) -> ModuleType:
+    global _STAGED_PROTOCOL, _STAGED_PROTOCOL_SOURCE
     if _STAGED_PROTOCOL is None:
+        source = STAGED_PROTOCOL_PATH if path is None else path
+        if not source.is_absolute():
+            raise RuntimeError("module path unavailable")
         _STAGED_PROTOCOL = _load_module(
-            "bangbang_production_vmnet_staged_protocol", STAGED_PROTOCOL_PATH
+            "bangbang_production_vmnet_staged_protocol", source
         )
+        _STAGED_PROTOCOL_SOURCE = source
+    elif path is not None and _STAGED_PROTOCOL_SOURCE != path:
+        raise RuntimeError("module path changed")
     return _STAGED_PROTOCOL
 
 
@@ -465,6 +475,12 @@ def prepare_elevated(
             (inputs.kernel, KERNEL_NAME, MAX_KERNEL_BYTES, False),
             (inputs.rootfs, ROOTFS_NAME, MAX_ROOTFS_BYTES, False),
             (inputs.sidecar, SIDECAR_NAME, MAX_SIDECAR_BYTES, False),
+            (
+                STAGED_PROTOCOL_PATH,
+                STAGED_PROTOCOL_NAME,
+                MAX_STAGED_PROTOCOL_BYTES,
+                False,
+            ),
         ):
             _copy_payload(
                 source_path,
@@ -861,6 +877,7 @@ def load_package(
             PRIVATE_PLAN_NAME: MAX_PRIVATE_PLAN_BYTES,
             ROOTFS_NAME: MAX_ROOTFS_BYTES,
             SIDECAR_NAME: MAX_SIDECAR_BYTES,
+            STAGED_PROTOCOL_NAME: MAX_STAGED_PROTOCOL_BYTES,
         }[name]
         identity = _root_file_identity(vmnet, path, maximum)
         metadata = os.lstat(path)
@@ -875,6 +892,10 @@ def load_package(
         observed[name] = record
     if set(observed) != set(PAYLOAD_ROLES):
         _fail(vmnet, "package")
+    try:
+        load_staged_protocol(directory / STAGED_PROTOCOL_NAME)
+    except BaseException as error:
+        raise vmnet.CertificationError("package") from error
 
     plan = _read_root_document(
         vmnet, directory / PRIVATE_PLAN_NAME, MAX_PRIVATE_PLAN_BYTES
@@ -1192,12 +1213,59 @@ class StagedBarrier:
         self.previous_command_sequence = 0
         self.terminal = False
         if create:
-            _create_sized_private_file(
+            self.identity = _create_sized_private_file(
                 vmnet,
                 path,
                 self.protocol.encode_header(scenario, nonce),
                 self.protocol.CONTROL_BYTES,
             )
+        else:
+            descriptor, self.identity = vmnet._open_regular(
+                path,
+                category="control",
+                maximum=self.protocol.CONTROL_BYTES,
+                private=True,
+            )
+            os.close(descriptor)
+            if self.identity.size != self.protocol.CONTROL_BYTES:
+                _fail(vmnet, "control")
+
+    def _open(self, flags: int) -> int:
+        descriptor = -1
+        try:
+            before = os.lstat(self.path)
+            descriptor = os.open(
+                self.path,
+                flags
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            visible = os.lstat(self.path)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(before.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != self.protocol.CONTROL_BYTES
+                or metadata.st_dev != self.identity.device
+                or metadata.st_ino != self.identity.inode
+                or before.st_dev != metadata.st_dev
+                or before.st_ino != metadata.st_ino
+                or visible.st_dev != metadata.st_dev
+                or visible.st_ino != metadata.st_ino
+            ):
+                _fail(self.vmnet, "control")
+            return descriptor
+        except self.vmnet.CertificationError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except OSError as error:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise self.vmnet.CertificationError("control") from error
 
     def command(self, sequence: int) -> None:
         protocol = self.protocol
@@ -1216,12 +1284,7 @@ class StagedBarrier:
         )
         descriptor = -1
         try:
-            descriptor = os.open(
-                self.path,
-                os.O_RDWR
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-            )
+            descriptor = self._open(os.O_RDWR)
             metadata = os.fstat(descriptor)
             current = protocol.decode_record(
                 os.pread(
@@ -1280,12 +1343,7 @@ class StagedBarrier:
             process.raise_if_failed()
             descriptor = -1
             try:
-                descriptor = os.open(
-                    self.path,
-                    os.O_RDONLY
-                    | getattr(os, "O_CLOEXEC", 0)
-                    | getattr(os, "O_NOFOLLOW", 0),
-                )
+                descriptor = self._open(os.O_RDONLY)
                 record = protocol.decode_record(
                     os.pread(
                         descriptor,
@@ -1355,12 +1413,7 @@ class StagedBarrier:
             _fail(self.vmnet, "control")
         descriptor = -1
         try:
-            descriptor = os.open(
-                self.path,
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-            )
+            descriptor = self._open(os.O_RDONLY)
             metadata = os.fstat(descriptor)
             value = os.pread(descriptor, protocol.CONTROL_BYTES + 1, 0)
         except BaseException as error:
@@ -2284,19 +2337,14 @@ class ElevatedSystemCertificationDriver:
             _fail(self.vmnet, "case")
 
     def _finish_process(self, process: RemoteProductionProcess) -> None:
-        try:
-            process.terminate()
-        finally:
-            self._retire(process)
+        process.terminate()
+        self._retire(process)
 
     def _abort_process(self, process: RemoteProductionProcess) -> None:
         if process not in self._active:
             return
-        try:
-            process.close()
-        finally:
-            if process in self._active:
-                self._retire(process)
+        process.close()
+        self._retire(process)
 
     def _configure(
         self,

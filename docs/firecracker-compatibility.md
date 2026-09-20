@@ -5494,9 +5494,10 @@ publish no canonical result.
 
 #1944 consumes the same fixed handoff without widening root authority. Ordinary
 preparation seals the v112 artifacts, digest-pinned fixture, private run plan,
-and payload manifest into the immutable package. After irreversible drop, the
-controller drives the exact 31-row canonical matrix through the real provider:
-policy denials, provider-free MMDS, shared guest DHCP/TCP, startup/runtime
+staged guest-coordination module, and payload manifest into the immutable
+package. After irreversible drop, the controller drives the exact 31-row
+canonical matrix through the real provider: policy denials, provider-free MMDS,
+shared guest DHCP/TCP, startup/runtime
 remove, fresh-owner Full restore, five-role TERM/SIGKILL, repeat, and distinct
 concurrent shared/host policies. The public version-2 result asserts the exact
 authority and entitlement split, permits only four named environment gates,

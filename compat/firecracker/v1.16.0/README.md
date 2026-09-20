@@ -203,9 +203,10 @@ an empty descriptor-anchored production-session namespace before and after the
 probe set. The fixed probes require no Apple authorization.
 
 #1944 consumes that bridge without widening it. Ordinary preparation seals the
-pinned kernel, `direct-boot-v112`, fixture, private plan, and payload manifest
-beside the normal product. After irreversible drop, the controller runs the
-exact 31-row remote-provider matrix: policy denials, provider-free MMDS, real
+pinned kernel, `direct-boot-v112`, fixture, staged guest-coordination module,
+private plan, and payload manifest beside the normal product. After
+irreversible drop, the controller runs the exact 31-row remote-provider matrix:
+policy denials, provider-free MMDS, real
 shared traffic, startup/runtime remove, fresh-owner restore, role-specific
 TERM/SIGKILL, repeat, and noninterchangeable concurrent policies. Its exact
 public result permits only four named environment gates and requires complete
