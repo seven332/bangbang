@@ -669,7 +669,7 @@ Use the following boundaries when designing or reviewing macOS isolation work:
 | --- | --- | --- |
 | Operator-owned private directories | Required for API sockets, vsock sockets, vhost-user sockets, observability sinks, and other configured paths that should not be shared. Contained API/vsock use requires one exact preauthorized create-children directory and safe child; contained vhost-user use requires one exact preauthorized connect-only directory and safe child; direct paths remain operator-owned. | Cross-launcher name allocation and sharing policy remain operator responsibilities. |
 | HVF entitlement and code signing | The production worker alone receives the Hypervisor entitlement; the outer launcher and provider cannot enter HVF. All three code objects use Hardened Runtime and are separately inspectable. | Developer ID possession, team policy, launch constraints, and notarization still require deployment evidence. |
-| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI, outer launcher, and provider are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, connect-only vhost-user-socket, and connected vmnet-provider authority form the current contained mode. Lifecycle v5 binds vmnet policy and the denied/local/remote route to the exact static profile and grant shape. | Real guest-through-provider lifecycle/concurrency and restricted local-entitlement evidence remain external gates; any optional general dynamic delivery surface requires a separately challenged design. |
+| macOS App Sandbox | The production worker is sandboxed; the ordinary direct CLI, outer launcher, and provider are not. Container/sealed resources plus granted config, metadata, kernel, initrd, block, pmem, logger, metrics, serial, snapshot, API-socket, vsock-socket, connect-only vhost-user-socket, and connected vmnet-provider authority form the current contained mode. Lifecycle v5 binds vmnet policy and the denied/local/remote route to the exact static profile and grant shape. The no-Apple version-2 certification exercises real guest-through-provider lifecycle and concurrency through that boundary. | Restricted local-entitlement evidence and the merged-main promotion gate remain external; any optional general dynamic delivery surface requires a separately challenged design. |
 | Launcher or resource broker | The production launcher validates fixed/live nested code, starts one closed-environment/default-close worker, authenticates lifecycle v5 credential/resource-limit/vmnet policy, applies worker-local limits before `Prepared`, owns cancellation/status, coordinates and enters the private namespace, atomically transfers a bounded typed startup batch, supports adopted file/directory/block-special consumers, offers signed daemon detach, and exposes separate fixed vsock, vhost-user, and retained-descriptor block-control facets. | Keep each private protocol fixed and redacted; separately challenge any broader dynamic broker and never infer hard revocation from closing a duplicate descriptor. |
 | Firecracker Linux jailer model | Direct port unsupported; exact fixed executable/current-user/rlimit/version/daemon outcomes implemented through the versioned macOS policy envelope; uid/gid root-retained/root-transition and configurable-chroot requests have separate terminal fixed-topology rejections; the disabled bootstrap harness completes credential continuation, launcher-created target-session adoption and retirement, real API/no-API guests, bounded signal/death convergence, and terminal cleanup for mapped, retained-root, and SDK-maximum unmapped classes. | Keep the uid/gid and configurable-chroot exclusions fail-closed unless a fresh public-platform Challenge changes the accepted topology result; keep seccomp, namespaces, cgroups, and parent-cgroup controls rejected. |
 
@@ -1360,6 +1360,45 @@ repository-owned restricted credentials. The separate #1930 gate below does
 not change that credentialed-production fact; it reclassifies both #1378 rows
 as `missing-platform-feasible` from a narrower entitlement-free topology.
 
+Schema version 2 is a disjoint no-Apple authority rather than a relaxation of
+that version-1 boundary. Its ordinary preparer accepts only a private
+mode-`0600` config, absent result and package destinations, and the exact
+`elevated-provider` discriminator. It reuses the pinned fixture and source
+checks, prepares `direct-boot-v112`, builds the normal ad-hoc/networkless
+product, and seals all certification inputs plus a private plan into the
+immutable handoff package, including the fixed staged guest-coordination
+module used after credential drop. It accepts no Apple identity or
+provisioning profile, and cross-mode fields fail validation.
+
+The externally authorized root command accepts only the prepared package and
+numeric nonroot uid/gid. Root verifies and stages opaque bytes, starts only the
+fixed provider, supervises bounded process handles, and removes its stage. It
+never parses the fixture protocol, run plan, API requests, guest barriers,
+snapshot paths, or result. Only after groups are cleared, gid/uid are
+irreversibly dropped, and root restoration fails does the ordinary controller
+parse private inputs, run the fixture/API/HVF matrix, and publish the result.
+The broad controller/outer/worker work therefore remains ordinary; root scope
+is limited to provider bootstrap, lifecycle, and reciprocal cleanup.
+
+The fixed 31-row ledger proves remote-only guest traffic, policy denials,
+provider-free MMDS, two hotplug/remove generations, fresh-owner restore,
+role-specific TERM/SIGKILL convergence, repeat, and two independent provider
+sessions. Only the four named host/bridge/service conditions may be
+environment-gated. Per-interface owner death first proves that exact ordinary
+owner absent, then deliberately retires the VM topology; it is not treated as
+an implicit topology-leader death. The concurrency case uses distinct shared
+and host authorities, rejects their interchange before backend acquisition,
+and proves the unaffected peer remains live. Every setup, case, timeout, signal,
+and failure path must restore the descriptor-anchored session baseline and
+leave no provider group, socket, stage, or case tree.
+
+The version-2 public result exposes only fixed categorical authority,
+entitlement, platform, ordered-case, cleanup, and verdict data. It contains no
+private path, identity, digest, endpoint, address, nonce, PID, session, packet,
+barrier, or raw output. The feature-head result remains nonfinal and does not
+alter `383/0/2/33`; merged-clean-main evidence and capability promotion remain
+a separate trust decision.
+
 ### Entitlement-free root-direct vmnet evidence boundary
 
 #1930 assumes the restricted Apple vmnet entitlement, approved provisioning
@@ -1407,8 +1446,10 @@ per-interface owner that drops privilege after vmnet start. #1936 supplies the
 credential-free contained remote adapter, and #1938 now supplies the fixed
 drop-before-outer-exec bootstrap, inherited provider grant, packaged
 provider/launcher/worker/owner assembly, and foreground/daemon supervision.
-Guest-through-provider certification, the complete concurrent production
-matrix, and the optional Apple-authorized matrix remain undelivered.
+The canonical version-2 feature gate now consumes those foundations for real
+guest-through-provider and complete bounded concurrency/death evidence. The
+optional Apple-authorized matrix and the merged-main promotion decision remain
+separate.
 
 ### Least-privileged elevated certification handoff boundary
 
@@ -1489,8 +1530,8 @@ acceptance, allowing the existing topology to acknowledge a clean terminal;
 direct version behavior is unchanged. Public output is categorical and
 contains no path, id, PID, session, argument, interface, address, packet,
 nonce, raw process output, or private value. This foundation changes no
-capability disposition; #1944 alone may import it from the ordinary controller
-and publish the canonical verdict.
+capability disposition. #1944 imports it only from the ordinary controller and
+publishes the nonfinal canonical version-2 verdict.
 
 The local vmnet worker path requires the host to satisfy macOS vmnet
 authorization, entitlement, and code-signing requirements. The split provider
@@ -4157,9 +4198,10 @@ The current scaffold does not implement:
 - full external-network containment beyond the documented lifecycle-v5 vmnet
   authority, authenticated remote route, and MMDS-only fast path. Networkless
   production accepts positive policy only through its exact provider grant; the
-  no-Apple product gate assembles and supervises that route but does not yet
-  certify a real guest or the complete concurrent lifecycle matrix. A local
-  vmnet profile still depends on operator-owned signing credentials,
+  no-Apple version-2 feature gate now certifies a real guest and the complete
+  bounded lifecycle/concurrency matrix, but final merged-main evidence and the
+  two retained capability promotions are still outstanding. A local vmnet
+  profile still depends on operator-owned signing credentials,
   current-host authorization, connectivity policy, and firewall policy. The current
   ownership boundary is summarized in
   [Firecracker Compatibility Scope](firecracker-compatibility.md#aggregate-network-and-mmds-closure).

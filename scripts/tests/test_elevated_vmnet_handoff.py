@@ -802,6 +802,14 @@ class ProcessTests(unittest.TestCase):
         guardian.close()
         supervisor.close()
 
+    def test_guardian_wait_uses_requested_session_timeout(self) -> None:
+        guardian = mock.Mock(spec=socket.socket)
+        guardian.recv.return_value = b"C\x00"
+
+        handoff._wait_supervisor_complete(guardian, 7200.0)
+
+        guardian.settimeout.assert_called_once_with(7200.0 + handoff.CLEANUP_TIMEOUT)
+
     def test_cleanup_completion_detects_each_single_peer_loss(self) -> None:
         guardian, supervisor = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         guardian.close()

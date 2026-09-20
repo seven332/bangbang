@@ -66,14 +66,16 @@ Each detailed subject has one primary document:
   ad-hoc-signed App Sandbox fake-provider test that needs no Apple identity or
   vmnet profile and constructs no local vmnet/XPC descriptor. The packaged
   no-Apple topology now supplies the drop-before-outer-exec bootstrap, inherited
-  grant, repeated real provider I/O, signals, daemon handoff, and cleanup. Real
-  guest-through-provider certification remains separate, and this integration
-  promotes no capability.
+  grant, repeated real provider I/O, signals, daemon handoff, and cleanup. The
+  canonical version-2 runner now composes that topology with real guest traffic,
+  hotplug, restore, death, repeat, and concurrency evidence without promoting a
+  capability on its feature head.
 - [Production vmnet certification runner](docs/testing.md#production-vmnet-certification-foundation)
   owns the private config, retained fixture, guest DHCP/TCP oracle, two-package
-  inspection, descriptor-grant assembly, fixed 21-case production matrix, and
-  redacted result. It remains the optional Apple-authorized production matrix;
-  the entitlement-free feasibility workflow does not substitute for it.
+  inspection, descriptor-grant assembly, fixed 21-case Apple-authorized matrix,
+  and redacted result. Its disjoint version-2 mode prepares one immutable
+  no-Apple package and runs a fixed 31-row matrix through the bounded-root
+  provider plus irreversibly ordinary controller.
 - [Wave 7 Aggregate Authority](compat/firecracker/v1.16.0/wave7-aggregate-audit.json)
   machine-checks the terminal design, device API, release, public-tool, and
   virtio-MMIO closure while retaining every external handoff.
@@ -245,8 +247,8 @@ sudo -- /usr/bin/python3 scripts/run-production-vmnet-topology.py \
 `sudo` is the operator authorization boundary. Bangbang never requests, reads,
 stores, forwards, or logs a password, and the runner itself never invokes
 `sudo`. This gate certifies product assembly and supervision without an Apple
-developer identity or vmnet provisioning profile; the full real-guest
-certification remains separate.
+developer identity or vmnet provisioning profile; the canonical version-2
+consumer below separately adds the full real-guest matrix.
 
 The least-privileged successor prepares the normal networkless production
 bundle and gives an irreversibly ordinary controller only fixed provider
@@ -271,6 +273,30 @@ targets only the root provider first, preserving the ordinary launcher/worker
 long enough for authenticated parent-loss cleanup before bounded group
 escalation; success also requires the descriptor-anchored production-session
 namespace to be empty before and after the probes.
+
+The canonical no-Apple certification consumer extends that same handoff with
+the pinned guest artifacts, private fixture, sealed staged guest-coordination
+module, exact run plan, and public result. Preparation remains ordinary and the
+repository still never invokes `sudo`:
+
+```sh
+scripts/prepare-production-vmnet-certification.sh \
+  --config /absolute/private/config.json \
+  --result /absolute/private/result.json \
+  --output /absolute/absent/bangbang-elevated-vmnet-handoff
+sudo -- scripts/run-production-vmnet-certification.sh \
+  --prepared /absolute/absent/bangbang-elevated-vmnet-handoff \
+  --target-uid TARGET_UID \
+  --target-gid TARGET_GID
+```
+
+This mode uses ad-hoc signing only. Its exact version-2 result records the
+ordinary controller/outer, bounded-root provider, irreversibly ordinary owner,
+remote-only route, 31 ordered outcomes, and cleanup. Only host connectivity,
+bridged connectivity, not-authorized, and sharing-service-busy may be
+environment-gated. The feature-head gate is deliberately nonfinal: inventory
+remains `383/0/2/33` until the separate merged-clean-main evidence and promotion
+workflow completes.
 
 ## Development
 

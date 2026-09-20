@@ -1,0 +1,25 @@
+{
+  "authority": {
+    "kind": "elevated-provider"
+  },
+  "fixture": {
+    "executable": "/private/path/to/production-vmnet-fixture",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "optional_cases": {
+    "bridged_interface": null,
+    "host_connectivity": false,
+    "not_authorized": false,
+    "sharing_service_busy": false
+  },
+  "schema_version": 2,
+  "timeouts": {
+    "artifact_seconds": 600,
+    "build_seconds": 900,
+    "fixture_seconds": 300,
+    "guest_seconds": 180,
+    "request_seconds": 15,
+    "startup_seconds": 60,
+    "terminate_seconds": 10
+  }
+}

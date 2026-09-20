@@ -173,7 +173,11 @@ mode-`0555` staged coordinator. A separate writable 4096-byte barrier drive
 binds startup, runtime-hotplug, and cross-process restore transitions to one
 scenario and nonce. The guest performs the required PCI rescan/removal while
 the host retains public API ownership. V112 is likewise not a public workflow
-mode or a production topology.
+mode. The canonical no-Apple production-vmnet version-2 preparer now seals this
+same checked v112 image into its immutable package and drives those barriers
+through the real entitlement-free provider topology after the controller drops
+privilege. That feature-head certification does not change either public guest
+workflow profile, vendor an image, or promote the two retained network rows.
 
 ## Troubleshooting
 

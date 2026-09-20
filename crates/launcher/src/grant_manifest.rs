@@ -1431,11 +1431,7 @@ fn open_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherErro
         let flags = if is_final {
             resource_open_flags(grant)
         } else {
-            libc::O_RDONLY
-                | libc::O_DIRECTORY
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
-                | libc::O_CLOEXEC
+            libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_CLOEXEC
         };
         // SAFETY: `descriptor` remains live, `component` is a NUL-terminated
         // single pathname component, and no creation mode is requested.
@@ -1560,11 +1556,7 @@ fn connect_resource(grant: &ManifestGrant) -> Result<PreparedResource, LauncherE
             libc::openat(
                 anchor.as_raw_fd(),
                 component.as_ptr(),
-                libc::O_RDONLY
-                    | libc::O_DIRECTORY
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK
-                    | libc::O_CLOEXEC,
+                libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if opened < 0 {
@@ -1670,12 +1662,7 @@ fn resource_path_components(path: &Path) -> Result<Vec<CString>, LauncherError> 
 fn open_root_directory() -> Result<OwnedFd, LauncherError> {
     // SAFETY: The static root path is NUL-terminated and open returns a fresh
     // descriptor on success.
-    let descriptor = unsafe {
-        libc::open(
-            c"/".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
+    let descriptor = unsafe { libc::open(c"/".as_ptr(), libc::O_SEARCH | libc::O_CLOEXEC) };
     if descriptor < 0 {
         return Err(LauncherError::GrantPreparation);
     }
@@ -2487,6 +2474,33 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn safe_open_traverses_search_only_ancestors_without_enumerating_them() {
+        let root = TestDir::new();
+        let search_only = root.path().join("search-only");
+        fs::create_dir(&search_only).expect("search-only directory should create");
+        let kernel = search_only.join("kernel");
+        fs::write(&kernel, b"kernel").expect("kernel fixture should write");
+        fs::set_permissions(&search_only, fs::Permissions::from_mode(0o111))
+            .expect("search-only mode should install");
+
+        let enumeration = fs::read_dir(&search_only);
+        let opened = open_resource(&manifest_grant(
+            "kernel",
+            ResourceRole::KernelImage,
+            GrantAccess::ReadOnly,
+            kernel,
+        ));
+
+        fs::set_permissions(&search_only, fs::Permissions::from_mode(0o700))
+            .expect("test cleanup mode should restore");
+        assert!(
+            enumeration.is_err(),
+            "search-only ancestor must not enumerate"
+        );
+        opened.expect("search authority should permit exact-path traversal");
     }
 
     #[test]

@@ -3,10 +3,11 @@
 ## Scope and inventory position
 
 This contract owns #1943, foundation child 2 of #1941 under #1348. It supplies
-the least-privileged process-control bridge between an ordinary future
-production-vmnet certification controller and the caller-authorized exact-root
-provider bootstrap. It does not execute the canonical guest matrix, publish a
-result, promote a capability, or replace the direct #1930/#1942 evidence.
+the least-privileged process-control bridge between the ordinary canonical
+version-2 production-vmnet certification controller and the caller-authorized
+exact-root provider bootstrap. It does not execute the canonical guest matrix,
+publish a result, promote a capability, or replace the direct #1930/#1942
+evidence.
 
 The live inventory remains exactly `383 implemented / 0 audit-required / 2
 missing-platform-feasible / 33 proven-platform-impossible`. The retained rows
@@ -166,7 +167,22 @@ cleanup acknowledgment. The target gate requires caller-arranged exact root
 and ad-hoc signing only; it has no unsupported-success or Apple-authorization
 fallback.
 
-#1944 may import the ordinary `ControllerProxy`/`RemoteProviderProcess` seam and
-adapt the canonical process factory after drop. It alone owns private plan
-parsing, guest/provider concurrency, canonical result publication, capability
-promotion, and parent completion.
+#1944 imports the ordinary `ControllerProxy`/`RemoteProviderProcess` seam only
+after drop. Its ordinary preparer extends the immutable package with fixed-name
+kernel, `direct-boot-v112` rootfs/sidecar, fixture, staged guest-coordination
+module, private-plan, and public payload-manifest entries before the outer
+manifest is sealed. Root still sees only opaque manifest-bound bytes and the
+closed provider lifecycle protocol.
+
+The dropped controller alone parses the private plan, drives the canonical
+31-row guest/API/provider matrix, and publishes the exact version-2 result. It
+proves provider-free MMDS, staged startup/runtime/restore generations,
+role-specific TERM/SIGKILL, repeat, and two noninterchangeable concurrent
+provider sessions. Only the four fixed external host/bridge/service rows may be
+environment-gated. Every case restores the production-session baseline, and
+the final guardian acknowledgment still requires stage and process absence.
+
+This consumer does not widen the root protocol, add a persistent service, use
+Apple authorization, or promote a capability on its feature head. The live
+inventory therefore remains `383/0/2/33`; merged-clean-main evidence and the
+two retained network disposition changes belong to the later promotion slice.

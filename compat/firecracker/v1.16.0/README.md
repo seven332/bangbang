@@ -185,10 +185,10 @@ vmnet/XPC descriptor and needs no Apple developer identity or vmnet profile.
 #1938 then packages the entitlement-free provider with the fixed outer and
 worker, starts the outer only after irreversible drop, transfers the inherited
 provider stream, and proves repeated real provider I/O, foreground signal
-convergence, provider-owned daemon handoff, and cleanup. Real
-guest-through-provider lifecycle/concurrency certification remains the next
-slice; the inventory and both `missing-platform-feasible` dispositions stay
-unchanged.
+convergence, provider-owned daemon handoff, and cleanup. The canonical
+version-2 consumer now adds real guest-through-provider lifecycle/concurrency
+certification; the inventory and both `missing-platform-feasible` dispositions
+still stay unchanged until merged-main promotion.
 
 #1943 adds the one-shot least-privileged certification bridge without changing
 the provider product ABI or inventory. The normal ad-hoc/networkless bundle is
@@ -200,8 +200,18 @@ either single root-actor loss. TERM targets the exact owned group; KILL first
 targets only the root provider and preserves ordinary parent-loss cleanup
 before bounded group escalation. Both require exact group absence and
 an empty descriptor-anchored production-session namespace before and after the
-probe set. The fixed probes require no Apple authorization. The canonical
-matrix and verdict remain #1944.
+probe set. The fixed probes require no Apple authorization.
+
+#1944 consumes that bridge without widening it. Ordinary preparation seals the
+pinned kernel, `direct-boot-v112`, fixture, staged guest-coordination module,
+private plan, and payload manifest beside the normal product. After
+irreversible drop, the controller runs the exact 31-row remote-provider matrix:
+policy denials, provider-free MMDS, real
+shared traffic, startup/runtime remove, fresh-owner restore, role-specific
+TERM/SIGKILL, repeat, and noninterchangeable concurrent policies. Its exact
+public result permits only four named environment gates and requires complete
+cleanup. The feature-head verdict is nonfinal, so `383/0/2/33` and both retained
+network dispositions remain authoritative pending the clean merged-main gate.
 
 ## Guest workflow artifact authority
 

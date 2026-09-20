@@ -4961,9 +4961,10 @@ networkless App Sandbox worker, and dropped interface owner as one packaged
 production topology. Its exact-root gate proves the drop-before-outer-exec
 boundary, inherited session-bound provider grant, real shared-provider packet
 I/O twice, foreground signal convergence, provider-owned daemon handoff, and
-empty cleanup without Apple authorization. It does not run a real guest through
-that provider or the complete concurrency/death matrix and therefore changes no
-inventory disposition.
+empty cleanup without Apple authorization. The later canonical version-2
+consumer now runs real guests through that same product and covers the complete
+bounded concurrency/death matrix. Its feature-head verdict remains nonfinal and
+therefore changes no inventory disposition.
 
 API request bodies, path identifiers, and host resource paths are untrusted
 input. Future implementations must validate them before mutating VMM state and
@@ -5420,8 +5421,9 @@ credential/chroot authority, remaining Linux
 jailer controls, seccomp outcome classification, and deployment signing policy
 remain later #1351 work.
 
-The production-vmnet certification path now fixes the external gate's private
-config, complete 21-row redacted result, retained digest-pinned fixture session,
+The production-vmnet certification version-1 path fixes the optional
+Apple-authorized gate's private config, complete 21-row redacted result,
+retained digest-pinned fixture session,
 independent guest oracle, and fail-closed production runner. The current
 direct-rootfs recipe is `direct-boot-v110`; it installs an exact mode-`0555`
 Python helper selected by the non-sensitive
@@ -5458,9 +5460,10 @@ grant, route, client pumps, process-registry integration, and fake-broker
 evidence. #1938 then packages the fixed entitlement-free provider, starts the
 outer only after irreversible drop, activates the inherited provider grant,
 and proves foreground/daemon supervision, signals, repeated real provider I/O,
-and cleanup. Neither slice changes either disposition. A real guest through the
-production provider, the complete concurrent production certification, and the
-optional Apple-authorized matrix remain #1378 work.
+and cleanup. Neither slice changes either disposition. #1944 now adds a real
+guest through the production provider and the complete bounded concurrent
+production certification; the optional Apple-authorized matrix and final
+merged-main promotion remain separate #1378 work.
 
 #1942 adds `direct-boot-v112` as a nonfinal root-direct oracle foundation. It
 retains the v111 DHCP/router-derived nonce-TCP helper and adds an authenticated
@@ -5469,7 +5472,7 @@ hotplug, and cross-process Full snapshot restore with a fresh destination
 network override. The guest performs manual PCI rescan/removal and each scenario
 ends with exact API and process cleanup. This evidence uses no Apple
 authorization and leaves both rows `missing-platform-feasible`; production
-provider handoff and the canonical matrix remain later slices.
+provider handoff and the canonical matrix consume it in later slices.
 
 #1943 adds the nonfinal least-privileged production-provider handoff. A clean
 ordinary preparation builds and recursively manifests the normal ad-hoc
@@ -5487,9 +5490,24 @@ parent-loss/TERM convergence before any group-KILL escalation. The former group
 must be absent and the descriptor-anchored production-session namespace must be
 empty before and after the probe set. Fixed
 normal-product completion and live-signal probes use no Apple authorization and
-publish no canonical result. The inventory stays `383/0/2/33`; #1944 remains
-responsible for the private concurrent matrix and both retained network
-dispositions.
+publish no canonical result.
+
+#1944 consumes the same fixed handoff without widening root authority. Ordinary
+preparation seals the v112 artifacts, digest-pinned fixture, private run plan,
+staged guest-coordination module, and payload manifest into the immutable
+package. After irreversible drop, the controller drives the exact 31-row
+canonical matrix through the real provider: policy denials, provider-free MMDS,
+shared guest DHCP/TCP, startup/runtime
+remove, fresh-owner Full restore, five-role TERM/SIGKILL, repeat, and distinct
+concurrent shared/host policies. The public version-2 result asserts the exact
+authority and entitlement split, permits only four named environment gates,
+and requires complete cleanup and no-clobber publication. Root never parses or
+receives private config, fixture, API, guest, snapshot, or result values.
+
+The feature-head matrix is intentionally nonfinal. The inventory stays
+`383/0/2/33`, and the global final validator continues to fail only the two
+retained network rows until the later clean merged-main evidence challenge and
+disposition promotion.
 
 ## Validation Expectations
 
