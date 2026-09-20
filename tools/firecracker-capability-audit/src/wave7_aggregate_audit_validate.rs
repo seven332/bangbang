@@ -583,14 +583,15 @@ fn validate_scope_and_counts(
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
-            | InventoryPhase::NetworkVmnetFeasibility,
+            | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet,
         ) => {}
         Ok(phase) => errors.push(format!(
             "Wave 7 aggregate inventory cannot use the earlier {} phase",
             phase.name()
         )),
         Err(error) => errors.push(format!(
-            "Wave 7 aggregate inventory must be its exact phase or an exact successor through 383/0/2/33 vmnet feasibility; found {}/{}/{}/{}: {error}",
+            "Wave 7 aggregate inventory must be its exact phase or an exact successor through 385/0/0/33 production vmnet; found {}/{}/{}/{}: {error}",
             counts.0, counts.1, counts.2, counts.3
         )),
     }
@@ -1130,7 +1131,8 @@ fn validate_tools(
                     | InventoryPhase::HostResourceAuthority
                     | InventoryPhase::JailerSeccompContainment
                     | InventoryPhase::ProductionHost
-                    | InventoryPhase::NetworkVmnetFeasibility,
+                    | InventoryPhase::NetworkVmnetFeasibility
+                    | InventoryPhase::ProductionVmnet,
                 ),
             ) => (6, 8, 0),
             _ => (
@@ -1505,7 +1507,8 @@ fn validate_handoffs(
         | InventoryPhase::HostResourceAuthority
         | InventoryPhase::JailerSeccompContainment
         | InventoryPhase::ProductionHost
-        | InventoryPhase::NetworkVmnetFeasibility),
+        | InventoryPhase::NetworkVmnetFeasibility
+        | InventoryPhase::ProductionVmnet),
     ) = phase
     {
         let expected = expected_nonterminal_ids(phase);

@@ -88,6 +88,8 @@ producing the exact `383/2/0/33` successor while preserving the two #1378 rows.
 #1930 subsequently reclassifies exactly those rows to
 `missing-platform-feasible` from real entitlement-free root-direct evidence,
 producing the exact `383/0/2/33` successor without altering this transition.
+#1948 later produces the exact terminal `385/0/0/33` successor by promoting
+only those two network rows.
 
 ## Terminal jailer/seccomp containment outcome
 
@@ -104,6 +106,6 @@ Validate the scoped terminal result with:
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-seccomp-containment-final
 ```
 
-The global `--final` gate remains intentionally stronger and continues to fail
-while the two independently owned #1378 feasible-but-undelivered records remain
-open.
+The global `--final` gate remains stronger. It failed while the two
+independently owned #1378 feasible-but-undelivered records remained and now
+passes only at the exact terminal `385/0/0/33` successor.

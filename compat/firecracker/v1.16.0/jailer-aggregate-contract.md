@@ -144,7 +144,8 @@ The final jailer/seccomp/macOS-containment composite is terminal under #1918;
 records remain audit-required at that successor; no feasible record remains,
 and the 33 exact platform exclusions remain unchanged. #1930 later moves those
 two rows to `missing-platform-feasible`, producing `383/0/2/33` without
-changing this historical transition.
+changing this historical transition. #1948 later promotes exactly those rows
+to produce the terminal `385/0/0/33` successor.
 
 This outcome explicitly does not claim Linux jailer mechanism parity, a
 literal per-run executable copy, absence of shared read-only code pages,
@@ -166,7 +167,8 @@ terminal leaves, current-tree path-and-anchor evidence, exact inventory
 transition, unrelated-record digest, and the two checked contract rows. The
 ordinary delivery command also validates the authority structure.
 
-The global `--final` mode remains stronger and intentionally fails while the
-two #1378 feasible-but-undelivered records remain. The
+The global `--final` mode remains stronger. It failed while the two #1378
+feasible-but-undelivered records remained and now passes only at the terminal
+`385/0/0/33` successor. The
 signed producer scenarios run through `scripts/run-integration-tests.sh`
 without `--allow-unsupported`; no sudo is required by this aggregate slice.

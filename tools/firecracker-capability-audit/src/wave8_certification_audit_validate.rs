@@ -211,10 +211,11 @@ fn validate_header(
             | InventoryPhase::HostResourceAuthority
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
-            | InventoryPhase::NetworkVmnetFeasibility,
+            | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet,
         ) => {}
         Ok(phase) => errors.push(format!(
-            "Wave 8 live inventory must be its exact phase or an exact successor through 383/0/2/33 vmnet feasibility; found {}",
+            "Wave 8 live inventory must be its exact phase or an exact successor through 385/0/0/33 production vmnet; found {}",
             phase.name()
         )),
         Err(error) => errors.push(format!("Wave 8 live inventory phase is invalid: {error}")),
@@ -564,7 +565,8 @@ fn validate_platform_reviews(
         | InventoryPhase::HostResourceAuthority
         | InventoryPhase::JailerSeccompContainment
         | InventoryPhase::ProductionHost
-        | InventoryPhase::NetworkVmnetFeasibility),
+        | InventoryPhase::NetworkVmnetFeasibility
+        | InventoryPhase::ProductionVmnet),
     ) = classify_inventory_phase(inventory)
     {
         let expected = expected_impossible_ids(phase);
@@ -645,7 +647,8 @@ fn validate_handoffs(
         | InventoryPhase::HostResourceAuthority
         | InventoryPhase::JailerSeccompContainment
         | InventoryPhase::ProductionHost
-        | InventoryPhase::NetworkVmnetFeasibility),
+        | InventoryPhase::NetworkVmnetFeasibility
+        | InventoryPhase::ProductionVmnet),
     ) = phase
     {
         let expected = expected_nonterminal_ids(phase);

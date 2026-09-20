@@ -23,7 +23,7 @@ pub const PRODUCTION_HOST_AUDIT_PATH: &str =
 pub const PRODUCTION_HOST_CAPABILITY_ID: &str = PRODUCTION_HOST_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "315f61e3b6fa8df867cbd929d20fdb7f5b5ed47a969c831e79e9ae25793cb3e3";
+    "2582645e3834cf42a5d0b4ac4c9ce81822cd9dfc6f2241a2902cd64b97fa9e6d";
 
 const PROFILE_IDS: [ProductionHostEvidenceProfileId; 7] = [
     ProductionHostEvidenceProfileId::ContainmentAndIdentity,
@@ -238,16 +238,18 @@ fn validate_inventory_transition(
     }
     if !matches!(
         disposition_counts(inventory),
-        (383, 2, 0, 33) | (383, 0, 2, 33)
+        (383, 2, 0, 33) | (383, 0, 2, 33) | (385, 0, 0, 33)
     ) {
         errors.push(
-            "production-host live inventory must be exactly 383/2/0/33 or its 383/0/2/33 vmnet-feasibility successor"
+            "production-host live inventory must be exactly 383/2/0/33 or an exact successor through 385/0/0/33 production vmnet"
                 .to_string(),
         );
     }
     if !matches!(
         classify_inventory_phase(inventory),
-        Ok(InventoryPhase::ProductionHost | InventoryPhase::NetworkVmnetFeasibility)
+        Ok(InventoryPhase::ProductionHost
+            | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet)
     ) {
         errors.push("production-host live inventory has an inexact successor phase".to_string());
     }
@@ -756,6 +758,13 @@ fn validate_external_dependencies(
                     && capability.validation.is_empty()
                     && capability.delivery_issue.as_deref()
                         == Some("https://github.com/seven332/bangbang/issues/1378")
+                    && capability.exclusion.is_none() => {}
+            Some(capability)
+                if phase == Some(InventoryPhase::ProductionVmnet)
+                    && capability.disposition == Disposition::ImplementedAndVerified
+                    && !capability.implementation.is_empty()
+                    && !capability.validation.is_empty()
+                    && capability.delivery_issue.is_none()
                     && capability.exclusion.is_none() => {}
             Some(_) => errors.push(format!(
                 "production-host external dependency changed disposition, ownership, or evidence: {}",

@@ -186,12 +186,12 @@ fn checked_vmnet_feasibility_audit_is_canonical_and_fail_closed() {
         .iter_mut()
         .find(|capability| capability.id == VMNET_FEASIBILITY_CAPABILITY_IDS[0])
         .expect("owned capability must exist")
-        .delivery_issue = None;
+        .delivery_issue = Some("https://github.com/seven332/bangbang/issues/1378".to_string());
     assert!(
         validate_vmnet_feasibility_audit(&audit, &manifest, &owned_capability_drift, &root)
             .expect_err("owned capability evidence drift must fail")
             .to_string()
-            .contains("not the exact feasible handoff")
+            .contains("does not match its exact live successor")
     );
 
     let mut digest_authority_drift = audit.clone();

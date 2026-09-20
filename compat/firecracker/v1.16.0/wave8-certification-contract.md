@@ -226,10 +226,14 @@ only `corpus:production-host` to implemented-and-verified through complete
 31-clause source accounting. The two #1378 network/vmnet records remain
 audit-required, and all 33 platform exclusions remain unchanged.
 
-The current vmnet-feasibility successor is exactly `383/0/2/33`: #1930 moves
+The historical vmnet-feasibility successor is exactly `383/0/2/33`: #1930 moves
 only those two #1378 rows from audit-required to missing-platform-feasible
 after real entitlement-free root-direct evidence. It does not promote either
 row to implemented or weaken their #1378 ownership.
+
+The terminal production-vmnet successor is exactly `385/0/0/33`: #1948 binds
+two byte-identical clean-main no-Apple product executions and promotes only
+those two rows to implemented-and-verified.
 
 The direct #1348 delivery-parent policy retains #1351 open and requires the
 other nine preceding parents complete. #1371, #1373, #1374, #1375, and #1378
@@ -253,12 +257,13 @@ at 377/5/3/33, the exact aggregate-jailer successor at 379/3/3/33, or the exact
 multiprocess-isolation successor at 380/3/2/33, the exact
 host-resource-authority successor at 381/3/1/33, or the exact containment
 successor at 382/3/0/33, or the exact production-host successor at
-383/2/0/33, or the exact vmnet-feasibility successor at 383/0/2/33; it
-rejects unrelated, count-preserving identity swaps, and partial drift.
+383/2/0/33, the exact vmnet-feasibility successor at 383/0/2/33, or the exact
+terminal production-vmnet successor at 385/0/0/33; it rejects unrelated,
+count-preserving identity swaps, and partial drift.
 
-The global `--final` mode remains stronger and intentionally fails while the
-two #1378 `missing-platform-feasible` outcomes remain. Neither Wave
-8 nor any exact later successor weakens that completion gate.
+The global `--final` mode remains stronger. It failed at every historical phase
+with nonterminal outcomes and now passes only at the exact `385/0/0/33`
+terminal successor; neither Wave 8 nor any later scoped gate weakens it.
 
 The checked command is reproducible and networkless. Live GitHub hierarchy,
 assignment, review threads, pull-request checks, remote branches, merge state,

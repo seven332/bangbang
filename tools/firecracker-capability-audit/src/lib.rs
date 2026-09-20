@@ -43,6 +43,8 @@ mod multiprocess_isolation_certify;
 mod production_host_audit_model;
 mod production_host_audit_validate;
 mod production_host_certify;
+mod production_vmnet_certification_audit_model;
+mod production_vmnet_certification_audit_validate;
 mod specification_benchmark_audit_model;
 mod specification_benchmark_audit_validate;
 mod specification_benchmark_certify;
@@ -220,6 +222,18 @@ pub use production_host_audit_validate::{
     validate_production_host_upstream_source,
 };
 pub use production_host_certify::validate_production_host_compatibility;
+pub use production_vmnet_certification_audit_model::{
+    ProductionVmnetAuthority, ProductionVmnetCapabilityClaim, ProductionVmnetCase,
+    ProductionVmnetCertificationAudit, ProductionVmnetCertificationResult,
+    ProductionVmnetDispositionCounts, ProductionVmnetEntitlements, ProductionVmnetEvidence,
+    ProductionVmnetPlatformIdentity, ProductionVmnetSourceIdentity, ProductionVmnetTransition,
+};
+pub use production_vmnet_certification_audit_validate::{
+    PRODUCTION_VMNET_CERTIFICATION_AUDIT_PATH, PRODUCTION_VMNET_CERTIFICATION_AUDIT_SCHEMA_VERSION,
+    PRODUCTION_VMNET_CERTIFICATION_CAPABILITY_IDS, PRODUCTION_VMNET_CERTIFICATION_EVIDENCE_PATH,
+    PRODUCTION_VMNET_MANDATORY_CASES, PRODUCTION_VMNET_OPTIONAL_CASES,
+    validate_production_vmnet_certification_audit, validate_production_vmnet_certification_result,
+};
 pub use specification_benchmark_audit_model::{
     SpecificationBenchmarkAudit, SpecificationBenchmarkEvidence, SpecificationBenchmarkMeasurement,
     SpecificationBenchmarkNonclaim, SpecificationBenchmarkPolicy,
@@ -540,6 +554,38 @@ pub fn read_production_host_audit(path: &Path) -> Result<ProductionHostAudit, Au
         .map_err(|error| AuditError::new(format!("failed to parse production-host audit: {error}")))
 }
 
+/// Read and parse the checked terminal production-vmnet authority.
+pub fn read_production_vmnet_certification_audit(
+    path: &Path,
+) -> Result<ProductionVmnetCertificationAudit, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read production vmnet certification audit: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse production vmnet certification audit: {error}"
+        ))
+    })
+}
+
+/// Read and parse one generated schema-v2 production-vmnet result.
+pub fn read_production_vmnet_certification_result(
+    path: &Path,
+) -> Result<ProductionVmnetCertificationResult, AuditError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        AuditError::new(format!(
+            "failed to read production vmnet certification result: {error}"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        AuditError::new(format!(
+            "failed to parse production vmnet certification result: {error}"
+        ))
+    })
+}
+
 /// Read and parse the checked entitlement-free vmnet feasibility authority.
 pub fn read_vmnet_feasibility_audit(path: &Path) -> Result<VmnetFeasibilityAudit, AuditError> {
     let bytes = std::fs::read(path).map_err(|error| {
@@ -714,6 +760,20 @@ pub fn jailer_seccomp_containment_audit_json(
 /// Serialize the checked production-host authority using canonical pretty JSON.
 pub fn production_host_audit_json(audit: &ProductionHostAudit) -> Result<Vec<u8>, AuditError> {
     canonical_json(audit, "production-host audit")
+}
+
+/// Serialize the checked terminal production-vmnet audit using canonical pretty JSON.
+pub fn production_vmnet_certification_audit_json(
+    audit: &ProductionVmnetCertificationAudit,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(audit, "production vmnet certification audit")
+}
+
+/// Serialize the generated production-vmnet result using canonical pretty JSON.
+pub fn production_vmnet_certification_result_json(
+    result: &ProductionVmnetCertificationResult,
+) -> Result<Vec<u8>, AuditError> {
+    canonical_json(result, "production vmnet certification result")
 }
 
 /// Serialize the checked entitlement-free vmnet feasibility authority using canonical pretty JSON.

@@ -249,7 +249,9 @@ then certifies the complete production-host corpus at `383/2/0/33`. Only the
 two #1378 network records remain audit-required at that phase; no
 platform-feasible isolation record remains. #1930 then moves exactly those two
 network records to `missing-platform-feasible` from entitlement-free
-root-direct evidence, producing the current `383/0/2/33` phase.
+root-direct evidence, producing the historical `383/0/2/33` phase. #1948 now
+binds two byte-identical clean-main no-Apple product results and promotes those
+rows to the terminal `385/0/0/33` phase.
 
 ## Certified Linux Runtime Isolation Exclusions
 
@@ -1395,9 +1397,9 @@ leave no provider group, socket, stage, or case tree.
 The version-2 public result exposes only fixed categorical authority,
 entitlement, platform, ordered-case, cleanup, and verdict data. It contains no
 private path, identity, digest, endpoint, address, nonce, PID, session, packet,
-barrier, or raw output. The feature-head result remains nonfinal and does not
-alter `383/0/2/33`; merged-clean-main evidence and capability promotion remain
-a separate trust decision.
+barrier, or raw output. The #1944 feature-head result was deliberately nonfinal
+at `383/0/2/33`; #1948 now binds two byte-identical clean-main executions, the
+result-specific challenge, and the exact terminal `385/0/0/33` promotion.
 
 ### Entitlement-free root-direct vmnet evidence boundary
 
@@ -3950,8 +3952,9 @@ certifies exactly the final containment row, leaving three audit rows at
 `383/2/0/33` successor with only the two #1378 rows. Missing authority
 or credentials alone is not an impossibility proof. #1930 subsequently proves
 the entitlement-free feasibility boundary and moves those two rows to
-`missing-platform-feasible`, producing `383/0/2/33`. Global `--final` stays
-blocked until the #1378 product outcomes complete.
+`missing-platform-feasible`, producing the historical `383/0/2/33` phase.
+#1948 completes the no-Apple product outcome and promotes only those rows to
+`implemented-and-verified`, so global `--final` now passes at `385/0/0/33`.
 
 The elevated same-host gates have now been executed rather than inferred from
 split environments. On Apple Silicon macOS 26.5.2 / SDK 26.5 with exact root

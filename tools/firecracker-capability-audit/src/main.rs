@@ -11,6 +11,7 @@ use bangbang_firecracker_capability_audit::{
     LOGGER_PRODUCER_MANIFEST_PATH, METRICS_DEVICE_PRODUCER_AUDIT_PATH,
     METRICS_LIFECYCLE_AUDIT_PATH, METRICS_PROCESS_PRODUCER_AUDIT_PATH,
     METRICS_SCHEMA_AUTHORITY_PATH, MULTIPROCESS_ISOLATION_AUDIT_PATH, PRODUCTION_HOST_AUDIT_PATH,
+    PRODUCTION_VMNET_CERTIFICATION_AUDIT_PATH, PRODUCTION_VMNET_CERTIFICATION_EVIDENCE_PATH,
     SOURCE_MANIFEST_PATH, SPECIFICATION_BENCHMARK_AUDIT_PATH, TRACING_AUDIT_PATH,
     VMNET_FEASIBILITY_AUDIT_PATH, WAVE7_AGGREGATE_AUDIT_PATH, WAVE8_CERTIFICATION_AUDIT_PATH,
     derive_logger_producer_manifest, derive_metrics_schema_source, derive_source_manifest,
@@ -21,10 +22,10 @@ use bangbang_firecracker_capability_audit::{
     read_logger_producer_manifest, read_metrics_device_producer_audit,
     read_metrics_lifecycle_audit, read_metrics_process_producer_audit,
     read_metrics_schema_authority, read_multiprocess_isolation_audit, read_production_host_audit,
-    read_source_manifest, read_specification_benchmark_audit, read_tracing_audit,
-    read_vmnet_feasibility_audit, read_wave7_aggregate_audit, read_wave8_certification_audit,
-    source_manifest_json, validate, validate_cpu_template_compatibility,
-    validate_cpu_template_fingerprint_compare_compatibility,
+    read_production_vmnet_certification_audit, read_source_manifest,
+    read_specification_benchmark_audit, read_tracing_audit, read_vmnet_feasibility_audit,
+    read_wave7_aggregate_audit, read_wave8_certification_audit, source_manifest_json, validate,
+    validate_cpu_template_compatibility, validate_cpu_template_fingerprint_compare_compatibility,
     validate_cpu_template_fingerprint_dump_compatibility, validate_cpu_template_helper_audit,
     validate_cpu_template_helper_compatibility, validate_cpu_template_helper_transition,
     validate_cpu_template_strip_compatibility, validate_formal_verification_audit,
@@ -40,8 +41,9 @@ use bangbang_firecracker_capability_audit::{
     validate_metrics_schema_compatibility, validate_multiprocess_isolation_audit,
     validate_multiprocess_isolation_compatibility, validate_production_host_audit,
     validate_production_host_compatibility, validate_production_host_upstream_source,
-    validate_specification_benchmark_audit, validate_specification_benchmark_compatibility,
-    validate_tracing_audit, validate_tracing_compatibility, validate_vmnet_feasibility_audit,
+    validate_production_vmnet_certification_audit, validate_specification_benchmark_audit,
+    validate_specification_benchmark_compatibility, validate_tracing_audit,
+    validate_tracing_compatibility, validate_vmnet_feasibility_audit,
     validate_wave7_aggregate_audit, validate_wave7_aggregate_compatibility,
     validate_wave8_certification_audit, validate_wave8_certification_compatibility,
 };
@@ -99,6 +101,7 @@ enum ValidateMode {
     HostResourceAuthorityFinal,
     JailerSeccompContainmentFinal,
     ProductionHostFinal,
+    ProductionVmnetFinal,
     FormalVerificationFinal,
     SpecificationBenchmarkFinal,
     Wave7Final,
@@ -136,6 +139,7 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
             Ok(ValidateMode::JailerSeccompContainmentFinal)
         }
         [flag] if flag == "--production-host-final" => Ok(ValidateMode::ProductionHostFinal),
+        [flag] if flag == "--production-vmnet-final" => Ok(ValidateMode::ProductionVmnetFinal),
         [flag] if flag == "--formal-verification-final" => {
             Ok(ValidateMode::FormalVerificationFinal)
         }
@@ -145,7 +149,7 @@ fn parse_validate_mode(args: &[String]) -> Result<ValidateMode, AuditError> {
         [flag] if flag == "--wave7-final" => Ok(ValidateMode::Wave7Final),
         [flag] if flag == "--wave8-final" => Ok(ValidateMode::Wave8Final),
         _ => Err(AuditError::new(
-            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, --guest-workflow-final, --jailer-final, --multiprocess-isolation-final, --host-resource-authority-final, --jailer-seccomp-containment-final, --production-host-final, --formal-verification-final, --specification-benchmark-final, --wave7-final, or --wave8-final flag",
+            "validate accepts only one optional --final, --logger-final, --tracing-final, --metrics-schema-final, --metrics-process-final, --metrics-device-final, --metrics-final, --cpu-template-helper-final, --cpu-template-strip-final, --cpu-template-fingerprint-dump-final, --cpu-template-fingerprint-compare-final, --cpu-template-final, --guest-workflow-final, --jailer-final, --multiprocess-isolation-final, --host-resource-authority-final, --jailer-seccomp-containment-final, --production-host-final, --production-vmnet-final, --formal-verification-final, --specification-benchmark-final, --wave7-final, or --wave8-final flag",
         )),
     }
 }
@@ -178,6 +182,9 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     let jailer_seccomp_containment_audit =
         read_jailer_seccomp_containment_audit(&root.join(JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH))?;
     let production_host_audit = read_production_host_audit(&root.join(PRODUCTION_HOST_AUDIT_PATH))?;
+    let production_vmnet_certification_audit = read_production_vmnet_certification_audit(
+        &root.join(PRODUCTION_VMNET_CERTIFICATION_AUDIT_PATH),
+    )?;
     let vmnet_feasibility_audit =
         read_vmnet_feasibility_audit(&root.join(VMNET_FEASIBILITY_AUDIT_PATH))?;
     let formal_verification_audit =
@@ -248,6 +255,16 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
             ))
         },
     )?;
+    validate_production_vmnet_certification_audit(
+        &production_vmnet_certification_audit,
+        &inventory,
+        &root,
+    )
+    .map_err(|errors| {
+        AuditError::new(format!(
+            "production vmnet certification audit validation errors:\n{errors}"
+        ))
+    })?;
     validate_vmnet_feasibility_audit(&vmnet_feasibility_audit, &manifest, &inventory, &root)
         .map_err(|errors| {
             AuditError::new(format!(
@@ -281,7 +298,7 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
         })?;
     let audit_mode = match mode {
         ValidateMode::Delivery => AuditMode::Delivery,
-        ValidateMode::Final => AuditMode::Final,
+        ValidateMode::Final | ValidateMode::ProductionVmnetFinal => AuditMode::Final,
         ValidateMode::LoggerFinal => {
             validate_logger_compatibility(
                 &manifest,
@@ -1456,12 +1473,15 @@ fn run_validate(args: &[String]) -> Result<String, AuditError> {
     if !failures.is_empty() {
         return Err(AuditError::new(failures.join("\n")));
     }
-    let mode_name = match audit_mode {
-        AuditMode::Delivery => "delivery",
-        AuditMode::Final => "final",
+    let mode_name = match mode {
+        ValidateMode::ProductionVmnetFinal => "terminal production vmnet",
+        _ => match audit_mode {
+            AuditMode::Delivery => "delivery",
+            AuditMode::Final => "final",
+        },
     };
     Ok(format!(
-        "Firecracker capability inventory, canonical CPU-template helper, guest-workflow, jailer aggregate, multiprocess isolation, host-resource authority, jailer/seccomp containment, production-host, formal-verification, specification-benchmark, Wave 7 aggregate, and Wave 8 certification audits, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
+        "Firecracker capability inventory, canonical CPU-template helper, guest-workflow, jailer aggregate, multiprocess isolation, host-resource authority, jailer/seccomp containment, production-host, production-vmnet certification, formal-verification, specification-benchmark, Wave 7 aggregate, and Wave 8 certification audits, logger producer audit, metrics schema authority, process producer audit, device producer audit, metrics lifecycle audit, and tracing audit are valid in {mode_name} mode"
     ))
 }
 
@@ -1646,6 +1666,10 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
     let host_resource_authority_audit_path = root.join(HOST_RESOURCE_AUTHORITY_AUDIT_PATH);
     let jailer_seccomp_containment_audit_path = root.join(JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH);
     let production_host_audit_path = root.join(PRODUCTION_HOST_AUDIT_PATH);
+    let production_vmnet_certification_audit_path =
+        root.join(PRODUCTION_VMNET_CERTIFICATION_AUDIT_PATH);
+    let production_vmnet_certification_evidence_path =
+        root.join(PRODUCTION_VMNET_CERTIFICATION_EVIDENCE_PATH);
     let vmnet_feasibility_audit_path = root.join(VMNET_FEASIBILITY_AUDIT_PATH);
     let formal_verification_audit_path = root.join(FORMAL_VERIFICATION_AUDIT_PATH);
     let specification_benchmark_audit_path = root.join(SPECIFICATION_BENCHMARK_AUDIT_PATH);
@@ -1669,6 +1693,8 @@ fn candidate_output_path(root: &Path, output: &Path) -> Result<PathBuf, AuditErr
         &host_resource_authority_audit_path,
         &jailer_seccomp_containment_audit_path,
         &production_host_audit_path,
+        &production_vmnet_certification_audit_path,
+        &production_vmnet_certification_evidence_path,
         &vmnet_feasibility_audit_path,
         &formal_verification_audit_path,
         &specification_benchmark_audit_path,
@@ -1795,7 +1821,7 @@ fn absolute_from(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final | --jailer-final | --multiprocess-isolation-final | --host-resource-authority-final | --jailer-seccomp-containment-final | --production-host-final | --formal-verification-final | --specification-benchmark-final | --wave7-final | --wave8-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
+    "Usage:\n  bangbang-firecracker-capability-audit validate [--final | --logger-final | --tracing-final | --metrics-schema-final | --metrics-process-final | --metrics-device-final | --metrics-final | --cpu-template-helper-final | --cpu-template-strip-final | --cpu-template-fingerprint-dump-final | --cpu-template-fingerprint-compare-final | --cpu-template-final | --guest-workflow-final | --jailer-final | --multiprocess-isolation-final | --host-resource-authority-final | --jailer-seccomp-containment-final | --production-host-final | --production-vmnet-final | --formal-verification-final | --specification-benchmark-final | --wave7-final | --wave8-final]\n  bangbang-firecracker-capability-audit compare --firecracker PATH\n  bangbang-firecracker-capability-audit regenerate --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-logger-producers --firecracker PATH --output PATH\n  bangbang-firecracker-capability-audit regenerate-metrics-schema-source --firecracker PATH --output PATH"
 }
 
 #[cfg(test)]
@@ -1885,6 +1911,10 @@ mod tests {
         assert_eq!(
             parse_validate_mode(&["--production-host-final".to_string()]).unwrap(),
             ValidateMode::ProductionHostFinal
+        );
+        assert_eq!(
+            parse_validate_mode(&["--production-vmnet-final".to_string()]).unwrap(),
+            ValidateMode::ProductionVmnetFinal
         );
         assert_eq!(
             parse_validate_mode(&["--formal-verification-final".to_string()]).unwrap(),
@@ -2072,6 +2102,13 @@ mod tests {
         let message = run_validate(&["--production-host-final".to_string()])
             .expect("terminal production-host validation must pass");
         assert!(message.contains("terminal production-host corpus scope"));
+    }
+
+    #[test]
+    fn production_vmnet_final_mode_certifies_the_terminal_scope() {
+        let message = run_validate(&["--production-vmnet-final".to_string()])
+            .expect("terminal production-vmnet validation must pass");
+        assert!(message.contains("terminal production vmnet mode"));
     }
 
     #[test]

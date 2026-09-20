@@ -193,8 +193,9 @@ At the later exact `382/3/0/33` successor, #1918 certifies that containment row
 without changing this #1916 transition or its terminal host-resource claim.
 At `383/2/0/33`, #1920 separately certifies the production-host corpus; only
 the two #1378 records remain audit-required. #1930 then moves exactly those two
-records to `missing-platform-feasible`, producing the current `383/0/2/33`
-successor without changing the terminal #1916 row.
+records to `missing-platform-feasible`, producing the historical `383/0/2/33`
+successor without changing the terminal #1916 row. #1948 later produces the
+exact terminal `385/0/0/33` successor from no-Apple product evidence.
 
 ## Terminal host-resource authority outcome
 
@@ -220,5 +221,6 @@ It composes delivery validation, canonical authority bytes, exact source blobs
 and clauses, the resource surface, dependencies, current-tree evidence,
 residuals/nonclaims, unrelated-row digest, contract, and single inventory row.
 
-The global `--final` gate remains stronger and intentionally fails while the
-independent audit and feasible outcomes remain nonterminal.
+The global `--final` gate remains stronger. It failed while independent audit
+and feasible outcomes were nonterminal and now passes only at the exact
+terminal `385/0/0/33` successor.

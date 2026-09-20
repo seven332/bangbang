@@ -1526,7 +1526,9 @@ Developer ID/notarization, hardware certification, or positive vmnet proof.
 Only `corpus:production-host` moves, producing `383/2/0/33`; the two #1378
 network/vmnet records remain audit-required at that transition. #1930 later
 moves exactly those rows to `missing-platform-feasible`, producing
-`383/0/2/33`. The scoped gate is:
+the historical `383/0/2/33` successor. #1948 later promotes those same two rows
+from repeated no-Apple production evidence, producing terminal `385/0/0/33`.
+The scoped historical gate is:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-host-final
@@ -5452,9 +5454,9 @@ shared-vmnet start, irreversible uid/gid drop, provider-v1
 Hello/readiness/read/write/stop/shutdown, cancellation, reap, and clean repeat.
 The independent direct dropped-owner gate and two real HVF guest
 DHCP/router-derived nonce-TCP executions remain. The workflow uses no Apple
-authorization and records only categorical output. Therefore
+authorization and records only categorical output. At the #1930 phase,
 `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity` are now
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` became
 `missing-platform-feasible`, not implemented. #1936 adds the credential-free
 grant, route, client pumps, process-registry integration, and fake-broker
 evidence. #1938 then packages the fixed entitlement-free provider, starts the
@@ -5462,8 +5464,9 @@ outer only after irreversible drop, activates the inherited provider grant,
 and proves foreground/daemon supervision, signals, repeated real provider I/O,
 and cleanup. Neither slice changes either disposition. #1944 now adds a real
 guest through the production provider and the complete bounded concurrent
-production certification; the optional Apple-authorized matrix and final
-merged-main promotion remain separate #1378 work.
+production certification. #1948 later validates it twice from clean merged
+main and completes the #1378 promotion; the optional Apple-authorized matrix is
+not a completion dependency.
 
 #1942 adds `direct-boot-v112` as a nonfinal root-direct oracle foundation. It
 retains the v111 DHCP/router-derived nonce-TCP helper and adds an authenticated
@@ -5471,8 +5474,9 @@ barrier that separately proves startup removal/re-addition, networkless runtime
 hotplug, and cross-process Full snapshot restore with a fresh destination
 network override. The guest performs manual PCI rescan/removal and each scenario
 ends with exact API and process cleanup. This evidence uses no Apple
-authorization and leaves both rows `missing-platform-feasible`; production
-provider handoff and the canonical matrix consume it in later slices.
+authorization and left both rows `missing-platform-feasible` at that phase;
+production provider handoff and the canonical matrix consume it in later
+slices.
 
 #1943 adds the nonfinal least-privileged production-provider handoff. A clean
 ordinary preparation builds and recursively manifests the normal ad-hoc
@@ -5504,10 +5508,18 @@ authority and entitlement split, permits only four named environment gates,
 and requires complete cleanup and no-clobber publication. Root never parses or
 receives private config, fixture, API, guest, snapshot, or result values.
 
-The feature-head matrix is intentionally nonfinal. The inventory stays
-`383/0/2/33`, and the global final validator continues to fail only the two
-retained network rows until the later clean merged-main evidence challenge and
-disposition promotion.
+The #1944 feature-head matrix was intentionally nonfinal at `383/0/2/33`.
+#1948 records two independently prepared, byte-identical clean-main schema-v2
+results: all 27 mandatory rows pass, the exact four host/bridge/service rows are
+visible environment-gated nondependencies, cleanup is complete, and the
+verdict passes. The terminal audit promotes only the two retained network rows
+to `implemented-and-verified`, checks every unrelated record by digest, and
+makes global final validation pass at `385/0/0/33`:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-vmnet-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
+```
 
 ## Validation Expectations
 

@@ -49,9 +49,10 @@ hazard, not a requirement to reproduce that unsafe handler design. Developer
 ID/notarization and deployment remain independently owned; no credential is
 enumerated or claimed.
 
-The complete positive production vmnet guest connectivity, service-failure, teardown,
-SIGKILL reclamation, repeat/concurrency, and optional Apple-approved
-identity/profile evidence remain exclusively owned by #1378. Sudo or root does
+At the #1920 boundary, complete positive production vmnet guest connectivity,
+service-failure, teardown, SIGKILL reclamation, repeat/concurrency, and optional
+Apple-approved identity/profile evidence remained exclusively owned by #1378.
+Sudo or root does
 not confer the restricted entitlement. #1930 later proves that direct shared
 vmnet and a privilege-dropped owner are feasible without that entitlement, so
 `corpus:network-setup` and
@@ -60,9 +61,11 @@ vmnet and a privilege-dropped owner are feasible without that entitlement, so
 #1938 subsequently packages and supervises the entitlement-free provider,
 ordinary launcher, sandbox worker, and dropped owner with real provider I/O,
 signals, daemon handoff, and cleanup. It neither changes this result nor
-substitutes for the remaining guest and complete lifecycle matrix.
+substitutes for the remaining guest and complete lifecycle matrix. #1944 adds
+that matrix, and #1948 validates it twice from clean merged main and completes
+the no-Apple #1378 promotion without rewriting this historical result.
 
-#1378 now has a credential-free protocol, contained-worker adapter, packaged
+#1378 later gained a credential-free protocol, contained-worker adapter, packaged
 no-Apple topology, and a checked optional production runner: strict private
 config and redacted result handling, a retained
 digest-pinned fixture exchange, a direct-rootfs-v110 DHCP/TCP guest oracle,
@@ -70,7 +73,8 @@ two-package inspection, descriptor-rooted grants, and the fixed 21-case
 policy/API/process/death matrix. Portable injection cannot turn fixture state
 into authorization, service-error, connectivity, or cleanup evidence, and no
 caller-approved restricted-credential execution has been recorded. This
-contract's external handoff and inventory totals are therefore unchanged.
+historical contract's external handoff and inventory totals are therefore
+unchanged; the no-Apple schema-v2 terminal authority is recorded separately.
 
 ## Exact inventory transition
 
@@ -98,5 +102,6 @@ Validate this scoped result with:
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-host-final
 ```
 
-The global `--final` gate remains intentionally stronger and continues to fail
-on the exact two #1378 `missing-platform-feasible` records.
+The global `--final` gate remains stronger. It failed on the exact two #1378
+`missing-platform-feasible` records at the historical successor and now passes
+only at the exact terminal `385/0/0/33` phase.
