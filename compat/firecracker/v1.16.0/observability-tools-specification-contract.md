@@ -407,7 +407,8 @@ terminal platform exclusions, and #1908 later makes only
 `jailer/run` implemented-and-verified from the checked aggregate authority.
 #1920 later certifies `corpus:production-host`, completing the historical
 #1373 rows; both #1378 rows were audit-required at the checked Wave 7 phase and
-are `missing-platform-feasible` in the current #1930 successor.
+became `missing-platform-feasible` in the historical #1930 successor. #1948
+later promotes both rows in the terminal production-vmnet successor.
 
 ## Disposition accounting
 

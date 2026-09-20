@@ -74,10 +74,12 @@ and observability ownership.
   additionally fixes and portable-tests the private protocols,
   direct-rootfs-v110 DHCP/TCP oracle, two-package inspection, descriptor grants,
   complete 21-case production runner, and redacted result. The placeholder
-  `run` exits 3 and publishes nothing. #1378 still owns the first real
-  Apple-approved start, packet-connectivity, service-error, teardown, crash,
-  retry, and concurrent-session results; an injected driver, non-success local
-  gate, or fixture declaration is never a passing skip.
+  `run` exits 3 and publishes nothing. At that schema-v1 boundary, #1378 owned
+  the first real Apple-approved start, packet-connectivity, service-error,
+  teardown, crash, retry, and concurrent-session results; an injected driver,
+  non-success local gate, or fixture declaration was never a passing skip.
+  #1948 later completes those capability claims through the disjoint no-Apple
+  schema-v2 path, while Apple-authorized schema v1 remains optional.
 - **ROOT-FEASIBILITY** — #1930 prepares an immutable v111 package as an
   ordinary user, proves the identical ad-hoc-signed binary is denied without
   elevation, then uses explicit exact-root authority to start shared vmnet. A

@@ -4133,7 +4133,9 @@ credential, helper, or service.
 #1920 then certifies all 31 stable production-host source groups as exact macOS,
 terminal platform/architecture, operator-owned, implementation-specific, or
 external outcomes. It adds no runtime path, host mutation, credential, or
-deployment claim; only #1378's two positive vmnet records remain nonterminal.
+deployment claim; only #1378's two positive vmnet records remained nonterminal
+at that checkpoint. #1930 later proves their root-direct feasibility, and #1948
+promotes them from repeated clean-main no-Apple production evidence.
 
 ## Private vmnet provider boundary
 

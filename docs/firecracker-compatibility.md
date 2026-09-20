@@ -1596,12 +1596,13 @@ four exact portable and signed product leaves. It also rechecks the historical
 30-record platform-exclusion partition and originally retained the exact eleven
 #1351/#1373/#1378 external outcomes. Its certifier accepts only the checked
 uid/gid, configurable-chroot, aggregate-jailer, multiprocess-isolation,
-host-resource-authority, and containment successors. The current successor is
-extended by the production-host phase at `383/2/0/33`: only the two #1378
-audit records remain, with no missing-platform-feasible records. It does not
-turn missing credentials,
-root/HVF authority, skipped
-execution, or a weaker macOS mechanism into success or impossibility.
+host-resource-authority, and containment successors. The chain continues
+through the historical production-host phase at `383/2/0/33` and
+vmnet-feasibility phase at `383/0/2/33`. #1948 is the current terminal
+successor at `385/0/0/33`, with both #1378 rows implemented-and-verified and no
+audit-required or missing-platform-feasible records. It does not turn missing
+credentials, root/HVF authority, skipped execution, or a weaker macOS
+mechanism into success or impossibility.
 
 The independent `corpus:formal-verification` owner is now terminal through the
 [Targeted Formal Verification](formal-verification.md) boundary and checked
@@ -4940,11 +4941,12 @@ implementation. Exact native-v2 2.11 instead restores a fresh lossy session.
 
 The checked
 [Firecracker v1.16.0 network and MMDS contract](../compat/firecracker/v1.16.0/network-mmds-contract.md)
-owns exactly 35 identities. Thirty-three live, capture, and exact-2.11
-restore/clone outcomes are `implemented-and-verified`; the network setup corpus
-and broad network semantic record are `missing-platform-feasible` after the
-entitlement-free #1930 gate. Their ledger rows retain #1378 implementation
-ownership and the exact #1491 portability boundary.
+owns exactly 35 identities, all now `implemented-and-verified`. Thirty-three
+live, capture, and exact-2.11 restore/clone outcomes retain their existing
+evidence; #1948 makes the network setup corpus and broad network semantic
+record terminal from repeated clean-main no-Apple production evidence. Their
+ledger rows retain the exact terminal authority and #1491 portability
+boundary.
 Focused API/runtime evidence is composed with signed MMIO and PCI transport,
 process isolation/hotplug, capture traversal, exact-2.11 signed V1/V2 restore,
 contained production ownership, and the fail-closed credential preflight. No

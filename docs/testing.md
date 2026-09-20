@@ -2791,7 +2791,9 @@ profiles and signing tools to prove bounds, ordering, leaf matching,
 nonpublication on authorization failure, cleanup, and that the disposable
 probe—not the supplied worker—is the only executable handed to the
 authorization runner. None of those tests claim `vmnet_start_interface` or
-packet connectivity; that positive signed matrix remains #1378.
+packet connectivity. At this schema-v1 checkpoint that positive signed matrix
+remained #1378 work; #1948 later completes the capability claims through the
+independent no-Apple schema-v2 matrix without making schema v1 a dependency.
 
 ### Production vmnet certification foundation
 
