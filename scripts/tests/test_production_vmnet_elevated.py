@@ -424,6 +424,7 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             "_run_post_ready_cancellation",
             "_run_startup_provider_death",
             "_run_live_role_death",
+            "_run_owner_death",
             "_run_clean_repeat",
             "_run_concurrent",
         )
@@ -550,8 +551,8 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             ],
             "owner-runtime-death": [
                 (
-                    "_run_live_role_death",
-                    ("owner-runtime-death", "owner", signal.SIGTERM),
+                    "_run_owner_death",
+                    ("owner-runtime-death", signal.SIGTERM),
                     {},
                 )
             ],
@@ -585,8 +586,8 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             ],
             "owner-sigkill-reclamation": [
                 (
-                    "_run_live_role_death",
-                    ("owner-sigkill-reclamation", "owner", signal.SIGKILL),
+                    "_run_owner_death",
+                    ("owner-sigkill-reclamation", signal.SIGKILL),
                     {},
                 )
             ],
@@ -1161,15 +1162,13 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
         )
         driver._start_live_shared = mock.Mock(return_value=death)
         driver._retire = mock.Mock()
+        driver._finish_process = mock.Mock()
         driver._abort_process = mock.Mock()
         with mock.patch.object(vmnet, "_wait_process_absent") as wait_absent:
-            driver._run_live_role_death(
-                "owner-sigkill-reclamation", "owner", signal.SIGKILL
-            )
+            driver._run_owner_death("owner-sigkill-reclamation", signal.SIGKILL)
         death.signal_role.assert_called_once_with("owner", signal.SIGKILL)
-        death.wait_after_external_signal.assert_called_once_with()
+        driver._finish_process.assert_called_once_with(death)
         wait_absent.assert_called_once_with(31337, 2)
-        driver._retire.assert_called_once_with(death)
         driver._abort_process.assert_not_called()
 
         first = mock.Mock()

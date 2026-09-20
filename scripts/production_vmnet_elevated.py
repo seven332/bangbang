@@ -2679,6 +2679,20 @@ class ElevatedSystemCertificationDriver:
             self._abort_process(process)
             raise
 
+    def _run_owner_death(self, case: str, number: int) -> None:
+        process = self._start_live_shared(case)
+        try:
+            pid = process.signal_role("owner", number)
+            # The per-interface owner is not the topology leader.  Prove that
+            # exact generation is gone before deliberately retiring the VM.
+            self.vmnet._wait_process_absent(
+                pid, self.config.timeouts.terminate_seconds
+            )
+            self._finish_process(process)
+        except BaseException:
+            self._abort_process(process)
+            raise
+
     def _run_clean_repeat(self, case: str) -> None:
         for _attempt in range(2):
             self._finish_process(self._start_live_shared(case))
@@ -2811,7 +2825,7 @@ class ElevatedSystemCertificationDriver:
             self._run_live_role_death(case, "broker", signal.SIGTERM)
             return
         if case == "owner-runtime-death":
-            self._run_live_role_death(case, "owner", signal.SIGTERM)
+            self._run_owner_death(case, signal.SIGTERM)
             return
         if case == "launcher-first-death":
             self._run_live_role_death(case, "outer", signal.SIGTERM)
@@ -2826,7 +2840,7 @@ class ElevatedSystemCertificationDriver:
             self._run_live_role_death(case, "broker", signal.SIGKILL)
             return
         if case == "owner-sigkill-reclamation":
-            self._run_live_role_death(case, "owner", signal.SIGKILL)
+            self._run_owner_death(case, signal.SIGKILL)
             return
         if case == "launcher-sigkill-reclamation":
             self._run_live_role_death(case, "outer", signal.SIGKILL)
