@@ -1,12 +1,12 @@
 # Firecracker v1.16.0 network and MMDS closure contract
 
 This checked #1496 closure ledger owns exactly 35 Firecracker v1.16.0 network
-and MMDS identities. Thirty-three are `implemented-and-verified`, including
-the exact native-v2 2.11 snapshot/session rows. Two broad rows are
-`missing-platform-feasible` after the #1930 entitlement-free root-direct gate;
-their implementation remains owned by
-[#1378](https://github.com/seven332/bangbang/issues/1378),
-[#1491](https://github.com/seven332/bangbang/issues/1491).
+and MMDS identities. All 35 are now `implemented-and-verified`. The exact
+native-v2 2.11 snapshot/session rows were already terminal; #1948 closes the
+two broad [#1378](https://github.com/seven332/bangbang/issues/1378) production
+rows from repeated no-Apple clean-main evidence while retaining
+[#1491](https://github.com/seven332/bangbang/issues/1491)'s terminal performance
+and observability ownership.
 
 ## Evidence keys
 
@@ -74,10 +74,12 @@ their implementation remains owned by
   additionally fixes and portable-tests the private protocols,
   direct-rootfs-v110 DHCP/TCP oracle, two-package inspection, descriptor grants,
   complete 21-case production runner, and redacted result. The placeholder
-  `run` exits 3 and publishes nothing. #1378 still owns the first real
-  Apple-approved start, packet-connectivity, service-error, teardown, crash,
-  retry, and concurrent-session results; an injected driver, non-success local
-  gate, or fixture declaration is never a passing skip.
+  `run` exits 3 and publishes nothing. At that schema-v1 boundary, #1378 owned
+  the first real Apple-approved start, packet-connectivity, service-error,
+  teardown, crash, retry, and concurrent-session results; an injected driver,
+  non-success local gate, or fixture declaration was never a passing skip.
+  #1948 later completes those capability claims through the disjoint no-Apple
+  schema-v2 path, while Apple-authorized schema v1 remains optional.
 - **ROOT-FEASIBILITY** — #1930 prepares an immutable v111 package as an
   ordinary user, proves the identical ad-hoc-signed binary is denied without
   elevation, then uses explicit exact-root authority to start shared vmnet. A
@@ -123,11 +125,11 @@ their implementation remains owned by
 | `api-schema:PartialNetworkInterface` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `corpus:mmds-design` | `implemented-and-verified` | `API-MMDS + MMDS-CORE + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `corpus:mmds-user-guide` | `implemented-and-verified` | `API-MMDS + MMDS-CORE + SNAPSHOT-CODEC` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-SNAPSHOT` | `terminal` |
-| `corpus:network-setup` | `missing-platform-feasible` | `API-NET + NET-CORE` applicable live subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CONTAINED + EXTERNAL-GATE + ROOT-FEASIBILITY` | `#1378` |
+| `corpus:network-setup` | `implemented-and-verified` | `API-NET + NET-CORE + PRODUCTION-VMNET` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CONTAINED + ROOT-FEASIBILITY + PRODUCTION-VMNET` | `terminal` |
 | `corpus:patch-network-interface` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS` | `terminal` |
 | `non-swagger-route:DELETE /network-interfaces/{iface_id}` | `implemented-and-verified` | `API-NET + NET-CORE` | `FOCUSED` | `SIGNED-PROCESS + SIGNED-CONTAINED` | `terminal` |
 | `semantic.mmds:tcp-token-session-and-isolation` | `implemented-and-verified` | `MMDS-CORE + SNAPSHOT-CODEC` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-SNAPSHOT` | `terminal` |
-| `semantic.network:virtio-net-vmnet-policy-and-connectivity` | `missing-platform-feasible` | `API-NET + NET-CORE + MMDS-CORE` live and capture-ready subset | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-CONTAINED + EXTERNAL-GATE + ROOT-FEASIBILITY` | `#1378 + W7` |
+| `semantic.network:virtio-net-vmnet-policy-and-connectivity` | `implemented-and-verified` | `API-NET + NET-CORE + MMDS-CORE + PRODUCTION-VMNET` | `FOCUSED` | `SIGNED-TRANSPORT + SIGNED-PROCESS + SIGNED-CAPTURE + SIGNED-CONTAINED + ROOT-FEASIBILITY + PRODUCTION-VMNET` | `terminal + W7` |
 
 ## Observable live contract
 
@@ -221,19 +223,39 @@ handles/callbacks/properties, tokens, or guest diagnostics. Networkless remains
 the default signed profile and rejects positive host/shared/bridged policy
 before session creation.
 
+## Terminal production vmnet certification
+
+#1948 consumes the credential-free topology and fixed schema-v2 runner from
+#1941. Two independently prepared packages from clean merged `main` produced
+the byte-identical checked
+[`production-vmnet-certification-evidence.json`](production-vmnet-certification-evidence.json):
+all 27 mandatory rows passed, only the four named external host/bridge/service
+conditions remained visibly environment-gated, cleanup was complete, and the
+verdict passed.
+
+The mandatory matrix proves the remote-only contained shared path with real
+guest DHCP and nonce-bound bidirectional TCP; bounded-root acquisition followed
+by irreversibly ordinary owners; provider-free MMDS; policy denial; startup and
+runtime removal; fresh ownership after restore; role-specific TERM/SIGKILL
+reclamation; repeat; concurrent noninterchangeability; and exact cleanup. The
+full mapping and source identity are checked by the
+[production vmnet certification authority](production-vmnet-certification-contract.md).
+This closes both #1378 rows without requiring Apple authorization or treating
+root-direct feasibility as the product topology.
+
 ## Explicit nonclaims and handoffs
 
-- #1378 remains open. #1930 proves entitlement-free shared-vmnet packet
+- #1378's delivery is terminal. #1930 proves entitlement-free shared-vmnet packet
   connectivity and a dropped owner in the root-direct evidence topology,
   moving the two rows to `missing-platform-feasible`. #1934 subsequently adds
   the minimal root broker, exact privilege-dropped interface owner, and real
   provider-v1 lifecycle/cancellation/repeat proof; #1936 adds the contained
   remote data plane. #1938 packages the fixed provider/launcher/worker/owner
   topology and proves repeated real provider I/O, signals, daemon handoff, and
-  cleanup without Apple authorization. This contract still does not claim a
-  real guest through that production provider, the complete concurrent
-  lifecycle/death matrix, capability promotion, or the optional Apple-authorized
-  matrix.
+  cleanup without Apple authorization. #1944 adds the real guest and complete
+  lifecycle/death/concurrency matrix; #1948 validates it twice from merged
+  `main` and promotes the exact two rows. The optional Apple-authorized schema
+  remains supported but is not a completion dependency.
 - The checked [Wave 6 snapshot contract](snapshot-wave6-contract.md) makes
   Diff, version/tool composition, exact 2.11 network/MMDS bytes,
   reconstruction, overrides, and clone-session freshness terminal. Current
@@ -244,7 +266,7 @@ before session creation.
   owns the terminal network-performance reference interpretation and optional
   fixture boundary. Correctness-critical network/MMDS producers already exist;
   this ledger does not claim throughput parity or Linux TAP/epoll/timerfd
-  mechanism identity, and #1378 retains positive production connectivity.
+  mechanism identity.
 - macOS vmnet modes replace Linux TAP/NAT/bridge mechanisms. Operators remain
   responsible for mode selection and host firewall policy; the MMDS classifier
   is not an egress firewall.

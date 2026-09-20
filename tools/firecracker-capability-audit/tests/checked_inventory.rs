@@ -42,7 +42,6 @@ fn checked_inventory_is_valid_for_delivery() {
         .expect("checked source manifest must parse");
     let inventory = read_capability_inventory(&repository_root.join(CAPABILITY_INVENTORY_PATH))
         .expect("checked capability inventory must parse");
-
     validate(&manifest, &inventory, repository_root, AuditMode::Delivery)
         .expect("checked inventory must satisfy delivery-time invariants");
 }
@@ -975,19 +974,29 @@ fn checked_logger_compatibility_is_terminal_and_fail_closed() {
     let logger_audit =
         read_logger_producer_audit(&repository_root.join(LOGGER_PRODUCER_AUDIT_PATH))
             .expect("checked logger producer audit must parse");
+    let capabilities = inventory
+        .capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<BTreeMap<_, _>>();
 
-    assert_eq!(
+    assert!(
         inventory
             .capabilities
             .iter()
-            .filter(|capability| { capability.disposition == Disposition::MissingPlatformFeasible })
-            .map(|capability| capability.id.as_str())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "corpus:network-setup",
-            "semantic.network:virtio-net-vmnet-policy-and-connectivity",
-        ])
+            .all(|capability| capability.disposition != Disposition::MissingPlatformFeasible)
     );
+    for id in [
+        "corpus:network-setup",
+        "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+    ] {
+        let capability = capabilities
+            .get(id)
+            .unwrap_or_else(|| panic!("terminal production vmnet capability must exist: {id}"));
+        assert_eq!(capability.disposition, Disposition::ImplementedAndVerified);
+        assert!(!capability.implementation.is_empty());
+        assert!(!capability.validation.is_empty());
+    }
     assert!(
         !inventory
             .capabilities
@@ -1218,7 +1227,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::ImplementedAndVerified })
             .count(),
-        383
+        385
     );
     assert_eq!(
         inventory
@@ -1234,7 +1243,7 @@ fn checked_metrics_schema_compatibility_is_terminal_and_fail_closed() {
             .iter()
             .filter(|capability| { capability.disposition == Disposition::MissingPlatformFeasible })
             .count(),
-        2
+        0
     );
     assert_eq!(
         inventory
@@ -2339,6 +2348,8 @@ fn wave_7_ownership_and_core_api_policy_is_stable() {
                 WAVE8_ID
                     | "corpus:production-host"
                     | "corpus:jailer"
+                    | "corpus:network-setup"
+                    | "semantic.network:virtio-net-vmnet-policy-and-connectivity"
                     | "tool-argument:jailer/chroot-base-dir"
                     | "tool-argument:jailer/gid"
                     | "tool-argument:jailer/uid"
@@ -4035,9 +4046,9 @@ fn snapshot_paging_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 385);
     assert_eq!(count(Disposition::AuditRequired), 0);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 2);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -4647,22 +4658,17 @@ fn snapshot_wave6_terminal_policy_is_stable() {
         let capability = by_id
             .get(id)
             .unwrap_or_else(|| panic!("Wave 6 capability must exist: {id}"));
-        if let Some(owners) = retained.get(id) {
+        if retained.contains_key(id) {
             assert_eq!(
                 capability.disposition,
-                Disposition::MissingPlatformFeasible,
-                "downstream-owned network aggregate must remain nonterminal: {id}"
+                Disposition::ImplementedAndVerified,
+                "production vmnet successor must close the Wave 6 handoff: {id}"
             );
             assert!(
-                capability.implementation.is_empty() && capability.validation.is_empty(),
-                "nonterminal network aggregate must not carry terminal evidence: {id}"
+                !capability.implementation.is_empty() && !capability.validation.is_empty(),
+                "production vmnet successor must carry terminal evidence: {id}"
             );
-            for owner in *owners {
-                assert!(
-                    capability.summary.contains(owner),
-                    "nonterminal network aggregate must name {owner}: {id}"
-                );
-            }
+            terminal_count += 1;
             continue;
         }
 
@@ -4683,7 +4689,7 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             "Wave 6 terminal summary still names pending work: {id}"
         );
     }
-    assert_eq!(terminal_count, 68, "Wave 6 terminal count must stay exact");
+    assert_eq!(terminal_count, 70, "Wave 6 terminal count must stay exact");
 
     let contract = std::fs::read_to_string(
         repository_root.join("compat/firecracker/v1.16.0/snapshot-wave6-contract.md"),
@@ -4765,9 +4771,9 @@ fn snapshot_wave6_terminal_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 385);
     assert_eq!(count(Disposition::AuditRequired), 0);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 2);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -4891,19 +4897,11 @@ fn network_mmds_closure_policy_is_stable() {
         "non-swagger-route:DELETE /network-interfaces/{iface_id}",
         "semantic.mmds:tcp-token-session-and-isolation",
     ];
-    const RETAINED: [(&str, &[&str], &str); 2] = [
-        (
-            "corpus:network-setup",
-            &["https://github.com/seven332/bangbang/issues/1378"],
-            "`#1378`",
-        ),
+    const PROMOTED: [(&str, &str); 2] = [
+        ("corpus:network-setup", "`terminal`"),
         (
             "semantic.network:virtio-net-vmnet-policy-and-connectivity",
-            &[
-                "https://github.com/seven332/bangbang/issues/1378",
-                "https://github.com/seven332/bangbang/issues/1491",
-            ],
-            "`#1378 + W7`",
+            "`terminal + W7`",
         ),
     ];
 
@@ -4926,7 +4924,7 @@ fn network_mmds_closure_policy_is_stable() {
 
     let expected_ids = TERMINAL
         .into_iter()
-        .chain(RETAINED.iter().map(|(id, _, _)| *id))
+        .chain(PROMOTED.iter().map(|(id, _)| *id))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_ids.len(),
@@ -4955,32 +4953,29 @@ fn network_mmds_closure_policy_is_stable() {
         );
     }
 
-    for (id, owner_urls, downstream) in RETAINED {
+    for (id, downstream) in PROMOTED {
         let capability = by_id
             .get(id)
-            .expect("retained network/MMDS record must exist");
+            .expect("promoted network/MMDS record must exist");
         assert_eq!(
             capability.disposition,
-            Disposition::MissingPlatformFeasible,
-            "retained network/MMDS disposition drifted: {id}"
+            Disposition::ImplementedAndVerified,
+            "promoted network/MMDS disposition drifted: {id}"
         );
-        for owner_url in owner_urls {
-            assert!(
-                capability.summary.contains(owner_url),
-                "retained network/MMDS summary must name {owner_url}: {id}"
-            );
-        }
         for outcome in ["Exact native-v2 2.11", "restor", "clone"] {
             assert!(
                 capability.summary.contains(outcome),
-                "retained network/MMDS summary must retain delivered {outcome}: {id}"
+                "promoted network/MMDS summary must retain delivered {outcome}: {id}"
             );
         }
         if id.contains("network") {
             assert!(
-                capability.summary.contains("Entitlement-free")
-                    && capability.summary.contains("root-direct"),
-                "retained network summary must name the exact feasibility boundary: {id}"
+                capability.summary.contains("no-Apple")
+                    && (capability.summary.contains("root-direct")
+                        || capability
+                            .summary
+                            .contains("never falls back to local vmnet")),
+                "promoted network summary must retain the exact feasibility boundary: {id}"
             );
         }
         if id.starts_with("semantic.network") {
@@ -4997,9 +4992,9 @@ fn network_mmds_closure_policy_is_stable() {
             .find(|line| line.starts_with(&row_prefix))
             .unwrap_or_else(|| panic!("network/MMDS contract row must exist: {id}"));
         assert!(
-            row.contains("`missing-platform-feasible`")
+            row.contains("`implemented-and-verified`")
                 && row.ends_with(&format!("| {downstream} |")),
-            "retained network/MMDS ledger row has the wrong handoff: {id}"
+            "promoted network/MMDS ledger row has the wrong terminal result: {id}"
         );
     }
 
@@ -5064,9 +5059,9 @@ fn network_mmds_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 385);
     assert_eq!(count(Disposition::AuditRequired), 0);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 2);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -5213,9 +5208,9 @@ fn vsock_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 385);
     assert_eq!(count(Disposition::AuditRequired), 0);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 2);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 }
 
@@ -5461,9 +5456,9 @@ fn delivery_closure_policy_is_stable() {
             .filter(|capability| capability.disposition == disposition)
             .count()
     };
-    assert_eq!(count(Disposition::ImplementedAndVerified), 383);
+    assert_eq!(count(Disposition::ImplementedAndVerified), 385);
     assert_eq!(count(Disposition::AuditRequired), 0);
-    assert_eq!(count(Disposition::MissingPlatformFeasible), 2);
+    assert_eq!(count(Disposition::MissingPlatformFeasible), 0);
     assert_eq!(count(Disposition::ProvenPlatformImpossible), 33);
 
     for id in IMPLEMENTED_ORIGINAL {

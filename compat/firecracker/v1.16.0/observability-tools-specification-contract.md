@@ -267,9 +267,10 @@ exactly its one #1351 semantic row, producing 381/3/1/33 with one #1373, two
 moves that last #1351 row, producing 382/3/0/33 with one #1373 and two #1378
 audit-required outcomes. #1920 then moves only the production-host row,
 producing 383/2/0/33 with the two #1378 outcomes. #1930 then reclassifies
-exactly those outcomes to `missing-platform-feasible`, producing the current
-383/0/2/33 phase. Any other identity or count transition fails the Wave 7
-gate.
+exactly those outcomes to `missing-platform-feasible`, producing the historical
+383/0/2/33 phase. #1948 then promotes exactly those two outcomes to produce the
+terminal 385/0/0/33 phase. Any other identity or count transition fails the
+Wave 7 gate.
 
 The historical public-tool ledger derives 46 implemented leaves, five terminal
 Linux-only jailer exclusions, and four #1373 jailer handoffs. Its uid/gid
@@ -406,7 +407,8 @@ terminal platform exclusions, and #1908 later makes only
 `jailer/run` implemented-and-verified from the checked aggregate authority.
 #1920 later certifies `corpus:production-host`, completing the historical
 #1373 rows; both #1378 rows were audit-required at the checked Wave 7 phase and
-are `missing-platform-feasible` in the current #1930 successor.
+became `missing-platform-feasible` in the historical #1930 successor. #1948
+later promotes both rows in the terminal production-vmnet successor.
 
 ## Disposition accounting
 

@@ -108,6 +108,7 @@ pub(crate) enum InventoryPhase {
     JailerSeccompContainment,
     ProductionHost,
     NetworkVmnetFeasibility,
+    ProductionVmnet,
 }
 
 impl InventoryPhase {
@@ -124,6 +125,7 @@ impl InventoryPhase {
             Self::JailerSeccompContainment => "jailer/seccomp containment 382/3/0/33",
             Self::ProductionHost => "production-host corpus 383/2/0/33",
             Self::NetworkVmnetFeasibility => "network/vmnet feasibility 383/0/2/33",
+            Self::ProductionVmnet => "production vmnet 385/0/0/33",
         }
     }
 }
@@ -144,6 +146,7 @@ pub(crate) fn classify_inventory_phase(
         (382, 3, 0, 33) => InventoryPhase::JailerSeccompContainment,
         (383, 2, 0, 33) => InventoryPhase::ProductionHost,
         (383, 0, 2, 33) => InventoryPhase::NetworkVmnetFeasibility,
+        (385, 0, 0, 33) => InventoryPhase::ProductionVmnet,
         (implemented, audit, feasible, impossible) => {
             return Err(format!(
                 "inventory does not match an exact accepted phase: found {implemented}/{audit}/{feasible}/{impossible}"
@@ -205,6 +208,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
             | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet
     ) {
         ids.extend(JAILER_UID_GID_IDS);
     }
@@ -217,6 +221,7 @@ pub(crate) fn expected_impossible_ids(phase: InventoryPhase) -> BTreeSet<&'stati
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
             | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet
     ) {
         ids.insert(JAILER_CHROOT_BASE_DIR_ID);
     }
@@ -271,7 +276,8 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         | InventoryPhase::HostResourceAuthority
         | InventoryPhase::JailerSeccompContainment
         | InventoryPhase::ProductionHost
-        | InventoryPhase::NetworkVmnetFeasibility => {
+        | InventoryPhase::NetworkVmnetFeasibility
+        | InventoryPhase::ProductionVmnet => {
             for id in JAILER_UID_GID_IDS {
                 ids.remove(id);
             }
@@ -281,11 +287,16 @@ fn expected_audit_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             }
             if matches!(
                 phase,
-                InventoryPhase::ProductionHost | InventoryPhase::NetworkVmnetFeasibility
+                InventoryPhase::ProductionHost
+                    | InventoryPhase::NetworkVmnetFeasibility
+                    | InventoryPhase::ProductionVmnet
             ) {
                 ids.remove(PRODUCTION_HOST_ID);
             }
-            if phase == InventoryPhase::NetworkVmnetFeasibility {
+            if matches!(
+                phase,
+                InventoryPhase::NetworkVmnetFeasibility | InventoryPhase::ProductionVmnet
+            ) {
                 for id in NETWORK_VMNET_FEASIBLE_IDS {
                     ids.remove(id);
                 }
@@ -306,6 +317,7 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
             | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet
     ) {
         ids.remove(MULTIPROCESS_ISOLATION_ID);
     }
@@ -315,6 +327,7 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
             | InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
             | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet
     ) {
         ids.remove(HOST_RESOURCE_AUTHORITY_ID);
     }
@@ -323,6 +336,7 @@ fn expected_feasible_ids(phase: InventoryPhase) -> BTreeSet<&'static str> {
         InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
             | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet
     ) {
         ids.remove(JAILER_SECCOMP_CONTAINMENT_ID);
     }
@@ -388,10 +402,23 @@ mod tests {
         let current = current_inventory();
         assert_eq!(
             classify_inventory_phase(&current),
+            Ok(InventoryPhase::ProductionVmnet)
+        );
+
+        let mut network_feasibility = current.clone();
+        for id in NETWORK_VMNET_FEASIBLE_IDS {
+            set_disposition(
+                &mut network_feasibility,
+                id,
+                Disposition::MissingPlatformFeasible,
+            );
+        }
+        assert_eq!(
+            classify_inventory_phase(&network_feasibility),
             Ok(InventoryPhase::NetworkVmnetFeasibility)
         );
 
-        let mut production_host = current.clone();
+        let mut production_host = network_feasibility;
         for id in NETWORK_VMNET_FEASIBLE_IDS {
             set_disposition(&mut production_host, id, Disposition::AuditRequired);
         }
@@ -483,6 +510,9 @@ mod tests {
     #[test]
     fn equal_count_identity_swaps_do_not_classify() {
         let mut inventory = current_inventory();
+        for id in NETWORK_VMNET_FEASIBLE_IDS {
+            set_disposition(&mut inventory, id, Disposition::MissingPlatformFeasible);
+        }
         set_disposition(
             &mut inventory,
             "corpus:network-setup",

@@ -1003,9 +1003,10 @@ source-connection loss, old-token rejection, fresh-session success, fresh
 metrics, malformed state/memory, missing/duplicate/unknown overrides,
 redaction, graceful cancellation, both death orders, retry, containment, and
 cleanup. The contained all-MMDS matrix requires no vmnet authority. Positive
-external vmnet connectivity remains #1378; performance reconciliation remains
-#1491; Diff, native-v2 Uffd, Firecracker bytes, source packets and connections,
-and unconstrained artifact/host portability remain explicit non-claims.
+external vmnet connectivity was separately owned by #1378 and is terminal
+through #1948; performance reconciliation remains #1491; Diff, native-v2 Uffd,
+Firecracker bytes, source packets and connections, and unconstrained
+artifact/host portability remain explicit non-claims.
 
 ### Native V2 2.12 Vsock Activation and Certification
 

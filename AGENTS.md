@@ -34,6 +34,9 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
   --wave8-final`: certify the final seven-domain/21-pair platform-feasible
   interaction scope while retaining the exact external evidence outcomes.
+- `cargo run -p bangbang-firecracker-capability-audit --locked -- validate
+  --production-vmnet-final`: certify the terminal no-Apple production-vmnet
+  evidence, exact two-row promotion, and `385/0/0/33` completion phase.
 - `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`: run the
   portable guest-artifact policy, cache, sidecar, publication, and wrapper tests.
 - `cargo run -p bangbang-firecracker-capability-audit --locked -- validate

@@ -1,0 +1,155 @@
+{
+  "authority": {
+    "controller": "ordinary",
+    "kind": "elevated-provider",
+    "outer": "ordinary",
+    "owner": "irreversibly-ordinary",
+    "provider": "bounded-root",
+    "route": "remote-only"
+  },
+  "cases": [
+    {
+      "name": "authority-split",
+      "outcome": "passed"
+    },
+    {
+      "name": "networkless-denial",
+      "outcome": "passed"
+    },
+    {
+      "name": "missing-policy-denial",
+      "outcome": "passed"
+    },
+    {
+      "name": "mismatched-policy-denial",
+      "outcome": "passed"
+    },
+    {
+      "name": "bridge-allowlist-denial",
+      "outcome": "passed"
+    },
+    {
+      "name": "active-interface-count-exhaustion",
+      "outcome": "passed"
+    },
+    {
+      "name": "mmds-only-no-consumption",
+      "outcome": "passed"
+    },
+    {
+      "name": "shared-connectivity",
+      "outcome": "passed"
+    },
+    {
+      "name": "host-connectivity",
+      "outcome": "environment-gated"
+    },
+    {
+      "name": "bridged-connectivity",
+      "outcome": "environment-gated"
+    },
+    {
+      "name": "not-authorized",
+      "outcome": "environment-gated"
+    },
+    {
+      "name": "sharing-service-busy",
+      "outcome": "environment-gated"
+    },
+    {
+      "name": "startup-interface-remove",
+      "outcome": "passed"
+    },
+    {
+      "name": "runtime-hotplug-remove",
+      "outcome": "passed"
+    },
+    {
+      "name": "normal-teardown",
+      "outcome": "passed"
+    },
+    {
+      "name": "partial-start-cleanup",
+      "outcome": "passed"
+    },
+    {
+      "name": "pre-ready-cancellation",
+      "outcome": "passed"
+    },
+    {
+      "name": "post-ready-cancellation",
+      "outcome": "passed"
+    },
+    {
+      "name": "provider-startup-death",
+      "outcome": "passed"
+    },
+    {
+      "name": "broker-runtime-death",
+      "outcome": "passed"
+    },
+    {
+      "name": "owner-runtime-death",
+      "outcome": "passed"
+    },
+    {
+      "name": "launcher-first-death",
+      "outcome": "passed"
+    },
+    {
+      "name": "worker-first-death",
+      "outcome": "passed"
+    },
+    {
+      "name": "provider-sigkill-reclamation",
+      "outcome": "passed"
+    },
+    {
+      "name": "broker-sigkill-reclamation",
+      "outcome": "passed"
+    },
+    {
+      "name": "owner-sigkill-reclamation",
+      "outcome": "passed"
+    },
+    {
+      "name": "launcher-sigkill-reclamation",
+      "outcome": "passed"
+    },
+    {
+      "name": "worker-sigkill-reclamation",
+      "outcome": "passed"
+    },
+    {
+      "name": "clean-repeat",
+      "outcome": "passed"
+    },
+    {
+      "name": "capture-restore-fresh-ownership",
+      "outcome": "passed"
+    },
+    {
+      "name": "concurrent-noninterchangeability",
+      "outcome": "passed"
+    }
+  ],
+  "cleanup": "complete",
+  "entitlements": {
+    "outer_empty": true,
+    "provider_empty": true,
+    "worker_app_sandbox_hvf": true,
+    "worker_vmnet": false
+  },
+  "platform": {
+    "architecture": "arm64",
+    "hvf": "supported",
+    "macos": "26.6.2",
+    "sdk": "26.5"
+  },
+  "schema_version": 2,
+  "source": {
+    "commit": "b4fe638a7fbbedbb118516285b4d21209c344f4e",
+    "tree": "2ccd3b8ae6f3742be9e102fc2428d2edeb0a7a04"
+  },
+  "verdict": "passed"
+}

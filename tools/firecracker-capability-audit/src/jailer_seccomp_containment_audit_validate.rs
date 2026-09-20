@@ -23,7 +23,7 @@ pub const JAILER_SECCOMP_CONTAINMENT_AUDIT_PATH: &str =
 pub const JAILER_SECCOMP_CONTAINMENT_CAPABILITY_ID: &str = JAILER_SECCOMP_CONTAINMENT_ID;
 
 const UNRELATED_INVENTORY_SHA256: &str =
-    "a918fc032188b8eec2845d9d837716a4dbd4573ad42e8eba0ff182971c00e13e";
+    "67b8ab81cf9d426b6ff21aa74e08f8e79564ffb63b20c0aef22b3e3f1cd4728c";
 
 const PROFILE_IDS: [ContainmentEvidenceProfileId; 8] = [
     ContainmentEvidenceProfileId::SignedCodeAndEntitlements,
@@ -226,17 +226,18 @@ fn validate_inventory_transition(
     }
     if !matches!(
         disposition_counts(inventory),
-        (382, 3, 0, 33) | (383, 2, 0, 33) | (383, 0, 2, 33)
+        (382, 3, 0, 33) | (383, 2, 0, 33) | (383, 0, 2, 33) | (385, 0, 0, 33)
     ) {
         errors.push(
-            "jailer/seccomp containment live inventory must be exactly 382/3/0/33 or one of its exact successors through 383/0/2/33 vmnet feasibility".to_string(),
+            "jailer/seccomp containment live inventory must be exactly 382/3/0/33 or one of its exact successors through 385/0/0/33 production vmnet".to_string(),
         );
     }
     if !matches!(
         classify_inventory_phase(inventory),
         Ok(InventoryPhase::JailerSeccompContainment
             | InventoryPhase::ProductionHost
-            | InventoryPhase::NetworkVmnetFeasibility)
+            | InventoryPhase::NetworkVmnetFeasibility
+            | InventoryPhase::ProductionVmnet)
     ) {
         errors.push(
             "jailer/seccomp containment live inventory has an inexact successor phase".to_string(),
@@ -903,9 +904,19 @@ fn validate_external_dependencies(
         let completed_production_host = expected.capability_id == "corpus:production-host"
             && matches!(
                 phase,
-                Some(InventoryPhase::ProductionHost | InventoryPhase::NetworkVmnetFeasibility)
+                Some(
+                    InventoryPhase::ProductionHost
+                        | InventoryPhase::NetworkVmnetFeasibility
+                        | InventoryPhase::ProductionVmnet
+                )
             );
         let vmnet_feasibility_successor = phase == Some(InventoryPhase::NetworkVmnetFeasibility)
+            && matches!(
+                expected.capability_id,
+                "corpus:network-setup"
+                    | "semantic.network:virtio-net-vmnet-policy-and-connectivity"
+            );
+        let production_vmnet_successor = phase == Some(InventoryPhase::ProductionVmnet)
             && matches!(
                 expected.capability_id,
                 "corpus:network-setup"
@@ -932,6 +943,13 @@ fn validate_external_dependencies(
                     && capability.validation.is_empty()
                     && capability.delivery_issue.as_deref()
                         == Some("https://github.com/seven332/bangbang/issues/1378")
+                    && capability.exclusion.is_none() => {}
+            Some(capability)
+                if production_vmnet_successor
+                    && capability.disposition == Disposition::ImplementedAndVerified
+                    && !capability.implementation.is_empty()
+                    && !capability.validation.is_empty()
+                    && capability.delivery_issue.is_none()
                     && capability.exclusion.is_none() => {}
             Some(_) => errors.push(format!(
                 "jailer/seccomp containment external dependency changed disposition, ownership, or evidence: {}",

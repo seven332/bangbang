@@ -137,6 +137,6 @@ source blobs and clauses, terminal dependencies, current-tree evidence,
 residual classifications, the unrelated-record digest, and the single checked
 inventory row. The ordinary delivery command also validates the authority.
 
-The global `--final` gate remains stronger and intentionally fails until every
-independent audit, feasible, and platform decision in the full inventory is
-terminal.
+The global `--final` gate remains stronger. It failed until every independent
+audit, feasible, and platform decision became terminal and now passes only at
+the exact `385/0/0/33` successor.

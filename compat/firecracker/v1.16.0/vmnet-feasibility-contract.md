@@ -142,9 +142,10 @@ failure-only auxiliary channel and may be empty.
 The checked `vmnet-feasibility-audit.json` pins the source identity, two public
 Apple references, authorization boundary, three evidence profiles, two exact
 disposition transitions, unrelated-inventory digest, and nonclaims. Default
-delivery validation requires that authority and the exact `383/0/2/33`
-partition. Global `validate --final` must still fail, and it must identify only
-the same two `missing-platform-feasible` records.
+delivery validation requires that authority and accepts its exact historical
+`383/0/2/33` partition or the exact terminal `385/0/0/33` successor. Global
+`validate --final` failed at the historical phase and now passes only after the
+same two records become terminal under #1948.
 
 The later [`provider-v1` contract](../../../docs/vmnet-provider-protocol.md)
 freezes the bounded wire, role state, and descriptor ownership for the split
@@ -156,10 +157,11 @@ contained grant, remote-only route, client pumps, and process-registry adapter;
 outer, transfers the inherited provider authority, and proves the foreground
 and provider-owned daemon topology with repeated real provider I/O, signals,
 and cleanup. Neither successor changes a disposition. A real guest through the
-production provider and the complete lifecycle/concurrency certification remain
-separate work. #1942 subsequently adds the three staged root-direct oracle
-scenarios described above, still without capability promotion or parent
-closure.
+production provider and the complete lifecycle/concurrency certification
+remained separate work at this boundary. #1942 subsequently adds the three
+staged root-direct oracle scenarios, #1944 adds the complete no-Apple product
+matrix, and #1948 promotes the two rows after two clean-main repetitions; none
+rewrites #1930's evidence scope.
 
 At its delivery boundary, #1930 itself did not claim any of the following;
 later provider and topology slices do not retroactively change that evidence

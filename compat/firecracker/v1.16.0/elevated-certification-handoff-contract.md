@@ -9,8 +9,9 @@ exact-root provider bootstrap. It does not execute the canonical guest matrix,
 publish a result, promote a capability, or replace the direct #1930/#1942
 evidence.
 
-The live inventory remains exactly `383 implemented / 0 audit-required / 2
-missing-platform-feasible / 33 proven-platform-impossible`. The retained rows
+At this historical delivery boundary, the inventory remained exactly `383
+implemented / 0 audit-required / 2 missing-platform-feasible / 33
+proven-platform-impossible`. The retained rows
 are `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity`.
 
@@ -183,6 +184,6 @@ environment-gated. Every case restores the production-session baseline, and
 the final guardian acknowledgment still requires stage and process absence.
 
 This consumer does not widen the root protocol, add a persistent service, use
-Apple authorization, or promote a capability on its feature head. The live
-inventory therefore remains `383/0/2/33`; merged-clean-main evidence and the
-two retained network disposition changes belong to the later promotion slice.
+Apple authorization, or promote a capability on its feature head. Its
+feature-head inventory therefore remained `383/0/2/33`; #1948 later owns the
+merged-clean-main evidence and exact terminal two-row promotion.

@@ -379,10 +379,18 @@ fn validate_inventory_transition(
     {
         errors.push("vmnet feasibility target counts must be exactly 383/0/2/33".to_string());
     }
-    if disposition_counts(inventory) != (383, 0, 2, 33)
-        || classify_inventory_phase(inventory) != Ok(InventoryPhase::NetworkVmnetFeasibility)
-    {
-        errors.push("vmnet feasibility live inventory must be exact 383/0/2/33".to_string());
+    let phase = classify_inventory_phase(inventory).ok();
+    if !matches!(
+        disposition_counts(inventory),
+        (383, 0, 2, 33) | (385, 0, 0, 33)
+    ) || !matches!(
+        phase,
+        Some(InventoryPhase::NetworkVmnetFeasibility | InventoryPhase::ProductionVmnet)
+    ) {
+        errors.push(
+            "vmnet feasibility live inventory must be exact 383/0/2/33 or its 385/0/0/33 production successor"
+                .to_string(),
+        );
     }
 
     if audit.transitions.len() != VMNET_FEASIBILITY_CAPABILITY_IDS.len() {
@@ -406,9 +414,14 @@ fn validate_inventory_transition(
             .iter()
             .find(|capability| capability.id == expected_id)
         {
-            Some(capability) if capability_is_exact_handoff(capability, expected_id) => {}
+            Some(capability)
+                if phase == Some(InventoryPhase::NetworkVmnetFeasibility)
+                    && capability_is_exact_handoff(capability, expected_id) => {}
+            Some(capability)
+                if phase == Some(InventoryPhase::ProductionVmnet)
+                    && capability_is_exact_terminal(capability, expected_id) => {}
             Some(_) => errors.push(format!(
-                "vmnet feasibility capability is not the exact feasible handoff: {expected_id}"
+                "vmnet feasibility capability does not match its exact live successor: {expected_id}"
             )),
             None => errors.push(format!(
                 "vmnet feasibility capability is missing: {expected_id}"
@@ -449,6 +462,29 @@ fn capability_is_exact_handoff(capability: &Capability, id: &str) -> bool {
         && capability.validation.is_empty()
         && capability.delivery_issue.as_deref()
             == Some("https://github.com/seven332/bangbang/issues/1378")
+        && capability.exclusion.is_none()
+}
+
+fn capability_is_exact_terminal(capability: &Capability, id: &str) -> bool {
+    let source_refs = if id == "corpus:network-setup" {
+        &["corpus:network-setup"][..]
+    } else {
+        &[
+            "corpus:network-performance",
+            "corpus:network-setup",
+            "corpus:patch-network-interface",
+        ][..]
+    };
+    capability.family == "network-and-mmds"
+        && capability
+            .source_refs
+            .iter()
+            .map(String::as_str)
+            .eq(source_refs.iter().copied())
+        && capability.disposition == Disposition::ImplementedAndVerified
+        && !capability.implementation.is_empty()
+        && !capability.validation.is_empty()
+        && capability.delivery_issue.is_none()
         && capability.exclusion.is_none()
 }
 

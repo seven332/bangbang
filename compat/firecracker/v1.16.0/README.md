@@ -151,10 +151,10 @@ only the exact Wave 8 one-row successor, the later exact uid/gid-only
 377/6/3/32 successor, the exact configurable-chroot-only 377/5/3/33 successor,
 the aggregate-jailer 379/3/3/33 successor, the multiprocess-isolation
 380/3/2/33 successor, the host-resource-authority 381/3/1/33 successor, and
-the jailer/seccomp-containment 382/3/0/33 successor, and the current
-production-host 383/2/0/33 successor, followed by the current exact
-network/vmnet-feasibility 383/0/2/33 successor. The two #1378 outcomes remain
-undelivered but are now `missing-platform-feasible` rather than unaudited. See the
+the jailer/seccomp-containment 382/3/0/33 successor, the production-host
+383/2/0/33 successor, the exact network/vmnet-feasibility 383/0/2/33 successor,
+and the current terminal production-vmnet 385/0/0/33 successor. The two #1378
+outcomes are now `implemented-and-verified` from no-Apple clean-main evidence. See the
 [Wave 8 contract](wave8-certification-contract.md) for the checked transitions,
 the [aggregate jailer contract](jailer-aggregate-contract.md) for its two-row
 transition, the [multiprocess isolation contract](multiprocess-isolation-contract.md)
@@ -167,6 +167,8 @@ for its one-row transition, the
 one-row transition, and
 the [vmnet feasibility contract](vmnet-feasibility-contract.md) for the
 two-row evidence transition, and
+the [production vmnet certification authority](production-vmnet-certification-contract.md)
+for the exact terminal two-row promotion, and
 the [elevated certification handoff contract](elevated-certification-handoff-contract.md)
 for the immutable normal-bundle, dropped-controller, fixed-provider lifecycle,
 and reciprocal cleanup boundary, and
@@ -186,9 +188,9 @@ vmnet/XPC descriptor and needs no Apple developer identity or vmnet profile.
 worker, starts the outer only after irreversible drop, transfers the inherited
 provider stream, and proves repeated real provider I/O, foreground signal
 convergence, provider-owned daemon handoff, and cleanup. The canonical
-version-2 consumer now adds real guest-through-provider lifecycle/concurrency
-certification; the inventory and both `missing-platform-feasible` dispositions
-still stay unchanged until merged-main promotion.
+version-2 consumer adds real guest-through-provider lifecycle/concurrency
+certification. #1948 validates two byte-identical clean-main results and
+promotes the exact two rows without Apple authorization.
 
 #1943 adds the one-shot least-privileged certification bridge without changing
 the provider product ABI or inventory. The normal ad-hoc/networkless bundle is
@@ -210,8 +212,16 @@ policy denials, provider-free MMDS, real
 shared traffic, startup/runtime remove, fresh-owner restore, role-specific
 TERM/SIGKILL, repeat, and noninterchangeable concurrent policies. Its exact
 public result permits only four named environment gates and requires complete
-cleanup. The feature-head verdict is nonfinal, so `383/0/2/33` and both retained
-network dispositions remain authoritative pending the clean merged-main gate.
+cleanup. That feature-head verdict was deliberately nonfinal at `383/0/2/33`.
+#1948 now records the clean merged-main repetitions, checks the closed claim
+mapping, and produces the terminal `385/0/0/33` successor.
+
+The terminal authority is checked independently and by the global final gate:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-vmnet-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
+```
 
 ## Guest workflow artifact authority
 
@@ -240,8 +250,8 @@ implement either #1378 capability.
 `rootfs-ext4-direct-boot-v112` retains the v111 one-shot oracle and adds
 #1942's staged coordinator and authenticated 4096-byte barrier protocol. It is
 used only for exact-root startup/runtime/restore foundation evidence, does not
-replace either public workflow profile, and leaves the inventory at
-`383/0/2/33`.
+replace either public workflow profile, and left the #1942 phase at
+`383/0/2/33`; the terminal promotion composes rather than rewrites that result.
 
 Runtime sidecars stay under the ignored cache root and never count as checked
 inventory or terminal workflow evidence.
@@ -302,9 +312,9 @@ This command validates the complete capability inventory in delivery mode,
 the complete logger producer audit in final mode, and the exact eleven #1786
 capability records as `implemented-and-verified`. It does not ignore a logger
 class or alter another capability's disposition. Repository-global
-`validate --final` remains the stronger all-capabilities completion gate and
-must continue to fail while any unrelated `audit-required` or
-`missing-platform-feasible` record or device producer remains nonterminal.
+`validate --final` remains the stronger all-capabilities completion gate. It
+now passes only at the exact terminal `385/0/0/33` phase; any later nonterminal
+capability or producer must make it fail closed again.
 
 ## Scoped Developer-Tracing Certification
 

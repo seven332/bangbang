@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "1.16.0",
+    "commit": "d83d72b710361a10294480131377b1b00b163af8",
+    "target": "aarch64-macos-hvf"
+  },
+  "parent_issue": "#1378",
+  "delivery_issue": "#1948",
+  "evidence": {
+    "path": "compat/firecracker/v1.16.0/production-vmnet-certification-evidence.json",
+    "sha256": "8f3dd5c3669f281e31536f617bc50648e8cf5d40cb38d1b661fec80b4fa87dca",
+    "repetitions": 2,
+    "byte_identical": true,
+    "source": {
+      "commit": "b4fe638a7fbbedbb118516285b4d21209c344f4e",
+      "tree": "2ccd3b8ae6f3742be9e102fc2428d2edeb0a7a04"
+    },
+    "platform": {
+      "architecture": "arm64",
+      "hvf": "supported",
+      "macos": "26.6.2",
+      "sdk": "26.5"
+    },
+    "result_comment": {
+      "kind": "github",
+      "url": "https://github.com/seven332/bangbang/issues/1948#issuecomment-5747681356"
+    },
+    "challenge": {
+      "kind": "github",
+      "url": "https://github.com/seven332/bangbang/issues/1948#issuecomment-5747683837"
+    }
+  },
+  "previous_counts": {
+    "implemented_and_verified": 383,
+    "audit_required": 0,
+    "missing_platform_feasible": 2,
+    "proven_platform_impossible": 33
+  },
+  "target_counts": {
+    "implemented_and_verified": 385,
+    "audit_required": 0,
+    "missing_platform_feasible": 0,
+    "proven_platform_impossible": 33
+  },
+  "unrelated_inventory_sha256": "eb54c4cf9cadaaf7a2ddb7a86b5642a93af1cc913bdd3edaedff5cc53472dc00",
+  "optional_non_dependencies": [
+    "host-connectivity",
+    "bridged-connectivity",
+    "not-authorized",
+    "sharing-service-busy"
+  ],
+  "claims": [
+    {
+      "capability_id": "corpus:network-setup",
+      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented and verified. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. The no-Apple schema-v2 production topology uses an ordinary launcher/controller, bounded-root provider acquisition, irreversibly ordinary packet owners, and a remote-only sandbox-worker route. Two byte-identical clean merged-main executions verify real shared guest DHCP plus nonce-bound bidirectional TCP, policy denial and MMDS nonconsumption, startup/runtime removal, fresh-owner restore, role-specific TERM/SIGKILL reclamation, repeat, concurrency, and complete cleanup. Positive host/bridged traffic and two externally induced service conditions remain visible optional environment gates; root-direct execution remains historical feasibility evidence rather than a supported topology.",
+      "required_cases": [
+        "authority-split",
+        "networkless-denial",
+        "missing-policy-denial",
+        "mismatched-policy-denial",
+        "bridge-allowlist-denial",
+        "active-interface-count-exhaustion",
+        "mmds-only-no-consumption",
+        "shared-connectivity",
+        "startup-interface-remove",
+        "runtime-hotplug-remove",
+        "normal-teardown",
+        "partial-start-cleanup",
+        "pre-ready-cancellation",
+        "post-ready-cancellation",
+        "provider-startup-death",
+        "broker-runtime-death",
+        "owner-runtime-death",
+        "launcher-first-death",
+        "worker-first-death",
+        "provider-sigkill-reclamation",
+        "broker-sigkill-reclamation",
+        "owner-sigkill-reclamation",
+        "launcher-sigkill-reclamation",
+        "worker-sigkill-reclamation",
+        "clean-repeat",
+        "capture-restore-fresh-ownership",
+        "concurrent-noninterchangeability"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/network-mmds-contract.md",
+          "anchor": "## Terminal production vmnet certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/vmnet_topology.rs",
+          "anchor": "pub(crate) fn child_bootstrap()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/vmnet-provider/src/macos/topology.rs",
+          "anchor": "pub fn run_public_bootstrap("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-contract.md",
+          "anchor": "## Terminal production vmnet outcome"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-evidence.json",
+          "anchor": "shared-connectivity"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_production_vmnet_elevated.py",
+          "anchor": "test_elevated_matrix_runs_exact_rows_and_publishes_canonical_result"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/production_vmnet_certification_audit.rs",
+          "anchor": "fn checked_production_vmnet_certification_is_canonical_and_fail_closed()"
+        }
+      ]
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented and verified. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. The no-Apple contained product authenticates one remote provider route, keeps the launcher/controller ordinary, confines root to bounded provider acquisition, drops sustained owners irreversibly, and never falls back to local vmnet. Two byte-identical clean merged-main schema-v2 results verify real shared guest DHCP and bidirectional nonce-bound TCP, provider-free MMDS, startup/hotplug/remove/restore generations, role-specific death and SIGKILL reclamation, repeat, noninterchangeable concurrent policies, and complete cleanup. Optional host/bridged traffic and externally induced service conditions remain explicit nondependencies. Wave 7 https://github.com/seven332/bangbang/issues/1491 retains terminal performance and observability ownership.",
+      "required_cases": [
+        "authority-split",
+        "networkless-denial",
+        "missing-policy-denial",
+        "mismatched-policy-denial",
+        "bridge-allowlist-denial",
+        "active-interface-count-exhaustion",
+        "mmds-only-no-consumption",
+        "shared-connectivity",
+        "startup-interface-remove",
+        "runtime-hotplug-remove",
+        "normal-teardown",
+        "partial-start-cleanup",
+        "pre-ready-cancellation",
+        "post-ready-cancellation",
+        "provider-startup-death",
+        "broker-runtime-death",
+        "owner-runtime-death",
+        "launcher-first-death",
+        "worker-first-death",
+        "provider-sigkill-reclamation",
+        "broker-sigkill-reclamation",
+        "owner-sigkill-reclamation",
+        "launcher-sigkill-reclamation",
+        "worker-sigkill-reclamation",
+        "clean-repeat",
+        "capture-restore-fresh-ownership",
+        "concurrent-noninterchangeability"
+      ],
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/remote_vmnet.rs",
+          "anchor": "pub(crate) struct RemoteVmnetProviderSource"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "pub struct PreparedSnapshotV2NetworkRestoreTopology"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/vmnet_provider/mod.rs",
+          "anchor": "Closed, bounded vmnet-provider protocol"
+        },
+        {
+          "kind": "local",
+          "path": "crates/vmnet-provider/src/macos/topology.rs",
+          "anchor": "pub fn run_public_bootstrap("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-contract.md",
+          "anchor": "## Mandatory claim mapping"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-evidence.json",
+          "anchor": "concurrent-noninterchangeability"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_production_vmnet_elevated.py",
+          "anchor": "test_restore_orchestration_requires_fresh_owner_and_exact_barrier"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/production_vmnet_certification_audit.rs",
+          "anchor": "fn checked_production_vmnet_certification_is_canonical_and_fail_closed()"
+        }
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "capability_id": "corpus:network-setup",
+      "previous_disposition": "missing-platform-feasible",
+      "target_disposition": "implemented-and-verified"
+    },
+    {
+      "capability_id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
+      "previous_disposition": "missing-platform-feasible",
+      "target_disposition": "implemented-and-verified"
+    }
+  ]
+}

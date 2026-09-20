@@ -2110,9 +2110,9 @@ host-resource-authority `381/3/1/33` successor retained those three audit rows
 and one #1351 feasible row. The containment `382/3/0/33` successor retained
 only those three audit rows. The production-host `383/2/0/33`
 successor retained only the two #1378 rows. #1930 then moves those rows to
-`missing-platform-feasible`, producing the current `383/0/2/33` phase. The
-global `--final` command deliberately continues to fail on those two
-undelivered records. The Rust
+`missing-platform-feasible`, producing the historical `383/0/2/33` phase.
+#1948 later promotes exactly those rows from repeated no-Apple production
+evidence, and global `--final` passes only at terminal `385/0/0/33`. The Rust
 command is offline; live GitHub hierarchy, reviews, CI, branches, merge state, and
 merged-main OID are checked and recorded by the pull-request workflow.
 
@@ -2791,7 +2791,9 @@ profiles and signing tools to prove bounds, ordering, leaf matching,
 nonpublication on authorization failure, cleanup, and that the disposable
 probe—not the supplied worker—is the only executable handed to the
 authorization runner. None of those tests claim `vmnet_start_interface` or
-packet connectivity; that positive signed matrix remains #1378.
+packet connectivity. At this schema-v1 checkpoint that positive signed matrix
+remained #1378 work; #1948 later completes the capability claims through the
+independent no-Apple schema-v2 matrix without making schema v1 a dependency.
 
 ### Production vmnet certification foundation
 
@@ -2904,13 +2906,12 @@ The committed placeholder invocation exits 3 with exactly
 result. Portable tests inject the orchestration boundary and use fake
 DHCP/TCP/kernel commands plus a local retained fixture. They launch no Bangbang
 production bundle, create no vmnet interface, use no Apple credentials, and
-promote no capability. Until the subsequent caller-approved external execution
-and exact evidence-promotion slice finishes,
+promote no capability. The optional Apple-authorized schema-v1 matrix remains
+unexecuted. The separate entitlement-free feasibility gate below first moved
 `corpus:network-setup` and
-`semantic.network:virtio-net-vmnet-policy-and-connectivity` are not implemented.
-The separate entitlement-free feasibility gate below has since moved them to
-`missing-platform-feasible`; the optional Apple-authorized matrix here remains
-unexecuted and the global final gate still fails on the same two identities.
+`semantic.network:virtio-net-vmnet-policy-and-connectivity` to
+`missing-platform-feasible`; the later schema-v2 no-Apple product matrix and
+#1948 clean-main repetitions promote both rows independently of schema v1.
 
 ### Entitlement-free vmnet feasibility
 
@@ -2981,13 +2982,15 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate
 
 Success moves only `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity` from
-`audit-required` to `missing-platform-feasible`, giving exact `383/0/2/33`.
+`audit-required` to `missing-platform-feasible`, giving the historical exact
+`383/0/2/33` #1930 phase.
 It does not support a root-direct production VMM. The later #1934 and #1936
 slices add the minimal provider/broker, privilege-dropped service owner, and
 contained remote adapter. #1938 separately assembles their fixed product
-topology as described below. None of those successor results replaces this
-direct guest evidence or promotes either row; real guest-through-provider and
-the complete concurrent production certification remain outstanding.
+topology as described below. None of those intermediate results replaces this
+direct guest evidence. #1944 later supplies real guest-through-provider and
+complete concurrent production certification, and #1948 promotes it after two
+clean-main repetitions.
 
 ### Private vmnet provider protocol
 
@@ -3087,9 +3090,9 @@ python3 -m unittest scripts.tests.test_production_vmnet_topology
 This command certifies packaging, transition, inherited authority,
 foreground/daemon supervision, signals, and cleanup; by itself it does not boot
 a guest through the provider. The canonical version-2 consumer below now adds
-the guest and concurrency/death matrix, but inventory remains exactly
-`383/0/2/33` until merged-main promotion, and global final validation still
-fails only on the two retained network rows.
+the guest and concurrency/death matrix. At the #1938/#1944 feature heads the
+inventory remained `383/0/2/33`; #1948 later validates that matrix twice from
+clean merged main and promotes only the two retained network rows.
 
 ### Least-privileged elevated certification handoff
 
@@ -3187,8 +3190,8 @@ decision. Manifest implementation hashes prove source/package coherence and
 reject stale packages; they do not authenticate an otherwise modified entry.
 The handoff-only command publishes neither the canonical private plan/result nor
 a capability claim. The canonical version-2 consumer below imports its ordinary
-process factory, while the inventory remains exactly `383/0/2/33` and global
-final retains the same two network outcomes.
+process factory. This historical handoff phase remained `383/0/2/33`; the later
+#1948 terminal audit owns the two-row promotion.
 
 ### No-Apple production vmnet certification matrix
 
@@ -3280,9 +3283,15 @@ The focused real gate must run from a freshly prepared package/result and be
 repeated from a second fresh destination. Both runs require all 27 mandatory
 rows passed, exactly four permitted environment gates when they are disabled,
 `cleanup=complete`, `verdict=passed`, and no stage, session, socket, or process
-residue. This is feature-head evidence only. It deliberately retains
-`383/0/2/33`; the two network rows may change only after the separate
-merged-clean-main evidence, review, and promotion slice.
+residue. #1948 records two byte-identical executions from clean merged main at
+the exact source and platform identity, retains the unchanged generated public
+result, and promotes only the two network rows to reach `385/0/0/33`. Validate
+that terminal authority and the repository-wide completion gate with:
+
+```sh
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-vmnet-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
+```
 
 The signed `hvf_lifecycle` native-v1 composite case builds the accepted one-
 vCPU/read-only-root session and gives the production generalized publisher two
@@ -4661,7 +4670,8 @@ fail while independently owned audit-required records remain open.
 The scoped #1920 production-host gate consumes the complete pinned
 `docs/prod-host-setup.md` authority and certifies the exact `383/2/0/33`
 historical successor. Delivery validation also accepts the later exact
-`383/0/2/33` vmnet-feasibility successor:
+`383/0/2/33` vmnet-feasibility successor and the exact terminal
+`385/0/0/33` production-vmnet successor:
 
 ```sh
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-host-final

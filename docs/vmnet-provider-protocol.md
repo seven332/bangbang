@@ -308,8 +308,8 @@ Its exact success line is:
 bangbang production vmnet topology proof: provider=passed repeat=passed outer-signal=passed provider-signal=passed daemon=passed cleanup=passed
 ```
 
-This implementation deliberately changes no capability disposition. The
-checked inventory remains `383 implemented / 0 audit-required / 2
+This #1938 implementation deliberately changed no capability disposition. Its
+feature-head inventory remained `383 implemented / 0 audit-required / 2
 missing-platform-feasible / 33 proven-platform-impossible`; the two retained
 rows are `corpus:network-setup` and
 `semantic.network:virtio-net-vmnet-policy-and-connectivity`. The packaged
@@ -319,5 +319,6 @@ through this provider and covers startup/runtime removal, fresh-owner restore,
 provider/broker/owner/launcher/worker TERM and SIGKILL, clean repeat, and two
 noninterchangeable live policies. Its ordinary controller uses only the closed
 provider process handles after irreversible drop; root never receives guest,
-fixture, API, or result values. Optional Apple-authorized evidence and the
-merged-clean-main capability promotion remain successor work.
+fixture, API, or result values. #1948 later validates that no-Apple matrix twice
+from clean merged main and promotes the two rows to terminal
+`385/0/0/33`; optional Apple-authorized evidence is not a dependency.

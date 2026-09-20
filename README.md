@@ -54,6 +54,10 @@ Each detailed subject has one primary document:
 - [Entitlement-free vmnet Feasibility Contract](compat/firecracker/v1.16.0/vmnet-feasibility-contract.md)
   owns the no-Apple-authorization root-direct evidence boundary, exact dropped
   owner and repeated guest-connectivity gates, and the `383/0/2/33` handoff.
+- [Production vmnet Certification Authority](compat/firecracker/v1.16.0/production-vmnet-certification-contract.md)
+  owns the two byte-identical clean-main schema-v2 results, exact 27 mandatory
+  and four optional rows, and the terminal `385/0/0/33` promotion without an
+  Apple signing identity, provisioning profile, or restricted entitlement.
 - [Elevated Certification Handoff Contract](compat/firecracker/v1.16.0/elevated-certification-handoff-contract.md)
   owns the immutable normal-bundle package, one-shot root guardian/supervisor,
   irreversibly ordinary controller, descriptor-only provider lifecycle, and
@@ -67,10 +71,11 @@ Each detailed subject has one primary document:
   vmnet profile and constructs no local vmnet/XPC descriptor. The packaged
   no-Apple topology now supplies the drop-before-outer-exec bootstrap, inherited
   grant, repeated real provider I/O, signals, daemon handoff, and cleanup. The
-  canonical version-2 runner now composes that topology with real guest traffic,
-  hotplug, restore, death, repeat, and concurrency evidence without promoting a
-  capability on its feature head.
-- [Production vmnet certification runner](docs/testing.md#production-vmnet-certification-foundation)
+  canonical version-2 runner composes that topology with real guest traffic,
+  hotplug, restore, death, repeat, and concurrency evidence. The terminal
+  authority validates two byte-identical clean-main executions before promoting
+  the two remaining network rows.
+- [Production vmnet certification runner](docs/testing.md#no-apple-production-vmnet-certification-matrix)
   owns the private config, retained fixture, guest DHCP/TCP oracle, two-package
   inspection, descriptor-grant assembly, fixed 21-case Apple-authorized matrix,
   and redacted result. Its disjoint version-2 mode prepares one immutable
@@ -91,9 +96,8 @@ Each detailed subject has one primary document:
   snapshot formats, version behavior, capture/restore semantics, and nonclaims.
 - [Wave 6 Snapshot Certification](compat/firecracker/v1.16.0/snapshot-wave6-contract.md)
   owns the exact 70-record load, artifact, device, tool, time/identity, and
-  bounded-portability evidence ledger. Later #1491/Wave 8 composition is
-  terminal; caller-owned credentialed vmnet evidence remains external under
-  #1378.
+  bounded-portability evidence ledger. Later #1491/Wave 8 and the no-Apple
+  production-vmnet successor complete its historical external handoffs.
 - [`bangbang-pager-v1` Protocol](docs/snapshot-pager-protocol.md) owns the pager
   wire and lifecycle contract.
 - [macOS Host Security Model](docs/security.md) owns authority, containment,
@@ -112,11 +116,13 @@ the exact 377/6/3/32 uid/gid successor, the 377/5/3/33 configurable-chroot
 successor, the 379/3/3/33 aggregate-jailer successor, the 380/3/2/33
 multiprocess-isolation successor, the 381/3/1/33 host-resource-authority
 successor, the exact 382/3/0/33 containment successor, the 383/2/0/33
-production-host successor, and the current exact 383/0/2/33 entitlement-free
-vmnet-feasibility successor. See the
+production-host successor, the exact 383/0/2/33 entitlement-free
+vmnet-feasibility successor, and the terminal 385/0/0/33 production-vmnet
+successor. See the
 [Testing Guide](docs/testing.md#entitlement-free-vmnet-feasibility) for the
-real-host command and the checked authority for the two #1378 feasible
-handoffs.
+real-host command and the
+[production authority](compat/firecracker/v1.16.0/production-vmnet-certification-contract.md)
+for the completed #1378 promotion.
 
 ## Workspace Layout
 
@@ -266,9 +272,10 @@ sudo -- scripts/run-elevated-vmnet-handoff.sh \
 The repository entries never obtain elevation themselves. The externally
 authorized root side accepts only the immutable package and numeric target
 ids; it cannot select a product image, environment, working directory,
-fixture, result, account, profile, interface, or socket. This foundation uses
-only ad-hoc signing, publishes no certification result, and leaves the exact
-`383/0/2/33` inventory unchanged. TERM exercises exact group shutdown. KILL
+fixture, result, account, profile, interface, or socket. This historical
+foundation uses only ad-hoc signing, publishes no certification result, and
+left its feature-head inventory at `383/0/2/33`. TERM exercises exact group
+shutdown. KILL
 targets only the root provider first, preserving the ordinary launcher/worker
 long enough for authenticated parent-loss cleanup before bounded group
 escalation; success also requires the descriptor-anchored production-session
@@ -294,9 +301,10 @@ This mode uses ad-hoc signing only. Its exact version-2 result records the
 ordinary controller/outer, bounded-root provider, irreversibly ordinary owner,
 remote-only route, 31 ordered outcomes, and cleanup. Only host connectivity,
 bridged connectivity, not-authorized, and sharing-service-busy may be
-environment-gated. The feature-head gate is deliberately nonfinal: inventory
-remains `383/0/2/33` until the separate merged-clean-main evidence and promotion
-workflow completes.
+environment-gated. The checked terminal authority records two byte-identical
+clean-main results with all 27 mandatory rows passed, promotes exactly the two
+network rows, and leaves the repository at `385/0/0/33` without making the four
+environment-gated rows completion dependencies.
 
 ## Development
 
@@ -323,7 +331,7 @@ platform-tagged CPU-fingerprint dump, deterministic fingerprint compare,
 aggregate CPU-template workflow,
 69-field API/process,
 231-field device, ten-scenario aggregate metrics, multiprocess isolation,
-host-resource authority, and jailer/seccomp containment
+host-resource authority, jailer/seccomp containment, and production vmnet
 scopes have separate
 fail-closed certification gates:
 
@@ -341,6 +349,8 @@ cargo run -p bangbang-firecracker-capability-audit --locked -- validate --metric
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --multiprocess-isolation-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --host-resource-authority-final
 cargo run -p bangbang-firecracker-capability-audit --locked -- validate --jailer-seccomp-containment-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --production-vmnet-final
+cargo run -p bangbang-firecracker-capability-audit --locked -- validate --final
 ```
 
 On Linux with the exact pinned Kani setup, compile, inventory, and execute all

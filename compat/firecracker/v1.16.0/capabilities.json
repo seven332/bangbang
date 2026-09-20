@@ -13247,12 +13247,50 @@
     {
       "id": "corpus:network-setup",
       "family": "network-and-mmds",
-      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. Entitlement-free exact-root feasibility now includes ordinary-user denial, root-start followed by irreversible owner drop with callback/read/write/stop, and repeat real guest shared-vmnet DHCP plus bidirectional nonce-bound TCP. Delivery issue https://github.com/seven332/bangbang/issues/1378 still owns the minimal privileged provider, contained production topology, service failure/reclamation, and concurrent-session certification; root-direct execution is evidence only.",
+      "summary": "Applicable guest device configuration, MAC/MTU identity, vmnet host/shared/bridged policy, bounded ingress/egress ownership, cleanup, and operator firewall guidance are implemented and verified. Exact native-v2 2.11 restores portable network configuration through complete clone-local overrides and fresh backend/MMDS ownership, with signed direct and contained clone evidence. The no-Apple schema-v2 production topology uses an ordinary launcher/controller, bounded-root provider acquisition, irreversibly ordinary packet owners, and a remote-only sandbox-worker route. Two byte-identical clean merged-main executions verify real shared guest DHCP plus nonce-bound bidirectional TCP, policy denial and MMDS nonconsumption, startup/runtime removal, fresh-owner restore, role-specific TERM/SIGKILL reclamation, repeat, concurrency, and complete cleanup. Positive host/bridged traffic and two externally induced service conditions remain visible optional environment gates; root-direct execution remains historical feasibility evidence rather than a supported topology.",
       "source_refs": [
         "corpus:network-setup"
       ],
-      "disposition": "missing-platform-feasible",
-      "delivery_issue": "https://github.com/seven332/bangbang/issues/1378"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/network-mmds-contract.md",
+          "anchor": "## Terminal production vmnet certification"
+        },
+        {
+          "kind": "local",
+          "path": "crates/launcher/src/macos/vmnet_topology.rs",
+          "anchor": "pub(crate) fn child_bootstrap()"
+        },
+        {
+          "kind": "local",
+          "path": "crates/vmnet-provider/src/macos/topology.rs",
+          "anchor": "pub fn run_public_bootstrap("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-contract.md",
+          "anchor": "## Terminal production vmnet outcome"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-evidence.json",
+          "anchor": "shared-connectivity"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_production_vmnet_elevated.py",
+          "anchor": "test_elevated_matrix_runs_exact_rows_and_publishes_canonical_result"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/production_vmnet_certification_audit.rs",
+          "anchor": "fn checked_production_vmnet_certification_is_canonical_and_fail_closed()"
+        }
+      ]
     },
     {
       "id": "corpus:patch-block",
@@ -16063,14 +16101,57 @@
     {
       "id": "semantic.network:virtio-net-vmnet-policy-and-connectivity",
       "family": "network-and-mmds",
-      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. Entitlement-free exact-root feasibility proves the real public shared-vmnet path through repeat guest DHCP and bidirectional nonce-bound TCP, plus callback/read/write/stop after irreversible owner drop. The credential-free contained adapter now authenticates one remote provider grant and route, uses sole-owner Provider-v1 control/data pumps for startup, hotplug, restore, readiness, packet I/O and cleanup, preserves MMDS zero-claim behavior, and never falls back to local vmnet. Delivery issue https://github.com/seven332/bangbang/issues/1378 still owns elevated launcher/provider assembly plus real guest-through-provider service, crash/reclamation and concurrency evidence; root-direct execution is not a supported topology. Wave 7 https://github.com/seven332/bangbang/issues/1491 retains terminal performance and observability ownership.",
+      "summary": "Virtio-net queues, portable headers/offloads, merged RX, typed vmnet results, generation-scoped callback readiness, bounded batches, limiters, metrics, MMDS ordering, PCI lifecycle, capture-ready state, contained policy, and cleanup are implemented and verified. Exact native-v2 2.11 encoding, complete clone-local overrides, fresh-owner restore, and signed direct and contained clone identity are implemented. The no-Apple contained product authenticates one remote provider route, keeps the launcher/controller ordinary, confines root to bounded provider acquisition, drops sustained owners irreversibly, and never falls back to local vmnet. Two byte-identical clean merged-main schema-v2 results verify real shared guest DHCP and bidirectional nonce-bound TCP, provider-free MMDS, startup/hotplug/remove/restore generations, role-specific death and SIGKILL reclamation, repeat, noninterchangeable concurrent policies, and complete cleanup. Optional host/bridged traffic and externally induced service conditions remain explicit nondependencies. Wave 7 https://github.com/seven332/bangbang/issues/1491 retains terminal performance and observability ownership.",
       "source_refs": [
         "corpus:network-performance",
         "corpus:network-setup",
         "corpus:patch-network-interface"
       ],
-      "disposition": "missing-platform-feasible",
-      "delivery_issue": "https://github.com/seven332/bangbang/issues/1378"
+      "disposition": "implemented-and-verified",
+      "implementation": [
+        {
+          "kind": "local",
+          "path": "crates/bangbang/src/host_network/remote_vmnet.rs",
+          "anchor": "pub(crate) struct RemoteVmnetProviderSource"
+        },
+        {
+          "kind": "local",
+          "path": "crates/runtime/src/snapshot_network_restore_v2_11.rs",
+          "anchor": "pub struct PreparedSnapshotV2NetworkRestoreTopology"
+        },
+        {
+          "kind": "local",
+          "path": "crates/session/src/vmnet_provider/mod.rs",
+          "anchor": "Closed, bounded vmnet-provider protocol"
+        },
+        {
+          "kind": "local",
+          "path": "crates/vmnet-provider/src/macos/topology.rs",
+          "anchor": "pub fn run_public_bootstrap("
+        }
+      ],
+      "validation": [
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-contract.md",
+          "anchor": "## Mandatory claim mapping"
+        },
+        {
+          "kind": "local",
+          "path": "compat/firecracker/v1.16.0/production-vmnet-certification-evidence.json",
+          "anchor": "concurrent-noninterchangeability"
+        },
+        {
+          "kind": "local",
+          "path": "scripts/tests/test_production_vmnet_elevated.py",
+          "anchor": "test_restore_orchestration_requires_fresh_owner_and_exact_barrier"
+        },
+        {
+          "kind": "local",
+          "path": "tools/firecracker-capability-audit/tests/production_vmnet_certification_audit.rs",
+          "anchor": "fn checked_production_vmnet_certification_is_canonical_and_fail_closed()"
+        }
+      ]
     },
     {
       "id": "semantic.observability:logger-delivery-filtering-loss-and-redaction",
