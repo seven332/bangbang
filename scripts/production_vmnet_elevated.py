@@ -2701,7 +2701,7 @@ class ElevatedSystemCertificationDriver:
         first = self._start_live_shared(case)
         second: Optional[RemoteProductionProcess] = None
         try:
-            second = self._spawn(case)
+            second = self._spawn(case, allowed=("host",), maximum=1)
             self._configure(second)
             self.vmnet._require_no_content(self._start(second))
             self.vmnet._require_policy_denial(

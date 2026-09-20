@@ -1189,6 +1189,11 @@ class ElevatedProductionVmnetContractTests(unittest.TestCase):
             mock.patch.object(vmnet, "_api_get", return_value=object()),
         ):
             driver._run_concurrent("concurrent-noninterchangeability")
+        driver._spawn.assert_called_once_with(
+            "concurrent-noninterchangeability",
+            allowed=("host",),
+            maximum=1,
+        )
         first.roles.assert_called_once_with(require_owner=True)
         second.roles.assert_called_once_with(require_owner=False, forbid_owner=True)
         self.assertEqual(require_running.call_count, 2)
